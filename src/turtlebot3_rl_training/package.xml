@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>turtlebot3_rl_training</name>
+  <version>0.0.0</version>
+  <description>SAC reinforcement learning training package for TurtleBot3 Burger in Gazebo</description>
+  <maintainer email="qhals8380@gmail.com">bomin</maintainer>
+  <license>TODO</license>
+  <buildtool_depend>ament_python</buildtool_depend>
+  <depend>rclpy</depend>
+  <depend>geometry_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>rosgraph_msgs</depend>
+  <depend>ros_gz_interfaces</depend>
+  <depend>ros_gz_bridge</depend>
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
