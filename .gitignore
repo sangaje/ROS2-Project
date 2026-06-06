@@ -1,0 +1,46 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.venv/
+venv/
+env/
+
+build/
+install/
+log/
+
+*.bag
+*.db3
+
+.DS_Store
+.vscode/
+.idea/
+
+rl_*
+
+# RL model/checkpoint outputs
+rl_models*/
+rl_*/
+*.pkl
+*.zip
+*.pt
+*.pth
+*.onnx
+
+# ROS2 build outputs
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Gazebo / ROS bags
+*.bag
+*.db3
+src/turtlebot3_simulations/
