@@ -1,0 +1,78 @@
+bayesian_risk_map_node:
+  ros__parameters:
+    # Topics / frames
+    map_topic: "/map"
+    image_topic: "/camera/image_raw"
+    map_frame: "map"
+    base_frame: "base_link"
+    use_sim_time: false
+    update_rate_hz: 2.0
+    tf_timeout_sec: 0.25
+
+    # YOLO
+    enable_yolo: true
+    model_path: "yolo11n.pt"
+    device: "cpu"
+    conf_threshold: 0.20
+    yolo_imgsz: 640
+    yolo_max_rate_hz: 3.0
+    detection_timeout_sec: 0.8
+
+    # Fake detection debug
+    enable_fake_detection: false
+    fake_detection_interval_sec: 2.0
+    fake_bearing_deg: 0.0
+    fake_range_m: 2.0
+    fake_confidence: 0.9
+
+    # Camera prior
+    camera_hfov_deg: 62.0
+    camera_vfov_deg: 49.5
+    real_person_height_m: 1.70
+    min_range_m: 0.5
+    max_range_m: 5.0
+
+    # Positive detection candidate model
+    bearing_sigma_deg: 8.0
+    angular_sample_step_deg: 1.0
+    range_sigma_m: 0.75
+    use_bbox_range_prior: true
+    source_min_value: 0.03
+    positive_memory_alpha: 0.85
+
+    # Risk halo: bounded, wall-aware, not global diffusion
+    source_halo_radius_m: 0.75
+    source_halo_sigma_m: 0.35
+    source_halo_seed_threshold: 0.12
+    source_halo_top_k: 80
+
+    # Room / region inference
+    enable_room_probability: true
+    room_top_k: 3
+    room_min_score: 0.02
+
+    # Empty observation is stored separately, not subtracted from risk
+    enable_empty_observation_map: true
+    visibility_num_rays: 96
+    observed_empty_alpha: 0.20
+
+    # Occupancy policy
+    allow_unknown: false
+    free_threshold: 30
+    occupied_threshold: 65
+
+    # Clear
+    clear_radius_m: 0.6
+
+    # Debug images
+    publish_overlay: true
+    publish_debug_image: true
+    debug_show_opencv: false
+    debug_save_images: false
+    debug_image_dir: "/tmp/tb3_bayesian_risk_map_debug"
+    debug_image_rate_hz: 1.0
+    debug_log_image_status: true
+
+    # Persistence
+    preserve_risk_on_map_resize: true
+    publish_yolo_debug_even_without_detection: true

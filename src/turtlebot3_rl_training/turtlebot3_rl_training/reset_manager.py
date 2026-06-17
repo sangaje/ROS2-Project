@@ -61,6 +61,11 @@ class ResetManager:
         self.last_requested_pose: Optional[ResetPose] = None
         self.last_actual_pose: Optional[ResetPose] = None
         self.last_reset_entity_name: Optional[str] = None
+        # Keep normal training logs compact. Full Gazebo discovery lists are
+        # available through the debug logger only.
+        self._last_candidate_order_log: tuple[str, ...] = ()
+        self._stale_pose_warned_entities: set[str] = set()
+        self._unverified_pose_warned_entities: set[str] = set()
 
         self.node.get_logger().info(f"Reset service     : {self.set_pose_service}")
         self.node.get_logger().info(f"Reset entity hint : {self.entity_name}")
@@ -199,7 +204,7 @@ class ResetManager:
     def reset_to_pose(
         self,
         reset_pose: ResetPose,
-        timeout_sec: float = 3.0,
+        timeout_sec: float = 5.0,
     ) -> bool:
         if not self.wait_until_ready(timeout_sec=self.service_wait_timeout_sec):
             return False
@@ -208,46 +213,81 @@ class ResetManager:
         self.last_actual_pose = None
         self.last_reset_entity_name = None
 
-        candidates = self._candidate_entity_names()
-        candidates = [name for name in candidates if name not in self.failed_entity_names]
+        # v25.4: Gazebo 10x / Cartographer restart can transiently make SetEntityPose
+        # or gz discovery time out.  Do not permanently blacklist the already validated
+        # robot entity; retry once after clearing transient failures.
+        last_candidates: list[str] = []
+        for pass_idx in range(2):
+            candidates = self._candidate_entity_names()
+            candidates = [name for name in candidates if name not in self.failed_entity_names]
+            last_candidates = candidates
 
-        if not candidates:
-            self.node.get_logger().error(
-                "No valid Gazebo robot model candidate was found for pose reset. "
-                "Run these commands and pass the model name with --entity-name:\n"
-                "  ros2 topic list | grep '^/model/'\n"
-                "  gz model --list\n"
-                "  timeout 2 gz topic -e -t /world/default/pose/info | grep 'name:'"
-            )
-            return False
-
-        self.node.get_logger().info(
-            "Pose reset candidate order: " + ", ".join(candidates)
-        )
-
-        for candidate in candidates:
-            if self._reset_to_pose_with_entity_name(
-                entity_name=candidate,
-                reset_pose=reset_pose,
-                timeout_sec=timeout_sec,
-            ):
-                if candidate != self.entity_name:
+            if not candidates:
+                if pass_idx == 0:
                     self.node.get_logger().warn(
-                        "Gazebo entity auto-detected: "
-                        f"'{self.entity_name}' -> '{candidate}'"
+                        "No reset entity candidates after transient blacklist filtering; "
+                        "clearing transient failures and retrying discovery once."
                     )
-                self.entity_name = candidate
-                self.validated_entity_name = candidate
-                self.last_reset_entity_name = candidate
-                return True
+                    self.failed_entity_names.clear()
+                    time.sleep(0.20)
+                    continue
+                self.node.get_logger().error(
+                    "No valid Gazebo robot model candidate was found for pose reset. "
+                    "Run these commands and pass the model name with --entity-name:\n"
+                    "  ros2 topic list | grep '^/model/'\n"
+                    "  gz model --list\n"
+                    "  timeout 2 gz topic -e -t /world/default/pose/info | grep 'name:'"
+                )
+                return False
 
-            # 같은 실행에서 같은 잘못된 이름을 계속 때리지 않는다.
-            self.failed_entity_names.add(candidate)
+            cand_tuple = tuple(candidates)
+            if cand_tuple != self._last_candidate_order_log:
+                self._last_candidate_order_log = cand_tuple
+                self.node.get_logger().warn(
+                    "Pose reset candidate order: " + ", ".join(candidates)
+                )
+
+            for candidate in candidates:
+                if self._reset_to_pose_with_entity_name(
+                    entity_name=candidate,
+                    reset_pose=reset_pose,
+                    timeout_sec=timeout_sec,
+                ):
+                    if candidate != self.entity_name:
+                        self.node.get_logger().warn(
+                            "Gazebo entity auto-detected: "
+                            f"'{self.entity_name}' -> '{candidate}'"
+                        )
+                    self.entity_name = candidate
+                    self.validated_entity_name = candidate
+                    self.last_reset_entity_name = candidate
+                    # A successful reset proves this entity is valid; clear old transient failures.
+                    self.failed_entity_names.clear()
+                    return True
+
+                # Do not blacklist the user-specified or previously validated robot after a timeout.
+                # With high Gazebo real_time_factor, service calls can time out even though the
+                # model is correct.  Blacklisting it causes the next reset to fall through to
+                # bad world objects such as turtlebot3_house.
+                if self._is_protected_robot_candidate(candidate):
+                    self.node.get_logger().warn(
+                        f"Reset attempt failed for protected robot candidate='{candidate}', "
+                        "but it will NOT be blacklisted. Retrying/reset discovery may recover."
+                    )
+                else:
+                    self.failed_entity_names.add(candidate)
+
+            if pass_idx == 0:
+                self.node.get_logger().warn(
+                    "Pose reset failed on first pass; clearing transient failures and retrying once."
+                )
+                self.failed_entity_names.clear()
+                time.sleep(0.20)
 
         self.node.get_logger().error(
             "Failed to reset pose for all discovered Gazebo robot candidates: "
-            + ", ".join(candidates)
-            + ". Use --disable-pose-reset temporarily or pass the exact model name with --entity-name."
+            + ", ".join(last_candidates)
+            + ". Pass the exact model name with --entity-name burger or lower Gazebo speed."
         )
         return False
 
@@ -305,7 +345,7 @@ class ResetManager:
             if not self._verify_actual_gazebo_pose(entity_name, reset_pose):
                 return False
 
-            self.node.get_logger().info(
+            self.node.get_logger().debug(
                 f"Reset by ROS SetEntityPose: entity='{entity_name}' -> "
                 f"requested=(x={reset_pose.x:.3f}, y={reset_pose.y:.3f}, "
                 f"z={reset_pose.z:.3f}, yaw={reset_pose.yaw:.3f}), "
@@ -383,7 +423,7 @@ class ResetManager:
                 if not self._verify_actual_gazebo_pose(entity_name, reset_pose):
                     return False
 
-                self.node.get_logger().info(
+                self.node.get_logger().debug(
                     f"Reset by Gazebo service: entity='{entity_name}' -> "
                     f"requested=(x={reset_pose.x:.3f}, y={reset_pose.y:.3f}, "
                     f"z={reset_pose.z:.3f}, yaw={reset_pose.yaw:.3f}), "
@@ -431,8 +471,26 @@ class ResetManager:
 
     @staticmethod
     def _looks_like_robot_model(name: str) -> bool:
-        lower = name.lower()
-        return any(token in lower for token in ("burger", "waffle", "turtlebot3", "tb3"))
+        lower = name.strip().lower()
+        # v25.4: turtlebot3_house is a world model, not the robot.  Do not accept
+        # generic turtlebot3 names unless they clearly identify burger/waffle.
+        if lower in {"burger", "waffle", "turtlebot3_burger", "turtlebot3_waffle"}:
+            return True
+        if "burger" in lower or "waffle" in lower:
+            return True
+        # Common shortened robot aliases are okay, but environment names are not.
+        if lower in {"tb3", "tb3_burger", "tb3_waffle"}:
+            return True
+        return False
+
+    def _is_protected_robot_candidate(self, name: str) -> bool:
+        if not name:
+            return False
+        if self.validated_entity_name and name == self.validated_entity_name:
+            return True
+        if self.entity_name and name == self.entity_name:
+            return True
+        return name.strip().lower() in {"burger", "waffle", "turtlebot3_burger", "turtlebot3_waffle"}
 
     @staticmethod
     def _is_bad_entity_candidate(name: str) -> bool:
@@ -447,6 +505,8 @@ class ResetManager:
             "default",
             "ground_plane",
             "sun",
+            "turtlebot3_house",
+            "house",
             "link",
             "base_link",
             "base_footprint",
@@ -463,8 +523,16 @@ class ResetManager:
         # 환경/월드 모델 또는 링크/센서 이름을 로봇 모델로 오인하지 않는다.
         bad_substrings = (
             "world",
+            "house",
             "ground",
             "symbol",
+            "bookshelf",
+            "cabinet",
+            "table",
+            "chair",
+            "wall",
+            "door",
+            "mailbox",
             "base_link",
             "base_footprint",
             "base_scan",
@@ -510,33 +578,65 @@ class ResetManager:
         entity_name: str,
         reset_pose: ResetPose,
         tolerance_xy: float = 0.08,
-        timeout_sec: float = 0.8,
+        timeout_sec: float = 1.20,
     ) -> bool:
-        actual = self._wait_for_gazebo_pose(entity_name, timeout_sec=timeout_sec)
+        """
+        Verify Gazebo pose when /world/<world>/pose/info is useful, but do not
+        reject a successful SetEntityPose call only because pose/info is stale.
+
+        In paused / stepped Gazebo runs, SetEntityPose can return success while
+        /world/<world>/pose/info still reports the previous model pose until the
+        next world update.  Treating that stale sample as a hard failure makes
+        every valid reset candidate look invalid and can blacklist the robot
+        entity for the rest of the run.  The real spawn safety check is still
+        done later through fresh LiDAR clearance validation in GazeboNavEnv.
+        """
+        start = time.time()
+        last_actual: Optional[ResetPose] = None
+        last_dx: Optional[float] = None
+        last_dy: Optional[float] = None
+
+        while time.time() - start < max(float(timeout_sec), 0.0):
+            actual = self._read_gazebo_pose(entity_name)
+            if actual is None:
+                time.sleep(0.05)
+                continue
+
+            last_actual = actual
+            self.last_actual_pose = actual
+            last_dx = abs(float(actual.x) - float(reset_pose.x))
+            last_dy = abs(float(actual.y) - float(reset_pose.y))
+
+            if last_dx <= tolerance_xy and last_dy <= tolerance_xy:
+                return True
+
+            time.sleep(0.05)
 
         # pose/info를 못 읽는 환경이면 service success를 신뢰하되, 로그에는 미검증으로 남긴다.
-        if actual is None:
+        if last_actual is None:
             self.last_actual_pose = None
-            self.node.get_logger().warn(
-                f"Could not verify actual Gazebo pose for entity='{entity_name}'. "
-                "Accepting service success, but check /world/<world>/pose/info if the GUI looks wrong."
+            if entity_name not in self._unverified_pose_warned_entities:
+                self._unverified_pose_warned_entities.add(entity_name)
+                self.node.get_logger().debug(
+                    f"Gazebo pose verification unavailable for entity='{entity_name}'. "
+                    "Accepting SetEntityPose; LiDAR validation will check spawn safety."
+                )
+            return True
+
+        # 여기서 return False를 하면 valid spawn까지 전부 버리고 burger entity가 blacklist된다.
+        # Gazebo가 paused 상태면 pose/info가 한 tick 늦게 갱신될 수 있으므로 hard failure가 아니라
+        # stale verification warning으로만 처리한다.
+        self.last_actual_pose = last_actual
+        if entity_name not in self._stale_pose_warned_entities:
+            self._stale_pose_warned_entities.add(entity_name)
+            self.node.get_logger().debug(
+                f"Pose reset verification stale for entity='{entity_name}': "
+                f"requested=({reset_pose.x:.2f},{reset_pose.y:.2f}), "
+                f"pose_info={self._format_pose(last_actual)}, "
+                f"dx={float(last_dx or 0.0):.2f}, dy={float(last_dy or 0.0):.2f}. "
+                "Accepting SetEntityPose; LiDAR validation is authoritative."
             )
-            return True
-
-        self.last_actual_pose = actual
-        dx = abs(float(actual.x) - float(reset_pose.x))
-        dy = abs(float(actual.y) - float(reset_pose.y))
-
-        if dx <= tolerance_xy and dy <= tolerance_xy:
-            return True
-
-        self.node.get_logger().warn(
-            f"Pose reset verification failed for entity='{entity_name}': "
-            f"requested=(x={reset_pose.x:.3f}, y={reset_pose.y:.3f}, z={reset_pose.z:.3f}), "
-            f"actual={self._format_pose(actual)}, "
-            f"|dx|={dx:.3f}, |dy|={dy:.3f}. Trying next candidate."
-        )
-        return False
+        return True
 
     def _wait_for_gazebo_pose(
         self,
@@ -638,7 +738,7 @@ class ResetManager:
 
         names = self._unique_preserve_order(names)
         if names:
-            self.node.get_logger().info(
+            self.node.get_logger().debug(
                 f"Gazebo model candidates from ROS /model topics: {names}"
             )
         return names
@@ -678,9 +778,10 @@ class ResetManager:
 
             names = self._unique_preserve_order(names)
             if names:
-                self.node.get_logger().info(
+                robot_like = [n for n in names if self._looks_like_robot_model(n) and not self._is_bad_entity_candidate(n)]
+                self.node.get_logger().debug(
                     "Gazebo model candidates from command "
-                    f"'{ ' '.join(cmd) }': {names}"
+                    f"'{ ' '.join(cmd) }': robot_like={robot_like}"
                 )
                 return names
 
@@ -725,8 +826,9 @@ class ResetManager:
 
             names = self._unique_preserve_order(names)
             if names:
-                self.node.get_logger().info(
-                    f"Gazebo pose/info model candidates from {topic}: {names}"
+                robot_like = [n for n in names if self._looks_like_robot_model(n) and not self._is_bad_entity_candidate(n)]
+                self.node.get_logger().debug(
+                    f"Gazebo pose/info model candidates from {topic}: robot_like={robot_like}"
                 )
                 return names
 

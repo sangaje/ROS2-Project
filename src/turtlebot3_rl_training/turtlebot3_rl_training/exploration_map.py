@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import math
+import os
+import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Optional
@@ -42,14 +44,28 @@ class MapUpdateStats:
     path_distance: float
     path_angle: float
     path_progress: float
+    alternative_path_count: int
+    alternative_path_angles: tuple[float, ...]
     priority_score: float
     priority_gain: float
     priority_cleared_cells: int
     priority_clear_gain: float
     priority_invalidated_cells: int
     priority_invalidated_gain: float
+    priority_rechecked_cells: int
+    priority_rechecked_gain: float
     wall_support_score: float
     open_space_score: float
+    nearest_obstacle_distance: float
+    obstacle_proximity_score: float
+    # Delayed SLAM /map update diagnostics.  These describe new structural
+    # information that arrived through the SLAM OccupancyGrid, not through the
+    # immediate LiDAR ray-cast confidence update.  They default to zero so older
+    # callers that build MapUpdateStats manually remain compatible.
+    slam_update_new_known_cells: int = 0
+    slam_update_new_free_cells: int = 0
+    slam_update_new_occupied_cells: int = 0
+    slam_update_expand_known_cells: int = 0
 
 
 class ExplorationGridMap:
@@ -97,12 +113,14 @@ class ExplorationGridMap:
         size_m: float = 8.0,
         origin_x: float = -4.0,
         origin_y: float = -4.0,
-        frame_id: str = "map",
+        frame_id: str = "odom",
         publish_topic: str = "/rl_task_map",
         confidence_publish_topic: str = "/rl_confidence_map",
         priority_publish_topic: str = "/rl_priority_map",
-        path_publish_topic: str = "/rl_path",
+        disable_priority_map: bool = False,
+        path_publish_topic: str = "",
         filtered_slam_publish_topic: str = "/rl_filtered_slam_map",
+        publish_slam_aligned: bool = False,
         legacy_memory_publish_topic: str = "/rl_memory_map",
         keepalive_publish_period_sec: float = 0.50,
         lidar_stride: int = 2,
@@ -147,6 +165,11 @@ class ExplorationGridMap:
         open_space_front_distance_m: float = 1.80,
         open_space_side_width_m: float = 1.20,
         map_expand_chunk_cells: int = 64,
+        max_planned_candidates: int = 8,
+        max_alternative_paths: int = 5,
+        path_visual_publish_every_n: int = 5,
+        target_lock_steps: int = 16,
+        target_switch_margin: float = 0.12,
     ):
         self.node = node
         self.resolution = float(resolution)
@@ -154,20 +177,43 @@ class ExplorationGridMap:
         self.size_m = float(size_m)
         self.origin_x = float(origin_x)
         self.origin_y = float(origin_y)
-        self.frame_id = str(frame_id)
+        self.frame_id = str(frame_id or "odom").strip() or "odom"
+        self.disable_priority_map = bool(disable_priority_map)
         self.lidar_stride = max(int(lidar_stride), 1)
         self.max_range = float(max_range)
 
-        self.publish_every_n = max(int(publish_every_n), 1)
+        self.publish_every_n = max(int(publish_every_n), 0)
         self.update_count = 0
         self.step_index = 0
+        # Priority RViz diagnostics. This is deliberately low frequency so it
+        # does not dominate training logs, but it tells us whether /rl_priority_map
+        # is empty because generation failed or because RViz is not drawing it.
+        self._last_priority_publish_debug_step = -10_000_000
 
         # Cached index grids for vectorized SLAM sampling. Rebuilt only when
         # the auto-expanding map changes shape.
         self._index_cache_shape: tuple[int, int] | None = None
         self._index_cache: tuple[np.ndarray, np.ndarray] | None = None
         self._last_slam_sample_key = None
+        # Delayed SLAM /map reward bookkeeping.  Width/height are initialized
+        # later in __init__, so keep the dimensions at 0 here.  The first valid
+        # SLAM /map callback initializes the previous-known mask and is not paid
+        # as exploration reward.
+        self._slam_reward_prev_known_mask: np.ndarray | None = None
+        self._slam_reward_prev_origin_x = float(self.origin_x)
+        self._slam_reward_prev_origin_y = float(self.origin_y)
+        self._slam_reward_prev_resolution = float(self.resolution)
+        self._slam_reward_prev_width = 0
+        self._slam_reward_prev_height = 0
+        self._slam_reward_prev_frame_id = str(self.frame_id)
+        self._slam_reward_prev_stamp_key = None
+        self._last_slam_update_new_known_cells = 0
+        self._last_slam_update_new_free_cells = 0
+        self._last_slam_update_new_occupied_cells = 0
+        self._last_slam_update_expand_known_cells = 0
         self._base_grid_needs_resample = True
+        self._publish_resample_cache_key = None
+        self._publish_resample_cache = None
 
         self.min_known_confidence = float(min_known_confidence)
         self.low_confidence_threshold = float(low_confidence_threshold)
@@ -190,6 +236,26 @@ class ExplorationGridMap:
         self.gap_min_width_m = max(float(gap_min_width_m), self.resolution)
         self.gap_max_width_m = max(float(gap_max_width_m), self.gap_min_width_m)
         self.priority_recompute_interval = max(int(priority_recompute_interval), 1)
+        # v25.7: Priority recompute/birth throttles.
+        #
+        # `priority_recompute_interval` is a candidate-field refresh throttle.
+        # Dirty flags request a refresh, but must not bypass the interval.
+        #
+        # `TB3_RL_PRIORITY_BIRTH_DELTA` is a separate region-birth throttle:
+        # new/high priority regions ramp up by at most this many priority points
+        # per recompute.  Clears/decreases are still immediate.
+        self._last_priority_recompute_step = -10_000_000
+        self._last_priority_recompute_debug_step = -10_000_000
+        try:
+            self.priority_birth_max_delta_per_recompute = float(
+                os.environ.get("TB3_RL_PRIORITY_BIRTH_DELTA", "6.0")
+            )
+        except Exception:
+            self.priority_birth_max_delta_per_recompute = 6.0
+        self.priority_birth_max_delta_per_recompute = float(
+            np.clip(self.priority_birth_max_delta_per_recompute, 0.05, 100.0)
+        )
+        self._last_priority_birth_debug_step = -10_000_000
         self.priority_visit_suppression_radius_m = max(
             float(priority_visit_suppression_radius_m),
             self.resolution,
@@ -245,6 +311,14 @@ class ExplorationGridMap:
         # 64 cells at 0.05 m resolution equals 3.2 m per expansion chunk.
         self.map_expand_chunk_cells = max(int(map_expand_chunk_cells), 1)
 
+        # Hot-path planning controls. Multi-path reward is useful, but planning
+        # too many BFS paths every RL step dominates wall-clock time. These
+        # values cap the number of candidate paths while still exposing several
+        # distinct valid directions to reward.py.
+        self.max_planned_candidates = max(int(max_planned_candidates), 1)
+        self.max_alternative_paths = max(int(max_alternative_paths), 1)
+        self.path_visual_publish_every_n = max(int(path_visual_publish_every_n), 0)
+
         self.free_logodds_delta = float(free_logodds_delta)
         self.occupied_logodds_delta = float(occupied_logodds_delta)
         self.max_logodds_abs = float(max_logodds_abs)
@@ -259,12 +333,19 @@ class ExplorationGridMap:
         self.correction_logodds_grid = np.zeros((self.height, self.width), dtype=np.float32)
         self.confidence_grid = np.zeros((self.height, self.width), dtype=np.float32)
         self.priority_grid = np.zeros((self.height, self.width), dtype=np.float32)
+        self._persistent_priority_seed_grid = np.zeros((self.height, self.width), dtype=np.float32)
+        self._persistent_priority_allowed_grid = np.zeros((self.height, self.width), dtype=bool)
+        self._last_priority_cluster_spawn_step = -10_000_000
         # 0..1 persistent mask that suppresses priority around already explored / visited regions.
         # It prevents a door-like gap from remaining attractive after the robot has already checked it.
         self.priority_suppression_grid = np.zeros((self.height, self.width), dtype=np.float32)
         # True means this area has already been checked for priority purposes.
         # It is a hard exclusion for future priority recomputation.
         self.priority_checked_grid = np.zeros((self.height, self.width), dtype=bool)
+        # One-shot reward bookkeeping for checked(-1) cells that would later
+        # become valid priority candidates again.  Without this mask the same
+        # checked cell can pay a positive reward on every priority recompute.
+        self.priority_rechecked_rewarded_grid = np.zeros((self.height, self.width), dtype=bool)
         self.visit_grid = np.zeros((self.height, self.width), dtype=np.int32)
         self.last_seen_grid = np.full((self.height, self.width), -1, dtype=np.int32)
         self.grid = np.full((self.height, self.width), self.UNKNOWN, dtype=np.int8)
@@ -275,13 +356,15 @@ class ExplorationGridMap:
         self._priority_dirty = True
         self._last_priority_invalidated_cells = 0
         self._last_priority_invalidated_gain = 0.0
+        self._last_priority_rechecked_cells = 0
+        self._last_priority_rechecked_gain = 0.0
 
         # Target hysteresis state. Target selection used to be a per-step global
         # argmax over unknown/low-confidence/priority candidates, which made
         # frontier_angle flip between left/right candidates. Keep a selected
         # target for a short horizon unless a clearly better target appears.
-        self.target_lock_steps = 16
-        self.target_switch_margin = 0.12
+        self.target_lock_steps = max(int(target_lock_steps), 0)
+        self.target_switch_margin = float(np.clip(float(target_switch_margin), 0.0, 1.0))
         self._locked_target_ix: Optional[int] = None
         self._locked_target_iy: Optional[int] = None
         self._locked_target_type: str = self.TARGET_NONE
@@ -297,21 +380,32 @@ class ExplorationGridMap:
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
 
-        self.map_pub = self.node.create_publisher(OccupancyGrid, publish_topic, map_qos)
-        self.confidence_pub = self.node.create_publisher(
-            OccupancyGrid,
-            confidence_publish_topic,
-            map_qos,
-        )
-        self.priority_pub = self.node.create_publisher(
-            OccupancyGrid,
-            priority_publish_topic,
-            map_qos,
-        )
+        self.publish_topic = str(publish_topic).strip()
+        self.confidence_publish_topic = str(confidence_publish_topic).strip()
+        self.priority_publish_topic = str(priority_publish_topic).strip()
+        self.map_pub = None
+        self.confidence_pub = None
+        self.priority_pub = None
+        if self.publish_topic:
+            self.map_pub = self.node.create_publisher(OccupancyGrid, self.publish_topic, map_qos)
+        if self.confidence_publish_topic:
+            self.confidence_pub = self.node.create_publisher(
+                OccupancyGrid,
+                self.confidence_publish_topic,
+                map_qos,
+            )
+        if self.priority_publish_topic:
+            self.priority_pub = self.node.create_publisher(
+                OccupancyGrid,
+                self.priority_publish_topic,
+                map_qos,
+            )
 
         # RL-only filtered SLAM view. Do not overwrite /map published by slam_toolbox.
         # This topic mirrors the post-filter base_grid actually used by priority/path/CNN logic.
         self.filtered_slam_publish_topic = str(filtered_slam_publish_topic).strip()
+        self.publish_slam_aligned = bool(publish_slam_aligned)
+        self._slam_publish_ref = None
         self.filtered_slam_pub = None
         if self.filtered_slam_publish_topic:
             self.filtered_slam_pub = self.node.create_publisher(
@@ -345,7 +439,18 @@ class ExplorationGridMap:
 
         self.keepalive_publish_period_sec = max(float(keepalive_publish_period_sec), 0.0)
         self._keepalive_timer = None
-        if self.keepalive_publish_period_sec > 0.0:
+        self._has_any_map_publisher = any(
+            pub is not None
+            for pub in (
+                self.map_pub,
+                self.confidence_pub,
+                self.priority_pub,
+                self.filtered_slam_pub,
+                self.path_pub,
+                self.legacy_memory_pub,
+            )
+        )
+        if self._has_any_map_publisher and self.keepalive_publish_period_sec > 0.0:
             # RViz sometimes subscribes after the first reset publish. Re-publish
             # full maps periodically so Map displays do not stay at "No map received".
             self._keepalive_timer = self.node.create_timer(
@@ -353,9 +458,9 @@ class ExplorationGridMap:
                 self.publish,
             )
 
-        # Publish a valid empty initial map immediately. This also seeds the
-        # TRANSIENT_LOCAL history before the first environment reset/update.
-        self.publish()
+        # Publish a valid empty initial map only when a visualization topic exists.
+        if self._has_any_map_publisher:
+            self.publish()
 
         self.node.get_logger().info(
             f"SLAM task/confidence/priority map publishers: "
@@ -367,6 +472,7 @@ class ExplorationGridMap:
             f"seen_confidence_floor={self.seen_confidence_floor:.1f}, "
             f"confidence_decay={'disabled' if self.confidence_decay_per_step <= 0.0 else self.confidence_decay_per_step}, "
             f"gap_confidence_suppression=disabled, "
+            f"priority_disabled={self.disable_priority_map}, priority_birth_delta={self.priority_birth_max_delta_per_recompute:.2f}/recompute, "
             f"priority_gap_width=[{self.gap_min_width_m:.2f},{self.gap_max_width_m:.2f}]m, "
             f"priority_visit_suppression_radius={self.priority_visit_suppression_radius_m:.2f}m, "
             f"priority_visit_suppression_gain={self.priority_visit_suppression_gain:.2f}, "
@@ -378,8 +484,12 @@ class ExplorationGridMap:
             f"priority_clear_angle_sigma={math.degrees(self.priority_clear_angle_sigma_rad):.1f}deg, "
             f"priority_clear_min_weight={self.priority_clear_min_weight:.2f}, "
             f"auto_expand=local_robot_window, expand_chunk_cells={self.map_expand_chunk_cells}, "
+            f"max_planned_candidates={self.max_planned_candidates}, "
+            f"max_alternative_paths={self.max_alternative_paths}, "
+            f"path_visual_publish_every_n={self.path_visual_publish_every_n}, "
             f"path_topic={self.path_publish_topic or '(disabled)'}, "
             f"filtered_slam_topic={self.filtered_slam_publish_topic or '(disabled)'}, "
+            f"publish_slam_aligned={self.publish_slam_aligned}, "
             f"cnn_channels=5, "
             f"legacy_memory_alias={self.legacy_memory_topic or '(disabled)'}, "
             f"keepalive_publish_period={self.keepalive_publish_period_sec:.2f}s"
@@ -390,8 +500,22 @@ class ExplorationGridMap:
         self.correction_logodds_grid.fill(0.0)
         self.confidence_grid.fill(0.0)
         self.priority_grid.fill(0.0)
+        if hasattr(self, "_persistent_priority_seed_grid") and isinstance(self._persistent_priority_seed_grid, np.ndarray):
+            self._persistent_priority_seed_grid.fill(0.0)
+        if hasattr(self, "_persistent_priority_allowed_grid") and isinstance(self._persistent_priority_allowed_grid, np.ndarray):
+            self._persistent_priority_allowed_grid.fill(False)
+        self._last_priority_cluster_spawn_step = -10_000_000
         self.priority_suppression_grid.fill(0.0)
         self.priority_checked_grid.fill(False)
+        if hasattr(self, "priority_rechecked_rewarded_grid"):
+            self.priority_rechecked_rewarded_grid.fill(False)
+        self._last_lidar_visible_free_mask = np.zeros_like(self.priority_grid, dtype=bool)
+        self._last_lidar_priority_clear_weight = np.zeros_like(self.priority_grid, dtype=np.float32)
+        self._last_lidar_hit_wall_mask = np.zeros_like(self.priority_grid, dtype=bool)
+        self._last_lidar_hit_cells_for_priority = []
+        self._last_lidar_visible_step = -1
+        self._random_priority_epoch = None
+        self._random_priority_seed_cache = None
         self.visit_grid.fill(0)
         self.last_seen_grid.fill(-1)
         self.grid.fill(self.UNKNOWN)
@@ -400,11 +524,17 @@ class ExplorationGridMap:
         self.prev_priority_score = 0.0
         self._last_priority_invalidated_cells = 0
         self._last_priority_invalidated_gain = 0.0
+        self._last_priority_rechecked_cells = 0
+        self._last_priority_rechecked_gain = 0.0
         self.update_count = 0
         self.step_index = 0
         self._priority_dirty = True
         self._last_slam_sample_key = None
         self._base_grid_needs_resample = True
+        self._publish_resample_cache_key = None
+        self._publish_resample_cache = None
+        self._slam_publish_ref = None
+        self._reset_slam_update_reward_bookkeeping()
         self._reset_target_lock()
         self.publish()
 
@@ -426,10 +556,19 @@ class ExplorationGridMap:
         self.correction_logodds_grid = np.zeros((self.height, self.width), dtype=np.float32)
         self.confidence_grid = np.zeros((self.height, self.width), dtype=np.float32)
         self.priority_grid = np.zeros((self.height, self.width), dtype=np.float32)
+        self._persistent_priority_seed_grid = np.zeros((self.height, self.width), dtype=np.float32)
+        self._persistent_priority_allowed_grid = np.zeros((self.height, self.width), dtype=bool)
+        self._last_priority_cluster_spawn_step = -10_000_000
         # 0..1 persistent mask that suppresses priority around already explored / visited regions.
         # It prevents a door-like gap from remaining attractive after the robot has already checked it.
         self.priority_suppression_grid = np.zeros((self.height, self.width), dtype=np.float32)
         self.priority_checked_grid = np.zeros((self.height, self.width), dtype=bool)
+        self.priority_rechecked_rewarded_grid = np.zeros((self.height, self.width), dtype=bool)
+        self._last_lidar_visible_free_mask = np.zeros((self.height, self.width), dtype=bool)
+        self._last_lidar_priority_clear_weight = np.zeros((self.height, self.width), dtype=np.float32)
+        self._last_lidar_visible_step = -1
+        self._random_priority_epoch = None
+        self._random_priority_seed_cache = None
         self.visit_grid = np.zeros((self.height, self.width), dtype=np.int32)
         self.last_seen_grid = np.full((self.height, self.width), -1, dtype=np.int32)
         self.grid = np.full((self.height, self.width), self.UNKNOWN, dtype=np.int8)
@@ -447,24 +586,36 @@ class ExplorationGridMap:
         self.step_index += 1
         self._last_priority_invalidated_cells = 0
         self._last_priority_invalidated_gain = 0.0
+        self._last_priority_rechecked_cells = 0
+        self._last_priority_rechecked_gain = 0.0
         self._apply_temporal_decay()
 
-        # Ensure the internal maps can hold the robot-centered local operating region.
-        # Do not add padding here: reset_centered_at() already creates exactly this
-        # initial window. Adding padding made the map grow immediately at episode start.
-        local_pad = max(self.initial_size_m * 0.5, self.confidence_max_range + 0.5)
-        self._ensure_world_bounds(
-            float(robot_xy[0]) - local_pad,
-            float(robot_xy[0]) + local_pad,
-            float(robot_xy[1]) - local_pad,
-            float(robot_xy[1]) + local_pad,
-            padding_m=0.0,
-        )
-
+        # In map/map/map mode the internal confidence/priority canvas must be
+        # the exact SLAM /map canvas.  Lock to the latest /map before any local
+        # LiDAR/robot bounds logic; otherwise the RL maps grow in a separate
+        # robot-centered rectangle and RViz alignment drifts.
         if self.use_slam_prior and slam_map is not None:
             self._sample_slam_base(slam_map)
         elif not self.use_slam_prior:
             self.base_grid.fill(self.UNKNOWN)
+
+        def _same_frame_name(a, b) -> bool:
+            return str(a or "").strip().lstrip("/") == str(b or "").strip().lstrip("/") and bool(str(a or "").strip())
+
+        slam_frame_for_update = str(getattr(getattr(slam_map, "header", None), "frame_id", "") or "").strip() if slam_map is not None else ""
+        map_canvas_locked_mode = bool(self.use_slam_prior and slam_map is not None and _same_frame_name(self.frame_id, slam_frame_for_update))
+
+        # Only non-map-locked operation may grow from LiDAR/robot bounds.  In
+        # map-locked mode, growth is exclusively driven by SLAM /map metadata.
+        if not map_canvas_locked_mode:
+            local_pad = max(self.initial_size_m * 0.5, self.confidence_max_range + 0.5)
+            self._ensure_world_bounds(
+                float(robot_xy[0]) - local_pad,
+                float(robot_xy[0]) + local_pad,
+                float(robot_xy[1]) - local_pad,
+                float(robot_xy[1]) + local_pad,
+                padding_m=0.0,
+            )
 
         prev_known = self.known_cell_count()
         prev_mean_conf = self.mean_confidence()
@@ -474,9 +625,55 @@ class ExplorationGridMap:
         observed_mask = np.zeros((self.height, self.width), dtype=bool)
         priority_clear_mask = np.zeros((self.height, self.width), dtype=np.float32)
 
+        def _remap_update_mask(mask: np.ndarray, old_ox: float, old_oy: float, old_w: int, old_h: int, fill, dtype):
+            """Remap a per-update temporary mask after the persistent map canvas changes.
+
+            update() may lock the internal canvas to a newly grown SLAM /map or, in
+            odom mode, expand the canvas for a LiDAR ray.  Temporary masks such as
+            priority_clear_mask must follow the same origin/size shift; otherwise
+            later visibility masking crashes or, worse, clears confidence/priority
+            in the wrong physical cells.
+            """
+            if isinstance(mask, np.ndarray) and mask.shape == (self.height, self.width):
+                return mask
+            out = np.full((self.height, self.width), fill, dtype=dtype)
+            if not isinstance(mask, np.ndarray) or mask.shape != (int(old_h), int(old_w)):
+                return out
+            try:
+                off_x = int(round((float(old_ox) - float(self.origin_x)) / max(float(self.resolution), 1e-9)))
+                off_y = int(round((float(old_oy) - float(self.origin_y)) / max(float(self.resolution), 1e-9)))
+                src_x0 = max(0, -off_x)
+                src_y0 = max(0, -off_y)
+                dst_x0 = max(0, off_x)
+                dst_y0 = max(0, off_y)
+                cols = min(int(old_w) - src_x0, int(self.width) - dst_x0)
+                rows = min(int(old_h) - src_y0, int(self.height) - dst_y0)
+                if cols > 0 and rows > 0:
+                    out[dst_y0:dst_y0 + rows, dst_x0:dst_x0 + cols] = mask[src_y0:src_y0 + rows, src_x0:src_x0 + cols]
+            except Exception:
+                pass
+            return out
+
+        def _is_slam_canvas_locked() -> bool:
+            try:
+                if slam_map is None:
+                    return False
+                frame = str(self.frame_id or "").strip().lstrip("/")
+                slam_frame = str(getattr(getattr(slam_map, "header", None), "frame_id", "") or "").strip().lstrip("/")
+                return bool(frame and slam_frame and frame == slam_frame)
+            except Exception:
+                return False
+
+        slam_canvas_locked = _is_slam_canvas_locked()
+
         robot_ix, robot_iy = self.world_to_map(float(robot_xy[0]), float(robot_xy[1]))
+        self._last_robot_ix = int(robot_ix)
+        self._last_robot_iy = int(robot_iy)
+        self._last_robot_yaw = float(robot_yaw)
 
         robot_visit_count = 0
+        lidar_hit_cells_for_priority: list[tuple[int, int, int, float]] = []
+        lidar_hit_wall_mask = np.zeros((self.height, self.width), dtype=bool)
         if self.in_bounds(robot_ix, robot_iy):
             self.visit_grid[robot_iy, robot_ix] += 1
             robot_visit_count = int(self.visit_grid[robot_iy, robot_ix])
@@ -496,6 +693,24 @@ class ExplorationGridMap:
         range_min = max(float(scan.range_min), 0.05)
         range_max = min(float(scan.range_max), self.max_range)
         confirmation_range_max = min(range_max, self.confidence_max_range)
+
+        # Hot path optimization only: structural occupancy is immutable during
+        # this update call, so reuse it for all LiDAR ray occlusion checks.
+        # This preserves semantics while avoiding thousands of _structural_grid()
+        # rebuilds per second at 10Hz live-map update.
+        occlusion_struct = self._structural_grid()
+        occlusion_threshold = self._slam_occupied_threshold()
+        # Use an inflated SLAM wall as the ray barrier.  A single-cell /map wall
+        # can otherwise be bypassed by diagonal Bresenham rays and the auxiliary
+        # confidence/priority layers look like they are going through the wall.
+        try:
+            _occ = occlusion_struct >= occlusion_threshold
+            _inflated = self._dilate_bool(_occ, radius=2)
+            if np.any(_inflated):
+                occlusion_struct = np.asarray(occlusion_struct, dtype=np.int16).copy()
+                occlusion_struct[_inflated] = max(int(occlusion_threshold) + 20, 100)
+        except Exception:
+            pass
 
         for i in range(0, ranges.size, self.lidar_stride):
             rel_angle = normalize_angle(angle_min + float(i) * angle_increment)
@@ -527,14 +742,36 @@ class ExplorationGridMap:
             end_x = float(robot_xy[0]) + r * math.cos(beam_angle)
             end_y = float(robot_xy[1]) + r * math.sin(beam_angle)
 
-            # Rays may point outside the current grid; expand before conversion.
-            self._ensure_world_bounds(
-                min(float(robot_xy[0]), end_x),
-                max(float(robot_xy[0]), end_x),
-                min(float(robot_xy[1]), end_y),
-                max(float(robot_xy[1]), end_y),
-                padding_m=0.50,
-            )
+            # Rays may point outside the current grid.  In map/map/map mode the
+            # internal canvas must remain exactly locked to SLAM /map; do not grow
+            # a separate LiDAR-driven canvas, otherwise /rl_confidence_map and
+            # /rl_priority_map drift away from /map.  They will grow on the next
+            # /map metadata update instead.  In non-locked odom mode, allow the
+            # old dynamic expansion and remap temporary update masks with it.
+            if not slam_canvas_locked:
+                old_ox, old_oy = float(self.origin_x), float(self.origin_y)
+                old_w, old_h = int(self.width), int(self.height)
+                self._ensure_world_bounds(
+                    min(float(robot_xy[0]), end_x),
+                    max(float(robot_xy[0]), end_x),
+                    min(float(robot_xy[1]), end_y),
+                    max(float(robot_xy[1]), end_y),
+                    padding_m=0.50,
+                )
+                if (old_w, old_h) != (int(self.width), int(self.height)) or abs(old_ox - float(self.origin_x)) > 1e-9 or abs(old_oy - float(self.origin_y)) > 1e-9:
+                    observed_mask = _remap_update_mask(observed_mask, old_ox, old_oy, old_w, old_h, False, bool)
+                    priority_clear_mask = _remap_update_mask(priority_clear_mask, old_ox, old_oy, old_w, old_h, 0.0, np.float32)
+                    lidar_hit_wall_mask = _remap_update_mask(lidar_hit_wall_mask, old_ox, old_oy, old_w, old_h, False, bool)
+                    occlusion_struct = self._structural_grid()
+                    occlusion_threshold = self._slam_occupied_threshold()
+                    try:
+                        _occ = occlusion_struct >= occlusion_threshold
+                        _inflated = self._dilate_bool(_occ, radius=2)
+                        if np.any(_inflated):
+                            occlusion_struct = np.asarray(occlusion_struct, dtype=np.int16).copy()
+                            occlusion_struct[_inflated] = max(int(occlusion_threshold) + 20, 100)
+                    except Exception:
+                        pass
 
             robot_ix, robot_iy = self.world_to_map(float(robot_xy[0]), float(robot_xy[1]))
             end_ix, end_iy = self.world_to_map(end_x, end_y)
@@ -552,27 +789,32 @@ class ExplorationGridMap:
             visible_cells, slam_blocked = self._truncate_ray_by_slam_occlusion(
                 cells,
                 include_blocking_cell=True,
+                struct=occlusion_struct,
+                occupied_threshold=occlusion_threshold,
             )
             if not visible_cells:
                 continue
 
-            # Priority clearing uses a short Gaussian front cone, but only along
-            # the /map-visible part of the ray. A second visibility mask below
-            # clips Gaussian spill-over across walls.
+            # Priority checked(-1) must mean "directly inspected free/known
+            # space".  Do not include the blocking endpoint: if the beam stopped
+            # because of a LiDAR hit or a SLAM wall, that endpoint is obstacle
+            # evidence, not a visited/free cell.  Also do not use Gaussian spill
+            # around the endpoint; wide coverage comes from the front FOV's many
+            # individual rays.
+            effective_hit = bool(hit or slam_blocked)
+            free_cells = visible_cells[:-1] if effective_hit else visible_cells
+
             if in_priority_clear_fov:
                 self._mark_priority_clear_ray(
                     priority_clear_mask,
                     robot_ix,
                     robot_iy,
-                    visible_cells,
+                    free_cells,
                     angle_weight=self._priority_clear_angle_weight(rel_angle),
                 )
 
             if not in_confidence_fov:
                 continue
-
-            effective_hit = bool(hit or slam_blocked)
-            free_cells = visible_cells[:-1] if effective_hit else visible_cells
             total_free = max(len(free_cells), 1)
 
             for j, (cx, cy) in enumerate(free_cells):
@@ -593,6 +835,16 @@ class ExplorationGridMap:
             if effective_hit:
                 ox, oy = visible_cells[-1]
                 if self.in_bounds(ox, oy):
+                    # Store actual LiDAR/SLAM hit endpoints.  Priority entrance seeds
+                    # are built from pairs of these black obstacle dots, and the hit
+                    # mask is also used as an extra wall barrier so confidence/priority
+                    # cannot survive behind a physical obstacle that LiDAR saw before
+                    # SLAM fully closes the wall.
+                    try:
+                        lidar_hit_cells_for_priority.append((int(ox), int(oy), int(i), float(r)))
+                        lidar_hit_wall_mask[int(oy), int(ox)] = True
+                    except Exception:
+                        pass
                     # Use the actual grid distance to the visible endpoint, because
                     # /map occlusion can truncate the scan before the LaserScan range.
                     d_cells = math.sqrt(float((int(ox) - int(robot_ix)) ** 2 + (int(oy) - int(robot_iy)) ** 2))
@@ -610,40 +862,150 @@ class ExplorationGridMap:
         # Clip Gaussian priority clear by actual /map line-of-sight. This prevents
         # cells behind walls from becoming checked(-1) just because a Gaussian blob
         # overlapped them.
+        if priority_clear_mask.shape != self.priority_grid.shape:
+            priority_clear_mask = _remap_update_mask(
+                priority_clear_mask,
+                float(self.origin_x),
+                float(self.origin_y),
+                int(priority_clear_mask.shape[1]) if isinstance(priority_clear_mask, np.ndarray) and priority_clear_mask.ndim == 2 else 0,
+                int(priority_clear_mask.shape[0]) if isinstance(priority_clear_mask, np.ndarray) and priority_clear_mask.ndim == 2 else 0,
+                0.0,
+                np.float32,
+            )
+
         if np.any(priority_clear_mask):
-            priority_clear_mask *= self._slam_visibility_mask_from_robot(
+            visibility_mask = self._slam_visibility_mask_from_robot(
                 robot_ix=robot_ix,
                 robot_iy=robot_iy,
                 robot_yaw=robot_yaw,
                 max_range_m=self.priority_clear_max_range_m,
                 fov_rad=self.priority_clear_fov_rad,
             )
+            if visibility_mask.shape == priority_clear_mask.shape:
+                priority_clear_mask *= visibility_mask
+            else:
+                # Last-resort protection against stale temporary masks after a
+                # SLAM resize: never clear priority through an unknown-sized mask.
+                priority_clear_mask = np.zeros_like(self.priority_grid, dtype=np.float32)
 
-        # Lower priority around regions that the robot has already physically reached
-        # or has just confirmed with the front-FOV sensor model. This is separate
-        # from confidence: a gap may remain structurally important, but once the
-        # robot has explored it, it should stop being repeatedly selected as a
-        # high-priority target.
-        priority_cleared_cells, priority_clear_gain = self._update_priority_checked(priority_clear_mask)
+        # Store the current LiDAR-visible free-space mask for priority generation.
+        # SLAM line-of-sight alone is not enough: freshly observed physical obstacles
+        # may not yet be in /map, so random priority targets must also be constrained
+        # by the latest LaserScan free rays.  This is also what stops Gaussian
+        # priority from appearing behind a wall/hit that LiDAR just saw.
+        try:
+            lidar_visible_free = priority_clear_mask >= max(float(self.priority_clear_min_weight), 1e-4)
+            struct_now = self._structural_grid()
+            occ_now = struct_now >= self._slam_occupied_threshold()
+            if lidar_visible_free.shape == occ_now.shape:
+                lidar_visible_free &= ~occ_now
+            self._last_lidar_visible_free_mask = lidar_visible_free.astype(bool, copy=True)
+            self._last_lidar_priority_clear_weight = np.clip(priority_clear_mask, 0.0, 1.0).astype(np.float32, copy=True)
+            self._last_lidar_visible_step = int(self.step_index)
+        except Exception:
+            self._last_lidar_visible_free_mask = np.zeros_like(self.priority_grid, dtype=bool)
+            self._last_lidar_priority_clear_weight = np.zeros_like(self.priority_grid, dtype=np.float32)
+            self._last_lidar_visible_step = int(self.step_index)
 
-        self._update_priority_suppression(robot_ix, robot_iy, observed_mask)
+        # Store latest physical hit wall before the final clamp.  SLAM can lag
+        # behind LaserScan; this mask closes those gaps immediately for auxiliary
+        # maps.
+        try:
+            if lidar_hit_wall_mask.shape == self.priority_grid.shape:
+                self._last_lidar_hit_wall_mask = self._dilate_bool(lidar_hit_wall_mask.astype(bool), radius=2)
+                self._last_lidar_hit_cells_for_priority = list(lidar_hit_cells_for_priority[-720:])
+        except Exception:
+            self._last_lidar_hit_wall_mask = np.zeros_like(self.priority_grid, dtype=bool)
+            self._last_lidar_hit_cells_for_priority = []
 
-        # Recompute priority map after confidence/SLAM update. Track priority that
-        # disappears because the newer SLAM geometry no longer supports the old
-        # door/gap hypothesis. This is diagnostic only; it is not rewarded.
-        if self._priority_dirty or self.step_index % self.priority_recompute_interval == 0:
-            old_active_priority = np.clip(self._active_priority_grid(), 0.0, 100.0)
-            self._recompute_priority_grid()
-            new_active_priority = np.clip(self._active_priority_grid(), 0.0, 100.0)
-            dropped = (old_active_priority >= self.priority_clear_min_value) & (new_active_priority < 1.0)
-            if self.priority_checked_grid.shape == dropped.shape:
-                dropped &= ~self.priority_checked_grid
-            dropped_cells = int(np.count_nonzero(dropped))
-            dropped_gain = float(np.sum(old_active_priority[dropped] / 100.0))
-            if dropped_cells > 0:
-                self._last_priority_invalidated_cells += dropped_cells
-                self._last_priority_invalidated_gain += dropped_gain
+        # Hard wall/component clamp after applying this LiDAR frame.  This removes
+        # stale confidence/priority that survived behind newly drawn SLAM/LiDAR walls.
+        strict_component_mask = self._apply_strict_wall_visibility_clamp(robot_ix, robot_iy)
+        if priority_clear_mask.shape == strict_component_mask.shape:
+            priority_clear_mask *= strict_component_mask.astype(np.float32)
+
+        # Priority can be disabled for real-robot safety/eval.  Keep the map channel
+        # shape unchanged for the trained policy, but force it to all zeros and do
+        # not let priority affect reward, target selection, or reset gates.
+        if self.disable_priority_map:
+            if self.priority_grid.shape != self.base_grid.shape:
+                self.priority_grid = np.zeros_like(self.base_grid, dtype=np.float32)
+            else:
+                self.priority_grid.fill(0.0)
+            if self.priority_checked_grid.shape != self.base_grid.shape:
+                self.priority_checked_grid = np.zeros_like(self.base_grid, dtype=bool)
+            else:
+                self.priority_checked_grid.fill(False)
+            if self.priority_suppression_grid.shape != self.base_grid.shape:
+                self.priority_suppression_grid = np.zeros_like(self.base_grid, dtype=np.float32)
+            else:
+                self.priority_suppression_grid.fill(0.0)
+            if hasattr(self, "_persistent_priority_seed_grid") and isinstance(self._persistent_priority_seed_grid, np.ndarray):
+                if self._persistent_priority_seed_grid.shape != self.base_grid.shape:
+                    self._persistent_priority_seed_grid = np.zeros_like(self.base_grid, dtype=np.float32)
+                else:
+                    self._persistent_priority_seed_grid.fill(0.0)
+            if hasattr(self, "_persistent_priority_allowed_grid") and isinstance(self._persistent_priority_allowed_grid, np.ndarray):
+                if self._persistent_priority_allowed_grid.shape != self.base_grid.shape:
+                    self._persistent_priority_allowed_grid = np.zeros_like(self.base_grid, dtype=bool)
+                else:
+                    self._persistent_priority_allowed_grid.fill(False)
+            priority_cleared_cells, priority_clear_gain = 0, 0.0
+            self._last_priority_invalidated_cells = 0
+            self._last_priority_invalidated_gain = 0.0
+            self._last_priority_rechecked_cells = 0
+            self._last_priority_rechecked_gain = 0.0
+            self.prev_priority_score = 0.0
             self._priority_dirty = False
+        else:
+            # Lower priority around regions that the robot has already physically reached
+            # or has just confirmed with the front-FOV sensor model. This is separate
+            # from confidence: a gap may remain structurally important, but once the
+            # robot has explored it, it should stop being repeatedly selected as a
+            # high-priority target.
+            priority_cleared_cells, priority_clear_gain = self._update_priority_checked(priority_clear_mask)
+
+            self._update_priority_suppression(robot_ix, robot_iy, observed_mask)
+
+            # Recompute priority map after confidence/SLAM update. Track priority that
+            # disappears because the newer SLAM geometry no longer supports the old
+            # door/gap hypothesis. This is diagnostic only; it is not rewarded.
+            #
+            # v25.7: respect --priority-recompute-interval strictly. `_priority_dirty`
+            # means "refresh eventually", not "refresh immediately". Without this,
+            # confidence/SLAM updates set dirty almost every step and the interval flag
+            # looked ineffective.
+            priority_interval = max(int(self.priority_recompute_interval), 1)
+            steps_since_priority = int(self.step_index) - int(getattr(self, "_last_priority_recompute_step", -10_000_000))
+            interval_tick = (int(self.step_index) % priority_interval) == 0
+            dirty_ready = bool(self._priority_dirty) and steps_since_priority >= priority_interval
+            initial_priority = getattr(self, "_last_priority_recompute_step", -10_000_000) < 0
+
+            if initial_priority or interval_tick or dirty_ready:
+                old_active_priority = np.clip(self._active_priority_grid(), 0.0, 100.0)
+                self._recompute_priority_grid()
+                self._last_priority_recompute_step = int(self.step_index)
+                new_active_priority = np.clip(self._active_priority_grid(), 0.0, 100.0)
+                dropped = (old_active_priority >= self.priority_clear_min_value) & (new_active_priority < 1.0)
+                if self.priority_checked_grid.shape == dropped.shape:
+                    dropped &= ~self.priority_checked_grid
+                dropped_cells = int(np.count_nonzero(dropped))
+                dropped_gain = float(np.sum(old_active_priority[dropped] / 100.0))
+                if dropped_cells > 0:
+                    self._last_priority_invalidated_cells += dropped_cells
+                    self._last_priority_invalidated_gain += dropped_gain
+                self._priority_dirty = False
+
+                if (int(self.step_index) - int(getattr(self, "_last_priority_recompute_debug_step", -10_000_000))) >= max(priority_interval, 200):
+                    try:
+                        active_cells = int(np.count_nonzero(new_active_priority >= max(self.priority_clear_min_value, 1.0)))
+                        self.node.get_logger().info(
+                            "PRIORITY_RECOMPUTE | step=%d interval=%d dirty=%s active=%d"
+                            % (int(self.step_index), int(priority_interval), str(bool(self._priority_dirty)), active_cells)
+                        )
+                        self._last_priority_recompute_debug_step = int(self.step_index)
+                    except Exception:
+                        pass
 
         stale_refresh_cells = int(np.count_nonzero(stale_before & observed_mask))
 
@@ -667,6 +1029,11 @@ class ExplorationGridMap:
             robot_xy=robot_xy,
             robot_yaw=robot_yaw,
         )
+        nearest_obstacle_distance, obstacle_proximity_score = self.compute_obstacle_proximity_score(
+            robot_xy=robot_xy,
+            warning_radius_m=0.55,
+            hard_radius_m=0.20,
+        )
 
         (
             frontier_count,
@@ -678,6 +1045,8 @@ class ExplorationGridMap:
             path_distance,
             path_angle,
             path_progress,
+            alternative_path_count,
+            alternative_path_angles,
         ) = self.compute_frontier_info(robot_xy=robot_xy, robot_yaw=robot_yaw)
 
         stale_known_cells = self.stale_known_count()
@@ -711,18 +1080,33 @@ class ExplorationGridMap:
             path_distance=float(path_distance),
             path_angle=float(path_angle),
             path_progress=float(path_progress),
+            alternative_path_count=int(alternative_path_count),
+            alternative_path_angles=tuple(float(a) for a in alternative_path_angles),
             priority_score=float(priority_score),
             priority_gain=float(priority_gain),
             priority_cleared_cells=int(priority_cleared_cells),
             priority_clear_gain=float(priority_clear_gain),
             priority_invalidated_cells=int(self._last_priority_invalidated_cells),
             priority_invalidated_gain=float(self._last_priority_invalidated_gain),
+            priority_rechecked_cells=int(getattr(self, "_last_priority_rechecked_cells", 0)),
+            priority_rechecked_gain=float(getattr(self, "_last_priority_rechecked_gain", 0.0)),
             wall_support_score=float(wall_support_score),
             open_space_score=float(open_space_score),
+            nearest_obstacle_distance=float(nearest_obstacle_distance),
+            obstacle_proximity_score=float(obstacle_proximity_score),
+            slam_update_new_known_cells=int(getattr(self, "_last_slam_update_new_known_cells", 0)),
+            slam_update_new_free_cells=int(getattr(self, "_last_slam_update_new_free_cells", 0)),
+            slam_update_new_occupied_cells=int(getattr(self, "_last_slam_update_new_occupied_cells", 0)),
+            slam_update_expand_known_cells=int(getattr(self, "_last_slam_update_expand_known_cells", 0)),
         )
 
         self.update_count += 1
-        if publish and (self.update_count == 1 or self.update_count % self.publish_every_n == 0):
+        if (
+            publish
+            and self.publish_every_n > 0
+            and self._has_any_map_publisher
+            and (self.update_count == 1 or self.update_count % self.publish_every_n == 0)
+        ):
             self.publish()
 
         return stats
@@ -734,7 +1118,21 @@ class ExplorationGridMap:
             self.confidence_grid *= np.float32(decay)
 
         np.clip(self.confidence_grid, 0.0, 100.0, out=self.confidence_grid)
-        self.correction_logodds_grid.fill(0.0)
+
+        # Keep live LiDAR structural evidence across steps.  The previous patched
+        # version zeroed this grid every update, so the odom-locked structural
+        # map never contained occupied cells unless SLAM /map was directly usable.
+        # Priority generation depends on occupied/free geometry, therefore this
+        # grid must be persistent with only a small decay.
+        if self.logodds_decay_per_step > 0.0:
+            decay = max(0.0, 1.0 - float(self.logodds_decay_per_step))
+            self.correction_logodds_grid *= np.float32(decay)
+        np.clip(
+            self.correction_logodds_grid,
+            -float(self.max_logodds_abs),
+            float(self.max_logodds_abs),
+            out=self.correction_logodds_grid,
+        )
 
     def _observe_cell(
         self,
@@ -745,9 +1143,19 @@ class ExplorationGridMap:
         observed_mask: Optional[np.ndarray] = None,
         confidence_floor: float = 0.0,
     ):
-        _ = logodds_delta
         if not self.in_bounds(ix, iy):
             return
+
+        # LiDAR-local structural evidence. Negative means free-space evidence,
+        # positive means obstacle endpoint evidence. This restores the original
+        # behavior required by priority: doors/corners need occupied geometry even
+        # when slam_toolbox /map is in another frame or still empty.
+        if abs(float(logodds_delta)) > 1e-9:
+            self.correction_logodds_grid[iy, ix] = np.clip(
+                float(self.correction_logodds_grid[iy, ix]) + float(logodds_delta),
+                -float(self.max_logodds_abs),
+                float(self.max_logodds_abs),
+            )
 
         new_confidence = self.confidence_grid[iy, ix] + float(confidence_gain)
         if confidence_floor > 0.0:
@@ -782,29 +1190,485 @@ class ExplorationGridMap:
         yy, xx = self._index_cache
         return yy, xx
 
+
+    @staticmethod
+    def _quat_to_yaw(q) -> float:
+        """Return yaw from a geometry_msgs/Quaternion-like object."""
+        try:
+            x = float(getattr(q, "x", 0.0))
+            y = float(getattr(q, "y", 0.0))
+            z = float(getattr(q, "z", 0.0))
+            w = float(getattr(q, "w", 1.0))
+            return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+        except Exception:
+            return 0.0
+
+    def set_slam_publish_reference(self, slam_map: Optional[OccupancyGrid]) -> None:
+        """
+        Store the current /map metadata as the RViz publication reference.
+
+        Internal RL/confidence/priority maps have their own dynamically centered
+        grid. Publishing those grids directly is valid mathematically, but RViz
+        overlays can look shifted after slam_toolbox resets /map origin.  For
+        visualization, resample the RL layers onto the exact current /map grid
+        metadata so /rl_priority_map and /map share resolution, origin, and frame.
+        """
+        if not bool(getattr(self, "publish_slam_aligned", False)):
+            # The RL debug maps are now intentionally published in the same
+            # internal odom grid.  Keeping a stale SLAM publication reference
+            # around can make /rl_priority_map and /rl_filtered_slam_map use
+            # different RViz origins after SLAM reset.
+            self._slam_publish_ref = None
+            return
+        if slam_map is None:
+            return
+        try:
+            width = int(slam_map.info.width)
+            height = int(slam_map.info.height)
+            resolution = float(slam_map.info.resolution)
+        except Exception:
+            return
+        if width <= 0 or height <= 0 or not np.isfinite(resolution) or resolution <= 0.0:
+            return
+        origin = slam_map.info.origin
+        q = origin.orientation
+        stamp = getattr(getattr(slam_map, "header", None), "stamp", None)
+
+        # Keep an exact copy of the latest SLAM grid used as the RViz reference.
+        # In map-fixed mode /rl_filtered_slam_map must be byte-for-byte sampled on
+        # the same /map canvas, not rebuilt from the internal robot-centered RL
+        # grid.  Otherwise RViz can show the filtered layer drifting or changing
+        # size while raw /map remains fixed.
+        try:
+            self._slam_publish_raw_grid = np.asarray(slam_map.data, dtype=np.int8).reshape((height, width)).copy()
+        except Exception:
+            self._slam_publish_raw_grid = None
+
+        self._slam_publish_ref = {
+            "frame_id": str(getattr(getattr(slam_map, "header", None), "frame_id", self.frame_id) or self.frame_id),
+            "stamp_sec": int(getattr(stamp, "sec", 0)) if stamp is not None else 0,
+            "stamp_nanosec": int(getattr(stamp, "nanosec", 0)) if stamp is not None else 0,
+            "width": width,
+            "height": height,
+            "resolution": resolution,
+            "origin_x": float(origin.position.x),
+            "origin_y": float(origin.position.y),
+            "origin_z": float(origin.position.z),
+            "origin_qx": float(getattr(q, "x", 0.0)),
+            "origin_qy": float(getattr(q, "y", 0.0)),
+            "origin_qz": float(getattr(q, "z", 0.0)),
+            "origin_qw": float(getattr(q, "w", 1.0)),
+            "origin_yaw": self._quat_to_yaw(q),
+        }
+
+    def _resample_grid_to_slam_reference(
+        self,
+        grid: np.ndarray,
+        fill_value,
+        dtype=np.int8,
+    ) -> Optional[np.ndarray]:
+        """Nearest-neighbor sample an internal RL layer onto current /map metadata."""
+        ref = getattr(self, "_slam_publish_ref", None)
+        if not self.publish_slam_aligned or ref is None:
+            return None
+        try:
+            width = int(ref["width"])
+            height = int(ref["height"])
+            res = float(ref["resolution"])
+            ox = float(ref["origin_x"])
+            oy = float(ref["origin_y"])
+            yaw = float(ref.get("origin_yaw", 0.0))
+        except Exception:
+            return None
+        if width <= 0 or height <= 0 or res <= 0.0:
+            return None
+
+        ref_frame = str(ref.get("frame_id", self.frame_id) or self.frame_id)
+        cache_key = (
+            width,
+            height,
+            round(res, 9),
+            round(ox, 6),
+            round(oy, 6),
+            round(yaw, 9),
+            self.width,
+            self.height,
+            round(float(self.resolution), 9),
+            round(float(self.origin_x), 6),
+            round(float(self.origin_y), 6),
+            str(ref_frame),
+            str(self.frame_id),
+        )
+        cached = getattr(self, "_publish_resample_cache", None)
+        if cache_key == getattr(self, "_publish_resample_cache_key", None) and cached is not None:
+            valid, ix_valid, iy_valid = cached
+        else:
+            yy, xx = np.indices((height, width), dtype=np.float32)
+            local_x = (xx + 0.5) * res
+            local_y = (yy + 0.5) * res
+            c = math.cos(yaw)
+            s = math.sin(yaw)
+            wx_ref = ox + local_x * c - local_y * s
+            wy_ref = oy + local_x * s + local_y * c
+
+            ref_to_internal = self._lookup_2d_transform(self.frame_id, ref_frame)
+            if ref_to_internal is None:
+                return None
+            wx, wy = self._apply_2d_transform(wx_ref, wy_ref, ref_to_internal)
+
+            ix = np.floor((wx - self.origin_x) / max(self.resolution, 1e-6)).astype(np.int32)
+            iy = np.floor((wy - self.origin_y) / max(self.resolution, 1e-6)).astype(np.int32)
+            valid = (ix >= 0) & (ix < self.width) & (iy >= 0) & (iy < self.height)
+            ix_valid = ix[valid]
+            iy_valid = iy[valid]
+            self._publish_resample_cache_key = cache_key
+            self._publish_resample_cache = (valid, ix_valid, iy_valid)
+
+        out = np.full((height, width), fill_value, dtype=dtype)
+        if np.any(valid):
+            out[valid] = grid[iy_valid, ix_valid].astype(dtype, copy=False)
+        return out
+
+
+    def _lookup_2d_transform(self, target_frame: str, source_frame: str) -> Optional[tuple[float, float, float]]:
+        """
+        Return planar transform target_T_source = (tx, ty, yaw).
+
+        This is intentionally local to ExplorationGridMap so SLAM /map can be
+        sampled into an odom-locked internal grid without assuming that map and
+        odom are numerically identical.  If frames are identical the identity
+        transform is returned.  If TF is unavailable, None is returned and the
+        caller must skip the SLAM sample rather than silently misalign layers.
+        """
+        target = str(target_frame or "").strip()
+        source = str(source_frame or "").strip()
+        if not target or not source or target == source:
+            return 0.0, 0.0, 0.0
+
+        tf_buffer = getattr(self.node, "tf_buffer", None)
+        if tf_buffer is None:
+            return None
+
+        try:
+            import rclpy
+            transform = tf_buffer.lookup_transform(
+                target,
+                source,
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.03),
+            )
+        except Exception:
+            return None
+
+        t = transform.transform.translation
+        q = transform.transform.rotation
+        yaw = self._quat_to_yaw(q)
+        return float(t.x), float(t.y), float(yaw)
+
+    @staticmethod
+    def _apply_2d_transform(
+        x,
+        y,
+        tf: tuple[float, float, float],
+    ):
+        """Vectorized planar transform for scalars or numpy arrays."""
+        tx, ty, yaw = tf
+        c = math.cos(float(yaw))
+        s = math.sin(float(yaw))
+        return float(tx) + c * x - s * y, float(ty) + s * x + c * y
+
+    def _ensure_slam_known_bounds(
+        self,
+        data: np.ndarray,
+        slam_res: float,
+        slam_origin_x: float,
+        slam_origin_y: float,
+        slam_origin_yaw: float,
+        slam_frame_id: str = "",
+    ) -> None:
+        """Expand all internal RL maps to cover the known SLAM bounding box.
+
+        This expands base/confidence/priority/suppression/checked/visit grids
+        together through _ensure_world_bounds(), preserving alignment.  Unknown
+        SLAM canvas is ignored so a large empty /map does not explode the task
+        map size immediately after reset.
+        """
+        if data.size == 0 or float(slam_res) <= 0.0:
+            return
+
+        known_y, known_x = np.nonzero(np.asarray(data) >= 0)
+        if known_x.size == 0:
+            return
+
+        min_sx = int(np.min(known_x))
+        max_sx = int(np.max(known_x)) + 1
+        min_sy = int(np.min(known_y))
+        max_sy = int(np.max(known_y)) + 1
+
+        # Use cell-boundary corners, not centers, so the whole known SLAM extent
+        # is covered after discretization.
+        local_corners = (
+            (min_sx * slam_res, min_sy * slam_res),
+            (max_sx * slam_res, min_sy * slam_res),
+            (min_sx * slam_res, max_sy * slam_res),
+            (max_sx * slam_res, max_sy * slam_res),
+        )
+        c = math.cos(float(slam_origin_yaw))
+        s = math.sin(float(slam_origin_yaw))
+        # Corners above are first expressed in the SLAM map frame.  Convert them
+        # into the internal map frame before expanding the RL/confidence/priority
+        # arrays.  This fixes the common RViz failure where /map is in `map` but
+        # the RL layers are maintained in `odom`.
+        slam_frame = str(slam_frame_id or self.frame_id).strip() or self.frame_id
+        slam_to_internal = self._lookup_2d_transform(self.frame_id, slam_frame)
+        if slam_to_internal is None:
+            # Avoid expanding the odom grid with raw map-frame coordinates; that
+            # is exactly what creates the large skewed/shifted overlays.
+            if self.node is not None:
+                now = time.time()
+                if now - float(getattr(self, "_last_slam_bounds_tf_warn_time", 0.0)) > 2.0:
+                    self._last_slam_bounds_tf_warn_time = now
+                    self.node.get_logger().warn(
+                        f"SLAM_BOUNDS_TF_WAIT | cannot transform {slam_frame} -> {self.frame_id}; "
+                        "skipping SLAM bounds expansion this cycle"
+                    )
+            return
+
+        world_x: list[float] = []
+        world_y: list[float] = []
+        for lx, ly in local_corners:
+            sx = float(slam_origin_x) + float(lx) * c - float(ly) * s
+            sy = float(slam_origin_y) + float(lx) * s + float(ly) * c
+            ix, iy = self._apply_2d_transform(sx, sy, slam_to_internal)
+            world_x.append(float(ix))
+            world_y.append(float(iy))
+
+        pad = max(0.25, 4.0 * self.resolution)
+        self._ensure_world_bounds(
+            min(world_x),
+            max(world_x),
+            min(world_y),
+            max(world_y),
+            padding_m=pad,
+        )
+
+    def _reset_slam_update_reward_bookkeeping(self) -> None:
+        """Clear delayed-SLAM reward state for a new episode/reset."""
+        self._slam_reward_prev_known_mask = None
+        self._slam_reward_prev_origin_x = float(getattr(self, "origin_x", 0.0))
+        self._slam_reward_prev_origin_y = float(getattr(self, "origin_y", 0.0))
+        self._slam_reward_prev_resolution = float(getattr(self, "resolution", 0.05))
+        self._slam_reward_prev_width = int(getattr(self, "width", 0))
+        self._slam_reward_prev_height = int(getattr(self, "height", 0))
+        self._slam_reward_prev_frame_id = str(getattr(self, "frame_id", "map"))
+        self._slam_reward_prev_stamp_key = None
+        self._last_slam_update_new_known_cells = 0
+        self._last_slam_update_new_free_cells = 0
+        self._last_slam_update_new_occupied_cells = 0
+        self._last_slam_update_expand_known_cells = 0
+
+    def _record_slam_map_update_delta(
+        self,
+        data: np.ndarray,
+        slam_res: float,
+        slam_origin_x: float,
+        slam_origin_y: float,
+        slam_frame_id: str,
+        slam_stamp_key,
+    ) -> None:
+        """Record unknown->known cells introduced by a newly sampled SLAM /map.
+
+        This is deliberately separate from confidence gain.  Confidence is updated
+        synchronously from the latest LaserScan; this method tracks delayed SLAM
+        OccupancyGrid updates so the env can give a small capped bonus when the
+        global map finally incorporates new free/occupied cells.
+
+        The first map after reset only initializes the previous-known mask.  This
+        prevents reset warmup / map bootstrap from being rewarded as exploration.
+        """
+        self._last_slam_update_new_known_cells = 0
+        self._last_slam_update_new_free_cells = 0
+        self._last_slam_update_new_occupied_cells = 0
+        self._last_slam_update_expand_known_cells = 0
+        try:
+            cur = np.asarray(data, dtype=np.int16)
+            if cur.ndim != 2 or cur.size == 0:
+                return
+            h, w = int(cur.shape[0]), int(cur.shape[1])
+            if h <= 0 or w <= 0:
+                return
+            # Avoid paying the same /map message more than once when the live
+            # map timer and env.step both sample it.
+            stamp_key = (
+                slam_stamp_key,
+                int(w),
+                int(h),
+                round(float(slam_res), 9),
+                round(float(slam_origin_x), 6),
+                round(float(slam_origin_y), 6),
+                str(slam_frame_id or ""),
+            )
+            if self._slam_reward_prev_stamp_key == stamp_key:
+                return
+
+            cur_known = cur >= 0
+            occ_thr = int(self._slam_occupied_threshold())
+            cur_occ = cur >= occ_thr
+            cur_free = cur_known & (~cur_occ)
+
+            prev = getattr(self, "_slam_reward_prev_known_mask", None)
+            prev_w = int(getattr(self, "_slam_reward_prev_width", 0))
+            prev_h = int(getattr(self, "_slam_reward_prev_height", 0))
+            prev_res = float(getattr(self, "_slam_reward_prev_resolution", float(slam_res)))
+            prev_ox = float(getattr(self, "_slam_reward_prev_origin_x", float(slam_origin_x)))
+            prev_oy = float(getattr(self, "_slam_reward_prev_origin_y", float(slam_origin_y)))
+
+            if not isinstance(prev, np.ndarray) or prev.shape != (prev_h, prev_w) or prev_w <= 0 or prev_h <= 0:
+                # First accepted SLAM map after reset: initialize only, no reward.
+                self._slam_reward_prev_known_mask = cur_known.astype(bool, copy=True)
+                self._slam_reward_prev_origin_x = float(slam_origin_x)
+                self._slam_reward_prev_origin_y = float(slam_origin_y)
+                self._slam_reward_prev_resolution = float(slam_res)
+                self._slam_reward_prev_width = int(w)
+                self._slam_reward_prev_height = int(h)
+                self._slam_reward_prev_frame_id = str(slam_frame_id or self.frame_id)
+                self._slam_reward_prev_stamp_key = stamp_key
+                return
+
+            # Project previous known mask onto the current SLAM canvas.  This
+            # handles /map origin/size expansion without treating all shifted cells
+            # as new information.
+            yy, xx = np.indices((h, w), dtype=np.float32)
+            wx = float(slam_origin_x) + (xx + 0.5) * float(slam_res)
+            wy = float(slam_origin_y) + (yy + 0.5) * float(slam_res)
+            pix = np.floor((wx - prev_ox) / max(prev_res, 1e-9)).astype(np.int32)
+            piy = np.floor((wy - prev_oy) / max(prev_res, 1e-9)).astype(np.int32)
+            prev_valid = (pix >= 0) & (pix < prev_w) & (piy >= 0) & (piy < prev_h)
+            prev_known_on_cur = np.zeros((h, w), dtype=bool)
+            if np.any(prev_valid):
+                prev_known_on_cur[prev_valid] = prev[piy[prev_valid], pix[prev_valid]]
+
+            new_known = cur_known & (~prev_known_on_cur)
+            expanded_known = cur_known & (~prev_valid)
+            if np.any(new_known):
+                self._last_slam_update_new_known_cells = int(np.count_nonzero(new_known))
+                self._last_slam_update_new_free_cells = int(np.count_nonzero(new_known & cur_free))
+                self._last_slam_update_new_occupied_cells = int(np.count_nonzero(new_known & cur_occ))
+                self._last_slam_update_expand_known_cells = int(np.count_nonzero(expanded_known))
+
+            self._slam_reward_prev_known_mask = cur_known.astype(bool, copy=True)
+            self._slam_reward_prev_origin_x = float(slam_origin_x)
+            self._slam_reward_prev_origin_y = float(slam_origin_y)
+            self._slam_reward_prev_resolution = float(slam_res)
+            self._slam_reward_prev_width = int(w)
+            self._slam_reward_prev_height = int(h)
+            self._slam_reward_prev_frame_id = str(slam_frame_id or self.frame_id)
+            self._slam_reward_prev_stamp_key = stamp_key
+        except Exception:
+            # Reward bookkeeping must never break map update/training.
+            self._last_slam_update_new_known_cells = 0
+            self._last_slam_update_new_free_cells = 0
+            self._last_slam_update_new_occupied_cells = 0
+            self._last_slam_update_expand_known_cells = 0
+
+    def _try_lock_internal_grid_to_slam_canvas(
+        self,
+        data: np.ndarray,
+        slam_res: float,
+        slam_origin_x: float,
+        slam_origin_y: float,
+        slam_origin_yaw: float,
+        slam_frame_id: str,
+    ) -> bool:
+        """Make the internal RL/confidence/priority canvas exactly match /map.
+
+        This path is used when the environment frame is already the SLAM frame
+        (the recommended pure-velocity debug command uses map/map/map).  It
+        removes the last source of RViz drift: an expanding robot-centered RL
+        grid projected onto a separately expanding SLAM grid.  The arrays are
+        resampled onto the new /map canvas so confidence follows SLAM growth.
+        """
+        try:
+            frame = str(self.frame_id or "").strip().lstrip("/")
+            slam_frame = str(slam_frame_id or "").strip().lstrip("/")
+            if not frame or not slam_frame or frame != slam_frame:
+                return False
+            if abs(float(slam_origin_yaw)) > 1e-3:
+                return False
+            h, w = int(data.shape[0]), int(data.shape[1])
+            if h <= 0 or w <= 0 or not np.isfinite(slam_res) or float(slam_res) <= 0.0:
+                return False
+        except Exception:
+            return False
+
+        old_w = int(getattr(self, "width", 0))
+        old_h = int(getattr(self, "height", 0))
+        old_res = float(getattr(self, "resolution", slam_res))
+        old_ox = float(getattr(self, "origin_x", slam_origin_x))
+        old_oy = float(getattr(self, "origin_y", slam_origin_y))
+
+        same_canvas = (
+            old_w == w
+            and old_h == h
+            and abs(old_res - float(slam_res)) < 1e-9
+            and abs(old_ox - float(slam_origin_x)) < 1e-6
+            and abs(old_oy - float(slam_origin_y)) < 1e-6
+        )
+        if same_canvas:
+            return True
+
+        def resample_old(name: str, fill, dtype):
+            old = getattr(self, name, None)
+            out = np.full((h, w), fill, dtype=dtype)
+            if not isinstance(old, np.ndarray) or old.shape != (old_h, old_w) or old_w <= 0 or old_h <= 0:
+                return out
+            yy, xx = np.indices((h, w), dtype=np.float32)
+            wx = float(slam_origin_x) + (xx + 0.5) * float(slam_res)
+            wy = float(slam_origin_y) + (yy + 0.5) * float(slam_res)
+            ix = np.floor((wx - old_ox) / max(old_res, 1e-9)).astype(np.int32)
+            iy = np.floor((wy - old_oy) / max(old_res, 1e-9)).astype(np.int32)
+            valid = (ix >= 0) & (ix < old_w) & (iy >= 0) & (iy < old_h)
+            if np.any(valid):
+                out[valid] = old[iy[valid], ix[valid]].astype(dtype, copy=False)
+            return out
+
+        self.origin_x = float(slam_origin_x)
+        self.origin_y = float(slam_origin_y)
+        self.resolution = float(slam_res)
+        self.width = w
+        self.height = h
+        self.size_m = max(float(w), float(h)) * float(slam_res)
+
+        self.base_grid = np.full((h, w), self.UNKNOWN, dtype=np.int16)
+        self.correction_logodds_grid = resample_old("correction_logodds_grid", 0.0, np.float32)
+        self.confidence_grid = resample_old("confidence_grid", 0.0, np.float32)
+        self.priority_grid = resample_old("priority_grid", 0.0, np.float32)
+        self._persistent_priority_seed_grid = resample_old("_persistent_priority_seed_grid", 0.0, np.float32)
+        self._persistent_priority_allowed_grid = resample_old("_persistent_priority_allowed_grid", False, bool)
+        self.priority_suppression_grid = resample_old("priority_suppression_grid", 0.0, np.float32)
+        self.priority_checked_grid = resample_old("priority_checked_grid", False, bool)
+        self.priority_rechecked_rewarded_grid = resample_old("priority_rechecked_rewarded_grid", False, bool)
+        self._last_lidar_visible_free_mask = resample_old("_last_lidar_visible_free_mask", False, bool)
+        self._last_lidar_priority_clear_weight = resample_old("_last_lidar_priority_clear_weight", 0.0, np.float32)
+        self._last_lidar_hit_wall_mask = resample_old("_last_lidar_hit_wall_mask", False, bool)
+        self._last_lidar_hit_cells_for_priority = []
+        self.visit_grid = resample_old("visit_grid", 0, np.int32)
+        self.last_seen_grid = resample_old("last_seen_grid", -1, np.int32)
+        self.grid = np.full((h, w), self.UNKNOWN, dtype=np.int8)
+
+        self._index_cache_shape = None
+        self._index_cache = None
+        self._publish_resample_cache_key = None
+        self._publish_resample_cache = None
+        self._base_grid_needs_resample = True
+        return True
+
     def _sample_slam_base(self, slam_map: OccupancyGrid):
+        self.set_slam_publish_reference(slam_map)
         slam_width = int(slam_map.info.width)
         slam_height = int(slam_map.info.height)
         slam_stamp = getattr(getattr(slam_map, "header", None), "stamp", None)
         slam_stamp_key = (getattr(slam_stamp, "sec", 0), getattr(slam_stamp, "nanosec", 0))
-        sample_key = (
-            slam_stamp_key,
-            slam_width,
-            slam_height,
-            float(slam_map.info.resolution),
-            float(slam_map.info.origin.position.x),
-            float(slam_map.info.origin.position.y),
-            self.width,
-            self.height,
-            round(float(self.origin_x), 6),
-            round(float(self.origin_y), 6),
-        )
-
-        if (
-            not self._base_grid_needs_resample
-            and self._last_slam_sample_key == sample_key
-        ):
-            return
 
         if slam_width <= 0 or slam_height <= 0:
             self.base_grid.fill(self.UNKNOWN)
@@ -819,25 +1683,133 @@ class ExplorationGridMap:
         slam_res = float(slam_map.info.resolution)
         slam_origin_x = float(slam_map.info.origin.position.x)
         slam_origin_y = float(slam_map.info.origin.position.y)
+        slam_origin_yaw = self._quat_to_yaw(slam_map.info.origin.orientation)
+        slam_frame = str(getattr(getattr(slam_map, "header", None), "frame_id", "") or self.frame_id).strip() or self.frame_id
 
-        # Important: do NOT expand the RL maps to the full SLAM /map extent.
-        # slam_toolbox may publish a large transient-local map from a previous run
-        # immediately after reset. Expanding to that full extent made /rl_* maps
-        # jump to huge sizes at episode start. The RL maps now grow only from
-        # robot motion and local ray bounds; SLAM is sampled only inside the
-        # current RL map window.
+        self._record_slam_map_update_delta(
+            data=data,
+            slam_res=slam_res,
+            slam_origin_x=slam_origin_x,
+            slam_origin_y=slam_origin_y,
+            slam_frame_id=slam_frame,
+            slam_stamp_key=slam_stamp_key,
+        )
+
+        # Preferred pure-velocity debugging path: when the env frame is map,
+        # lock the internal RL/confidence/priority canvas to the exact SLAM /map
+        # canvas.  This makes /rl_confidence_map and /rl_priority_map grow with
+        # /map instead of with a separate robot-centered grid.
+        if self._try_lock_internal_grid_to_slam_canvas(
+            data=data,
+            slam_res=slam_res,
+            slam_origin_x=slam_origin_x,
+            slam_origin_y=slam_origin_y,
+            slam_origin_yaw=slam_origin_yaw,
+            slam_frame_id=slam_frame,
+        ):
+            self.base_grid = np.asarray(data, dtype=np.int16).copy()
+            self._last_slam_sample_key = None
+            self._base_grid_needs_resample = False
+            try:
+                occupied_internal = self.base_grid >= self._slam_occupied_threshold()
+                if np.any(occupied_internal):
+                    self.confidence_grid[occupied_internal] = 0.0
+                    self.priority_grid[occupied_internal] = 0.0
+                    self.priority_checked_grid[occupied_internal] = False
+                    self.priority_suppression_grid[occupied_internal] = 0.0
+            except Exception:
+                pass
+            self._invalidate_priority_from_slam_geometry()
+            self._priority_dirty = True
+            return
+
+        # Fallback for odom/internal-frame operation: expand to known SLAM bounds
+        # and resample through TF.
+        self._ensure_slam_known_bounds(
+            data=data,
+            slam_res=slam_res,
+            slam_origin_x=slam_origin_x,
+            slam_origin_y=slam_origin_y,
+            slam_origin_yaw=slam_origin_yaw,
+            slam_frame_id=slam_frame,
+        )
+
+        # Cache key must be computed after possible expansion; otherwise the
+        # sample cache can say "already sampled" while the internal map size has
+        # changed.
+        sample_key = (
+            slam_stamp_key,
+            slam_width,
+            slam_height,
+            slam_res,
+            slam_origin_x,
+            slam_origin_y,
+            self.width,
+            self.height,
+            round(float(self.origin_x), 6),
+            round(float(self.origin_y), 6),
+            str(slam_frame),
+            str(self.frame_id),
+        )
+
+        if (
+            not self._base_grid_needs_resample
+            and self._last_slam_sample_key == sample_key
+        ):
+            return
 
         yy, xx = self._grid_index_arrays()
-        wx = self.origin_x + (xx + 0.5) * self.resolution
-        wy = self.origin_y + (yy + 0.5) * self.resolution
+        wx_internal = self.origin_x + (xx + 0.5) * self.resolution
+        wy_internal = self.origin_y + (yy + 0.5) * self.resolution
 
-        sx = np.floor((wx - slam_origin_x) / max(slam_res, 1e-6)).astype(np.int32)
-        sy = np.floor((wy - slam_origin_y) / max(slam_res, 1e-6)).astype(np.int32)
+        internal_to_slam = self._lookup_2d_transform(slam_frame, self.frame_id)
+        if internal_to_slam is None:
+            # Do not sample map-frame /map as if it were odom.  Keep the previous
+            # accepted base grid and try again when TF becomes available.
+            if self.node is not None:
+                now = time.time()
+                if now - float(getattr(self, "_last_slam_sample_tf_warn_time", 0.0)) > 2.0:
+                    self._last_slam_sample_tf_warn_time = now
+                    self.node.get_logger().warn(
+                        f"SLAM_SAMPLE_TF_WAIT | cannot transform {self.frame_id} -> {slam_frame}; "
+                        "holding previous RL structural map"
+                    )
+            return
+
+        wx, wy = self._apply_2d_transform(wx_internal, wy_internal, internal_to_slam)
+
+        dx = wx - slam_origin_x
+        dy = wy - slam_origin_y
+        cyaw = math.cos(slam_origin_yaw)
+        syaw = math.sin(slam_origin_yaw)
+        slam_local_x = dx * cyaw + dy * syaw
+        slam_local_y = -dx * syaw + dy * cyaw
+        sx = np.floor(slam_local_x / max(slam_res, 1e-6)).astype(np.int32)
+        sy = np.floor(slam_local_y / max(slam_res, 1e-6)).astype(np.int32)
 
         valid = (sx >= 0) & (sx < slam_width) & (sy >= 0) & (sy < slam_height)
 
         self.base_grid.fill(self.UNKNOWN)
         self.base_grid[valid] = data[sy[valid], sx[valid]]
+
+        # Hard wall mask for auxiliary layers. Confidence and priority are
+        # traversable-space quantities; they must never occupy SLAM wall cells.
+        # This also prevents old confidence/checked cells from surviving after a
+        # SLAM reset or after a wall is redrawn in a slightly different place.
+        try:
+            occupied_internal = self.base_grid >= self._slam_occupied_threshold()
+            if np.any(occupied_internal):
+                if self.confidence_grid.shape == occupied_internal.shape:
+                    self.confidence_grid[occupied_internal] = 0.0
+                if self.priority_grid.shape == occupied_internal.shape:
+                    self.priority_grid[occupied_internal] = 0.0
+                if self.priority_checked_grid.shape == occupied_internal.shape:
+                    self.priority_checked_grid[occupied_internal] = False
+                if self.priority_suppression_grid.shape == occupied_internal.shape:
+                    self.priority_suppression_grid[occupied_internal] = 0.0
+        except Exception:
+            pass
+
         self._last_slam_sample_key = sample_key
         self._base_grid_needs_resample = False
         self._invalidate_priority_from_slam_geometry()
@@ -858,6 +1830,8 @@ class ExplorationGridMap:
         """
         self._last_priority_invalidated_cells = 0
         self._last_priority_invalidated_gain = 0.0
+        self._last_priority_rechecked_cells = 0
+        self._last_priority_rechecked_gain = 0.0
 
         if self.priority_grid.shape != self.base_grid.shape:
             return
@@ -896,6 +1870,8 @@ class ExplorationGridMap:
         # Occupied cells are not “checked priority”; they are invalid geometry.
         # Keep them out of RViz priority(-1) and out of future priority targets.
         self.priority_grid[invalid] = 0.0
+        if hasattr(self, "_persistent_priority_seed_grid") and isinstance(self._persistent_priority_seed_grid, np.ndarray) and self._persistent_priority_seed_grid.shape == self.priority_grid.shape:
+            self._persistent_priority_seed_grid[invalid] = 0.0
         self.priority_checked_grid[invalid] = False
         self.priority_suppression_grid[invalid] = 0.0
 
@@ -967,8 +1943,13 @@ class ExplorationGridMap:
 
         # Keep exact cell counts. Because chunk_m is an integer multiple of resolution,
         # width/height increase by multiples of map_expand_chunk_cells.
-        new_width = self.width + (left_chunks + right_chunks) * self.map_expand_chunk_cells
-        new_height = self.height + (down_chunks + up_chunks) * self.map_expand_chunk_cells
+        # Capture the pre-expansion shape before mutating any arrays.  Persistent
+        # priority state is validated against this old shape, then copied into
+        # the expanded canvas below.
+        old_w = int(self.width)
+        old_h = int(self.height)
+        new_width = old_w + (left_chunks + right_chunks) * self.map_expand_chunk_cells
+        new_height = old_h + (down_chunks + up_chunks) * self.map_expand_chunk_cells
 
         off_x = left_chunks * self.map_expand_chunk_cells
         off_y = down_chunks * self.map_expand_chunk_cells
@@ -983,8 +1964,27 @@ class ExplorationGridMap:
         self.correction_logodds_grid = expand_array(self.correction_logodds_grid, 0.0, np.float32)
         self.confidence_grid = expand_array(self.confidence_grid, 0.0, np.float32)
         self.priority_grid = expand_array(self.priority_grid, 0.0, np.float32)
+        if not hasattr(self, "_persistent_priority_seed_grid") or self._persistent_priority_seed_grid.shape != (old_h, old_w):
+            self._persistent_priority_seed_grid = np.zeros((old_h, old_w), dtype=np.float32)
+        self._persistent_priority_seed_grid = expand_array(self._persistent_priority_seed_grid, 0.0, np.float32)
+        if not hasattr(self, "_persistent_priority_allowed_grid") or self._persistent_priority_allowed_grid.shape != (old_h, old_w):
+            self._persistent_priority_allowed_grid = np.zeros((old_h, old_w), dtype=bool)
+        self._persistent_priority_allowed_grid = expand_array(self._persistent_priority_allowed_grid, False, bool)
         self.priority_suppression_grid = expand_array(self.priority_suppression_grid, 0.0, np.float32)
         self.priority_checked_grid = expand_array(self.priority_checked_grid, False, bool)
+        if not hasattr(self, "_last_lidar_visible_free_mask") or self._last_lidar_visible_free_mask.shape != (self.height, self.width):
+            self._last_lidar_visible_free_mask = np.zeros((self.height, self.width), dtype=bool)
+        if not hasattr(self, "_last_lidar_priority_clear_weight") or self._last_lidar_priority_clear_weight.shape != (self.height, self.width):
+            self._last_lidar_priority_clear_weight = np.zeros((self.height, self.width), dtype=np.float32)
+        self._last_lidar_visible_free_mask = expand_array(self._last_lidar_visible_free_mask, False, bool)
+        self._last_lidar_priority_clear_weight = expand_array(self._last_lidar_priority_clear_weight, 0.0, np.float32)
+        if not hasattr(self, "_last_lidar_hit_wall_mask") or not isinstance(self._last_lidar_hit_wall_mask, np.ndarray) or self._last_lidar_hit_wall_mask.shape != (old_h, old_w):
+            self._last_lidar_hit_wall_mask = np.zeros((old_h, old_w), dtype=bool)
+        self._last_lidar_hit_wall_mask = expand_array(self._last_lidar_hit_wall_mask, False, bool)
+        self._last_lidar_hit_cells_for_priority = []
+        if not hasattr(self, "priority_rechecked_rewarded_grid") or self.priority_rechecked_rewarded_grid.shape != (self.height, self.width):
+            self.priority_rechecked_rewarded_grid = np.zeros((self.height, self.width), dtype=bool)
+        self.priority_rechecked_rewarded_grid = expand_array(self.priority_rechecked_rewarded_grid, False, bool)
         self.visit_grid = expand_array(self.visit_grid, 0, np.int32)
         self.last_seen_grid = expand_array(self.last_seen_grid, -1, np.int32)
         self.grid = expand_array(self.grid, self.UNKNOWN, np.int8)
@@ -1027,11 +2027,20 @@ class ExplorationGridMap:
         return float(np.max(np.clip(active / 100.0, 0.0, 1.0)))
 
     def _active_priority_grid(self) -> np.ndarray:
-        if getattr(self, "priority_checked_grid", None) is None:
-            return np.clip(self.priority_grid, 0.0, 100.0)
-        if self.priority_checked_grid.shape != self.priority_grid.shape:
-            self.priority_checked_grid = np.zeros_like(self.priority_grid, dtype=bool)
-        return np.where(self.priority_checked_grid, 0.0, np.clip(self.priority_grid, 0.0, 100.0)).astype(np.float32)
+        """
+        Return priority candidates that are still actionable.
+
+        priority_checked_grid is a hard exclusion mask: cells already checked by
+        the robot's front field-of-view are rendered as 0 in RViz and must not be
+        selected again by target/reward/CNN logic.
+        """
+        if bool(getattr(self, "disable_priority_map", False)):
+            return np.zeros_like(self.priority_grid, dtype=np.float32)
+        active = np.clip(self.priority_grid, 0.0, 100.0).astype(np.float32)
+        if self.priority_checked_grid.shape == active.shape:
+            active = active.copy()
+            active[self.priority_checked_grid] = 0.0
+        return active
 
     def stale_known_count(self) -> int:
         return int(np.count_nonzero(self._stale_mask()))
@@ -1046,18 +2055,52 @@ class ExplorationGridMap:
         return known & seen & (age >= self.stale_after_steps)
 
     def _low_confidence_mask(self) -> np.ndarray:
-        base_free = (self.base_grid >= 0) & (self.base_grid <= 35)
+        struct = self._structural_grid()
+        base_free = (struct >= 0) & (struct <= 35)
         return base_free & (self.confidence_grid < self.low_confidence_threshold)
 
+    def _structural_grid(self) -> np.ndarray:
+        """
+        Occupancy geometry actually used by priority/RViz/CNN.
+
+        `base_grid` is the SLAM-derived prior. In odom-locked debugging mode,
+        slam_toolbox may publish /map in the map frame while all RL layers are
+        forced to odom, or /map may simply not contain occupied cells yet.  The
+        live LaserScan ray model is therefore kept in `correction_logodds_grid`
+        and fused here.
+
+        Result convention follows OccupancyGrid: -1 unknown, 0 free, 100 occupied.
+        """
+        grid = np.array(self.base_grid, dtype=np.int16, copy=True)
+
+        # Priority geometry must come from the accepted SLAM /map snapshot, not
+        # from the robot's current front LiDAR cone.  The LiDAR correction grid is
+        # still maintained for confidence/update statistics, but it is deliberately
+        # not fused into the structural grid used by priority generation when
+        # use_slam_prior=True.  This makes /rl_priority_map follow the SLAM map
+        # immediately after each accepted /map update instead of painting whatever
+        # the robot is currently facing.
+        if bool(getattr(self, "use_slam_prior", True)):
+            return grid
+
+        if self.correction_logodds_grid.shape != grid.shape:
+            return grid
+
+        logodds = self.correction_logodds_grid.astype(np.float32, copy=False)
+        evidence = np.abs(logodds) >= 0.03
+        if np.any(evidence):
+            prob = 1.0 / (1.0 + np.exp(-3.0 * np.clip(logodds, -4.0, 4.0)))
+            occ = np.clip(np.round(prob * 100.0), 0, 100).astype(np.int16)
+            grid[evidence] = occ[evidence]
+
+        return grid
+
     def _modified_grid(self) -> np.ndarray:
+        struct = self._structural_grid()
         grid = np.full((self.height, self.width), self.UNKNOWN, dtype=np.int8)
-        base_known = self.base_grid >= 0
-        if np.any(base_known):
-            grid[base_known] = np.clip(
-                np.round(self.base_grid[base_known]),
-                0,
-                100,
-            ).astype(np.int8)
+        known = struct >= 0
+        if np.any(known):
+            grid[known] = np.clip(np.round(struct[known]), 0, 100).astype(np.int8)
         return grid
 
     def world_to_map(self, x: float, y: float) -> tuple[int, int]:
@@ -1106,6 +2149,23 @@ class ExplorationGridMap:
         """Occupancy threshold used only for visibility/occlusion against SLAM /map."""
         return float(np.clip(getattr(self, "gap_occupied_threshold", 65.0), 0.0, 100.0))
 
+    @staticmethod
+    def _is_occupied_in_structural_grid(
+        struct: np.ndarray,
+        occupied_threshold: float,
+        ix: int,
+        iy: int,
+    ) -> bool:
+        """Fast occupied-cell test for callers that already own struct.
+
+        This is behavior-equivalent to _is_slam_occupied_cell(), but avoids
+        rebuilding _structural_grid() for every cell along every ray.
+        """
+        try:
+            return bool(struct[int(iy), int(ix)] >= float(occupied_threshold))
+        except Exception:
+            return False
+
     def _is_slam_occupied_cell(self, ix: int, iy: int) -> bool:
         """
         True only when the SLAM /map-derived base_grid says this cell is occupied.
@@ -1116,12 +2176,132 @@ class ExplorationGridMap:
         """
         if not self.in_bounds(ix, iy):
             return False
-        return bool(self.base_grid[int(iy), int(ix)] >= self._slam_occupied_threshold())
+        struct = self._structural_grid()
+        return self._is_occupied_in_structural_grid(
+            struct,
+            self._slam_occupied_threshold(),
+            int(ix),
+            int(iy),
+        )
+
+    def _inflated_wall_mask(
+        self,
+        radius: int = 2,
+        struct: Optional[np.ndarray] = None,
+        include_lidar: bool = True,
+    ) -> np.ndarray:
+        """Return an inflated wall barrier for update-time masking.
+
+        SLAM occupied cells are stable geometry.  Recent LiDAR hit endpoints are
+        useful as a *temporary* barrier for ray updates/priority clear, but they
+        are too noisy to destructively erase old confidence.  `include_lidar`
+        therefore stays opt-in for temporary visibility checks, while persistent
+        map-memory cleanup uses SLAM-only walls.
+        """
+        try:
+            base = self._structural_grid() if struct is None else np.asarray(struct)
+            occ = base >= self._slam_occupied_threshold()
+            wall = self._dilate_bool(occ, radius=max(int(radius), 0))
+            if bool(include_lidar):
+                # Fuse recent LiDAR hit endpoints only for temporary visibility
+                # masks.  Do not use this path for persistent confidence erasure,
+                # otherwise one noisy scan can make the published confidence map
+                # look as if it reset mid-episode.
+                lidar_wall = getattr(self, "_last_lidar_hit_wall_mask", None)
+                if isinstance(lidar_wall, np.ndarray) and lidar_wall.shape == wall.shape:
+                    wall |= lidar_wall.astype(bool, copy=False)
+            return wall
+        except Exception:
+            return np.zeros((self.height, self.width), dtype=bool)
+
+    def _reachable_component_from_robot(self, robot_ix: int, robot_iy: int, wall_mask: Optional[np.ndarray] = None) -> np.ndarray:
+        """4-connected traversable component containing the robot.
+
+        This is intentionally strict.  It is used only as a safety clamp for the
+        auxiliary confidence/priority layers so those layers cannot visually or
+        numerically leak through a wall if SLAM closes a passage after earlier
+        LiDAR updates.
+        """
+        h = int(self.height)
+        w = int(self.width)
+        out = np.zeros((h, w), dtype=bool)
+        if h <= 0 or w <= 0:
+            return out
+        rx = int(robot_ix)
+        ry = int(robot_iy)
+        if rx < 0 or rx >= w or ry < 0 or ry >= h:
+            return out
+        if wall_mask is None or not isinstance(wall_mask, np.ndarray) or wall_mask.shape != (h, w):
+            wall_mask = self._inflated_wall_mask(radius=2)
+        blocked = wall_mask.astype(bool, copy=False)
+        if blocked[ry, rx]:
+            # After a teleport/reset SLAM can mark the robot cell as occupied for
+            # a few frames.  Open a tiny local hole around the robot, otherwise
+            # the whole component becomes empty and all debug layers disappear.
+            blocked = blocked.copy()
+            y0 = max(0, ry - 1); y1 = min(h, ry + 2)
+            x0 = max(0, rx - 1); x1 = min(w, rx + 2)
+            blocked[y0:y1, x0:x1] = False
+        from collections import deque
+        q = deque([(rx, ry)])
+        out[ry, rx] = True
+        while q:
+            x, y = q.popleft()
+            for nx, ny in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+                if nx < 0 or nx >= w or ny < 0 or ny >= h:
+                    continue
+                if out[ny, nx] or blocked[ny, nx]:
+                    continue
+                out[ny, nx] = True
+                q.append((nx, ny))
+        return out
+
+    def _apply_strict_wall_visibility_clamp(self, robot_ix: int, robot_iy: int) -> np.ndarray:
+        """Return a wall-separated component and erase only confirmed wall cells.
+
+        Earlier patches destructively zeroed every confidence/priority cell outside
+        the robot's *current* component.  That did stop wall leaks, but it also made
+        RViz look as if /rl_confidence_map reset whenever a temporary LiDAR wall or
+        slightly changed SLAM wall split the component.
+
+        Current policy:
+          - Use SLAM+LiDAR component only as a temporary mask for *new writes* and
+            priority clear.
+          - Persist old confidence memory across components.
+          - Destructively erase only confirmed SLAM wall cells so confidence never
+            remains inside occupied geometry.
+        """
+        temp_wall = self._inflated_wall_mask(radius=2, include_lidar=True)
+        component = self._reachable_component_from_robot(robot_ix, robot_iy, temp_wall)
+        if component.shape != self.priority_grid.shape:
+            component = np.zeros_like(self.priority_grid, dtype=bool)
+
+        # Stable, destructive cleanup: SLAM walls only.  Do not include transient
+        # LiDAR endpoints and do not erase the whole outside-component area.
+        stable_wall = self._inflated_wall_mask(radius=1, include_lidar=False)
+        try:
+            if stable_wall.shape == self.confidence_grid.shape:
+                self.confidence_grid[stable_wall] = 0.0
+            if stable_wall.shape == self.priority_grid.shape:
+                self.priority_grid[stable_wall] = 0.0
+            if hasattr(self, "_persistent_priority_seed_grid") and isinstance(self._persistent_priority_seed_grid, np.ndarray) and self._persistent_priority_seed_grid.shape == stable_wall.shape:
+                self._persistent_priority_seed_grid[stable_wall] = 0.0
+            if hasattr(self, "_persistent_priority_allowed_grid") and isinstance(self._persistent_priority_allowed_grid, np.ndarray) and self._persistent_priority_allowed_grid.shape == stable_wall.shape:
+                self._persistent_priority_allowed_grid[stable_wall] = False
+            if self.priority_checked_grid.shape == stable_wall.shape:
+                self.priority_checked_grid[stable_wall] = False
+            if self.priority_suppression_grid.shape == stable_wall.shape:
+                self.priority_suppression_grid[stable_wall] = 0.0
+        except Exception:
+            pass
+        return component
 
     def _truncate_ray_by_slam_occlusion(
         self,
         cells: list[tuple[int, int]],
         include_blocking_cell: bool = True,
+        struct: Optional[np.ndarray] = None,
+        occupied_threshold: Optional[float] = None,
     ) -> tuple[list[tuple[int, int]], bool]:
         """
         Cut a ray at the first occupied SLAM /map cell.
@@ -1137,23 +2317,39 @@ class ExplorationGridMap:
         if not cells:
             return [], False
 
+        if struct is None:
+            struct = self._structural_grid()
+        occ_thr = self._slam_occupied_threshold() if occupied_threshold is None else float(occupied_threshold)
+
         visible: list[tuple[int, int]] = []
+        width = int(self.width)
+        height = int(self.height)
         for idx, (cx, cy) in enumerate(cells):
-            if not self.in_bounds(cx, cy):
+            cx_i = int(cx)
+            cy_i = int(cy)
+            if cx_i < 0 or cx_i >= width or cy_i < 0 or cy_i >= height:
                 break
 
             # The robot's own cell can be occupied/noisy in SLAM after reset; do not
             # let it occlude the ray.
-            if idx > 0 and self._is_slam_occupied_cell(cx, cy):
+            if idx > 0 and self._is_occupied_in_structural_grid(struct, occ_thr, cx_i, cy_i):
                 if include_blocking_cell:
-                    visible.append((int(cx), int(cy)))
+                    visible.append((cx_i, cy_i))
                 return visible, True
 
-            visible.append((int(cx), int(cy)))
+            visible.append((cx_i, cy_i))
 
         return visible, False
 
-    def _has_slam_line_of_sight(self, robot_ix: int, robot_iy: int, ix: int, iy: int) -> bool:
+    def _has_slam_line_of_sight(
+        self,
+        robot_ix: int,
+        robot_iy: int,
+        ix: int,
+        iy: int,
+        struct: Optional[np.ndarray] = None,
+        occupied_threshold: Optional[float] = None,
+    ) -> bool:
         """
         Segment visibility test using only SLAM /map occupied cells.
 
@@ -1167,10 +2363,14 @@ class ExplorationGridMap:
         if not cells:
             return False
 
+        if struct is None:
+            struct = self._structural_grid()
+        occ_thr = self._slam_occupied_threshold() if occupied_threshold is None else float(occupied_threshold)
+
         for idx, (cx, cy) in enumerate(cells):
             if idx == 0:
                 continue
-            if self._is_slam_occupied_cell(cx, cy):
+            if self._is_occupied_in_structural_grid(struct, occ_thr, int(cx), int(cy)):
                 return False
         return True
 
@@ -1199,23 +2399,48 @@ class ExplorationGridMap:
         x1 = min(self.width, int(robot_ix) + max_cells + 1)
         y0 = max(0, int(robot_iy) - max_cells)
         y1 = min(self.height, int(robot_iy) + max_cells + 1)
-        max_range2 = float(max_range_m) * float(max_range_m)
-        half_fov = float(fov_rad) * 0.5
+        if x1 <= x0 or y1 <= y0:
+            return mask
 
-        for y in range(y0, y1):
-            wy = self.origin_y + (float(y) + 0.5) * self.resolution
-            dy = wy - (self.origin_y + (float(robot_iy) + 0.5) * self.resolution)
-            for x in range(x0, x1):
-                wx = self.origin_x + (float(x) + 0.5) * self.resolution
-                dx = wx - (self.origin_x + (float(robot_ix) + 0.5) * self.resolution)
-                dist2 = dx * dx + dy * dy
-                if dist2 > max_range2:
-                    continue
-                rel = normalize_angle(math.atan2(dy, dx) - float(robot_yaw))
-                if abs(rel) > half_fov:
-                    continue
-                if self._has_slam_line_of_sight(robot_ix, robot_iy, x, y):
-                    mask[y, x] = 1.0
+        # Same candidate set as the old nested loop, but the range/FOV filtering
+        # is vectorized and the structural occupancy grid is computed once.
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        dx_cells = xx.astype(np.float32) - float(robot_ix)
+        dy_cells = yy.astype(np.float32) - float(robot_iy)
+        dx_m = dx_cells * float(self.resolution)
+        dy_m = dy_cells * float(self.resolution)
+        dist2 = dx_m * dx_m + dy_m * dy_m
+        max_range2 = float(max_range_m) * float(max_range_m)
+        candidate = dist2 <= max_range2
+
+        half_fov = float(fov_rad) * 0.5
+        if half_fov < math.pi:
+            rel = np.arctan2(
+                np.sin(np.arctan2(dy_m, dx_m) - float(robot_yaw)),
+                np.cos(np.arctan2(dy_m, dx_m) - float(robot_yaw)),
+            )
+            candidate &= np.abs(rel) <= half_fov
+
+        cy, cx = np.nonzero(candidate)
+        if cx.size == 0:
+            return mask
+
+        struct = self._structural_grid()
+        occ_thr = self._slam_occupied_threshold()
+        rix = int(robot_ix)
+        riy = int(robot_iy)
+        for ly, lx in zip(cy.tolist(), cx.tolist()):
+            x = int(x0 + lx)
+            y = int(y0 + ly)
+            if self._has_slam_line_of_sight(
+                rix,
+                riy,
+                x,
+                y,
+                struct=struct,
+                occupied_threshold=occ_thr,
+            ):
+                mask[y, x] = 1.0
 
         return mask
 
@@ -1253,18 +2478,65 @@ class ExplorationGridMap:
         view = weight_grid[y0:y1, x0:x1]
         np.maximum(view, local_weight.astype(np.float32), out=view)
 
-    def _mark_priority_clear_visit(self, weight_grid: np.ndarray, ix: int, iy: int):
+    def _priority_robot_reached_mask(self, ix: int, iy: int) -> np.ndarray:
+        """Cells physically reached by the robot for priority clearing.
+
+        Priority is now a *target to reach*, not a target to merely look at.
+        This mask is centered on the robot body and clipped by the SLAM/LiDAR
+        wall barrier through a 4-neighbor reachable component, so it does not
+        clear priority through a wall.
         """
-        Direct robot visit clears priority with a compact Gaussian footprint.
-        """
-        self._paint_gaussian_blob(
-            weight_grid=weight_grid,
-            ix=ix,
-            iy=iy,
-            sigma_m=self.priority_clear_visit_sigma_m,
-            max_radius_m=self.priority_clear_robot_radius_m,
-            base_weight=1.0,
+        mask = np.zeros_like(self.priority_grid, dtype=bool)
+        if mask.size == 0 or not self.in_bounds(int(ix), int(iy)):
+            return mask
+
+        radius_cells = max(
+            int(math.ceil(float(self.priority_clear_robot_radius_m) / max(float(self.resolution), 1e-6))),
+            1,
         )
+        x0 = max(0, int(ix) - radius_cells)
+        x1 = min(int(self.width), int(ix) + radius_cells + 1)
+        y0 = max(0, int(iy) - radius_cells)
+        y1 = min(int(self.height), int(iy) + radius_cells + 1)
+
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        disk = ((xx - int(ix)) ** 2 + (yy - int(iy)) ** 2) <= int(radius_cells) ** 2
+        if not np.any(disk):
+            return mask
+
+        try:
+            struct = self._structural_grid()
+            wall = self._inflated_wall_mask(radius=1, struct=struct)
+            # Also treat latest LiDAR hit endpoints as temporary walls when the
+            # mask exists; this prevents a radius clear from crossing a freshly
+            # observed obstacle that SLAM has not fully integrated yet.
+            hit_wall = getattr(self, "_last_lidar_hit_wall_mask", None)
+            if isinstance(hit_wall, np.ndarray) and hit_wall.shape == wall.shape:
+                wall = wall | self._dilate_bool(hit_wall.astype(bool, copy=False), radius=1)
+            reachable = self._reachable_component_from_robot(int(ix), int(iy), wall)
+            if reachable.shape == mask.shape:
+                local = disk & reachable[y0:y1, x0:x1]
+            else:
+                local = disk
+        except Exception:
+            local = disk
+
+        mask[y0:y1, x0:x1] = local
+        return mask
+
+    def _mark_priority_clear_visit(self, weight_grid: np.ndarray, ix: int, iy: int):
+        """Mark robot-body reached cells for priority clearing.
+
+        Priority is no longer cleared by merely looking at it with LiDAR.
+        It is cleared only when the robot physically reaches the target
+        neighborhood.  The neighborhood is wall-clipped, so it cannot erase a
+        priority cluster behind a wall.
+        """
+        if weight_grid.shape != self.priority_grid.shape:
+            return
+        reached = self._priority_robot_reached_mask(int(ix), int(iy))
+        if np.any(reached):
+            weight_grid[reached] = 1.0
 
     def _priority_clear_angle_weight(self, rel_angle: float) -> float:
         angle = abs(normalize_angle(float(rel_angle)))
@@ -1279,11 +2551,16 @@ class ExplorationGridMap:
         angle_weight: float = 1.0,
     ):
         """
-        Mark a short front cone as checked using Gaussian blobs along the beam.
+        Mark only directly visible free-space cells as checked candidates.
 
-        Compared with the previous binary ray, this clears a wider and smoother
-        region around a door/gap candidate, so the policy receives reward when it
-        actually inspects the region rather than needing to hit exactly one cell.
+        Important semantics for /rl_priority_map:
+          -1 must not mean "wall" or "LiDAR blocked here".
+          It means "the robot has directly inspected this traversable cell".
+
+        Therefore this function writes weights only to cells on the visible ray
+        before the blocking endpoint.  No Gaussian side-spill is used here; a
+        wide front sector is obtained by many LiDAR rays across the FOV, not by
+        painting around obstacles.
         """
         if weight_grid.shape != self.priority_grid.shape or not cells:
             return
@@ -1295,6 +2572,8 @@ class ExplorationGridMap:
         rix = int(robot_ix)
         riy = int(robot_iy)
         base_angle_weight = float(np.clip(angle_weight, 0.0, 1.0))
+        if base_angle_weight <= 0.0:
+            return
 
         for cx, cy in cells:
             if not self.in_bounds(cx, cy):
@@ -1305,43 +2584,94 @@ class ExplorationGridMap:
                 break
 
             d_m = d_cells * self.resolution
-            # Keep the ray core mostly strong but reduce the far tail mildly.
-            radial_weight = 0.55 + 0.45 * math.exp(
+            radial_weight = 0.65 + 0.35 * math.exp(
                 -0.5 * (d_m / max(self.priority_clear_max_range_m, 1e-6)) ** 2
             )
-            self._paint_gaussian_blob(
-                weight_grid=weight_grid,
-                ix=int(cx),
-                iy=int(cy),
-                sigma_m=self.priority_clear_sigma_m,
-                max_radius_m=3.0 * self.priority_clear_sigma_m,
-                base_weight=base_angle_weight * radial_weight,
-            )
+            w = float(np.clip(base_angle_weight * radial_weight, 0.0, 1.0))
+            if w > weight_grid[int(cy), int(cx)]:
+                weight_grid[int(cy), int(cx)] = w
 
     def _update_priority_checked(self, clear_weight: Optional[np.ndarray]) -> tuple[int, float]:
+        """
+        Clear active priority only when the robot physically reaches it.
+
+        LiDAR rays still build a visibility mask elsewhere for confidence and
+        target spawning, but they do not clear priority by themselves.  Checked
+        cells are internal-only and render as 0 in /rl_priority_map.
+        """
         if clear_weight is None or clear_weight.shape != self.priority_grid.shape:
             return 0, 0.0
         if self.priority_checked_grid.shape != self.priority_grid.shape:
             self.priority_checked_grid = np.zeros_like(self.priority_grid, dtype=bool)
 
         clear_weight = np.clip(clear_weight.astype(np.float32, copy=False), 0.0, 1.0)
-        newly_checked = (clear_weight >= self.priority_clear_min_weight) & (~self.priority_checked_grid)
-        if not np.any(newly_checked):
+        previous_priority = np.clip(self.priority_grid.astype(np.float32, copy=False), 0.0, 100.0)
+
+        # Priority is a physical target.  LiDAR rays may make a cluster visible
+        # and may be used for confidence/random-target spawning, but visibility
+        # alone must NOT clear priority.  A priority cluster is cleared only when
+        # the robot reaches its local neighborhood.
+        visible_clear_mask = clear_weight >= self.priority_clear_min_weight
+
+        try:
+            visit_mask = self._priority_robot_reached_mask(
+                int(getattr(self, "_last_robot_ix", -1)),
+                int(getattr(self, "_last_robot_iy", -1)),
+            )
+            if visit_mask.shape == visible_clear_mask.shape:
+                visible_clear_mask &= visit_mask
+            else:
+                visible_clear_mask[:] = False
+        except Exception:
+            visible_clear_mask[:] = False
+
+        # Final wall guard against stale/reshaped maps.
+        try:
+            struct = self._structural_grid()
+            occ_thr = min(float(self.gap_occupied_threshold), 45.0)
+            visible_clear_mask &= ~(struct >= occ_thr)
+        except Exception:
+            pass
+
+        if not np.any(visible_clear_mask):
+            self._priority_dirty = True
             return 0, 0.0
 
-        previous_priority = np.clip(self.priority_grid.astype(np.float32), 0.0, 100.0)
-        counted = newly_checked & (previous_priority >= self.priority_clear_min_value)
-        cleared_cells = int(np.count_nonzero(counted))
-        # Gaussian-weighted clear gain: high-priority cells close to the ray/robot center pay more reward.
-        clear_gain = float(np.sum((previous_priority[counted] / 100.0) * clear_weight[counted]))
+        active_before = previous_priority >= self.priority_clear_min_value
+        check_mask = visible_clear_mask & active_before
+        cleared_cells = int(np.count_nonzero(check_mask))
+        clear_gain = float(np.sum((previous_priority[check_mask] / 100.0) * clear_weight[check_mask]))
 
-        self.priority_checked_grid[newly_checked] = True
-        self.priority_grid[newly_checked] = 0.0
+        if np.any(check_mask):
+            # Checked is internal only: it blocks regeneration, but RViz renders it as 0.
+            clear_blob = self._dilate_bool(check_mask, radius=max(1, int(round(0.20 / max(self.resolution, 1e-6)))))
+            self.priority_checked_grid[clear_blob] = True
+            self.priority_grid[clear_blob] = 0.0
+            if hasattr(self, "_persistent_priority_seed_grid") and isinstance(self._persistent_priority_seed_grid, np.ndarray) and self._persistent_priority_seed_grid.shape == self.priority_grid.shape:
+                self._persistent_priority_seed_grid[clear_blob] = 0.0
+                if hasattr(self, "_persistent_priority_allowed_grid") and isinstance(self._persistent_priority_allowed_grid, np.ndarray) and self._persistent_priority_allowed_grid.shape == self.priority_grid.shape:
+                    self._persistent_priority_allowed_grid[clear_blob] = False
+
+        # Visible free space may reduce priority slightly, but it must not erase
+        # future doorway/frontier seeds.  This prevents /rl_priority_map from
+        # degenerating into a huge -1 canvas.
         if self.priority_suppression_grid.shape == self.priority_grid.shape:
-            self.priority_suppression_grid[newly_checked] = np.maximum(
-                self.priority_suppression_grid[newly_checked],
-                self.priority_visit_suppression_max,
+            self.priority_suppression_grid[visible_clear_mask] = np.maximum(
+                self.priority_suppression_grid[visible_clear_mask],
+                min(float(self.priority_visit_suppression_max), 0.35),
             )
+
+        # If the currently locked target has just been checked, drop it immediately.
+        if (
+            np.any(check_mask)
+            and self._locked_target_ix is not None
+            and self._locked_target_iy is not None
+            and self.in_bounds(int(self._locked_target_ix), int(self._locked_target_iy))
+            and bool(self.priority_checked_grid[int(self._locked_target_iy), int(self._locked_target_ix)])
+        ):
+            self._reset_target_lock()
+            self._clear_path_visualization()
+
         self._priority_dirty = True
         return cleared_cells, clear_gain
 
@@ -1422,7 +2752,8 @@ class ExplorationGridMap:
         an integral image, so it is much cheaper than repeated dilation with a
         large radius.
         """
-        occ = (self.base_grid >= min(float(self.gap_occupied_threshold), 55.0)).astype(np.float32)
+        struct = self._structural_grid()
+        occ = (struct >= min(float(self.gap_occupied_threshold), 55.0)).astype(np.float32)
         if occ.size == 0 or not np.any(occ > 0.0):
             return np.zeros((self.height, self.width), dtype=np.float32)
 
@@ -1468,6 +2799,73 @@ class ExplorationGridMap:
         if np.any(valid):
             out[valid] = grid[iy[valid], ix[valid]].astype(np.float32)
         return out, lf, lr
+
+    def compute_obstacle_proximity_score(
+        self,
+        robot_xy: np.ndarray,
+        warning_radius_m: float = 0.55,
+        hard_radius_m: float = 0.20,
+        occupied_threshold: float | None = None,
+    ) -> tuple[float, float]:
+        """
+        SLAM /map 기반 장애물 근접도를 계산한다.
+
+        반환:
+          nearest_distance_m:
+            robot 중심에서 가장 가까운 /map occupied cell까지의 거리.
+            occupied cell이 warning_radius_m 안에 없으면 warning_radius_m 이상 값.
+
+          proximity_score:
+            [0, 1] 범위의 위험도.
+              0: warning_radius_m 밖
+              1: hard_radius_m 안쪽
+
+        이 값은 reward에서만 사용하고 observation 차원에는 넣지 않는다.
+        따라서 기존 SAC 모델과 observation/action space 호환성이 깨지지 않는다.
+        """
+        warning_radius_m = max(float(warning_radius_m), self.resolution)
+        hard_radius_m = max(float(hard_radius_m), 0.0)
+        if hard_radius_m >= warning_radius_m:
+            hard_radius_m = max(0.0, warning_radius_m - self.resolution)
+
+        threshold = self._slam_occupied_threshold() if occupied_threshold is None else float(occupied_threshold)
+        occupied = self._structural_grid() >= threshold
+        if not np.any(occupied):
+            return float(warning_radius_m), 0.0
+
+        robot_ix, robot_iy = self.world_to_map(float(robot_xy[0]), float(robot_xy[1]))
+        if not self.in_bounds(robot_ix, robot_iy):
+            return float(warning_radius_m), 0.0
+
+        radius_cells = max(int(math.ceil(warning_radius_m / max(self.resolution, 1e-6))), 1)
+        x0 = max(robot_ix - radius_cells, 0)
+        x1 = min(robot_ix + radius_cells + 1, self.width)
+        y0 = max(robot_iy - radius_cells, 0)
+        y1 = min(robot_iy + radius_cells + 1, self.height)
+
+        local_occ = occupied[y0:y1, x0:x1]
+        if not np.any(local_occ):
+            return float(warning_radius_m), 0.0
+
+        yy, xx = np.nonzero(local_occ)
+        cell_x = xx + x0
+        cell_y = yy + y0
+
+        # cell center 기준 거리. /map occupied 셀이 robot 주변 어느 방향에 있든 벌점화한다.
+        wx = self.origin_x + (cell_x.astype(np.float32) + 0.5) * self.resolution
+        wy = self.origin_y + (cell_y.astype(np.float32) + 0.5) * self.resolution
+        dx = wx - float(robot_xy[0])
+        dy = wy - float(robot_xy[1])
+        dists = np.sqrt(dx * dx + dy * dy)
+        nearest = float(np.min(dists))
+
+        if nearest >= warning_radius_m:
+            return nearest, 0.0
+
+        denom = max(warning_radius_m - hard_radius_m, 1e-6)
+        score = (warning_radius_m - nearest) / denom
+        score = float(np.clip(score, 0.0, 1.0))
+        return nearest, score
 
     def compute_forward_structure_scores(
         self,
@@ -1518,118 +2916,684 @@ class ExplorationGridMap:
         open_space = float(np.clip(1.0 - structured, 0.0, 1.0))
         return float(structured), open_space
 
-    def _recompute_priority_grid(self):
-        """
-        Door/gap/opening priority map, vectorized.
+    def _nearest_occupied_steps_grid(self, occupied: np.ndarray, dx: int, dy: int, max_steps: int) -> np.ndarray:
+        """Nearest occupied cell distance in a discrete direction. 0 means not found."""
+        steps = np.zeros(occupied.shape, dtype=np.int16)
+        for step in range(1, max(int(max_steps), 1) + 1):
+            hit = self._shift_bool(occupied, int(dx) * step, int(dy) * step)
+            set_mask = (steps == 0) & hit
+            if np.any(set_mask):
+                steps[set_mask] = step
+        return steps
 
-        The scoring is intentionally equivalent to the previous permissive logic,
-        but it avoids a Python loop over every candidate cell. For each direction
-        it finds the nearest occupied cell on both sides using shifted boolean
-        masks and combines the resulting width/symmetry scores with NumPy.
+    def _corner_priority_score_map(self, base_occupied: np.ndarray, candidate: np.ndarray) -> np.ndarray:
         """
-        occ_threshold = min(float(self.gap_occupied_threshold), 55.0)
-        base_occupied = self.base_grid >= occ_threshold
-        if self.priority_checked_grid.shape != self.base_grid.shape:
-            self.priority_checked_grid = np.zeros_like(self.base_grid, dtype=bool)
-        candidate = (~base_occupied) & (~self.priority_checked_grid)
+        Score L-shaped corner / corridor-turn cells.
 
+        Door/gap priority uses opposite occupied supports.  Corners are different:
+        the useful target cell is near two perpendicular wall supports and usually
+        has an open diagonal continuation.  This helper therefore looks for
+        occupied support in two orthogonal directions, then gates it by the absence
+        of an immediate diagonal obstacle.
+        """
+        if base_occupied.shape != self.base_grid.shape or candidate.shape != self.base_grid.shape:
+            return np.zeros((self.height, self.width), dtype=np.float32)
         if not np.any(base_occupied) or not np.any(candidate):
+            return np.zeros((self.height, self.width), dtype=np.float32)
+
+        max_steps = max(int(math.ceil(self.gap_check_radius_m / max(self.resolution, 1e-6))), 1)
+        min_wall_m = max(0.05, self.resolution)
+        max_wall_m = max(float(self.gap_check_radius_m), min_wall_m + self.resolution)
+        sigma_m = max(0.36 * max_wall_m, 0.22, self.resolution)
+
+        right = self._nearest_occupied_steps_grid(base_occupied, 1, 0, max_steps).astype(np.float32) * self.resolution
+        left = self._nearest_occupied_steps_grid(base_occupied, -1, 0, max_steps).astype(np.float32) * self.resolution
+        up = self._nearest_occupied_steps_grid(base_occupied, 0, 1, max_steps).astype(np.float32) * self.resolution
+        down = self._nearest_occupied_steps_grid(base_occupied, 0, -1, max_steps).astype(np.float32) * self.resolution
+
+        def support_score(dist: np.ndarray) -> np.ndarray:
+            valid = (dist >= min_wall_m) & (dist <= max_wall_m)
+            # Stronger when the wall is close enough to define a corner, but not
+            # exactly on the candidate cell.
+            score = np.exp(-0.5 * (dist / sigma_m) ** 2).astype(np.float32)
+            return np.where(valid, score, 0.0).astype(np.float32)
+
+        sr = support_score(right)
+        sl = support_score(left)
+        su = support_score(up)
+        sd = support_score(down)
+
+        # For each L orientation, require two perpendicular supports.  Also avoid
+        # cells where the diagonal continuation is immediately occupied, because
+        # those are usually inside/behind a wall rather than an explorable corner.
+        diag_ru_open = ~self._shift_bool(base_occupied, 1, 1)
+        diag_rd_open = ~self._shift_bool(base_occupied, 1, -1)
+        diag_lu_open = ~self._shift_bool(base_occupied, -1, 1)
+        diag_ld_open = ~self._shift_bool(base_occupied, -1, -1)
+
+        ru = np.sqrt(sr * su).astype(np.float32) * diag_ru_open.astype(np.float32)
+        rd = np.sqrt(sr * sd).astype(np.float32) * diag_rd_open.astype(np.float32)
+        lu = np.sqrt(sl * su).astype(np.float32) * diag_lu_open.astype(np.float32)
+        ld = np.sqrt(sl * sd).astype(np.float32) * diag_ld_open.astype(np.float32)
+
+        corner = np.maximum.reduce([ru, rd, lu, ld]).astype(np.float32)
+        corner *= candidate.astype(np.float32)
+
+        # Give the corner a small spatial footprint so RViz shows a usable region
+        # instead of a single unstable pixel.
+        if np.any(corner > 0.0):
+            corner = self._max_filter_float(corner, radius=2, decay=0.82)
+            corner *= candidate.astype(np.float32)
+        return np.clip(corner, 0.0, 1.0).astype(np.float32)
+
+
+    def _doorway_frontier_priority_score_map(
+        self,
+        base_occupied: np.ndarray,
+        base_free: np.ndarray,
+        base_unknown: np.ndarray,
+        candidate: np.ndarray,
+        unknown_near: np.ndarray,
+        free_near: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Soft doorway / entrance seed detector.
+
+        The strict two-sided gap detector is precise but often too brittle on an
+        early SLAM map: doorway posts may be sparse, one wall may be missing, or
+        the opening may be represented as a free/unknown mouth rather than a clean
+        gap between two occupied supports.  This detector creates lower-amplitude
+        seeds where traversable cells sit on a free/unknown boundary and have
+        nearby occupied structural support.
+        """
+        if base_occupied.shape != candidate.shape:
+            return np.zeros((self.height, self.width), dtype=np.float32)
+        if not np.any(candidate):
+            return np.zeros((self.height, self.width), dtype=np.float32)
+
+        support = self._occupied_density_score_map(radius_m=max(self.wall_support_radius_m, 0.65))
+        support = np.clip(support, 0.0, 1.0).astype(np.float32)
+        if not np.any(support > 0.0):
+            return np.zeros((self.height, self.width), dtype=np.float32)
+
+        traversable = candidate & (base_free | base_unknown)
+        boundary = traversable & (unknown_near | self._dilate_bool(base_unknown, radius=3)) & free_near
+        wall_context = support >= 0.10
+        seed_mask = boundary & wall_context
+        if not np.any(seed_mask):
+            return np.zeros((self.height, self.width), dtype=np.float32)
+
+        low_conf = self.confidence_grid < max(self.low_confidence_threshold, self.min_known_confidence)
+        low_conf_near = self._dilate_bool(low_conf, radius=3)
+        exploration = np.where(base_unknown | unknown_near | low_conf_near, 1.0, 0.55).astype(np.float32)
+
+        # Soft doorway/frontier values should still be visible in RViz.  Keep them
+        # below true two-sided gaps but not in the almost-black 1..10 range.
+        score = np.where(seed_mask, 0.32 + 0.48 * support * exploration, 0.0).astype(np.float32)
+        score[base_occupied] = 0.0
+        return np.clip(score, 0.0, 0.80).astype(np.float32)
+
+    def _wall_mouth_priority_score_map(
+        self,
+        base_occupied: np.ndarray,
+        base_free: np.ndarray,
+        base_unknown: np.ndarray,
+        candidate: np.ndarray,
+        unknown_near: np.ndarray,
+        free_near: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Entrance/frontier-mouth priority detector.
+
+        The strict two-sided detector gives strong priority between obstacle
+        supports. Real SLAM entrances often appear as a free/unknown mouth next
+        to one or two wall fragments instead of a clean pair of posts. This
+        restores that older useful behavior: cells at a free/unknown boundary
+        with nearby wall support become visible purple priority; the same
+        wall-constrained Gaussian spread then makes the blob broad without
+        crossing walls.
+        """
+        out = np.zeros((self.height, self.width), dtype=np.float32)
+        if candidate.shape != out.shape or base_occupied.shape != out.shape:
+            return out
+        if not np.any(candidate) or not np.any(base_occupied):
+            return out
+
+        support = self._occupied_density_score_map(radius_m=max(self.wall_support_radius_m, 0.75))
+        support = np.clip(support.astype(np.float32, copy=False), 0.0, 1.0)
+
+        unknown_mouth = unknown_near | self._dilate_bool(base_unknown, radius=5)
+        free_context = free_near | self._dilate_bool(base_free, radius=2)
+        low_conf = self.confidence_grid < max(self.low_confidence_threshold, self.min_known_confidence)
+        low_conf_near = self._dilate_bool(low_conf, radius=3)
+
+        wall_context = support >= max(0.055, 0.55 * float(self.wall_support_density_threshold))
+        mouth = candidate & (~base_occupied) & (base_free | base_unknown | low_conf_near) & free_context & wall_context & (unknown_mouth | low_conf_near)
+        if not np.any(mouth):
+            return out
+
+        occ_near_1 = self._dilate_bool(base_occupied, radius=1)
+        occ_near_3 = self._dilate_bool(base_occupied, radius=3)
+        corner_like = occ_near_3 & (~occ_near_1)
+        mouth &= (corner_like | unknown_mouth | low_conf_near)
+        if not np.any(mouth):
+            return out
+
+        score = (0.44 + 0.50 * support).astype(np.float32)
+        score = np.where(mouth, score, 0.0).astype(np.float32)
+        score[base_occupied] = 0.0
+        return np.clip(score, 0.0, 0.94).astype(np.float32)
+
+    def _random_priority_spot_seed_map(
+        self,
+        candidate: np.ndarray,
+        base_occupied: np.ndarray,
+        base_free: np.ndarray,
+        base_unknown: np.ndarray,
+        unknown_near: np.ndarray,
+        free_near: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Add a few weak stochastic exploration-prior spots.
+
+        These are deliberately low amplitude and sparse.  They make the priority
+        layer non-empty in large partially-known rooms but should not dominate
+        real door/gap seeds or change reward.py itself.
+        """
+        out = np.zeros((self.height, self.width), dtype=np.float32)
+        if candidate.shape != out.shape or not np.any(candidate):
+            return out
+
+        # Refresh slowly to avoid frame-to-frame flicker and repeated priority_gain.
+        epoch = int(self.step_index) // 80
+        if getattr(self, "_random_priority_epoch", None) == epoch:
+            cached = getattr(self, "_random_priority_seed_cache", None)
+            if isinstance(cached, np.ndarray) and cached.shape == out.shape:
+                return cached.copy()
+
+        low_conf = self.confidence_grid < max(self.low_confidence_threshold, self.min_known_confidence)
+        spot_candidates = candidate & (~base_occupied) & (base_free | base_unknown | low_conf) & (unknown_near | free_near | low_conf)
+        if self.priority_checked_grid.shape == spot_candidates.shape:
+            spot_candidates &= ~self.priority_checked_grid
+        if self.priority_suppression_grid.shape == spot_candidates.shape:
+            spot_candidates &= self.priority_suppression_grid < 0.65
+
+        ys, xs = np.nonzero(spot_candidates)
+        n_available = int(xs.size)
+        if n_available <= 0:
+            self._random_priority_epoch = epoch
+            self._random_priority_seed_cache = out.copy()
+            return out
+
+        # Sparse by area: weak exploration prior only.  Keep it visible, but do
+        # not flood the map; real door/gap priority remains stronger.
+        n_spots = max(1, min(6, n_available // 5000 + 1))
+        seed = (
+            int(epoch) * 73856093
+            ^ int(self.width) * 19349663
+            ^ int(self.height) * 83492791
+            ^ int(round(float(self.origin_x) * 100.0)) * 2654435761
+            ^ int(round(float(self.origin_y) * 100.0)) * 97531
+        ) & 0xFFFFFFFF
+        rng = np.random.default_rng(seed)
+
+        order = rng.permutation(n_available)
+        chosen: list[tuple[int, int]] = []
+        min_spacing_cells = max(int(round(0.90 / max(self.resolution, 1e-6))), 1)
+        min_spacing2 = min_spacing_cells * min_spacing_cells
+        for idx in order.tolist():
+            x = int(xs[idx])
+            y = int(ys[idx])
+            ok = True
+            for px, py in chosen:
+                if (x - px) * (x - px) + (y - py) * (y - py) < min_spacing2:
+                    ok = False
+                    break
+            if not ok:
+                continue
+            chosen.append((x, y))
+            if len(chosen) >= n_spots:
+                break
+
+        for x, y in chosen:
+            out[y, x] = float(rng.uniform(0.20, 0.35))
+
+        self._random_priority_epoch = epoch
+        self._random_priority_seed_cache = out.copy()
+        return out
+
+    def _two_wall_entrance_priority_seed(self, base_occupied: np.ndarray, candidate: np.ndarray) -> np.ndarray:
+        """High priority in cells geometrically between two nearby wall supports.
+
+        This restores the old useful behavior for door/entrance-like gaps, but it
+        is intentionally clipped later by LiDAR/map visibility and 4-neighbor wall
+        constraints.  It never paints directly on occupied/inflated wall cells.
+        """
+        out = np.zeros((self.height, self.width), dtype=np.float32)
+        if base_occupied.shape != out.shape or candidate.shape != out.shape:
+            return out
+        if not np.any(base_occupied) or not np.any(candidate):
+            return out
+
+        max_steps = max(int(math.ceil(1.45 / max(self.resolution, 1e-6))), 2)
+        min_gap_m = 0.22
+        max_gap_m = 1.35
+
+        right = self._nearest_occupied_steps_grid(base_occupied, 1, 0, max_steps).astype(np.float32)
+        left = self._nearest_occupied_steps_grid(base_occupied, -1, 0, max_steps).astype(np.float32)
+        up = self._nearest_occupied_steps_grid(base_occupied, 0, 1, max_steps).astype(np.float32)
+        down = self._nearest_occupied_steps_grid(base_occupied, 0, -1, max_steps).astype(np.float32)
+
+        # Diagonal/skew supports catch doorway posts that are not axis-aligned.
+        ru = self._nearest_occupied_steps_grid(base_occupied, 1, 1, max_steps).astype(np.float32)
+        ld = self._nearest_occupied_steps_grid(base_occupied, -1, -1, max_steps).astype(np.float32)
+        rd = self._nearest_occupied_steps_grid(base_occupied, 1, -1, max_steps).astype(np.float32)
+        lu = self._nearest_occupied_steps_grid(base_occupied, -1, 1, max_steps).astype(np.float32)
+
+        def pair_score(a: np.ndarray, b: np.ndarray, diag: bool = False) -> np.ndarray:
+            scale = math.sqrt(2.0) if diag else 1.0
+            da = a * float(self.resolution) * scale
+            db = b * float(self.resolution) * scale
+            gap = da + db
+            ok = (a > 0) & (b > 0) & (gap >= min_gap_m) & (gap <= max_gap_m)
+            center_balance = 1.0 - np.clip(np.abs(da - db) / np.maximum(gap, 1e-6), 0.0, 1.0)
+            # Prefer roughly doorway-sized openings.  Still allow broader mouths.
+            target_gap = 0.72
+            width_score = np.exp(-0.5 * ((gap - target_gap) / 0.38) ** 2).astype(np.float32)
+            score = (0.45 + 0.55 * center_balance.astype(np.float32)) * width_score
+            return np.where(ok, score, 0.0).astype(np.float32)
+
+        score = np.maximum.reduce([
+            pair_score(left, right, False),
+            pair_score(up, down, False),
+            pair_score(ru, ld, True),
+            pair_score(rd, lu, True),
+        ]).astype(np.float32)
+
+        # Need at least a little unknown/low-confidence context so an already
+        # fully explored empty corridor does not dominate forever.
+        unknown = self.base_grid < 0
+        low_conf = self.confidence_grid < max(self.low_confidence_threshold, self.min_known_confidence)
+        frontier_context = self._dilate_bool(unknown | low_conf, radius=4)
+        score *= candidate.astype(np.float32)
+        score *= np.where(frontier_context, 1.0, 0.40).astype(np.float32)
+        if np.any(score > 0.0):
+            score = self._max_filter_float(score, radius=1, decay=0.88)
+            score *= candidate.astype(np.float32)
+        return np.clip(score, 0.0, 1.0).astype(np.float32)
+
+    def _lidar_wall_pair_priority_seed(
+        self,
+        base_occupied: np.ndarray,
+        candidate: np.ndarray,
+        struct: Optional[np.ndarray] = None,
+        occupied_threshold: Optional[float] = None,
+    ) -> np.ndarray:
+        """Seed priority by connecting pairs of LiDAR obstacle-hit cells.
+
+        The useful entrance/corridor signal here is not a single obstacle pixel;
+        it is the free segment between two LiDAR hit points.  We therefore find
+        nearby pairs of hit endpoints, draw the segment between them, and place a
+        high Gaussian seed on the traversable part of that segment.  The segment
+        is later spread only through wall-constrained 4-neighbor free space.
+        """
+        out = np.zeros((self.height, self.width), dtype=np.float32)
+        if base_occupied.shape != out.shape or candidate.shape != out.shape:
+            return out
+        hits = getattr(self, "_last_lidar_hit_cells_for_priority", [])
+        if not hits:
+            return out
+        if struct is None:
+            struct = self._structural_grid()
+        occ_thr = self._slam_occupied_threshold() if occupied_threshold is None else float(occupied_threshold)
+        # Deduplicate while keeping scan order.
+        uniq = []
+        seen = set()
+        for item in hits:
+            try:
+                x, y, idx, rr = int(item[0]), int(item[1]), int(item[2]), float(item[3])
+            except Exception:
+                continue
+            if not self.in_bounds(x, y):
+                continue
+            key = (x, y)
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append((x, y, idx, rr))
+        if len(uniq) < 2:
+            return out
+
+        pairs: list[tuple[float, int, int, list[tuple[int, int]]]] = []
+        max_pairs = 80
+        min_gap_m = max(0.28, float(getattr(self, "gap_min_width_m", 0.25)))
+        max_gap_m = min(1.65, max(0.75, float(getattr(self, "gap_max_width_m", 1.25)) + 0.35))
+        # Limit pair search to nearby scan hits, which represent adjacent doorway/wall returns.
+        n = len(uniq)
+        for a in range(n):
+            x1, y1, i1, r1 = uniq[a]
+            for b in range(a + 1, min(n, a + 35)):
+                x2, y2, i2, r2 = uniq[b]
+                if abs(int(i2) - int(i1)) < 3:
+                    continue
+                dx = (x2 - x1) * self.resolution
+                dy = (y2 - y1) * self.resolution
+                gap = math.hypot(dx, dy)
+                if gap < min_gap_m or gap > max_gap_m:
+                    continue
+                mx = int(round((x1 + x2) * 0.5))
+                my = int(round((y1 + y2) * 0.5))
+                if not self.in_bounds(mx, my) or not candidate[my, mx]:
+                    continue
+                # Robot must have line-of-sight to the midpoint; otherwise the segment is behind a wall.
+                rix = int(getattr(self, "_last_robot_ix", self.width // 2))
+                riy = int(getattr(self, "_last_robot_iy", self.height // 2))
+                if not self._has_slam_line_of_sight(rix, riy, mx, my, struct=struct, occupied_threshold=occ_thr):
+                    continue
+                line = self.bresenham(x1, y1, x2, y2)
+                if len(line) < 3:
+                    continue
+                passable_line = []
+                blocked = False
+                for lx, ly in line[1:-1]:
+                    if not self.in_bounds(lx, ly):
+                        blocked = True
+                        break
+                    if base_occupied[ly, lx]:
+                        blocked = True
+                        break
+                    if candidate[ly, lx]:
+                        passable_line.append((lx, ly))
+                if blocked or len(passable_line) == 0:
+                    continue
+                # Prefer gap sizes around a TurtleBot-scale doorway / passage.
+                width_score = math.exp(-0.5 * ((gap - 0.72) / 0.33) ** 2)
+                range_score = math.exp(-0.5 * (((r1 + r2) * 0.5 - 1.45) / 0.85) ** 2)
+                score = float(0.35 + 0.65 * width_score) * float(0.55 + 0.45 * range_score)
+                pairs.append((score, mx, my, passable_line))
+        if not pairs:
+            return out
+        pairs.sort(key=lambda t: -t[0])
+        for score, mx, my, line_cells in pairs[:max_pairs]:
+            # Put the strongest seed at the midpoint and a weaker ridge along the segment.
+            if self.in_bounds(mx, my) and candidate[my, mx]:
+                out[my, mx] = max(float(out[my, mx]), min(1.0, 0.75 + 0.25 * float(score)))
+            L = max(len(line_cells) - 1, 1)
+            for k, (lx, ly) in enumerate(line_cells):
+                if not candidate[ly, lx]:
+                    continue
+                center_w = math.exp(-0.5 * (((k / L) - 0.5) / 0.28) ** 2)
+                out[ly, lx] = max(float(out[ly, lx]), float(score) * (0.40 + 0.45 * center_w))
+        return np.clip(out, 0.0, 1.0).astype(np.float32)
+
+    def _recompute_priority_grid(self):
+        """Simple persistent random priority clusters only.
+
+        User-facing policy for /rl_priority_map:
+          0      = no active priority
+          1..100 = active persistent random target priority
+
+        The checked mask is internal only. Checked cells are not rendered as -1;
+        they simply suppress future priority regeneration and stay zero in RViz.
+
+        Priority generation/clearing is constrained by latest LiDAR-visible free
+        rays, SLAM/LiDAR inflated wall barriers, and the robot 4-connected free
+        component. Door/entrance heuristics are intentionally disabled here.
+        """
+        if self.priority_grid.shape != self.base_grid.shape:
+            self.priority_grid = np.zeros_like(self.base_grid, dtype=np.float32)
+        if self.priority_checked_grid.shape != self.priority_grid.shape:
+            self.priority_checked_grid = np.zeros_like(self.priority_grid, dtype=bool)
+        if not hasattr(self, "_persistent_priority_seed_grid") or not isinstance(self._persistent_priority_seed_grid, np.ndarray) or self._persistent_priority_seed_grid.shape != self.priority_grid.shape:
+            self._persistent_priority_seed_grid = np.zeros_like(self.priority_grid, dtype=np.float32)
+        if not hasattr(self, "_persistent_priority_allowed_grid") or not isinstance(self._persistent_priority_allowed_grid, np.ndarray) or self._persistent_priority_allowed_grid.shape != self.priority_grid.shape:
+            self._persistent_priority_allowed_grid = np.zeros_like(self.priority_grid, dtype=bool)
+
+        struct = self._structural_grid()
+        occ_thr = self._slam_occupied_threshold()
+        base_occupied = np.asarray(struct >= occ_thr, dtype=bool)
+        wall_inflated = self._inflated_wall_mask(radius=2, struct=struct)
+
+        rix = int(getattr(self, "_last_robot_ix", self.width // 2))
+        riy = int(getattr(self, "_last_robot_iy", self.height // 2))
+        reachable = self._reachable_component_from_robot(rix, riy, wall_inflated)
+        if reachable.shape != self.priority_grid.shape:
+            reachable = np.zeros_like(self.priority_grid, dtype=bool)
+
+        lidar_visible = getattr(self, "_last_lidar_visible_free_mask", None)
+        if not isinstance(lidar_visible, np.ndarray) or lidar_visible.shape != self.priority_grid.shape:
+            lidar_visible = np.zeros_like(self.priority_grid, dtype=bool)
+        else:
+            lidar_visible = lidar_visible.astype(bool, copy=False)
+
+        base_free = np.asarray((self.base_grid >= 0) & (self.base_grid < occ_thr), dtype=bool)
+        base_unknown = np.asarray(self.base_grid < 0, dtype=bool)
+        low_conf = np.asarray(self.confidence_grid < max(self.low_confidence_threshold, self.min_known_confidence), dtype=bool)
+        passable = (base_free | base_unknown | low_conf) & reachable & (~base_occupied) & (~wall_inflated)
+        if self.priority_checked_grid.shape == passable.shape:
+            passable &= ~self.priority_checked_grid
+
+        seed_grid = self._persistent_priority_seed_grid.astype(np.float32, copy=True)
+        allowed_grid = self._persistent_priority_allowed_grid.astype(bool, copy=True)
+
+        invalid = (~passable) | base_occupied | wall_inflated | (~reachable)
+        seed_grid[invalid] = 0.0
+        allowed_grid[invalid] = False
+
+        # One small persistent cluster approximately every 70 map updates.
+        # Each cluster has up to 3 nearby Gaussian seeds.  It persists until the
+        # robot clears it with a LiDAR-visible priority clear ray.
+        spawn_interval_steps = 70
+        max_seed_points = 24  # about 8 clusters * 3 seeds
+        active_seed_points = int(np.count_nonzero(seed_grid > 1e-4))
+        due = int(self.step_index) - int(getattr(self, "_last_priority_cluster_spawn_step", -10_000_000)) >= spawn_interval_steps
+
+        if due and active_seed_points < max_seed_points:
+            yy, xx = np.ogrid[:self.height, :self.width]
+            dist_m = np.sqrt((xx.astype(np.float32) - float(rix)) ** 2 + (yy.astype(np.float32) - float(riy)) ** 2) * float(self.resolution)
+            spawn_mask = passable & lidar_visible & (dist_m >= 0.55) & (dist_m <= 2.60)
+
+            if np.any(seed_grid > 1e-4):
+                near_existing = self._dilate_bool(seed_grid > 1e-4, radius=max(3, int(round(0.55 / max(self.resolution, 1e-6)))))
+                spawn_mask &= ~near_existing
+            if np.any(self.priority_grid > 0.5):
+                near_active = self._dilate_bool(self.priority_grid > 0.5, radius=max(2, int(round(0.35 / max(self.resolution, 1e-6)))))
+                spawn_mask &= ~near_active
+
+            ys, xs = np.nonzero(spawn_mask)
+            if xs.size > 0:
+                seed = (
+                    int(self.step_index) * 73856093
+                    ^ int(self.width) * 19349663
+                    ^ int(self.height) * 83492791
+                    ^ int(round(float(self.origin_x) * 100.0)) * 2654435761
+                    ^ int(round(float(self.origin_y) * 100.0)) * 97531
+                ) & 0xFFFFFFFF
+                rng = np.random.default_rng(seed)
+                pick = int(rng.integers(0, int(xs.size)))
+                cx = int(xs[pick])
+                cy = int(ys[pick])
+
+                allow_radius = max(3, int(round(0.55 / max(self.resolution, 1e-6))))
+                cluster_allowed = passable & lidar_visible & (
+                    ((xx.astype(np.float32) - float(cx)) ** 2 + (yy.astype(np.float32) - float(cy)) ** 2)
+                    <= float(allow_radius * allow_radius)
+                )
+                # Keep only cells connected to the selected center within the local
+                # LiDAR-visible cluster. This prevents diagonal wall/corner leaks.
+                if self.in_bounds(cx, cy) and bool(cluster_allowed[cy, cx]):
+                    local_comp = self._reachable_component_from_robot(cx, cy, ~cluster_allowed)
+                    if local_comp.shape == cluster_allowed.shape:
+                        cluster_allowed &= local_comp
+
+                if int(np.count_nonzero(cluster_allowed)) >= 3:
+                    allowed_grid[cluster_allowed] = True
+                    seed_grid[cy, cx] = max(float(seed_grid[cy, cx]), float(rng.uniform(0.78, 1.00)))
+                    made = 1
+                    attempts = 0
+                    seed_radius = max(1, int(round(0.24 / max(self.resolution, 1e-6))))
+                    while made < 3 and attempts < 60:
+                        attempts += 1
+                        px = cx + int(rng.integers(-seed_radius, seed_radius + 1))
+                        py = cy + int(rng.integers(-seed_radius, seed_radius + 1))
+                        if px < 0 or px >= self.width or py < 0 or py >= self.height:
+                            continue
+                        if not bool(cluster_allowed[py, px]):
+                            continue
+                        seed_grid[py, px] = max(float(seed_grid[py, px]), float(rng.uniform(0.60, 0.92)))
+                        made += 1
+                    self._last_priority_cluster_spawn_step = int(self.step_index)
+
+        # Existing clusters persist in their stored allowed mask, but remain clipped
+        # by current wall geometry, reachable component, and internal checked mask.
+        allowed_grid &= passable
+        seed_grid[~allowed_grid] = 0.0
+        self._persistent_priority_seed_grid = seed_grid.astype(np.float32, copy=False)
+        self._persistent_priority_allowed_grid = allowed_grid.astype(bool, copy=False)
+
+        if not np.any(seed_grid > 1e-4):
             self.priority_grid.fill(0.0)
+            self._reset_target_lock()
+            self._clear_path_visualization()
             return
 
-        max_steps = max(int(math.ceil(self.gap_check_radius_m / self.resolution)), 1)
-        dirs = [
-            (1, 0, 1.0),
-            (0, 1, 1.0),
-            (1, 1, math.sqrt(2.0)),
-            (1, -1, math.sqrt(2.0)),
-            (2, 1, math.sqrt(5.0)),
-            (1, 2, math.sqrt(5.0)),
-            (2, -1, math.sqrt(5.0)),
-            (1, -2, math.sqrt(5.0)),
-            (3, 1, math.sqrt(10.0)),
-            (1, 3, math.sqrt(10.0)),
-            (3, -1, math.sqrt(10.0)),
-            (1, -3, math.sqrt(10.0)),
-        ]
+        random_prio = self._wall_constrained_gaussian_priority_spread(
+            seed_grid=seed_grid,
+            candidate_mask=passable & allowed_grid,
+            occupied_mask=base_occupied | wall_inflated,
+        )
+        random_prio[~reachable] = 0.0
+        random_prio[base_occupied | wall_inflated] = 0.0
+        if self.priority_checked_grid.shape == random_prio.shape:
+            random_prio[self.priority_checked_grid] = 0.0
+        target_priority = np.clip(random_prio * 100.0, 0.0, 100.0).astype(np.float32)
 
-        min_width = max(float(self.gap_min_width_m), self.resolution)
-        max_width = max(float(self.gap_max_width_m), min_width + self.resolution)
-        soft_upper = max(max_width * 1.80, max_width + 0.60)
-        soft_lower = max(min_width * 0.50, self.resolution)
-        width_center = 0.5 * (min_width + max_width)
-        width_sigma = max(0.45 * (max_width - min_width), 0.35, self.resolution)
+        # v25.7: slow the birth/growth of newly generated priority regions.
+        # Recompute interval controls how often target_priority is recalculated;
+        # birth_delta controls how fast a new high-value area becomes visible to
+        # RViz/CNN. Decreases/clears are immediate.
+        if self.priority_grid.shape == target_priority.shape:
+            previous_priority = np.clip(self.priority_grid.astype(np.float32, copy=False), 0.0, 100.0)
+            birth_delta = float(
+                np.clip(getattr(self, "priority_birth_max_delta_per_recompute", 6.0), 0.05, 100.0)
+            )
+            growing = target_priority > previous_priority
+            grown_priority = np.minimum(target_priority, previous_priority + birth_delta)
+            new_priority = np.where(growing, grown_priority, target_priority).astype(np.float32)
 
-        prio = np.zeros((self.height, self.width), dtype=np.float32)
+            new_priority[~reachable] = 0.0
+            new_priority[base_occupied | wall_inflated] = 0.0
+            if self.priority_checked_grid.shape == new_priority.shape:
+                new_priority[self.priority_checked_grid] = 0.0
 
-        # First occupied distance in +dir / -dir. 0 means not found.
-        for dx, dy, step_scale in dirs:
-            pos_steps = np.zeros((self.height, self.width), dtype=np.int16)
-            neg_steps = np.zeros((self.height, self.width), dtype=np.int16)
+            if (int(self.step_index) - int(getattr(self, "_last_priority_birth_debug_step", -10_000_000))) >= max(int(self.priority_recompute_interval), 200):
+                try:
+                    target_active = int(np.count_nonzero(target_priority >= max(self.priority_clear_min_value, 1.0)))
+                    new_active = int(np.count_nonzero(new_priority >= max(self.priority_clear_min_value, 1.0)))
+                    self.node.get_logger().info(
+                        "PRIORITY_BIRTH_THROTTLE | step=%d delta=%.2f target_active=%d active=%d"
+                        % (int(self.step_index), birth_delta, target_active, new_active)
+                    )
+                    self._last_priority_birth_debug_step = int(self.step_index)
+                except Exception:
+                    pass
 
-            for step in range(1, max_steps + 1):
-                pos_hit = self._shift_bool(base_occupied, dx * step, dy * step)
-                neg_hit = self._shift_bool(base_occupied, -dx * step, -dy * step)
+            self.priority_grid = np.clip(new_priority, 0.0, 100.0).astype(np.float32)
+        else:
+            self.priority_grid = target_priority
 
-                pos_set = (pos_steps == 0) & pos_hit
-                neg_set = (neg_steps == 0) & neg_hit
-                if np.any(pos_set):
-                    pos_steps[pos_set] = step
-                if np.any(neg_set):
-                    neg_steps[neg_set] = step
+    def _wall_constrained_gaussian_priority_spread(
+        self,
+        seed_grid: np.ndarray,
+        candidate_mask: np.ndarray,
+        occupied_mask: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Wall-tight Gaussian spread.
 
-            valid = candidate & (pos_steps > 0) & (neg_steps > 0)
-            if not np.any(valid):
+        This version deliberately uses 4-neighbor connectivity only.  The earlier
+        8-neighbor spread could visually tunnel through one-cell diagonal wall
+        corners in RViz.  With 4-neighbor expansion, a seed can spread only
+        through cells connected by free/unknown traversable space and never across
+        SLAM occupied cells.
+        """
+        if seed_grid.shape != occupied_mask.shape or candidate_mask.shape != occupied_mask.shape:
+            return np.asarray(seed_grid, dtype=np.float32)
+
+        seeds = np.asarray(seed_grid, dtype=np.float32)
+        occupied_bool = np.asarray(occupied_mask, dtype=bool)
+        passable = np.asarray(candidate_mask, dtype=bool) & (~occupied_bool)
+        seed_mask = (seeds > 1e-4) & passable
+        out = np.zeros_like(seeds, dtype=np.float32)
+        if not np.any(seed_mask):
+            return out
+
+        sigma_m = max(0.18, min(0.36, 0.26 * max(float(self.gap_max_width_m), 1e-6)))
+        radius_m = max(0.42, min(0.82, 2.4 * sigma_m))
+        radius_cells = max(int(math.ceil(radius_m / max(self.resolution, 1e-6))), 1)
+
+        ys, xs = np.nonzero(seed_mask)
+        vals = seeds[ys, xs]
+        max_seeds = 900
+        if vals.size > max_seeds:
+            keep = np.argpartition(vals, -max_seeds)[-max_seeds:]
+            xs = xs[keep]
+            ys = ys[keep]
+            vals = vals[keep]
+        order = np.argsort(-vals)
+
+        import heapq
+        neighbors = ((1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0))
+
+        for idx in order:
+            sx = int(xs[idx])
+            sy = int(ys[idx])
+            seed_value = float(vals[idx])
+            if seed_value <= 0.0 or not self.in_bounds(sx, sy) or not passable[sy, sx]:
                 continue
 
-            m_pos = pos_steps.astype(np.float32) * self.resolution * float(step_scale)
-            m_neg = neg_steps.astype(np.float32) * self.resolution * float(step_scale)
-            width = m_pos + m_neg
+            x0 = max(0, sx - radius_cells)
+            x1 = min(self.width, sx + radius_cells + 1)
+            y0 = max(0, sy - radius_cells)
+            y1 = min(self.height, sy + radius_cells + 1)
+            dist = np.full((y1 - y0, x1 - x0), np.inf, dtype=np.float32)
+            heap: list[tuple[float, int, int]] = []
+            dist[sy - y0, sx - x0] = 0.0
+            heapq.heappush(heap, (0.0, sx, sy))
 
-            width_valid = valid & (width >= soft_lower) & (width <= soft_upper)
-            if not np.any(width_valid):
-                continue
+            while heap:
+                d_cells, cx, cy = heapq.heappop(heap)
+                if d_cells > float(dist[cy - y0, cx - x0]) + 1e-6:
+                    continue
+                if not passable[cy, cx]:
+                    continue
+                d_m = float(d_cells) * self.resolution
+                if d_m > radius_m:
+                    continue
 
-            symmetry = 1.0 - np.minimum(np.abs(m_pos - m_neg) / np.maximum(width, 1e-6), 1.0)
-            width_score = np.exp(-0.5 * ((width - width_center) / width_sigma) ** 2)
-            nominal_boost = np.where((width >= min_width) & (width <= max_width), 1.0, 0.60).astype(np.float32)
-            score = nominal_boost * width_score * (0.45 + 0.55 * symmetry)
-            prio = np.maximum(prio, np.where(width_valid, score, 0.0).astype(np.float32))
+                weight = seed_value * math.exp(-0.5 * (d_m / max(sigma_m, 1e-6)) ** 2)
+                if weight > float(out[cy, cx]):
+                    out[cy, cx] = weight
 
-        if not np.any(prio > 0.0):
-            self.priority_grid.fill(0.0)
-            return
+                for dx, dy, step_cost in neighbors:
+                    nx = cx + dx
+                    ny = cy + dy
+                    if nx < x0 or nx >= x1 or ny < y0 or ny >= y1:
+                        continue
+                    if not passable[ny, nx]:
+                        continue
+                    nd = float(d_cells) + float(step_cost)
+                    if nd * self.resolution > radius_m:
+                        continue
+                    ly = ny - y0
+                    lx = nx - x0
+                    if nd + 1e-6 < float(dist[ly, lx]):
+                        dist[ly, lx] = nd
+                        heapq.heappush(heap, (nd, nx, ny))
 
-        # Require structural wall support. This prevents priority from appearing
-        # in featureless empty voids while preserving door/gap candidates between
-        # two obstacle boundaries.
-        wall_support = self._occupied_density_score_map()
-        prio = prio * (0.20 + 0.80 * wall_support)
-
-        confidence_deficit = 1.0 - np.clip(self.confidence_grid / 100.0, 0.0, 1.0)
-        base_unknown = self.base_grid < 0
-        low_confirmed = self.confidence_grid < max(self.low_confidence_threshold, self.min_known_confidence)
-        near_exploration_edge = self._dilate_bool(base_unknown | low_confirmed, radius=2)
-
-        edge_boost = np.where(near_exploration_edge, 1.0, 0.72).astype(np.float32)
-        conf_boost = (0.78 + 0.22 * confidence_deficit).astype(np.float32)
-        prio = prio * edge_boost * conf_boost
-
-        # Persistent suppression: robot-visited / front-FOV observed regions are
-        # less attractive in the priority map. We leave a small residual priority
-        # instead of hard-zeroing it, so if the environment changes or every other
-        # candidate is worse, the policy can still pass through the area.
-        suppression = np.clip(
-            self.priority_suppression_grid,
-            0.0,
-            self.priority_visit_suppression_max,
-        ).astype(np.float32)
-        prio = prio * (1.0 - suppression)
-        prio[self.priority_checked_grid] = 0.0
-
-        prio = self._max_filter_float(prio, radius=2, decay=0.86)
-        prio[self.priority_checked_grid] = 0.0
-        self.priority_grid = np.clip(prio * 100.0, 0.0, 100.0).astype(np.float32)
+        out[occupied_bool] = 0.0
+        out[~passable] = 0.0
+        return np.clip(out, 0.0, 1.0).astype(np.float32)
 
     @staticmethod
     def _shift_bool(mask: np.ndarray, dx: int, dy: int) -> np.ndarray:
@@ -1934,7 +3898,9 @@ class ExplorationGridMap:
 
         msg = NavPath()
         msg.header.frame_id = self.frame_id
-        msg.header.stamp = self.node.get_clock().now().to_msg()
+        # stamp=0: RViz uses the latest odom transform and does not extrapolate.
+        msg.header.stamp.sec = 0
+        msg.header.stamp.nanosec = 0
 
         for x, y in path_world:
             pose = PoseStamped()
@@ -1970,6 +3936,23 @@ class ExplorationGridMap:
         self._last_path_world = []
         self._publish_path([])
 
+    def _planner_traversable_grid(self) -> np.ndarray:
+        """Build the traversability grid once per frontier-info computation.
+
+        Older code rebuilt occupied/free/inflated masks inside every candidate
+        path query. With multi-path reward that means many full-map allocations
+        per RL step. This helper centralizes that work so all candidate BFS
+        calls share the same traversability layer.
+        """
+        struct = self._structural_grid()
+        occupied = struct >= min(float(self.gap_occupied_threshold), 55.0)
+        known_free = (struct >= 0) & (struct <= 35)
+        confirmed_free = self.confidence_grid >= self.min_known_confidence
+        traversable_base = known_free | confirmed_free
+        inflated_occupied = self._dilate_bool(occupied, radius=1)
+        return traversable_base & (~inflated_occupied)
+
+
     def _path_guidance_to_target(
         self,
         robot_xy: np.ndarray,
@@ -1978,6 +3961,7 @@ class ExplorationGridMap:
         target_iy: int,
         selected_type: str,
         commit: bool = True,
+        traversable: Optional[np.ndarray] = None,
     ) -> tuple[bool, float, float, float]:
         """
         Compute an actionable path direction to the selected target.
@@ -1999,18 +3983,8 @@ class ExplorationGridMap:
                 self._clear_path_visualization()
             return False, self.size_m, 0.0, 0.0
 
-        occupied = self.base_grid >= 65
-        # Plan only through cells that are actually known/confirmed as traversable.
-        # The previous version used ~occupied, which made unknown space traversable
-        # and could create misleading paths through unmapped areas or behind walls.
-        known_free = (self.base_grid >= 0) & (self.base_grid <= 35)
-        confirmed_free = self.confidence_grid >= self.min_known_confidence
-        traversable_base = known_free | confirmed_free
-
-        # Light inflation avoids rewarding paths that graze a wall. Keep it small
-        # because TurtleBot house door/gap candidates may be narrow.
-        inflated_occupied = self._dilate_bool(occupied, radius=1)
-        traversable = traversable_base & (~inflated_occupied)
+        if traversable is None:
+            traversable = self._planner_traversable_grid()
 
         start = self._nearest_traversable_cell(robot_ix, robot_iy, traversable, radius_cells=4)
         goal = self._nearest_traversable_cell(target_ix, target_iy, traversable, radius_cells=8)
@@ -2128,7 +4102,12 @@ class ExplorationGridMap:
             guard += 1
         path.append((sx, sy))
         path.reverse()
-        if commit:
+        if (
+            commit
+            and self.path_pub is not None
+            and self.path_visual_publish_every_n > 0
+            and (int(self.step_index) % int(self.path_visual_publish_every_n) == 0)
+        ):
             self._set_path_cells_for_visualization(path)
 
         if len(path) < 2:
@@ -2169,26 +4148,57 @@ class ExplorationGridMap:
 
         return True, float(path_distance), float(path_angle), float(path_progress)
 
+
+    @staticmethod
+    def _append_diverse_path_angle(
+        angles: list[float],
+        angle: float,
+        min_separation_rad: float = math.radians(18.0),
+        max_count: int = 8,
+    ) -> None:
+        """
+        Append a robot-relative path lookahead angle if it adds a meaningfully
+        different branch. This keeps multi-path reward from being dominated by
+        near-duplicate paths to adjacent cells.
+        """
+        if len(angles) >= int(max_count):
+            return
+        try:
+            a = float(angle)
+        except Exception:
+            return
+        if not np.isfinite(a):
+            return
+        for old in angles:
+            diff = math.atan2(math.sin(a - float(old)), math.cos(a - float(old)))
+            if abs(diff) < float(min_separation_rad):
+                return
+        angles.append(a)
+
     def compute_frontier_info(
         self,
         robot_xy: np.ndarray,
         robot_yaw: float,
-    ) -> tuple[int, float, float, float, str, bool, float, float, float]:
+    ) -> tuple[int, float, float, float, str, bool, float, float, float, int, tuple[float, ...]]:
         """
-        Select a stable exploration target and compute path guidance.
+        Select a stable exploration target without /rl_path planning.
 
-        Priority order is now explicit:
+        Path/BFS guidance is intentionally removed.  The returned target is a
+        robot-relative semantic target bearing:
+
           1. active priority_gap cells from priority_map
           2. unknown frontier cells
           3. low-confidence / unconfirmed free cells
 
-        Previous versions mixed all candidates in one argmax, so target_type and
-        frontier_angle could oscillate every step. This function first selects a
-        semantic class, then applies target hysteresis within that class.
+        The angle returned in frontier_angle is direct target bearing in the
+        robot frame.  Positive angle means target is to the robot's left, and
+        negative angle means target is to the robot's right.  All path_* fields
+        are kept only for API compatibility and are always neutral.
         """
-        base_unknown = self.base_grid < 0
-        base_free = (self.base_grid >= 0) & (self.base_grid <= 35)
-        base_occupied = self.base_grid >= 65
+        struct = self._structural_grid()
+        base_unknown = struct < 0
+        base_free = (struct >= 0) & (struct <= 35)
+        base_occupied = struct >= min(float(self.gap_occupied_threshold), 55.0)
 
         confirmed = self.confidence_grid >= self.min_known_confidence
         traversable_anchor = base_free | confirmed
@@ -2218,8 +4228,6 @@ class ExplorationGridMap:
         wall_support = self._occupied_density_score_map()
         structure_gate = 0.10 + 0.90 * wall_support
 
-        # Separate score maps. Do not let unknown frontier masquerade as a
-        # priority_gap target in reward.py.
         priority_gap_score = np.zeros((self.height, self.width), dtype=np.float32)
         priority_gap_score[priority_gap] = active_priority[priority_gap]
         priority_gap_score[base_occupied] = 0.0
@@ -2234,17 +4242,11 @@ class ExplorationGridMap:
         )
         low_conf_score[base_occupied] = 0.0
 
-        # Visit penalty applies to all target classes, but it should not erase
-        # priority_gap completely because checked_grid already handles hard removal.
         visit_penalty = np.clip(self.visit_grid.astype(np.float32) / 24.0, 0.0, 0.35)
         priority_gap_score = np.clip(priority_gap_score - 0.40 * visit_penalty, 0.0, 1.0)
         unknown_score = np.clip(unknown_score - visit_penalty, 0.0, 1.0)
         low_conf_score = np.clip(low_conf_score - visit_penalty, 0.0, 1.0)
 
-        # Semantic priority order is still priority_gap -> unknown -> low-confidence,
-        # but unreachable priority_gap must not block reachable unknown/frontier
-        # targets. Therefore we evaluate a small ranked list per class and pick
-        # the first reachable path target.
         candidate_classes: list[tuple[str, np.ndarray, np.ndarray]] = []
         if np.any(priority_gap_score > 0.05):
             candidate_classes.append((self.TARGET_PRIORITY_GAP, priority_gap_score > 0.05, priority_gap_score))
@@ -2255,11 +4257,12 @@ class ExplorationGridMap:
 
         if not candidate_classes:
             self._reset_target_lock()
-            return 0, self.size_m, 0.0, 0.0, self.TARGET_NONE, False, self.size_m, 0.0, 0.0
+            self._prev_path_target_key = None
+            self._prev_path_distance = None
+            self._clear_path_visualization()
+            return 0, self.size_m, 0.0, 0.0, self.TARGET_NONE, False, self.size_m, 0.0, 0.0, 0, ()
 
         chosen = None
-        fallback = None
-
         for candidate_type, candidate_mask, candidate_score in candidate_classes:
             count = int(np.count_nonzero(candidate_mask))
             ranked = self._ranked_targets_from_mask(
@@ -2280,72 +4283,31 @@ class ExplorationGridMap:
                 selected_type=candidate_type,
             )
             if old is not None:
-                # Put a still-valid locked target into the comparison set.
                 ranked = [old] + [r for r in ranked if not (r[0] == old[0] and r[1] == old[1])]
 
-            # Keep the best unreachable candidate only as a last-resort debug target.
-            if fallback is None:
-                fallback = (candidate_type, candidate_mask, candidate_score, count, ranked[0], False, self.size_m, 0.0, 0.0)
-
-            for cand in ranked:
-                cx, cy, cscore, cdist, cangle = cand
-                reachable, pdist, pangle, pprogress = self._path_guidance_to_target(
-                    robot_xy=robot_xy,
-                    robot_yaw=robot_yaw,
-                    target_ix=int(cx),
-                    target_iy=int(cy),
-                    selected_type=str(candidate_type),
-                    commit=False,
-                )
-                if reachable:
-                    chosen = (candidate_type, candidate_mask, candidate_score, count, cand, True, pdist, pangle, 0.0)
-                    break
-
-            if chosen is not None:
-                break
+            chosen = (candidate_type, candidate_mask, candidate_score, count, ranked[0], old)
+            break
 
         if chosen is None:
-            # No candidate has a reachable path on the current SLAM map. Do not
-            # let an unreachable priority_gap dominate reward; expose it only as
-            # a weak/unreachable debug target.
-            if fallback is None:
-                self._reset_target_lock()
-                return 0, self.size_m, 0.0, 0.0, self.TARGET_NONE, False, self.size_m, 0.0, 0.0
-            chosen = fallback
+            self._reset_target_lock()
+            self._prev_path_target_key = None
+            self._prev_path_distance = None
+            self._clear_path_visualization()
+            return 0, self.size_m, 0.0, 0.0, self.TARGET_NONE, False, self.size_m, 0.0, 0.0, 0, ()
 
-        selected_type, selected_mask, selected_score, count, best, target_reachable, path_distance, path_angle, path_progress = chosen
+        selected_type, selected_mask, selected_score, count, best, old = chosen
         target_x, target_y, target_score, target_dist, angle_robot = best
 
-        # Hysteresis: only keep the previous target when it is from the same
-        # semantic class and still reachable. Otherwise an unreachable stale
-        # lock can force the robot to rotate toward a dead target.
-        old = self._locked_target_score(
-            selected_mask=selected_mask,
-            base_score=selected_score,
-            robot_xy=robot_xy,
-            robot_yaw=robot_yaw,
-            selected_type=selected_type,
-        )
-
         use_old = False
-        if old is not None and bool(target_reachable):
+        if old is not None:
             old_ix, old_iy, old_score, old_dist, old_angle = old
-            old_reachable, old_pdist, old_pangle, old_pprogress = self._path_guidance_to_target(
-                robot_xy=robot_xy,
-                robot_yaw=robot_yaw,
-                target_ix=int(old_ix),
-                target_iy=int(old_iy),
-                selected_type=str(selected_type),
-                commit=False,
-            )
-            if old_reachable:
-                _, _, best_score, _, _ = best
-                if self._target_lock_age < self.target_lock_steps:
-                    use_old = old_score >= (best_score - self.target_switch_margin)
-                else:
-                    use_old = old_score >= (best_score + 0.03)
-                if use_old:
-                    target_x, target_y, target_score, target_dist, angle_robot = old
+            _, _, best_score, _, _ = best
+            if self._target_lock_age < self.target_lock_steps:
+                use_old = old_score >= (best_score - self.target_switch_margin)
+            else:
+                use_old = old_score >= (best_score + 0.03)
+            if use_old:
+                target_x, target_y, target_score, target_dist, angle_robot = old
 
         if use_old and old is not None:
             self._target_lock_age += 1
@@ -2366,88 +4328,209 @@ class ExplorationGridMap:
             self._target_lock_age = 0
             self._last_target_switched = bool(switched)
 
-        (
-            target_reachable,
-            path_distance,
-            path_angle,
-            path_progress,
-        ) = self._path_guidance_to_target(
-            robot_xy=robot_xy,
-            robot_yaw=robot_yaw,
-            target_ix=int(target_x),
-            target_iy=int(target_y),
-            selected_type=str(selected_type),
-            commit=True,
-        )
+        # /rl_path has been removed from the active algorithm.  Clear stale
+        # path visualization/state once and expose only direct semantic bearing.
+        self._prev_path_target_key = None
+        self._prev_path_distance = None
+        self._clear_path_visualization()
 
         target_priority = float(np.clip(selected_score[int(target_y), int(target_x)], 0.0, 1.0))
 
-        # frontier_angle is now the actionable path-next-waypoint angle when the
-        # target is reachable. If no path exists, return the direct angle only
-        # for logging/observation; reward gates it out using target_reachable.
-        actionable_angle = float(path_angle) if bool(target_reachable) else float(angle_robot)
-        actionable_distance = float(path_distance) if bool(target_reachable) else float(target_dist)
-
         return (
             int(count),
-            float(actionable_distance),
-            float(actionable_angle),
+            float(target_dist),
+            float(angle_robot),
             target_priority,
             str(selected_type),
-            bool(target_reachable),
-            float(path_distance),
-            float(path_angle),
-            float(path_progress),
+            False,          # target_reachable: no path planner is used
+            self.size_m,    # path_distance: neutral compatibility value
+            0.0,            # path_angle
+            0.0,            # path_progress
+            0,              # alternative_path_count
+            (),             # alternative_path_angles
         )
 
     def publish(self):
-        self._refresh_publish_grid()
-        self._publish_grid(self.grid, self.map_pub)
+        if not getattr(self, "_has_any_map_publisher", False):
+            return
 
-        # Backward-compatible RViz alias. This is NOT the old remember map;
-        # it mirrors /rl_task_map so old RViz configs do not show "No map received".
-        if self.legacy_memory_pub is not None:
-            self._publish_grid(self.grid, self.legacy_memory_pub)
+        # Hot path optimization only: publish() used to call _structural_grid() once
+        # through _modified_grid() and then again for /rl_filtered_slam_map.  At
+        # 10Hz this duplicated full-grid copies.  Use one structural snapshot for
+        # both outputs so the published layers are sampled from exactly the same
+        # internal state.
+        structural_grid = self._structural_grid()
+        self.grid = self._modified_grid_from_structural(structural_grid)
 
         confidence_grid = np.clip(np.round(self.confidence_grid), 0, 100).astype(np.int8)
-        self._publish_grid(confidence_grid, self.confidence_pub)
-
         priority_grid = self._priority_viz_grid()
-        self._publish_grid(priority_grid, self.priority_pub)
+        filtered_slam_grid = np.clip(structural_grid, -1, 100).astype(np.int8)
 
-        if self.filtered_slam_pub is not None:
-            filtered_slam_grid = np.clip(self.base_grid, -1, 100).astype(np.int8)
-            self._publish_grid(filtered_slam_grid, self.filtered_slam_pub)
+        # Map-fixed RViz path:
+        # When publish_slam_aligned=True, all debug/RL maps are reprojected onto
+        # the current accepted SLAM /map metadata.  This is the only mode in which
+        # raw /map and /rl_priority_map should be viewed together in RViz.  It
+        # prevents the previous failure mode where the internal RL grid expanded
+        # or shifted with robot motion while raw /map stayed in a separate grid.
+        ref = getattr(self, "_slam_publish_ref", None)
+        if bool(getattr(self, "publish_slam_aligned", False)):
+            # /map-locked RViz publication path.  Always try to refresh the raw
+            # /map reference directly from the ROS interface before falling back
+            # to the internal odom grid.  In pure-velocity mode the learning map
+            # stays in odom, but RViz layers must be projected onto raw /map; if
+            # this refresh is skipped, confidence/priority rectangles look shifted
+            # even though the internal control frame is correct.
+            if ref is None:
+                try:
+                    latest_raw_map = getattr(self.node, "slam_map", None)
+                    if latest_raw_map is not None:
+                        self.set_slam_publish_reference(latest_raw_map)
+                        ref = getattr(self, "_slam_publish_ref", None)
+                except Exception:
+                    ref = getattr(self, "_slam_publish_ref", None)
+
+            # /map-locked RViz publication path.  Once /map metadata exists, every
+            # /rl_* layer is resampled onto that exact canvas.  While SLAM is still
+            # booting, publish the internal odom grid instead of hiding all debug
+            # layers and spamming MAP_LOCKED_PUBLISH_WAITING_FOR_SLAM_REF.
+            if ref is None:
+                now = time.time()
+                if now - float(getattr(self, "_last_waiting_slam_ref_log_time", 0.0)) > 5.0:
+                    self._last_waiting_slam_ref_log_time = now
+                    if self.node is not None:
+                        self.node.get_logger().warn(
+                            "MAP_LOCKED_PUBLISH_FALLBACK_INTERNAL | "
+                            "raw /map metadata is unavailable; publishing LiDAR-only RL layers on the internal pose frame instead"
+                        )
+                # Real robot / dry-run fallback: slam_toolbox may fail to produce
+                # /map because of LaserScan beam-count/QoS/TF issues.  Do not hide
+                # the RL debug layers in that case.  Publish the common internal
+                # grid in self.frame_id so confidence/priority/debug remain visible
+                # and the policy still receives LiDAR-updated observations.
+                self._publish_grid(self.grid, self.map_pub)
+                if self.legacy_memory_pub is not None:
+                    self._publish_grid(self.grid, self.legacy_memory_pub)
+                self._publish_grid(confidence_grid, self.confidence_pub)
+                if self.priority_pub is not None:
+                    self._publish_grid(priority_grid, self.priority_pub)
+                if self.filtered_slam_pub is not None:
+                    self._publish_grid(filtered_slam_grid, self.filtered_slam_pub)
+                return
+
+            task_ref = self._resample_grid_to_slam_reference(self.grid, self.UNKNOWN, np.int8)
+            conf_ref = self._resample_grid_to_slam_reference(confidence_grid, 0, np.int8)
+            prio_ref = self._resample_grid_to_slam_reference(priority_grid, 0, np.int8)
+
+            raw_slam = getattr(self, "_slam_publish_raw_grid", None)
+            filt_ref = None
+            try:
+                if raw_slam is not None and raw_slam.shape == (int(ref["height"]), int(ref["width"])):
+                    filt_ref = np.asarray(raw_slam, dtype=np.int8)
+            except Exception:
+                filt_ref = None
+            if filt_ref is None:
+                # Fallback still uses the same /map metadata, never the internal
+                # grid metadata.  This preserves RViz alignment even if the raw
+                # SLAM data copy was unavailable for one callback.
+                filt_ref = self._resample_grid_to_slam_reference(filtered_slam_grid, self.UNKNOWN, np.int8)
+
+            if task_ref is not None and conf_ref is not None and prio_ref is not None and filt_ref is not None:
+                # Final wall clamp on the exact /map canvas. This is a
+                # publication safety net; internal confidence/priority already use
+                # wall-aware ray tracing/spread, but clamping here guarantees RViz
+                # never shows confidence or priority inside /map occupied cells.
+                try:
+                    raw_occ = np.asarray(filt_ref, dtype=np.int16) >= self._slam_occupied_threshold()
+                    if raw_occ.shape == conf_ref.shape:
+                        conf_ref = np.asarray(conf_ref, dtype=np.int8).copy()
+                        prio_ref = np.asarray(prio_ref, dtype=np.int8).copy()
+                        raw_wall = self._dilate_bool(raw_occ, radius=1)
+                        conf_ref[raw_wall] = 0
+                        prio_ref[raw_wall] = 0
+                        # Do not mask the published confidence map by the robot's
+                        # current connected component.  That made old explored
+                        # rooms disappear in RViz when a transient LiDAR wall or
+                        # inflated doorway split the component.  Wall cells are
+                        # still removed above, and new writes/priority clears are
+                        # still component-gated inside update().
+                except Exception:
+                    pass
+
+                self._publish_grid_with_ref(task_ref, self.map_pub, ref)
+                if self.legacy_memory_pub is not None:
+                    self._publish_grid_with_ref(task_ref, self.legacy_memory_pub, ref)
+                self._publish_grid_with_ref(conf_ref, self.confidence_pub, ref)
+                self._publish_grid_with_ref(prio_ref, self.priority_pub, ref)
+                self._publish_grid_with_ref(filt_ref, self.filtered_slam_pub, ref)
+                return
+
+            # If resampling failed, skip this publish rather than drawing a layer
+            # on the wrong origin/size. The next /map/live update will retry.
+            return
+
+        # Fallback path for non-map-locked modes only: publish all RL layers on
+        # the common internal grid.
+        self._publish_grid(self.grid, self.map_pub)
+        if self.legacy_memory_pub is not None:
+            self._publish_grid(self.grid, self.legacy_memory_pub)
+        self._publish_grid(confidence_grid, self.confidence_pub)
+        self._publish_grid(priority_grid, self.priority_pub)
+        self._publish_grid(filtered_slam_grid, self.filtered_slam_pub)
 
     def _refresh_publish_grid(self):
         self.grid = self._modified_grid()
 
+    def _modified_grid_from_structural(self, struct: np.ndarray) -> np.ndarray:
+        grid = np.full((self.height, self.width), self.UNKNOWN, dtype=np.int8)
+        known = struct >= 0
+        if np.any(known):
+            grid[known] = np.clip(np.round(struct[known]), 0, 100).astype(np.int8)
+        return grid
+
     def _priority_viz_grid(self) -> np.ndarray:
+        """RViz priority layer: 0=no priority, 1..100=active priority.
+
+        priority_checked_grid remains an internal regeneration-block mask only.
+        Checked/cleared areas are rendered as 0, not -1.
         """
-        Return a high-contrast RViz visualization of the priority map.
+        if bool(getattr(self, "disable_priority_map", False)):
+            return np.zeros_like(self.base_grid, dtype=np.int8)
+        raw = np.clip(self._active_priority_grid(), 0.0, 100.0).astype(np.float32)
+        visible = np.clip(np.round(raw), 0, 100).astype(np.int16)
+        active_mask = raw > 0.5
+        visible[active_mask] = np.maximum(visible[active_mask], 25)
+        try:
+            wall = self._inflated_wall_mask(radius=1)
+            if wall.shape == visible.shape:
+                visible[wall] = 0
+        except Exception:
+            pass
+        return np.clip(visible, 0, 100).astype(np.int8)
 
-        The internal priority_grid remains continuous 0..100 and is still used
-        for reward/CNN input. RViz Map displays, however, can make weak door-gap
-        candidates almost invisible. For visualization only, any non-zero
-        priority is lifted to a visible floor and strong priorities remain near
-        100.
-        """
-        raw = self._active_priority_grid()
-        visible = np.zeros_like(raw, dtype=np.float32)
-
-        mask = raw > 0.5
-        # 35 is deliberately above the map display's near-white range, so even
-        # weak priority cells are visible in RViz. Strong candidates still reach
-        # 100. Checked priority cells are published as -1 so they are visibly
-        # distinct and, more importantly, never regenerate as targets.
-        visible[mask] = 35.0 + 0.65 * raw[mask]
-
-        out = np.clip(np.round(visible), 0, 100).astype(np.int8)
-        if self.priority_checked_grid.shape == out.shape:
-            out[self.priority_checked_grid] = -1
-        return out
+    def _publish_grid_with_ref(self, grid: np.ndarray, publisher, ref: dict):
+        if publisher is None or ref is None:
+            return
+        msg = OccupancyGrid()
+        # stamp=0 avoids RViz TF extrapolation while metadata still matches /map.
+        msg.header.stamp.sec = 0
+        msg.header.stamp.nanosec = 0
+        msg.header.frame_id = str(ref.get("frame_id", self.frame_id) or self.frame_id)
+        msg.info.resolution = float(ref["resolution"])
+        msg.info.width = int(ref["width"])
+        msg.info.height = int(ref["height"])
+        msg.info.origin.position.x = float(ref["origin_x"])
+        msg.info.origin.position.y = float(ref["origin_y"])
+        msg.info.origin.position.z = float(ref.get("origin_z", 0.0))
+        msg.info.origin.orientation.x = float(ref.get("origin_qx", 0.0))
+        msg.info.origin.orientation.y = float(ref.get("origin_qy", 0.0))
+        msg.info.origin.orientation.z = float(ref.get("origin_qz", 0.0))
+        msg.info.origin.orientation.w = float(ref.get("origin_qw", 1.0))
+        msg.data = np.ravel(grid).astype(np.int8, copy=False).tolist()
+        publisher.publish(msg)
 
     def _publish_grid(self, grid: np.ndarray, publisher):
+        if publisher is None:
+            return
         msg = OccupancyGrid()
         # Use stamp=0 for RViz Map displays. With frame_id == Fixed Frame
         # this avoids TF/timestamp edge cases while still carrying the latest
@@ -2462,7 +4545,7 @@ class ExplorationGridMap:
         msg.info.origin.position.y = self.origin_y
         msg.info.origin.position.z = 0.0
         msg.info.origin.orientation.w = 1.0
-        msg.data = grid.flatten().astype(np.int8).tolist()
+        msg.data = np.ravel(grid).astype(np.int8, copy=False).tolist()
         publisher.publish(msg)
 
     def build_update_need_tensor(
@@ -2522,9 +4605,10 @@ class ExplorationGridMap:
         return np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
 
     def _update_need_channels(self) -> np.ndarray:
-        base_unknown = self.base_grid < 0
-        base_free = (self.base_grid >= 0) & (self.base_grid <= 35)
-        base_occupied = self.base_grid >= 65
+        struct = self._structural_grid()
+        base_unknown = struct < 0
+        base_free = (struct >= 0) & (struct <= 35)
+        base_occupied = struct >= min(float(self.gap_occupied_threshold), 55.0)
 
         channels = np.zeros((5, self.height, self.width), dtype=np.float32)
 

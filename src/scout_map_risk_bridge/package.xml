@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>scout_map_risk_bridge</name>
+  <version>0.3.0</version>
+  <description>Bridge scout robot map and risk map between ROS 2 DDS domains.</description>
+  <maintainer email="qhals8380@gmail.com">bomin</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
