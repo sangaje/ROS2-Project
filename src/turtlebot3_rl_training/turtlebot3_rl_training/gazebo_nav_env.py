@@ -848,6 +848,32 @@ class GazeboNavEnv(gym.Env):
         self._episode_slam_transform = None
         self._slam_transform_cache_key = None
         self._slam_transform_cache_msg = None
+
+        # v8 confidence pose policy.
+        # Do NOT integrate commands.  Confidence/priority/task maps must be
+        # physically aligned to the same /map canvas.  We therefore anchor one
+        # valid SLAM map pose at episode start, then project the *actual robot
+        # odometry* delta (/model/burger/odometry first, /odom message second)
+        # into that map frame.  If the real odometry source is unavailable, the
+        # update falls back to strict map TF and emits a warning instead of
+        # silently inventing motion.
+        self.confidence_pose_source = str(
+            os.environ.get("TB3_RL_CONFIDENCE_POSE_SOURCE", "real_odom_anchored") or "real_odom_anchored"
+        ).strip().lower()
+        self.confidence_motion_source = str(
+            os.environ.get("TB3_RL_CONFIDENCE_MOTION_SOURCE", "model_odom") or "model_odom"
+        ).strip().lower()
+        self._confidence_odom_anchor = None
+        self._last_confidence_pose_log_step = -10_000_000
+        self._last_confidence_pose_warn_time = 0.0
+        # v7: command-integrated pose fallback for confidence only.
+        # If /model odom, /odom msg, and odom TF are stale/frozen, this lets the
+        # camera-front confidence cone follow the actually published cmd_vel.
+        self._confidence_cmd_xy = np.zeros(2, dtype=np.float32)
+        self._confidence_cmd_yaw = 0.0
+        self._confidence_cmd_last_time = None
+        self._confidence_cmd_last_step = -1
+
         # reset_x/reset_y는 실제 Gazebo reset target이다.  이전 패치에서
         # reset_pose_candidates가 (1.2, -2.2)로 하드코딩되어 CLI의
         # --reset-x/--reset-y가 무시되는 문제가 있었다.  기본값은 다시
@@ -964,6 +990,7 @@ class GazeboNavEnv(gym.Env):
         self.debug_input_map_publishers = {}
 
         self.vector_history = deque(maxlen=self.temporal_history_len)
+        self.map_history = deque(maxlen=self.temporal_history_len)
 
         # 이미 확인한 영역에서 새 정보 없이 머무는 시간을 누적한다.
         # 이 값은 reward에서 시간 증가형 penalty로 사용한다.
@@ -1080,7 +1107,11 @@ class GazeboNavEnv(gym.Env):
             size_m=8.0,
             origin_x=-4.0,
             origin_y=-4.0,
-            frame_id=self.pose_frame,
+            # v11: every OccupancyGrid layer is locked to the SLAM map frame.
+            # Robot-centered crops use TF(map->base_footprint); LiDAR rays use
+            # TF(map->base_scan).  Do not let pose_frame/odom redefine layer
+            # coordinates.
+            frame_id=self.map_frame,
             publish_topic=rl_map_topic,
             confidence_publish_topic=rl_confidence_topic,
             priority_publish_topic=self.rl_priority_topic,
@@ -1098,7 +1129,7 @@ class GazeboNavEnv(gym.Env):
             # accepted /map canvas when SLAM is enabled.  ExplorationGridMap now
             # transforms between map and odom internally, so pure velocity odom
             # control can still get RViz layers that are locked to /map metadata.
-            publish_slam_aligned=bool(self.use_slam_map),
+            publish_slam_aligned=True,  # v5: RViz /rl_* layers are reprojected onto the raw /map canvas so confidence remains visible/aligned after SLAM map growth.
             keepalive_publish_period_sec=self.map_keepalive_period_sec,
             lidar_stride=2,
             max_range=3.5,
@@ -1169,6 +1200,20 @@ class GazeboNavEnv(gym.Env):
                     low=-1.0,
                     high=1.0,
                     shape=(self.temporal_history_len, self.obs_dim),
+                    dtype=np.float32,
+                )
+                # v18: temporal CNN now sees map/confidence/priority history as
+                # well as vector history.  Each item is the same robot-centric
+                # 5-channel map tensor used by the current map branch.
+                obs_spaces["map_seq"] = spaces.Box(
+                    low=0.0,
+                    high=1.0,
+                    shape=(
+                        self.temporal_history_len,
+                        5,
+                        self.map_obs_size,
+                        self.map_obs_size,
+                    ),
                     dtype=np.float32,
                 )
 
@@ -1270,6 +1315,14 @@ class GazeboNavEnv(gym.Env):
                 self.raw_scan_marker_topic,
                 10,
             )
+
+        # v12: anchor both confidence/priority rays and RViz scan markers at the
+        # robot position on /map by default. This uses the same TF(map->base)
+        # center as the robot-centric crop. It prevents debug rays and semantic
+        # maps from appearing at the SLAM canvas center when scan-frame TF is
+        # stale or evaluated at a different timestamp.
+        self.use_base_pose_for_raycast = self._scan_bool_env("TB3_RL_USE_BASE_POSE_FOR_RAYCAST", True)
+        self.use_base_pose_for_scan_markers = self._scan_bool_env("TB3_RL_USE_BASE_POSE_FOR_SCAN_MARKERS", True)
 
         self._last_scan_geometry_log_time = 0.0
         self._last_scan_geometry_debug = {}
@@ -2079,16 +2132,7 @@ class GazeboNavEnv(gym.Env):
                 accepted = self._strict_wait_for_accepted_slam_map(stage="post_reset_ready_disabled")
                 self._last_post_reset_ready = True
                 self._last_post_reset_ready_reason = "strict_slam_ready"
-                pose = self._get_robot_pose2d()
-                if pose is not None:
-                    robot_xy, robot_yaw = pose
-                    return self.exploration_map.update(
-                        scan=self.ros.scan,
-                        robot_xy=robot_xy,
-                        robot_yaw=robot_yaw,
-                        publish=True,
-                        slam_map=accepted,
-                    )
+                return self._update_exploration_map_with_unified_tf(slam_map=accepted)
             self._last_post_reset_ready = True
             self._last_post_reset_ready_reason = "disabled"
             return self._update_exploration_map()
@@ -2130,21 +2174,12 @@ class GazeboNavEnv(gym.Env):
                 # callbacks/mirror updates and keep cmd_vel at zero.
                 self._last_post_reset_ready_reason = f"strict_wait_slam:{self._last_slam_gate_reason}"
             else:
-                pose = self._get_robot_pose2d()
-                if pose is not None:
-                    robot_xy, robot_yaw = pose
-                    try:
-                        last_stats = self.exploration_map.update(
-                            scan=self.ros.scan,
-                            robot_xy=robot_xy,
-                            robot_yaw=robot_yaw,
-                            publish=True,
-                            slam_map=slam_map,
-                        )
-                        if use_slam and slam_map is None:
-                            self._last_post_reset_ready_reason = "lidar_only_slam_fallback"
-                    except Exception as exc:
-                        self._last_post_reset_ready_reason = f"map_update_error:{type(exc).__name__}"
+                try:
+                    last_stats = self._update_exploration_map_with_unified_tf(slam_map=slam_map)
+                    if use_slam and slam_map is None:
+                        self._last_post_reset_ready_reason = "lidar_only_slam_fallback"
+                except Exception as exc:
+                    self._last_post_reset_ready_reason = f"map_update_error:{type(exc).__name__}"
 
             metrics = self._post_reset_ready_metrics(last_stats)
             best_metrics = metrics
@@ -2219,6 +2254,87 @@ class GazeboNavEnv(gym.Env):
             f"prio={float(metrics.get('priority_score', 0.0)):.3f}"
         )
         return soft_ready_stats if soft_ready_stats is not None else last_stats
+
+    def _reset_confidence_pose_runtime_state(self) -> None:
+        """Reset per-episode confidence pose anchoring state.
+
+        This must run after every Gazebo/SLAM reset.  The confidence pose is
+        anchored from the first valid real odometry sample of the current
+        episode to the current /map pose.  Keeping the previous episode anchor
+        makes episode 2+ paint at the old position even though the maps publish
+        on the new /map canvas.
+        """
+        self._confidence_odom_anchor = None
+        self._last_confidence_pose_log_step = -10_000_000
+        self._confidence_cmd_xy = np.zeros(2, dtype=np.float32)
+        self._confidence_cmd_yaw = 0.0
+        self._confidence_cmd_last_time = None
+        self._confidence_cmd_last_step = -1
+        try:
+            self._last_confidence_pose_warn_time = 0.0
+        except Exception:
+            pass
+
+    def _sync_exploration_canvas_to_current_slam(self, *, reason: str = "", publish: bool = True) -> bool:
+        """Force all RL map layers to the current raw /map canvas.
+
+        v9 fix: reset_centered_at() intentionally clears the RL/confidence grids,
+        but it also clears the stored SLAM publish reference.  In episode 2+, the
+        first post-reset /rl_confidence_map can therefore be published on a stale
+        or internal canvas until another SLAM sample path refreshes the reference.
+        This helper makes the invariant explicit after every reset:
+
+            /map, /rl_task_map, /rl_confidence_map, /rl_priority_map
+            share exactly the same frame_id, origin, resolution, width, height.
+        """
+        try:
+            emap = getattr(self, "exploration_map", None)
+            slam = getattr(self.ros, "slam_map", None)
+            if emap is None or slam is None:
+                return False
+            # Clear publication/resampling caches so a new episode cannot reuse
+            # previous /map metadata after Cartographer restart.
+            for name, value in (
+                ("_publish_resample_cache_key", None),
+                ("_publish_resample_cache", None),
+                ("_last_direct_map_publish_step", -1),
+                ("_last_confidence_publish_debug_step", -10_000_000),
+            ):
+                try:
+                    setattr(emap, name, value)
+                except Exception:
+                    pass
+            if hasattr(emap, "set_slam_publish_reference"):
+                emap.set_slam_publish_reference(slam)
+            # Also lock the internal persistent arrays to the same SLAM canvas.
+            # This is not just an RViz visual fix; it makes reward/CNN/confidence
+            # use the same global grid metadata as /map.
+            try:
+                emap._sample_slam_base(slam)
+            except Exception:
+                pass
+            if publish:
+                try:
+                    emap.publish()
+                except Exception:
+                    pass
+            # Optional one-line debug only when explicitly requested.
+            try:
+                dbg = str(os.environ.get("TB3_RL_EPISODE_CANVAS_DEBUG", "0")).strip().lower() in {"1", "true", "yes", "on"}
+                if dbg:
+                    info = slam.info
+                    self.ros.get_logger().warn(
+                        "EPISODE_CANVAS_SYNC | "
+                        f"reason={reason} frame={getattr(slam.header, 'frame_id', '')} "
+                        f"size={int(info.width)}x{int(info.height)} "
+                        f"origin=({float(info.origin.position.x):+.2f},{float(info.origin.position.y):+.2f}) "
+                        f"res={float(info.resolution):.3f}"
+                    )
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -2380,6 +2496,10 @@ class GazeboNavEnv(gym.Env):
         self._last_orbit_reason = "reset"
         self.last_map_stats = self._empty_map_stats()
         self.vector_history.clear()
+        try:
+            self.map_history.clear()
+        except Exception:
+            pass
         self._waypoint_history.clear()
         self._clear_waypoint_visualization()
         self._last_terminal_reason = "none"
@@ -2410,6 +2530,7 @@ class GazeboNavEnv(gym.Env):
         self._episode_slam_transform = None
         self._slam_transform_cache_key = None
         self._slam_transform_cache_msg = None
+        self._reset_confidence_pose_runtime_state()
         should_reset_slam = bool(self.use_slam_map)
 
         if should_reset_slam:
@@ -2482,11 +2603,21 @@ class GazeboNavEnv(gym.Env):
         else:
             self.exploration_map.reset_centered_at(self.current_reset_xy.copy())
 
+        # v9: reset_centered_at() clears the grids and the SLAM publish reference.
+        # Re-lock all persistent RL layers to the current /map canvas immediately,
+        # then clear the confidence pose anchor so the first confidence update of
+        # this episode anchors real odometry to this episode's map pose.
+        self._sync_exploration_canvas_to_current_slam(reason="after_exploration_reset", publish=True)
+        self._reset_confidence_pose_runtime_state()
+
         # 6) RESET 직후에는 바로 episode를 열지 않는다.
         #    SLAM /map이 reset 이후 실제로 채워지고, LiDAR/confidence/priority가
         #    최소 기준을 만족할 때까지 /cmd_vel=0으로 대기한다. Gym reset()이
         #    아직 반환되지 않았으므로 이 구간은 reward/replay에 들어가지 않는다.
         self.last_map_stats = self._wait_post_reset_ready(reset_pose=reset_pose)
+        # v9: after the ready gate, Cartographer may have grown /map again.
+        # Refresh the shared /map canvas reference without clearing confidence.
+        self._sync_exploration_canvas_to_current_slam(reason="after_post_reset_ready", publish=True)
         self._last_live_map_update_wall = time.time()
         self._map_live_update_paused = False
 
@@ -6040,6 +6171,17 @@ class GazeboNavEnv(gym.Env):
         return RosTime(sec=0, nanosec=0)
 
     @staticmethod
+    def _zero_stamp() -> RosTime:
+        """Return a ROS zero timestamp for robot-frame debug markers.
+
+        v14 switched scan/debug markers to robot frames, but some call sites
+        referenced _zero_stamp() while only _latest_tf_stamp() existed.  Keep
+        both names because zero stamp is intentional for RViz latest-TF marker
+        visualization in sim time and real time.
+        """
+        return RosTime(sec=0, nanosec=0)
+
+    @staticmethod
     def _point_xyz(x: float, y: float, z: float = 0.0) -> Point:
         p = Point()
         p.x = float(x)
@@ -6377,19 +6519,25 @@ class GazeboNavEnv(gym.Env):
         if self.step_count % self.waypoint_visual_publish_every_n != 0:
             return
 
-        stamp = self._latest_tf_stamp()
-        # For real-robot RViz debugging, publish markers directly in map/pose frame
-        # instead of base_footprint.  This avoids losing arrows/text when TF is
-        # temporarily unavailable or RViz cannot transform robot-local markers.
-        frame_id = self._waypoint_visualization_frame()
-        robot_pose_for_overlay = self._get_robot_pose2d(frame_id=frame_id)
-        if robot_pose_for_overlay is None:
-            frame_id = "base_footprint"
+        # v14 default: velocity debug overlay is robot-attached.  The old map-frame
+        # overlay could appear at a stale/global location when map->odom changed,
+        # which made the user think the MarkerArray was not robot based.
+        if self._scan_bool_env("TB3_RL_DEBUG_OVERLAY_IN_BASE_FRAME", True):
+            stamp = self._zero_stamp()
+            frame_id = str(os.environ.get("TB3_RL_BASE_FRAME", getattr(self.ros, "base_frame", "base_footprint")) or "base_footprint").strip().lstrip("/") or "base_footprint"
             robot_xy_overlay = np.array([0.0, 0.0], dtype=np.float32)
             robot_yaw_overlay = 0.0
         else:
-            robot_xy_overlay = np.asarray(robot_pose_for_overlay[0], dtype=np.float32)[:2]
-            robot_yaw_overlay = float(robot_pose_for_overlay[1])
+            stamp = self._latest_tf_stamp()
+            frame_id = self._waypoint_visualization_frame()
+            robot_pose_for_overlay = self._get_robot_pose2d(frame_id=frame_id)
+            if robot_pose_for_overlay is None:
+                frame_id = "base_footprint"
+                robot_xy_overlay = np.array([0.0, 0.0], dtype=np.float32)
+                robot_yaw_overlay = 0.0
+            else:
+                robot_xy_overlay = np.asarray(robot_pose_for_overlay[0], dtype=np.float32)[:2]
+                robot_yaw_overlay = float(robot_pose_for_overlay[1])
         raw = np.asarray(raw_action, dtype=np.float32)
         exe = np.asarray(executed_action, dtype=np.float32)
         if raw.size < 2:
@@ -6491,6 +6639,7 @@ class GazeboNavEnv(gym.Env):
             f"lp={int(getattr(self, '_last_scan_geometry_debug', {}).get('sector_lowpass_kernel', 0))} "
             f"expand={str(getattr(self, '_last_scan_geometry_debug', {}).get('sector_expand_mode', ''))} "
             f"pmin={float(getattr(self, '_last_scan_geometry_debug', {}).get('policy_min', 0.0)):.2f}\n"
+            f"anchor=base scanYaw={float(getattr(self, '_last_hard_map_scan_yaw', 0.0)):+.2f} overlayFrame={frame_id}\n"
             f"SAFE pen={safety_pen:.2f} slow={slowdown:.2f} cd={safety_cd} assist={int(bool(getattr(self, '_last_velocity_forward_assist', False)))} spinfix={int(bool(getattr(self, '_last_velocity_spin_breaker', False)))} limit={int(bool(getattr(self, '_last_velocity_command_limited', False)))}  {safety_reason} {str(getattr(self, '_last_velocity_command_limit_reason', 'none'))}\n"
             f"Shake={shake_steps}/{shake_limit} {shake_reason}  "
             f"Lempty={l_empty_steps}/{l_empty_timeout} beams={valid_beams}  "
@@ -7204,8 +7353,12 @@ class GazeboNavEnv(gym.Env):
             "policy_mean": float(lidar_mean),
         }
 
+        try:
+            obs_scan_dbg_sec = float(os.environ.get("TB3_RL_OBS_SCAN_GEOMETRY_DEBUG_SEC", "0.0"))
+        except Exception:
+            obs_scan_dbg_sec = 0.0
         now = time.time()
-        if now - float(getattr(self, "_last_scan_geometry_log_time", 0.0)) >= 5.0:
+        if obs_scan_dbg_sec > 0.0 and now - float(getattr(self, "_last_scan_geometry_log_time", 0.0)) >= obs_scan_dbg_sec:
             self._last_scan_geometry_log_time = now
             try:
                 self.ros.get_logger().warn(
@@ -7218,6 +7371,620 @@ class GazeboNavEnv(gym.Env):
             except Exception:
                 pass
 
+
+    def _get_map_base_pose2d_hard(self) -> Optional[tuple[np.ndarray, float]]:
+        """Strict canonical robot anchor for every /map-aligned RL layer.
+
+        This intentionally bypasses Odometry/Gazebo pose fallbacks.  The returned
+        pose is exactly the TF pose RViz uses to place the robot on /map:
+
+            map_frame -> base_frame
+
+        If this TF is unavailable, the semantic maps must not update; using odom
+        coordinates as map coordinates is worse than skipping one update.
+        """
+        target_frame = str(self.map_frame or "map").strip().lstrip("/") or "map"
+        base_candidates = []
+        try:
+            base_candidates.extend(list(getattr(self.ros, "base_frame_fallbacks", []) or []))
+        except Exception:
+            pass
+        try:
+            base_candidates.append(str(getattr(self.ros, "base_frame", "base_footprint") or "base_footprint"))
+        except Exception:
+            pass
+        base_candidates.extend(["base_footprint", "base_link"])
+
+        seen = set()
+        for source_frame in base_candidates:
+            source_frame = str(source_frame or "").strip().lstrip("/")
+            if not source_frame or source_frame in seen:
+                continue
+            seen.add(source_frame)
+            pose = None
+            try:
+                if hasattr(self.ros, "get_frame_pose2d"):
+                    pose = self.ros.get_frame_pose2d(
+                        target_frame=target_frame,
+                        source_frame=source_frame,
+                        stamp=None,
+                        timeout_sec=0.05,
+                        allow_latest_fallback=True,
+                    )
+            except Exception:
+                pose = None
+            if pose is not None:
+                xy, yaw = pose
+                xy = np.asarray(xy, dtype=np.float32)
+                if xy.shape[0] >= 2 and np.all(np.isfinite(xy[:2])) and math.isfinite(float(yaw)):
+                    self._last_hard_map_base_frame = source_frame
+                    self._last_hard_map_base_xy = xy[:2].copy()
+                    self._last_hard_map_base_yaw = float(yaw)
+                    return xy[:2], float(yaw)
+
+        # Do not spam this during normal training.  Cartographer may briefly drop
+        # map->base TF during per-episode SLAM restart; v11 waits for a verified
+        # map->base anchor instead of writing at a guessed SLAM-local origin.
+        try:
+            warn_enabled = str(os.environ.get("TB3_RL_MAP_BASE_TF_WARN", "0")).strip().lower() in {"1", "true", "yes", "on"}
+        except Exception:
+            warn_enabled = False
+        now = time.time()
+        if warn_enabled and now - float(getattr(self, "_last_hard_map_base_tf_warn_time", 0.0)) > 2.0:
+            self._last_hard_map_base_tf_warn_time = now
+            try:
+                self.ros.get_logger().warn(
+                    "TF_MAP_BASE_POSE_UNAVAILABLE | "
+                    f"target={target_frame} candidates={list(seen)} | "
+                    "will skip semantic map write until map TF is available"
+                )
+            except Exception:
+                pass
+        return None
+
+    def _get_slam_origin_anchor_pose2d(self, motion_yaw: Optional[float] = None) -> Optional[tuple[np.ndarray, float, str]]:
+        """Fallback anchor for per-episode Cartographer TF gaps.
+
+        In this project every persistent semantic layer is published on the raw
+        /map OccupancyGrid canvas.  The preferred anchor is TF(map->base).  During
+        Cartographer restart this TF can be unavailable even though /map and the
+        actual odometry stream are alive.  In that case, do not skip confidence
+        updates indefinitely: anchor the actual odometry pose to the SLAM-local
+        origin.  For a freshly restarted Cartographer map this is normally where
+        the robot starts.
+
+        This is not command integration and not an odom-as-map fallback.  It only
+        supplies the initial map-frame anchor; subsequent motion still comes from
+        actual odometry (/model odom preferred).
+        """
+        try:
+            enabled = str(os.environ.get("TB3_RL_CONFIDENCE_ALLOW_SLAM_ORIGIN_ANCHOR", "0")).strip().lower() in {"1", "true", "yes", "on"}
+        except Exception:
+            enabled = False
+        if not enabled:
+            return None
+        try:
+            slam = getattr(self.ros, "slam_map", None)
+            if slam is None:
+                return None
+            info = slam.info
+            width = int(info.width)
+            height = int(info.height)
+            res = float(info.resolution)
+            if width <= 0 or height <= 0 or not math.isfinite(res) or res <= 0.0:
+                return None
+        except Exception:
+            return None
+
+        try:
+            ax = float(os.environ.get("TB3_RL_CONFIDENCE_SLAM_ANCHOR_X", "0.0") or 0.0)
+            ay = float(os.environ.get("TB3_RL_CONFIDENCE_SLAM_ANCHOR_Y", "0.0") or 0.0)
+        except Exception:
+            ax, ay = 0.0, 0.0
+
+        # If a yaw is explicitly provided use it; otherwise align map yaw with
+        # the actual odometry yaw at the anchor so camera/front rays rotate with
+        # the real robot pose.
+        try:
+            if "TB3_RL_CONFIDENCE_SLAM_ANCHOR_YAW_DEG" in os.environ:
+                yaw = math.radians(float(os.environ.get("TB3_RL_CONFIDENCE_SLAM_ANCHOR_YAW_DEG", "0.0") or 0.0))
+            elif motion_yaw is not None and math.isfinite(float(motion_yaw)):
+                yaw = float(motion_yaw)
+            else:
+                yaw = 0.0
+        except Exception:
+            yaw = float(motion_yaw) if motion_yaw is not None and math.isfinite(float(motion_yaw)) else 0.0
+
+        try:
+            dbg = str(os.environ.get("TB3_RL_CONFIDENCE_ANCHOR_DEBUG", "0")).strip().lower() in {"1", "true", "yes", "on"}
+            if dbg:
+                now = time.time()
+                if now - float(getattr(self, "_last_slam_origin_anchor_log_time", 0.0)) > 2.0:
+                    self._last_slam_origin_anchor_log_time = now
+                    self.ros.get_logger().warn(
+                        "CONFIDENCE_SLAM_ORIGIN_ANCHOR | "
+                        f"map_xy=({ax:+.3f},{ay:+.3f}) yaw={math.degrees(yaw):+.1f}deg "
+                        f"canvas={width}x{height} res={res:.3f}"
+                    )
+        except Exception:
+            pass
+
+        return np.array([ax, ay], dtype=np.float32), float(yaw), "slam_origin"
+
+    def _get_map_scan_yaw_hard(self, raw_scan_msg=None, base_yaw: Optional[float] = None) -> float:
+        """Return the current scan-frame yaw expressed in /map.
+
+        Important distinction for this project:
+          - ray *origin* is the robot anchor: TF(map -> base_footprint).
+          - ray *orientation* must still follow the LaserScan frame: TF(map -> base_scan).
+
+        The old v13 path used base yaw for both origin and scan angles.  If
+        base_scan has any yaw offset relative to base_footprint, confidence and
+        priority rays rotate away from the real scan and appear not to update at
+        the robot.
+        """
+        target_frame = str(self.map_frame or "map").strip().lstrip("/") or "map"
+        scan_frame = ""
+        try:
+            scan_frame = str(getattr(getattr(raw_scan_msg, "header", None), "frame_id", "") or "").strip().lstrip("/")
+        except Exception:
+            scan_frame = ""
+        if not scan_frame:
+            scan_frame = str(os.environ.get("TB3_RL_SCAN_FRAME", getattr(self, "scan_frame", "base_scan")) or "base_scan").strip().lstrip("/") or "base_scan"
+
+        pose = None
+        try:
+            if hasattr(self.ros, "get_frame_pose2d"):
+                # Use latest TF for semantic map updates.  All persistent layers
+                # are updated from the same current TF snapshot; do not mix old
+                # scan stamps with current /map canvas.
+                pose = self.ros.get_frame_pose2d(
+                    target_frame=target_frame,
+                    source_frame=scan_frame,
+                    stamp=None,
+                    timeout_sec=0.05,
+                    allow_latest_fallback=True,
+                )
+        except Exception:
+            pose = None
+        if pose is not None:
+            try:
+                _, yaw = pose
+                if math.isfinite(float(yaw)):
+                    self._last_hard_map_scan_frame = scan_frame
+                    self._last_hard_map_scan_yaw = float(yaw)
+                    return float(yaw)
+            except Exception:
+                pass
+
+        # Fall back to base yaw only for orientation, never for XY/map origin.
+        # This keeps confidence/priority anchored at the robot even if the
+        # optional base_scan TF is temporarily missing.
+        if base_yaw is not None and math.isfinite(float(base_yaw)):
+            now = time.time()
+            if now - float(getattr(self, "_last_scan_yaw_tf_warn_time", 0.0)) > 2.0:
+                self._last_scan_yaw_tf_warn_time = now
+                try:
+                    self.ros.get_logger().warn(
+                        "TF_MAP_SCAN_YAW_UNAVAILABLE | "
+                        f"target={target_frame} source={scan_frame} | use base yaw fallback for ray direction"
+                    )
+                except Exception:
+                    pass
+            return float(base_yaw)
+        return 0.0
+
+    def _pose2d_from_odometry_msg(self, msg, label: str) -> Optional[tuple[np.ndarray, float, str]]:
+        """Extract an SE(2) pose from an Odometry-like message.
+
+        The frame does not have to be /map.  For the confidence v6 odom-delta
+        policy, it only needs to be a self-consistent moving coordinate system.
+        """
+        if msg is None:
+            return None
+        try:
+            p = msg.pose.pose.position
+            q = msg.pose.pose.orientation
+            xy = np.array([float(p.x), float(p.y)], dtype=np.float32)
+            yaw = self._yaw_from_quaternion_xyzw_static(float(q.x), float(q.y), float(q.z), float(q.w))
+            if not (np.all(np.isfinite(xy)) and math.isfinite(float(yaw))):
+                return None
+            return xy, float(yaw), str(label)
+        except Exception:
+            return None
+
+    def _confidence_time_sec(self) -> float:
+        """Return a monotonic-ish time for command integration.
+
+        Prefer simulation time when it is advancing; otherwise use wall time.
+        """
+        try:
+            t = self.ros.get_sim_time_sec()
+            if t is not None and math.isfinite(float(t)) and float(t) > 0.0:
+                return float(t)
+        except Exception:
+            pass
+        return float(time.time())
+
+    def _get_confidence_cmd_integrated_pose2d(self) -> Optional[tuple[np.ndarray, float, str]]:
+        """Integrate the actually published cmd_vel for confidence pose only.
+
+        This is deliberately not used for robot localization, reward terminal
+        checks, or SLAM.  It is a visualization/task-map fallback for the case
+        seen in this run: map->base, odom->base, and model odom are unavailable
+        or frozen while the direct velocity controller is still publishing
+        non-zero commands.
+        """
+        try:
+            now = self._confidence_time_sec()
+        except Exception:
+            now = float(time.time())
+
+        try:
+            xy = np.asarray(getattr(self, "_confidence_cmd_xy", np.zeros(2, dtype=np.float32)), dtype=np.float32)[:2]
+            yaw = float(getattr(self, "_confidence_cmd_yaw", 0.0))
+        except Exception:
+            xy = np.zeros(2, dtype=np.float32)
+            yaw = 0.0
+
+        last_t = getattr(self, "_confidence_cmd_last_time", None)
+        if last_t is None or not math.isfinite(float(last_t)):
+            self._confidence_cmd_last_time = now
+            self._confidence_cmd_xy = xy.copy()
+            self._confidence_cmd_yaw = float(yaw)
+            return xy.copy(), float(yaw), "cmd_integrated"
+
+        dt = float(now) - float(last_t)
+        # Timer jitter and reset pauses can create large wall-time gaps; never
+        # integrate a huge jump into the map.
+        dt = float(np.clip(dt, 0.0, float(os.environ.get("TB3_RL_CONFIDENCE_CMD_DT_CAP", "0.12") or 0.12)))
+        self._confidence_cmd_last_time = now
+
+        try:
+            v = float(getattr(self.ros, "last_cmd_linear_x", 0.0))
+            w = float(getattr(self.ros, "last_cmd_angular_z", 0.0))
+        except Exception:
+            try:
+                fa = np.asarray(getattr(self, "filtered_action", np.zeros(2, dtype=np.float32)), dtype=np.float32)
+                v = float(fa[0])
+                w = float(fa[1])
+            except Exception:
+                v = 0.0
+                w = 0.0
+
+        # Avoid accumulating numerical noise when the command is effectively zero.
+        if abs(v) < 1e-4:
+            v = 0.0
+        if abs(w) < 1e-4:
+            w = 0.0
+
+        if dt > 0.0 and (v != 0.0 or w != 0.0):
+            mid_yaw = self._normalize_angle(float(yaw) + 0.5 * float(w) * dt)
+            xy = xy.copy()
+            xy[0] += float(v) * dt * math.cos(mid_yaw)
+            xy[1] += float(v) * dt * math.sin(mid_yaw)
+            yaw = self._normalize_angle(float(yaw) + float(w) * dt)
+
+        self._confidence_cmd_xy = xy.copy()
+        self._confidence_cmd_yaw = float(yaw)
+        return xy.copy(), float(yaw), "cmd_integrated"
+
+    def _get_confidence_motion_pose2d(self) -> Optional[tuple[np.ndarray, float, str]]:
+        """Return an actual robot pose source for confidence map alignment.
+
+        v8 rule: do not use command integration.  The confidence layers are
+        persistent map layers, so their robot anchor must come from a physical
+        pose measurement:
+          1) /model/<name>/odometry    (Gazebo model odom / simulated truth-ish)
+          2) /odom message             (wheel/Gazebo odometry)
+          3) odom TF                   (last-resort actual TF)
+
+        The returned pose is not assumed to be in /map.  The caller anchors it
+        once to the current map pose and applies SE(2) deltas so all published
+        maps remain on the same /map OccupancyGrid canvas.
+        """
+        source = str(getattr(self, "confidence_motion_source", "model_odom") or "model_odom").strip().lower()
+        if source in {"", "auto", "real", "actual", "real_odom", "actual_odom"}:
+            order = ["model_odom", "odom_msg", "odom_tf"]
+        elif source in {"model", "model_odom", "gazebo", "truth", "gazebo_model"}:
+            order = ["model_odom", "odom_msg", "odom_tf"]
+        elif source in {"model_strict", "model_odom_strict", "gazebo_strict", "truth_strict"}:
+            order = ["model_odom"]
+        elif source in {"odom", "odom_msg", "wheel_odom", "msg"}:
+            order = ["odom_msg", "odom_tf", "model_odom"]
+        elif source in {"odom_tf", "tf"}:
+            order = ["odom_tf", "odom_msg", "model_odom"]
+        elif source in {"cmd", "cmd_vel", "cmd_integrated", "integrated_cmd"}:
+            # v7 used this as a fallback, but it breaks true map alignment.
+            # Keep the alias only to prevent hard crashes from an old shell env.
+            try:
+                now = time.time()
+                if now - float(getattr(self, "_last_confidence_pose_warn_time", 0.0)) > 2.0:
+                    self._last_confidence_pose_warn_time = now
+                    self.ros.get_logger().warn(
+                        "CONFIDENCE_CMD_INTEGRATION_DISABLED | "
+                        "cmd_integrated is not a valid aligned map pose source; "
+                        "using actual odometry sources instead"
+                    )
+            except Exception:
+                pass
+            order = ["model_odom", "odom_msg", "odom_tf"]
+        else:
+            order = ["model_odom", "odom_msg", "odom_tf"]
+
+        for item in order:
+            if item == "model_odom":
+                pose = self._pose2d_from_odometry_msg(getattr(self.ros, "model_odom", None), "model_odom")
+                if pose is not None:
+                    return pose
+            elif item == "odom_msg":
+                pose = self._pose2d_from_odometry_msg(getattr(self.ros, "odom", None), "odom_msg")
+                if pose is not None:
+                    return pose
+            elif item == "odom_tf":
+                try:
+                    pose = self.ros.get_pose2d(frame_id="odom") if hasattr(self.ros, "get_pose2d") else None
+                    if pose is not None:
+                        xy, yaw = pose
+                        xy = np.asarray(xy, dtype=np.float32)
+                        if xy.size >= 2 and np.all(np.isfinite(xy[:2])) and math.isfinite(float(yaw)):
+                            return xy[:2], float(yaw), "odom_tf"
+                except Exception:
+                    pass
+        return None
+
+    def _get_confidence_update_pose2d(self) -> Optional[tuple[np.ndarray, float, np.ndarray, float, str]]:
+        """Return the pose used to paint camera-front confidence in /map.
+
+        v11 rule:
+          - All persistent maps stay on the same raw /map OccupancyGrid canvas.
+          - The initial anchor MUST be a verified TF(map->base) pose.
+          - Do not paint confidence/priority at a guessed SLAM origin.  That
+            created ghost confidence blobs away from the robot when Cartographer
+            had not produced map->base TF yet.
+          - After the anchor is created, actual odometry deltas move the pose.
+          - No cmd_vel integration is used.
+        """
+        mode = str(os.environ.get("TB3_RL_CONFIDENCE_POSE_SOURCE", getattr(self, "confidence_pose_source", "real_odom_anchored")) or "real_odom_anchored").strip().lower()
+        self.confidence_pose_source = mode
+
+        anchor = getattr(self, "_confidence_odom_anchor", None)
+        hard_map_pose = None
+
+        # In the normal anchored mode, map->base TF is only needed to create the
+        # anchor.  Calling it on every update causes repeated TF warnings during
+        # Cartographer restarts even when the actual odom anchor is already valid.
+        if mode in {"map", "map_tf", "tf", "cartographer"} or anchor is None:
+            hard_map_pose = self._get_map_base_pose2d_hard()
+
+        if mode in {"map", "map_tf", "tf", "cartographer"}:
+            if hard_map_pose is None:
+                return None
+            xy, yaw = hard_map_pose
+            scan_yaw = self._get_map_scan_yaw_hard(raw_scan_msg=self.ros.scan, base_yaw=yaw)
+            return np.asarray(xy, dtype=np.float32), float(yaw), np.asarray(xy, dtype=np.float32), float(scan_yaw), "map_tf"
+
+        motion_pose = self._get_confidence_motion_pose2d()
+        if motion_pose is None:
+            # Without actual odometry we cannot maintain true map alignment.  If
+            # TF exists, use it directly for this update; otherwise skip.
+            if hard_map_pose is None:
+                try:
+                    dbg = str(os.environ.get("TB3_RL_CONFIDENCE_POSE_WARN", "0")).strip().lower() in {"1", "true", "yes", "on"}
+                except Exception:
+                    dbg = False
+                if dbg:
+                    now = time.time()
+                    if now - float(getattr(self, "_last_confidence_pose_warn_time", 0.0)) > 2.0:
+                        self._last_confidence_pose_warn_time = now
+                        try:
+                            self.ros.get_logger().warn(
+                                "CONFIDENCE_POSE_SOURCE_UNAVAILABLE | "
+                                f"mode={mode} motion_source={getattr(self, 'confidence_motion_source', '')}"
+                            )
+                        except Exception:
+                            pass
+                return None
+            xy, yaw = hard_map_pose
+            scan_yaw = self._get_map_scan_yaw_hard(raw_scan_msg=self.ros.scan, base_yaw=yaw)
+            return np.asarray(xy, dtype=np.float32), float(yaw), np.asarray(xy, dtype=np.float32), float(scan_yaw), "map_tf_fallback"
+
+        motion_xy, motion_yaw, motion_label = motion_pose
+        motion_xy = np.asarray(motion_xy, dtype=np.float32)[:2]
+        motion_yaw = float(motion_yaw)
+
+        anchor = getattr(self, "_confidence_odom_anchor", None)
+        if anchor is None or str(anchor.get("motion_label", "")) != str(motion_label):
+            # v11: do not create a new anchor from a guessed map origin.
+            # A persistent map layer can only be considered aligned if the first
+            # anchor came from the same map->base TF used by RViz.  If TF is not
+            # available yet, skip this update and wait; otherwise confidence can
+            # be painted at (0,0) or another stale location with no robot there.
+            if hard_map_pose is None:
+                try:
+                    dbg = str(os.environ.get("TB3_RL_CONFIDENCE_ANCHOR_DEBUG", "0")).strip().lower() in {"1", "true", "yes", "on"}
+                except Exception:
+                    dbg = False
+                if dbg:
+                    now = time.time()
+                    if now - float(getattr(self, "_last_confidence_pose_warn_time", 0.0)) > 2.0:
+                        self._last_confidence_pose_warn_time = now
+                        try:
+                            self.ros.get_logger().warn(
+                                "CONFIDENCE_ANCHOR_WAIT_MAP_TF | "
+                                f"mode={mode} motion_source={motion_label}; skip map write until map->base TF is valid"
+                            )
+                        except Exception:
+                            pass
+                return None
+            anchor_source = "map_tf"
+            map_xy0, map_yaw0 = hard_map_pose
+
+            map_xy0 = np.asarray(map_xy0, dtype=np.float32)[:2]
+            map_yaw0 = float(map_yaw0)
+            try:
+                if hard_map_pose is not None:
+                    scan_yaw0 = self._get_map_scan_yaw_hard(raw_scan_msg=self.ros.scan, base_yaw=map_yaw0)
+                    scan_offset = self._normalize_angle(float(scan_yaw0) - float(map_yaw0))
+                else:
+                    scan_offset = 0.0
+            except Exception:
+                scan_offset = 0.0
+            anchor = {
+                "map_xy0": map_xy0.copy(),
+                "map_yaw0": float(map_yaw0),
+                "motion_xy0": motion_xy.copy(),
+                "motion_yaw0": float(motion_yaw),
+                "motion_label": str(motion_label),
+                "scan_offset": float(scan_offset),
+                "anchor_source": str(anchor_source),
+            }
+            self._confidence_odom_anchor = anchor
+            try:
+                _anchor_dbg_n = int(os.environ.get("TB3_RL_CONFIDENCE_POSE_DEBUG_EVERY_N", "0"))
+            except Exception:
+                _anchor_dbg_n = 0
+            if _anchor_dbg_n > 0:
+                try:
+                    self.ros.get_logger().warn(
+                        "CONFIDENCE_POSE_ANCHOR_SET | "
+                        f"mode=real_odom_anchored source={motion_label} anchor={anchor_source} "
+                        f"map=({map_xy0[0]:+.3f},{map_xy0[1]:+.3f},{math.degrees(map_yaw0):+.1f}deg) "
+                        f"motion=({motion_xy[0]:+.3f},{motion_xy[1]:+.3f},{math.degrees(motion_yaw):+.1f}deg) "
+                        f"scan_offset={math.degrees(scan_offset):+.1f}deg"
+                    )
+                except Exception:
+                    pass
+
+        theta = self._normalize_angle(float(anchor["map_yaw0"]) - float(anchor["motion_yaw0"]))
+        c = math.cos(theta)
+        s = math.sin(theta)
+        dx = float(motion_xy[0]) - float(anchor["motion_xy0"][0])
+        dy = float(motion_xy[1]) - float(anchor["motion_xy0"][1])
+        out_x = float(anchor["map_xy0"][0]) + c * dx - s * dy
+        out_y = float(anchor["map_xy0"][1]) + s * dx + c * dy
+        out_yaw = self._normalize_angle(float(motion_yaw) + theta)
+        scan_yaw = self._normalize_angle(out_yaw + float(anchor.get("scan_offset", 0.0)))
+        out_xy = np.array([out_x, out_y], dtype=np.float32)
+
+        try:
+            dbg_n = int(os.environ.get("TB3_RL_CONFIDENCE_POSE_DEBUG_EVERY_N", "0"))
+        except Exception:
+            dbg_n = 0
+        step = int(getattr(getattr(self, "exploration_map", None), "step_index", 0))
+        if dbg_n > 0 and (step <= 3 or step - int(getattr(self, "_last_confidence_pose_log_step", -10_000_000)) >= dbg_n):
+            self._last_confidence_pose_log_step = step
+            try:
+                self.ros.get_logger().info(
+                    "CONFIDENCE_POSE | "
+                    f"mode=real_odom_anchored source={motion_label} anchor={anchor.get('anchor_source', 'unknown')} step={step} "
+                    f"map_xy=({out_x:+.3f},{out_y:+.3f}) yaw={math.degrees(out_yaw):+.1f}deg "
+                    f"motion_delta=({dx:+.3f},{dy:+.3f}) "
+                    f"theta={math.degrees(theta):+.1f}deg"
+                )
+            except Exception:
+                pass
+
+        return out_xy, float(out_yaw), out_xy.copy(), float(scan_yaw), f"real_odom_anchored:{motion_label}:{anchor.get('anchor_source', 'unknown')}"
+
+    def _make_scan_points_marker_array_at_pose(
+        self,
+        *,
+        ranges: np.ndarray,
+        angles: np.ndarray,
+        target_frame: str,
+        origin_xy: np.ndarray,
+        origin_yaw: float,
+        namespace: str,
+        point_rgb: tuple[float, float, float],
+        ray_rgb: tuple[float, float, float],
+        point_scale: float = 0.055,
+        ray_scale: float = 0.010,
+        max_points: int = 720,
+        stamp=None,
+    ) -> Optional[MarkerArray]:
+        """Create map-frame scan endpoint/ray markers from one hard robot anchor.
+
+        Unlike the old TF-per-marker path, the origin is explicitly the same
+        map->base pose used for confidence/priority updates and robot-centric
+        crop.  This guarantees /rl_*_points starts at the robot location on /map.
+        """
+        ranges = np.asarray(ranges, dtype=np.float32)
+        angles = np.asarray(angles, dtype=np.float32)
+        if ranges.size == 0 or angles.size == 0:
+            return None
+        n = int(min(ranges.size, angles.size))
+        if n <= 0:
+            return None
+        xy = np.asarray(origin_xy, dtype=np.float32).reshape(-1)
+        if xy.size < 2 or not np.all(np.isfinite(xy[:2])) or not math.isfinite(float(origin_yaw)):
+            return None
+        ox, oy, yaw = float(xy[0]), float(xy[1]), float(origin_yaw)
+
+        step = max(1, int(math.ceil(float(n) / float(max(max_points, 1)))))
+        idxs = range(0, n, step)
+
+        arr = MarkerArray()
+        marker_stamp = stamp if stamp is not None else self._latest_tf_stamp()
+        lifetime = self._marker_lifetime(0.45)
+
+        pts = Marker()
+        pts.header.frame_id = target_frame
+        pts.header.stamp = marker_stamp
+        pts.ns = namespace
+        pts.id = 0
+        pts.type = Marker.POINTS
+        pts.action = Marker.ADD
+        pts.pose.orientation.w = 1.0
+        pts.scale.x = float(point_scale)
+        pts.scale.y = float(point_scale)
+        self._set_marker_color(pts, point_rgb[0], point_rgb[1], point_rgb[2], 0.95)
+        pts.lifetime = lifetime
+
+        rays = Marker()
+        rays.header.frame_id = target_frame
+        rays.header.stamp = marker_stamp
+        rays.ns = namespace
+        rays.id = 1
+        rays.type = Marker.LINE_LIST
+        rays.action = Marker.ADD
+        rays.pose.orientation.w = 1.0
+        rays.scale.x = float(ray_scale)
+        self._set_marker_color(rays, ray_rgb[0], ray_rgb[1], ray_rgb[2], 0.35)
+        rays.lifetime = lifetime
+
+        anchor = Marker()
+        anchor.header.frame_id = target_frame
+        anchor.header.stamp = marker_stamp
+        anchor.ns = namespace
+        anchor.id = 2
+        anchor.type = Marker.SPHERE
+        anchor.action = Marker.ADD
+        anchor.pose.position = self._point_xyz(ox, oy, 0.11)
+        anchor.pose.orientation.w = 1.0
+        anchor.scale.x = 0.16
+        anchor.scale.y = 0.16
+        anchor.scale.z = 0.16
+        self._set_marker_color(anchor, 1.0, 1.0, 0.0, 0.95)
+        anchor.lifetime = lifetime
+
+        origin = self._point_xyz(ox, oy, 0.07)
+        for i in idxs:
+            rr = float(ranges[i])
+            aa = float(angles[i])
+            if not math.isfinite(rr) or rr <= 0.0:
+                continue
+            gx = ox + rr * math.cos(yaw + aa)
+            gy = oy + rr * math.sin(yaw + aa)
+            p = self._point_xyz(gx, gy, 0.07)
+            pts.points.append(p)
+            rays.points.append(origin)
+            rays.points.append(p)
+
+        arr.markers.append(pts)
+        arr.markers.append(rays)
+        arr.markers.append(anchor)
+        return arr
 
     def _tf_pose2d_at(self, target_frame: str, source_frame: str, stamp=None) -> Optional[tuple[float, float, float]]:
         """Return source_frame pose expressed in target_frame at the scan timestamp.
@@ -7377,20 +8144,53 @@ class GazeboNavEnv(gym.Env):
         return arr
 
     def _publish_policy_scan_map_debug(self, vector_obs: np.ndarray, raw_scan_msg) -> None:
+        """Publish raw/policy scan debug markers anchored at TF(map->base).
+
+        v13 hard rule:
+          - marker origin = the same strict map->base pose used by
+            confidence/priority and robot-centric crop;
+          - raw marker uses driver-native /scan angles by default;
+          - policy marker uses the canonical policy 60-bin angles.
+
+        This prevents the previous failure where marker rays appeared around the
+        /map canvas center or used a different TF timestamp than the semantic
+        layer update.
+        """
         if self.policy_scan_marker_pub is None and self.raw_scan_marker_pub is None:
             return
         try:
-            target_frame = str(self.map_frame or "map").strip().lstrip("/") or "map"
             raw_header = getattr(raw_scan_msg, "header", None)
             raw_stamp = getattr(raw_header, "stamp", None)
-            scan_frame = str(getattr(raw_header, "frame_id", "") or "base_scan").strip().lstrip("/") or "base_scan"
+            raw_scan_frame = str(getattr(raw_header, "frame_id", "") or "").strip().lstrip("/")
+            if not raw_scan_frame:
+                raw_scan_frame = str(os.environ.get("TB3_RL_SCAN_FRAME", "base_scan") or "base_scan").strip().lstrip("/") or "base_scan"
+
+            # v14 default: scan debug markers are robot-frame markers, not
+            # precomputed absolute map points.  RViz then uses the same TF path
+            # as the RobotModel, so the marker fan must start at the robot.
+            robot_frame_debug = self._scan_bool_env("TB3_RL_SCAN_MARKERS_IN_ROBOT_FRAME", True)
+            if robot_frame_debug:
+                target_frame = raw_scan_frame
+                origin_xy = np.array([0.0, 0.0], dtype=np.float32)
+                origin_yaw = 0.0
+                marker_stamp = self._zero_stamp()
+            else:
+                target_frame = str(self.map_frame or "map").strip().lstrip("/") or "map"
+                pose = self._get_map_base_pose2d_hard()
+                if pose is None:
+                    return
+                origin_xy, base_yaw = pose
+                origin_yaw = self._get_map_scan_yaw_hard(raw_scan_msg=raw_scan_msg, base_yaw=base_yaw)
+                marker_stamp = self._zero_stamp()
+
 
             raw_min = self._scan_float(getattr(raw_scan_msg, "range_min", 0.12), 0.12)
             raw_max = self._scan_float(getattr(raw_scan_msg, "range_max", 3.5), 3.5)
             if raw_max <= raw_min + 1e-6:
                 raw_min, raw_max = 0.12, 3.5
 
-            # Policy vector markers: exactly the LiDAR slice the policy sees.
+            # Policy vector markers: exactly the LiDAR slice the policy sees,
+            # interpreted in the canonical policy convention.
             if self.policy_scan_marker_pub is not None:
                 num_bins = max(int(self.num_lidar_bins), 1)
                 norm = np.asarray(vector_obs[:num_bins], dtype=np.float32)
@@ -7399,24 +8199,32 @@ class GazeboNavEnv(gym.Env):
                 front_index = self._policy_scan_front_index()
                 policy_angles = 2.0 * math.pi * (np.arange(num_bins, dtype=np.float32) - float(front_index)) / float(num_bins)
                 policy_angles = np.arctan2(np.sin(policy_angles), np.cos(policy_angles)).astype(np.float32)
-                arr = self._make_scan_points_marker_array(
+                arr = self._make_scan_points_marker_array_at_pose(
                     ranges=policy_ranges,
                     angles=policy_angles,
                     target_frame=target_frame,
-                    source_frame=scan_frame,
+                    origin_xy=origin_xy,
+                    origin_yaw=origin_yaw,
                     namespace="rl_policy_scan_60_map_points",
                     point_rgb=(0.0, 1.0, 1.0),
                     ray_rgb=(0.0, 0.7, 1.0),
                     point_scale=0.075,
                     ray_scale=0.012,
                     max_points=max(num_bins, 1),
-                    stamp=raw_stamp,
+                    # v16: in robot-frame debug mode use a zero stamp for
+                    # policy markers too.  Mixing a base_scan frame with an old
+                    # raw scan stamp can make RViz render the marker fan detached
+                    # from the current robot pose even though the semantic update
+                    # is robot-anchored.
+                    stamp=marker_stamp,
                 )
                 if arr is not None:
                     self.policy_scan_marker_pub.publish(arr)
 
-            # Raw scan markers: use this as the reference. It should match the
-            # SLAM map if Cartographer TF/map alignment is healthy.
+            # Raw scan marker: reference geometry from /scan.  Do not apply the
+            # policy offset/flip by default; this should match raw /scan in RViz
+            # and the SLAM map if TF is healthy.  Set the env below to 0 only
+            # when intentionally comparing policy-corrected raw angles.
             if self.raw_scan_marker_pub is not None:
                 raw_ranges = np.asarray(getattr(raw_scan_msg, "ranges", []) or [], dtype=np.float32)
                 if raw_ranges.size > 0:
@@ -7426,23 +8234,21 @@ class GazeboNavEnv(gym.Env):
                     angle_inc = self._scan_float(getattr(raw_scan_msg, "angle_increment", 0.0), 0.0)
                     raw_angles = angle_min + np.arange(raw_ranges.size, dtype=np.float32) * float(angle_inc)
                     raw_angles = np.arctan2(np.sin(raw_angles), np.cos(raw_angles)).astype(np.float32)
-                    # Apply the same explicit convention correction used by the
-                    # policy resampler. Set TB3_RL_RAW_SCAN_MARKER_UNCORRECTED=1
-                    # to see the driver-native raw scan instead.
-                    if not self._scan_bool_env("TB3_RL_RAW_SCAN_MARKER_UNCORRECTED", False):
+                    if not self._scan_bool_env("TB3_RL_RAW_SCAN_MARKER_UNCORRECTED", True):
                         raw_angles = self._correct_scan_angles_for_policy(raw_angles)
-                    arr = self._make_scan_points_marker_array(
+                    arr = self._make_scan_points_marker_array_at_pose(
                         ranges=raw_ranges,
                         angles=raw_angles,
                         target_frame=target_frame,
-                        source_frame=scan_frame,
+                        origin_xy=origin_xy,
+                        origin_yaw=origin_yaw,
                         namespace="rl_raw_scan_map_points",
                         point_rgb=(1.0, 1.0, 1.0),
                         ray_rgb=(1.0, 1.0, 1.0),
                         point_scale=0.035,
                         ray_scale=0.006,
                         max_points=360,
-                        stamp=raw_stamp,
+                        stamp=marker_stamp,
                     )
                     if arr is not None:
                         self.raw_scan_marker_pub.publish(arr)
@@ -7524,9 +8330,8 @@ class GazeboNavEnv(gym.Env):
         self._update_scan_geometry_debug(scan_msg, vector_obs)
         self._publish_policy_scan(vector_obs, scan_msg)
 
-        self._push_vector_history(vector_obs)
-
         if not self.use_map_cnn:
+            self._push_vector_history(vector_obs)
             return vector_obs
 
         robot_pose = self._get_robot_pose2d()
@@ -7548,6 +8353,10 @@ class GazeboNavEnv(gym.Env):
 
         self._publish_debug_input_map(map_obs)
 
+        # v18: push both current vector and current robot-centric map so the
+        # temporal branch can learn fused map/LiDAR/state dynamics.
+        self._push_observation_history(vector_obs, map_obs)
+
         obs = {
             "vector": vector_obs,
             "map": map_obs,
@@ -7555,6 +8364,7 @@ class GazeboNavEnv(gym.Env):
 
         if self.use_temporal_cnn:
             obs["seq"] = self._sequence_observation()
+            obs["map_seq"] = self._map_sequence_observation()
 
         return obs
 
@@ -7577,21 +8387,39 @@ class GazeboNavEnv(gym.Env):
                 (self.temporal_history_len, self.obs_dim),
                 dtype=np.float32,
             )
+            obs["map_seq"] = np.zeros(
+                (self.temporal_history_len, 5, self.map_obs_size, self.map_obs_size),
+                dtype=np.float32,
+            )
 
         return obs
 
     def _push_vector_history(self, vector_obs: np.ndarray):
+        # Backward-compatible helper for vector-only observations.
         if not self.use_temporal_cnn:
             return
-
         vector_obs = np.asarray(vector_obs, dtype=np.float32)
-
         if not self.vector_history:
             for _ in range(self.temporal_history_len):
                 self.vector_history.append(vector_obs.copy())
             return
-
         self.vector_history.append(vector_obs.copy())
+
+    def _push_observation_history(self, vector_obs: np.ndarray, map_obs: np.ndarray):
+        if not self.use_temporal_cnn:
+            return
+        vector_obs = np.asarray(vector_obs, dtype=np.float32)
+        map_obs = np.asarray(map_obs, dtype=np.float32)
+        if not self.vector_history:
+            for _ in range(self.temporal_history_len):
+                self.vector_history.append(vector_obs.copy())
+        else:
+            self.vector_history.append(vector_obs.copy())
+        if not self.map_history:
+            for _ in range(self.temporal_history_len):
+                self.map_history.append(map_obs.copy())
+        else:
+            self.map_history.append(map_obs.copy())
 
     def _sequence_observation(self) -> np.ndarray:
         if not self.vector_history:
@@ -7599,13 +8427,31 @@ class GazeboNavEnv(gym.Env):
                 (self.temporal_history_len, self.obs_dim),
                 dtype=np.float32,
             )
-
         seq = list(self.vector_history)
-
         while len(seq) < self.temporal_history_len:
             seq.insert(0, seq[0].copy())
-
         return np.stack(seq[-self.temporal_history_len :], axis=0).astype(np.float32)
+
+    def _map_sequence_observation(self) -> np.ndarray:
+        shape = (self.temporal_history_len, 5, self.map_obs_size, self.map_obs_size)
+        if not hasattr(self, "map_history") or not self.map_history:
+            return np.zeros(shape, dtype=np.float32)
+        seq = list(self.map_history)
+        while len(seq) < self.temporal_history_len:
+            seq.insert(0, seq[0].copy())
+        out = np.stack(seq[-self.temporal_history_len :], axis=0).astype(np.float32)
+        if out.shape != shape:
+            fixed = np.zeros(shape, dtype=np.float32)
+            try:
+                t = min(fixed.shape[0], out.shape[0])
+                c = min(fixed.shape[1], out.shape[1])
+                h = min(fixed.shape[2], out.shape[2])
+                w = min(fixed.shape[3], out.shape[3])
+                fixed[-t:, :c, :h, :w] = out[-t:, :c, :h, :w]
+            except Exception:
+                pass
+            return fixed
+        return np.clip(out, 0.0, 1.0)
 
     def _distance_to_goal(self, robot_xy: Optional[np.ndarray]) -> float:
         if robot_xy is None:
@@ -7949,7 +8795,9 @@ class GazeboNavEnv(gym.Env):
         return float(sim_time)
 
     def _get_robot_pose2d(self, frame_id: Optional[str] = None) -> Optional[tuple[np.ndarray, float]]:
-        return self.ros.get_pose2d(frame_id=(frame_id or self.pose_frame))
+        # v11: never use Gazebo model pose for map layers.  This returns the
+        # same TF-based base pose that RViz uses, normally map->base_footprint.
+        return self.ros.get_pose2d(frame_id=(frame_id or self.map_frame or self.pose_frame))
 
     def _update_boundary_center_after_reset(self, requested_xy: np.ndarray) -> None:
         # Give /odom callbacks a short chance to reflect the Gazebo teleport.
@@ -8669,39 +9517,109 @@ class GazeboNavEnv(gym.Env):
             )
         return restart
 
-    def _update_exploration_map(self) -> MapUpdateStats:
+    def _get_scan_pose2d_for_map_update(self) -> Optional[tuple[np.ndarray, float]]:
+        """Return LiDAR frame pose in the map frame at the scan timestamp.
+
+        Confidence/priority ray-casting must use the same map-frame scan origin
+        that RViz uses for /scan.  The robot base pose is still used for visit
+        count, crop center and actor observation centering.
+        """
+        try:
+            scan = self.ros.scan
+            if scan is None:
+                return None
+            header = getattr(scan, "header", None)
+            scan_frame = str(getattr(header, "frame_id", "") or "base_scan").strip().lstrip("/") or "base_scan"
+            stamp = getattr(header, "stamp", None)
+            if hasattr(self.ros, "get_frame_pose2d"):
+                return self.ros.get_frame_pose2d(
+                    target_frame=str(self.map_frame or "map"),
+                    source_frame=scan_frame,
+                    stamp=stamp,
+                    timeout_sec=0.04,
+                    allow_latest_fallback=True,
+                )
+        except Exception:
+            return None
+        return None
+
+    def _update_exploration_map_with_unified_tf(self, slam_map=None) -> MapUpdateStats:
+        """Single owner for confidence/priority/task map update frames.
+
+        All persistent layers live in map_frame and all coordinates are generated
+        through TF:
+          - base pose:  map -> base_footprint/base_link
+          - scan pose:  map -> scan.header.frame_id, at scan timestamp
+          - grid:       latest accepted /map metadata
+        """
         if self.ros.scan is None or self.ros.odom is None:
             return self.last_map_stats
 
-        robot_pose = self._get_robot_pose2d()
+        # v8 pose anchor rule:
+        #   - confidence/priority/task layers live in /map and publish on the same
+        #     SLAM OccupancyGrid canvas.
+        #   - use actual odometry deltas (/model odom preferred, /odom msg fallback)
+        #     anchored once to the current map pose.
+        #   - no cmd_vel integration.  Set TB3_RL_CONFIDENCE_POSE_SOURCE=map_tf
+        #     only if Cartographer map->base TF is verified to move correctly.
+        pose_pack = self._get_confidence_update_pose2d()
+        if pose_pack is None:
+            return self.last_map_stats
+        robot_xy, robot_yaw, sensor_xy, sensor_yaw, confidence_pose_mode = pose_pack
 
-        if robot_pose is None:
+        # Optional legacy scan-pose origin path.  Default remains base-anchored:
+        # confidence is conceptually camera/front FOV, but the ray starts at the
+        # robot anchor so the grid does not jump due to tiny sensor-frame offsets.
+        if not bool(getattr(self, "use_base_pose_for_raycast", True)):
+            scan_pose = self._get_scan_pose2d_for_map_update()
+            if scan_pose is not None:
+                sensor_xy, sensor_yaw = scan_pose
+
+        if slam_map is None:
+            slam_map = self._filtered_slam_map_for_update()
+
+        try:
+            stats = self.exploration_map.update(
+                scan=self.ros.scan,
+                robot_xy=robot_xy,
+                robot_yaw=robot_yaw,
+                publish=True,
+                slam_map=slam_map,
+                sensor_xy=sensor_xy,
+                sensor_yaw=sensor_yaw,
+            )
+        except TypeError as exc:
+            # Do not silently fall back to the old robot_yaw-only update path.
+            # If this fires, colcon/symlink-install is still loading an older
+            # ExplorationGridMap and confidence direction/pose will be wrong.
+            try:
+                self.ros.get_logger().error(
+                    "CONFIDENCE_UPDATE_API_MISMATCH | "
+                    f"ExplorationGridMap.update() does not accept sensor_xy/sensor_yaw: {exc}"
+                )
+            except Exception:
+                pass
             return self.last_map_stats
 
-        robot_xy, robot_yaw = robot_pose
+        try:
+            if str(os.environ.get("TB3_RL_FORCE_MAP_PUBLISH_EVERY_UPDATE", "0")).strip().lower() in {"1", "true", "yes", "on"}:
+                self.exploration_map.publish()
+        except Exception:
+            pass
+        return stats
 
-        # v23.5: Do NOT poll /slam_toolbox/dynamic_map during live policy
-        # steps.  Dynamic_map service calls are relatively heavy and, if made
-        # every second while the node is already spinning, can both trigger
-        # "Executor is already spinning" in rclpy and make slam_toolbox print
-        # service-response timeout warnings.  After strict startup/reset gates,
-        # live map updates must come from /map topic/mirror content updates.
-        # Service fetch remains available only inside explicit strict gates.
+    def _update_exploration_map(self) -> MapUpdateStats:
+        """Canonical camera-front confidence update path.
 
-        slam_map = self._filtered_slam_map_for_update()
+        v4 rule:
+          - Do not use Odometry/Gazebo fallback for semantic map writes.
+          - Use the same TF(map -> base_footprint) pose that RViz uses for the robot.
+          - Use TF(map -> base_scan) yaw only for LaserScan/camera-front ray direction.
 
-        # If SLAM /map is missing/stale/ignored after reset, still update the
-        # internal exploration layers from the latest LaserScan and pose.  This is
-        # essential for real-robot tests where slam_toolbox may fail to publish
-        # /map because of sensor/TF/QoS problems; otherwise known=0, prio=0 and
-        # MAP_LOCKED_PUBLISH_WAITING_FOR_SLAM_REF repeat forever.
-        return self.exploration_map.update(
-            scan=self.ros.scan,
-            robot_xy=robot_xy,
-            robot_yaw=robot_yaw,
-            publish=True,
-            slam_map=slam_map,
-        )
+        This fixes the failure mode where /rl_confidence_map keeps being painted
+        around the first-step pose while the RViz robot has already moved/rotated.
+        """
+        return self._update_exploration_map_with_unified_tf()
 
     @staticmethod
     def _normalize_angle(angle_rad: float) -> float:

@@ -8,38 +8,30 @@ from torch import nn
 
 class MapVectorFeatureExtractor(BaseFeaturesExtractor):
     """
-    Dict observation 전용 feature extractor.
+    Dict observation feature extractor.
 
-    observation_space:
-      {
-        "map":    Box(0, 1, shape=(5, H, W), dtype=float32),
-        "vector": Box(-1, 1, shape=(N,), dtype=float32),
-        "seq":    Box(-1, 1, shape=(T, N), dtype=float32)  # optional
-      }
+    v26 model structure requested by user:
 
-    v17 stabilization:
-      - BatchNorm은 사용하지 않는다. RL에서는 train mini-batch 통계와
-        action-selection 시점의 단일 observation 통계가 달라져 제어가 튈 수 있다.
-      - CNN branch에는 GroupNorm을 사용한다.
-      - MLP/vector/fusion branch에는 LayerNorm을 사용한다.
-      - 입력 NaN/Inf를 제거하고, map/lidar/scalar 범위를 다시 clamp한다.
+      For each history step k:
+        map_k    -> shared Map 2D CNN
+        vector_k -> shared LiDAR circular 1D CNN + Stats MLP
+        concat(map_feature_k, vector_feature_k)
+        -> shared per-step Feature Fusion MLP -> z_k
 
-    최신 구조:
-      - map branch:
-          5-channel robot-centric map을 약한 2D CNN + Global Average Pooling으로 인코딩.
-          channel 0..2 = SLAM free/unknown/occupied one-hot
-          channel 3    = confidence
-          channel 4    = priority
+      Then:
+        Z = [z_{t-H+1}, ..., z_t]
+        -> Temporal 1D CNN over the time axis
+        -> final feature for SAC Actor / Twin Critic
 
-      - vector branch:
-          vector의 앞 lidar_dim개 LiDAR bin은 항상 1D CNN으로 각도 방향 local pattern을 인코딩.
-          나머지 scalar stats는 MLP로 인코딩.
-          [lidar_feature, stats_feature]를 concat한 뒤 vector feature로 projection.
+    Important distinction from v25:
+      v25 applied temporal CNN separately to map_seq and vector_seq before final fusion.
+      v26 applies temporal CNN to the already-fused per-step feature sequence.
 
-      - temporal branch:
-          raw seq(B,T,N)를 그대로 Conv1d에 넣지 않는다.
-          각 time step마다 같은 LiDAR 1D CNN + stats MLP로 token을 만든다.
-          token sequence (B,T,D)를 temporal 1D CNN으로 처리한다.
+    Expected v26 observation with 60-bin LiDAR and temporal history 8:
+      map     : (5, 48, 48)
+      vector  : (70,)
+      seq     : (8, 70)
+      map_seq : (8, 5, 48, 48)
     """
 
     DEFAULT_LIDAR_DIM = 360
@@ -55,29 +47,16 @@ class MapVectorFeatureExtractor(BaseFeaturesExtractor):
         lidar_dim: int | None = None,
     ):
         if not isinstance(observation_space, spaces.Dict):
-            raise TypeError(
-                "MapVectorFeatureExtractor requires a spaces.Dict observation space"
-            )
+            raise TypeError("MapVectorFeatureExtractor requires a spaces.Dict observation space")
 
         super().__init__(observation_space, features_dim=int(combined_features_dim))
 
         map_space = observation_space.spaces["map"]
         vector_space = observation_space.spaces["vector"]
-
         map_channels = int(map_space.shape[0])
         vector_dim = int(vector_space.shape[0])
 
-        # v5: LiDAR dimensionality is no longer hard-coded to 360.
-        # The exploration observation layout is:
-        #   vector = [lidar_0 .. lidar_{B-1}, 10 scalar stats]
-        # where B is configurable through --num-lidar-bins.  This keeps the
-        # same extractor usable for both legacy 360-bin checkpoints and new
-        # 60-sector checkpoints.
         if lidar_dim is None:
-            # Most project observations use 10 non-LiDAR scalar stats.  For a
-            # legacy 370-D vector this infers 360; for a new 70-D vector this
-            # infers 60.  If a different non-map observation is ever used, fall
-            # back to treating the whole vector as LiDAR rather than crashing.
             inferred = int(vector_dim) - 10
             if inferred <= 0:
                 inferred = min(int(vector_dim), int(self.DEFAULT_LIDAR_DIM))
@@ -86,27 +65,28 @@ class MapVectorFeatureExtractor(BaseFeaturesExtractor):
         self.vector_dim = int(vector_dim)
         self.lidar_dim = max(1, min(int(lidar_dim), int(vector_dim)))
         self.stats_dim = int(vector_dim) - int(self.lidar_dim)
-        self.use_temporal_cnn = bool(
-            use_temporal_cnn and "seq" in observation_space.spaces
-        )
+        self.use_temporal_cnn = bool(use_temporal_cnn and "seq" in observation_space.spaces)
+        self.temporal_uses_map_seq = bool(self.use_temporal_cnn and "map_seq" in observation_space.spaces)
 
         vector_features_dim = int(vector_features_dim)
         map_features_dim = int(map_features_dim)
         temporal_features_dim = int(temporal_features_dim)
         combined_features_dim = int(combined_features_dim)
 
-        # 기존 CLI 인자 수를 늘리지 않기 위해 vector_features_dim 내부에서
-        # LiDAR feature와 scalar stats feature 차원을 나눈다.
+        self.map_features_dim = map_features_dim
+        self.vector_features_dim = vector_features_dim
+        self.temporal_features_dim = temporal_features_dim
+        self.combined_features_dim = combined_features_dim
+
         self.lidar_features_dim = max(32, int(round(vector_features_dim * 0.65)))
         self.stats_features_dim = max(16, vector_features_dim - self.lidar_features_dim)
         if self.stats_dim == 0:
             self.stats_features_dim = 0
 
-        token_dim = self.lidar_features_dim + self.stats_features_dim
-        self.temporal_token_dim = token_dim
+        vector_token_dim = self.lidar_features_dim + self.stats_features_dim
 
         # ------------------------------------------------------------------
-        # 1) Map branch: weak 2D CNN + GroupNorm + Global Average Pooling
+        # Shared current/history map encoder.
         # ------------------------------------------------------------------
         self.map_cnn = nn.Sequential(
             nn.Conv2d(map_channels, 8, kernel_size=5, stride=2, padding=2),
@@ -123,11 +103,9 @@ class MapVectorFeatureExtractor(BaseFeaturesExtractor):
             nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(),
         )
-
         with torch.no_grad():
             sample = torch.zeros(1, *map_space.shape, dtype=torch.float32)
             cnn_flatten_dim = int(self.map_cnn(sample).shape[1])
-
         self.map_linear = nn.Sequential(
             nn.Linear(cnn_flatten_dim, map_features_dim),
             nn.LayerNorm(map_features_dim),
@@ -135,34 +113,30 @@ class MapVectorFeatureExtractor(BaseFeaturesExtractor):
         )
 
         # ------------------------------------------------------------------
-        # 2) LiDAR branch: configurable-bin circular 1D signal encoder + GroupNorm
+        # Shared current/history vector encoder.
+        # LiDAR keeps coarse angular layout using AdaptiveAvgPool1d(4), instead
+        # of collapsing all angle locations into one scalar token.
         # ------------------------------------------------------------------
-        self.lidar_cnn = nn.Sequential(
-            nn.Conv1d(
-                1, 16, kernel_size=5, stride=2, padding=3, padding_mode="circular"
-            ),
+        self.lidar_pool_bins = 4
+        self.lidar_conv = nn.Sequential(
+            nn.Conv1d(1, 16, kernel_size=5, stride=1, padding=2, padding_mode="circular"),
             nn.GroupNorm(num_groups=4, num_channels=16),
             nn.SiLU(),
-            nn.Conv1d(
-                16, 32, kernel_size=5, stride=2, padding=2, padding_mode="circular"
-            ),
+            nn.Conv1d(16, 32, kernel_size=5, stride=2, padding=2, padding_mode="circular"),
             nn.GroupNorm(num_groups=8, num_channels=32),
             nn.SiLU(),
-            nn.Conv1d(
-                32, 64, kernel_size=5, stride=2, padding=2, padding_mode="circular"
-            ),
+            nn.Conv1d(32, 64, kernel_size=5, stride=2, padding=2, padding_mode="circular"),
             nn.GroupNorm(num_groups=8, num_channels=64),
             nn.SiLU(),
-            nn.AdaptiveAvgPool1d(1),
+            nn.AdaptiveAvgPool1d(self.lidar_pool_bins),
             nn.Flatten(),
-            nn.Linear(64, self.lidar_features_dim),
+        )
+        self.lidar_linear = nn.Sequential(
+            nn.Linear(64 * self.lidar_pool_bins, self.lidar_features_dim),
             nn.LayerNorm(self.lidar_features_dim),
             nn.SiLU(),
         )
 
-        # ------------------------------------------------------------------
-        # 3) Scalar stats branch: non-LiDAR feature encoder + LayerNorm
-        # ------------------------------------------------------------------
         if self.stats_dim > 0:
             self.stats_net = nn.Sequential(
                 nn.Linear(self.stats_dim, self.stats_features_dim),
@@ -175,10 +149,8 @@ class MapVectorFeatureExtractor(BaseFeaturesExtractor):
         else:
             self.stats_net = None
 
-        # Current vector projection.
-        # 입력은 [lidar_feature, stats_feature].
         self.vector_net = nn.Sequential(
-            nn.Linear(token_dim, vector_features_dim),
+            nn.Linear(vector_token_dim, vector_features_dim),
             nn.LayerNorm(vector_features_dim),
             nn.SiLU(),
             nn.Linear(vector_features_dim, vector_features_dim),
@@ -186,48 +158,63 @@ class MapVectorFeatureExtractor(BaseFeaturesExtractor):
             nn.SiLU(),
         )
 
-        fusion_in_dim = map_features_dim + vector_features_dim
-
         # ------------------------------------------------------------------
-        # 4) Temporal branch: encoded token sequence -> 1D CNN over time
+        # Shared per-step Feature Fusion.
+        # This is the z_k encoder that is applied to both current observation
+        # and each historical observation.
         # ------------------------------------------------------------------
-        if self.use_temporal_cnn:
-            seq_space = observation_space.spaces["seq"]
-            history_len = int(seq_space.shape[0])
-            seq_vector_dim = int(seq_space.shape[1])
-
-            if seq_vector_dim != vector_dim:
-                raise ValueError(
-                    f"seq vector dim must match vector dim: seq={seq_vector_dim}, vector={vector_dim}"
-                )
-
-            self.history_len = history_len
-            self.temporal_cnn = nn.Sequential(
-                nn.Conv1d(token_dim, 128, kernel_size=3, padding=1),
-                nn.GroupNorm(num_groups=8, num_channels=128),
-                nn.SiLU(),
-                nn.Conv1d(128, 128, kernel_size=3, padding=1),
-                nn.GroupNorm(num_groups=8, num_channels=128),
-                nn.SiLU(),
-                nn.AdaptiveAvgPool1d(1),
-                nn.Flatten(),
-                nn.Linear(128, temporal_features_dim),
-                nn.LayerNorm(temporal_features_dim),
-                nn.SiLU(),
-            )
-            fusion_in_dim += temporal_features_dim
-        else:
-            self.history_len = 0
-            self.temporal_cnn = None
-
-        # ------------------------------------------------------------------
-        # 5) Final fusion
-        # ------------------------------------------------------------------
-        self.fusion = nn.Sequential(
-            nn.Linear(fusion_in_dim, combined_features_dim),
+        per_step_in_dim = map_features_dim + vector_features_dim
+        self.fusion_token_dim = combined_features_dim
+        self.per_step_fusion = nn.Sequential(
+            nn.Linear(per_step_in_dim, combined_features_dim),
+            nn.LayerNorm(combined_features_dim),
+            nn.SiLU(),
+            nn.Linear(combined_features_dim, combined_features_dim),
             nn.LayerNorm(combined_features_dim),
             nn.SiLU(),
         )
+
+        # ------------------------------------------------------------------
+        # Temporal CNN over fused feature sequence Z = [z_{t-H+1}, ..., z_t].
+        # Input layout for Conv1D is (B, D, H), so convolution happens along
+        # the H time axis, not the feature-channel axis.
+        # ------------------------------------------------------------------
+        if self.use_temporal_cnn:
+            seq_space = observation_space.spaces["seq"]
+            self.history_len = int(seq_space.shape[0])
+            seq_vector_dim = int(seq_space.shape[1])
+            if seq_vector_dim != vector_dim:
+                raise ValueError(f"seq vector dim must match vector dim: seq={seq_vector_dim}, vector={vector_dim}")
+
+            if not self.temporal_uses_map_seq:
+                raise ValueError(
+                    "v26 fused-feature temporal CNN requires map_seq in the observation space. "
+                    "Check that the environment is built with map_seq history enabled."
+                )
+
+            map_seq_space = observation_space.spaces["map_seq"]
+            if int(map_seq_space.shape[0]) != self.history_len:
+                raise ValueError("map_seq history length must match seq history length")
+            if int(map_seq_space.shape[1]) != map_channels:
+                raise ValueError("map_seq channel count must match map channel count")
+
+            mid_dim = max(64, int(temporal_features_dim) * 2)
+            self.fused_temporal_cnn = nn.Sequential(
+                nn.Conv1d(combined_features_dim, mid_dim, kernel_size=3, padding=1),
+                nn.GroupNorm(num_groups=8, num_channels=mid_dim),
+                nn.SiLU(),
+                nn.Conv1d(mid_dim, mid_dim, kernel_size=3, padding=1),
+                nn.GroupNorm(num_groups=8, num_channels=mid_dim),
+                nn.SiLU(),
+                nn.AdaptiveAvgPool1d(1),
+                nn.Flatten(),
+                nn.Linear(mid_dim, combined_features_dim),
+                nn.LayerNorm(combined_features_dim),
+                nn.SiLU(),
+            )
+        else:
+            self.history_len = 0
+            self.fused_temporal_cnn = None
 
     def _sanitize_map(self, map_obs: torch.Tensor) -> torch.Tensor:
         map_obs = torch.nan_to_num(map_obs.float(), nan=0.0, posinf=1.0, neginf=0.0)
@@ -241,22 +228,20 @@ class MapVectorFeatureExtractor(BaseFeaturesExtractor):
             return torch.cat([lidar, stats], dim=-1)
         return torch.clamp(vector_obs, -1.0, 1.0)
 
-    def _split_vector(
-        self, vector_obs: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    def _split_vector(self, vector_obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         vector_obs = self._sanitize_vector(vector_obs)
         lidar = vector_obs[..., : self.lidar_dim]
         stats = vector_obs[..., self.lidar_dim :] if self.stats_dim > 0 else None
         return lidar, stats
 
-    def _encode_lidar_flat(self, lidar_flat: torch.Tensor) -> torch.Tensor:
-        # lidar_flat: (B, lidar_dim), already normalized to 0..1.
-        lidar_flat = torch.clamp(lidar_flat.float(), 0.0, 1.0).unsqueeze(1)  # (B, 1, lidar_dim)
-        return self.lidar_cnn(lidar_flat)
+    def _encode_map_flat(self, map_flat: torch.Tensor) -> torch.Tensor:
+        return self.map_linear(self.map_cnn(self._sanitize_map(map_flat)))
 
-    def _encode_stats_flat(
-        self, stats_flat: torch.Tensor | None, batch_size: int
-    ) -> torch.Tensor | None:
+    def _encode_lidar_flat(self, lidar_flat: torch.Tensor) -> torch.Tensor:
+        lidar_flat = torch.clamp(lidar_flat.float(), 0.0, 1.0).unsqueeze(1)
+        return self.lidar_linear(self.lidar_conv(lidar_flat))
+
+    def _encode_stats_flat(self, stats_flat: torch.Tensor | None) -> torch.Tensor | None:
         if self.stats_net is None or stats_flat is None:
             return None
         stats_flat = torch.nan_to_num(stats_flat.float(), nan=0.0, posinf=1.0, neginf=-1.0)
@@ -264,45 +249,56 @@ class MapVectorFeatureExtractor(BaseFeaturesExtractor):
         return self.stats_net(stats_flat)
 
     def _encode_vector_token_flat(self, vector_flat: torch.Tensor) -> torch.Tensor:
-        # vector_flat: (B, lidar_dim + scalar_stats_dim)
         vector_flat = self._sanitize_vector(vector_flat)
         lidar, stats = self._split_vector(vector_flat)
         lidar_features = self._encode_lidar_flat(lidar)
-        stats_features = self._encode_stats_flat(stats, vector_flat.shape[0])
-
+        stats_features = self._encode_stats_flat(stats)
         if stats_features is None:
             return lidar_features
-
         return torch.cat([lidar_features, stats_features], dim=1)
+
+    def _encode_vector_feature_flat(self, vector_flat: torch.Tensor) -> torch.Tensor:
+        return self.vector_net(self._encode_vector_token_flat(vector_flat))
+
+    def _fuse_flat(self, map_features: torch.Tensor, vector_features: torch.Tensor) -> torch.Tensor:
+        return self.per_step_fusion(torch.cat([map_features, vector_features], dim=1))
 
     def forward(self, observations: dict[str, torch.Tensor]) -> torch.Tensor:
         map_obs = self._sanitize_map(observations["map"])
         vector_obs = self._sanitize_vector(observations["vector"])
 
-        map_features = self.map_linear(self.map_cnn(map_obs))
+        current_map_features = self._encode_map_flat(map_obs)
+        current_vector_features = self._encode_vector_feature_flat(vector_obs)
+        current_z = self._fuse_flat(current_map_features, current_vector_features)
 
-        current_token = self._encode_vector_token_flat(vector_obs)
-        vector_features = self.vector_net(current_token)
+        if not self.use_temporal_cnn or self.fused_temporal_cnn is None:
+            return current_z
 
-        features = [map_features, vector_features]
+        seq_obs = observations["seq"].float()
+        seq_obs = torch.nan_to_num(seq_obs, nan=0.0, posinf=1.0, neginf=-1.0)
+        map_seq_obs = observations["map_seq"].float()
+        map_seq_obs = torch.nan_to_num(map_seq_obs, nan=0.0, posinf=1.0, neginf=0.0)
 
-        if self.use_temporal_cnn and self.temporal_cnn is not None:
-            seq_obs = observations["seq"].float()  # (B, T, N)
-            seq_obs = torch.nan_to_num(seq_obs, nan=0.0, posinf=1.0, neginf=-1.0)
-            batch_size, history_len, vector_dim = seq_obs.shape
+        batch_size, history_len, vector_dim = seq_obs.shape
+        _, map_history_len, c, h, w = map_seq_obs.shape
+        if int(map_history_len) != int(history_len):
+            raise RuntimeError("map_seq and seq history lengths differ")
 
-            # 각 time step의 vector를 같은 LiDAR CNN + stats MLP로 token화한다.
-            seq_flat = seq_obs.reshape(batch_size * history_len, vector_dim)
-            seq_token_flat = self._encode_vector_token_flat(seq_flat)
-            seq_tokens = seq_token_flat.reshape(
-                batch_size,
-                history_len,
-                self.temporal_token_dim,
-            )
+        seq_flat = seq_obs.reshape(batch_size * history_len, vector_dim)
+        map_seq_flat = map_seq_obs.reshape(batch_size * history_len, c, h, w)
 
-            # Conv1d expects (B, C=token_dim, L=T).
-            seq_tokens = seq_tokens.transpose(1, 2)
-            temporal_features = self.temporal_cnn(seq_tokens)
-            features.append(temporal_features)
+        seq_map_features = self._encode_map_flat(map_seq_flat)
+        seq_vector_features = self._encode_vector_feature_flat(seq_flat)
+        fused_seq = self._fuse_flat(seq_map_features, seq_vector_features).reshape(
+            batch_size, history_len, self.fusion_token_dim
+        )
 
-        return self.fusion(torch.cat(features, dim=1))
+        # Guard against an incorrectly initialized first reset where history may
+        # not yet contain the current frame. This keeps the last temporal token
+        # exactly equal to the current observation's fused feature.
+        fused_seq = fused_seq.clone()
+        fused_seq[:, -1, :] = current_z
+
+        # Conv1D over time axis: (B, H, D) -> (B, D, H)
+        temporal_input = fused_seq.transpose(1, 2)
+        return self.fused_temporal_cnn(temporal_input)

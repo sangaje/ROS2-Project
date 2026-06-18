@@ -64,6 +64,17 @@ def _occupancy_grid_data_signature(msg: OccupancyGrid) -> tuple[int, int, int, i
         return (int(total), -1, -1, -1, -1, -1)
 
 
+def _quiet_map_logs() -> bool:
+    raw = os.environ.get("TB3_RL_QUIET_MAP_LOGS", "1")
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _quiet_startup_logs() -> bool:
+    raw = os.environ.get("TB3_RL_QUIET_STARTUP_LOGS", "0")
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+
 class _BackgroundMapSubscriber(Node):
     """
     Dedicated /map subscriber spun by its own executor thread.
@@ -127,9 +138,10 @@ class _BackgroundMapSubscriber(Node):
                     qos,
                 )
             )
-        self.get_logger().info(
-            f"MAP_MIRROR_START | {self.map_topic} -> parent + {self.relay_topic} | multi-qos background executor"
-        )
+        if not _quiet_map_logs():
+            self.get_logger().info(
+                f"MAP_MIRROR_START | {self.map_topic} -> parent + {self.relay_topic} | multi-qos background executor"
+            )
 
     @staticmethod
     def _sig(msg: OccupancyGrid):
@@ -196,14 +208,14 @@ class _BackgroundMapSubscriber(Node):
             self.get_logger().warn(f"MAP_MIRROR_PARENT_UPDATE_FAILED | {type(exc).__name__}: {exc}")
 
         now = time.time()
-        if parent_missing and now - self._last_parent_force_log > 2.0:
+        if (not _quiet_map_logs()) and parent_missing and now - self._last_parent_force_log > 2.0:
             self._last_parent_force_log = now
             self.get_logger().warn(
                 "MAP_MIRROR_FORCE_PARENT_UPDATE | parent slam_map was empty; "
                 "delivered latest /map even if metadata signature was unchanged"
             )
 
-        if self._recv_count <= 3 or self._recv_count % 10 == 0 or parent_missing:
+        if (not _quiet_map_logs()) and (self._recv_count <= 3 or self._recv_count % 10 == 0 or parent_missing):
             info = msg.info
             try:
                 _total, _known, _free, _occ, _unk, _crc = _occupancy_grid_data_signature(msg)
@@ -264,6 +276,18 @@ class TurtleBot3RosInterface(Node):
         self._configure_use_sim_time(self.use_sim_time_requested)
 
         self.namespace = namespace.strip("/")
+
+        # v11: map-layer alignment must use the same TF pose RViz uses, not
+        # Gazebo ground-truth pose and not raw Odometry.pose as if it were map.
+        # These frame names are configurable for real robot vs Gazebo but default
+        # to TurtleBot3 conventions.
+        self.base_frame = os.environ.get("TB3_RL_BASE_FRAME", "base_footprint").strip().lstrip("/") or "base_footprint"
+        self.base_frame_fallbacks = []
+        for _f in (self.base_frame, "base_footprint", "base_link"):
+            _f = str(_f or "").strip().lstrip("/")
+            if _f and _f not in self.base_frame_fallbacks:
+                self.base_frame_fallbacks.append(_f)
+        self.scan_frame = os.environ.get("TB3_RL_SCAN_FRAME", "base_scan").strip().lstrip("/") or "base_scan"
 
         self.scan_topic = self._topic(scan_topic)
         self.odom_topic = self._topic(odom_topic)
@@ -347,6 +371,14 @@ class TurtleBot3RosInterface(Node):
         self.last_clock_time_sec: Optional[float] = None
         self.last_slam_map_time: Optional[float] = None
 
+        # v7 confidence fallback: remember the actually published command.
+        # This is used only when TF/odom/model odom do not advance while the
+        # robot is visibly commanded to move.
+        self.last_cmd_linear_x: float = 0.0
+        self.last_cmd_angular_z: float = 0.0
+        self.last_cmd_wall_time: Optional[float] = None
+        self.last_cmd_sim_time: Optional[float] = None
+
         self.tf_buffer = None
         self.tf_listener = None
 
@@ -402,6 +434,7 @@ class TurtleBot3RosInterface(Node):
             )
 
         self.model_odom_sub = None
+        self.model_odom_bridge_proc = None
         if self.model_odom_topic:
             self.model_odom_sub = self.create_subscription(
                 Odometry,
@@ -409,6 +442,11 @@ class TurtleBot3RosInterface(Node):
                 self._model_odom_callback,
                 sensor_qos,
             )
+            # v8: confidence map alignment uses actual odometry, not cmd integration.
+            # In Gazebo Sim the model odometry topic is often native Gazebo only;
+            # start a one-way bridge unless explicitly disabled.
+            if str(os.environ.get("TB3_RL_AUTO_START_MODEL_ODOM_BRIDGE", "1")).strip().lower() not in {"0", "false", "no", "off"}:
+                self._ensure_model_odom_bridge()
 
         self.clock_sub = self.create_subscription(
             Clock,
@@ -472,18 +510,25 @@ class TurtleBot3RosInterface(Node):
 
         self._ensure_robot_state_publisher_guard()
 
-        self.get_logger().info(f"scan topic    : {self.scan_topic}")
-        self.get_logger().info(f"odom topic    : {self.odom_topic}")
+        if not _quiet_startup_logs():
+            self.get_logger().info(f"scan topic    : {self.scan_topic}")
+        if not _quiet_startup_logs():
+            self.get_logger().info(f"odom topic    : {self.odom_topic}")
         self.get_logger().info(f"imu topic     : {self.imu_topic or '(disabled)'}")
-        self.get_logger().info(f"model odom    : {self.model_odom_topic or '(disabled)'}")
-        self.get_logger().info(f"cmd_vel topic : {self.cmd_vel_topic}")
-        self.get_logger().info(f"clock topic   : {self.clock_topic}")
+        if not _quiet_startup_logs():
+            self.get_logger().info(f"model odom    : {self.model_odom_topic or '(disabled)'}")
+        if not _quiet_startup_logs():
+            self.get_logger().info(f"cmd_vel topic : {self.cmd_vel_topic}")
+        if not _quiet_startup_logs():
+            self.get_logger().info(f"clock topic   : {self.clock_topic}")
         self.get_logger().info(f"slam map topic: {self.map_topic or '(disabled)'}")
-        self.get_logger().info(f"auto SLAM    : {self.auto_start_slam}")
+        if not _quiet_startup_logs():
+            self.get_logger().info(f"auto SLAM    : {self.auto_start_slam}")
         self.get_logger().warn(f"SLAM_BACKEND : {self.slam_backend} (/map source)")
         self.get_logger().info("sensor QoS   : BEST_EFFORT/VOLATILE for /scan and /odom")
         self._slam_map_service_candidates = self._make_slam_map_service_candidates()
-        self.get_logger().info("map QoS      : multi-sub RELIABLE/TRANSIENT_LOCAL + RELIABLE/VOLATILE + BEST_EFFORT/VOLATILE")
+        if not _quiet_startup_logs():
+            self.get_logger().info("map QoS      : multi-sub RELIABLE/TRANSIENT_LOCAL + RELIABLE/VOLATILE + BEST_EFFORT/VOLATILE")
         self.get_logger().info(f"map service  : fallback GetMap candidates={self._slam_map_service_candidates}")
         if self.enable_cmd_vel_pub:
             self.get_logger().info("cmd msg type  : geometry_msgs/msg/TwistStamped")
@@ -547,6 +592,35 @@ class TurtleBot3RosInterface(Node):
             self.get_logger().warn(f"TF_GUARD | failed to start robot_state_publisher: {exc}")
             self.robot_state_publisher_proc = None
             return False
+
+    def _ensure_model_odom_bridge(self) -> None:
+        """Start a Gazebo->ROS bridge for /model/<name>/odometry when needed.
+
+        The process is intentionally quiet.  If the bridge is already running or
+        the topic is already ROS-native, starting another parameter_bridge is
+        harmless in this workflow; if the bridge syntax is unsupported, the normal
+        /odom and TF fallbacks still work and the confidence pose log will expose
+        the chosen source.
+        """
+        topic = str(getattr(self, "model_odom_topic", "") or "").strip()
+        if not topic:
+            return
+        try:
+            bridge_arg = f"{topic}@nav_msgs/msg/Odometry[gz.msgs.Odometry"
+            cmd = ["ros2", "run", "ros_gz_bridge", "parameter_bridge", bridge_arg]
+            self.model_odom_bridge_proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            if str(os.environ.get("TB3_RL_QUIET_STARTUP_LOGS", "0")).strip().lower() not in {"1", "true", "yes", "on"}:
+                self.get_logger().info("MODEL_ODOM_BRIDGE_START | " + " ".join(cmd))
+        except Exception as exc:
+            try:
+                self.get_logger().warn(f"MODEL_ODOM_BRIDGE_START_FAILED | topic={topic} err={exc}")
+            except Exception:
+                pass
 
     def _imu_callback(self, msg: Imu):
         self.imu = msg
@@ -723,7 +797,7 @@ class TurtleBot3RosInterface(Node):
             self.slam_map = msg
             self.last_slam_map_time = time.time()
             self._slam_map_recv_count = int(getattr(self, "_slam_map_recv_count", 0)) + 1
-        if self._slam_map_recv_count <= 3 or self._slam_map_recv_count % 10 == 0:
+        if (not _quiet_map_logs()) and (self._slam_map_recv_count <= 3 or self._slam_map_recv_count % 10 == 0):
             try:
                 total, known, free, occupied, unknown, crc = _occupancy_grid_data_signature(msg)
                 total = max(int(total), 1)
@@ -895,6 +969,19 @@ class TurtleBot3RosInterface(Node):
         return False
 
     def publish_cmd_vel(self, linear_x: float, angular_z: float):
+        # Store the command even if publisher is unavailable.  The confidence
+        # command-integrated pose fallback needs the actual command path after
+        # safety shields, not the raw SAC action.
+        try:
+            self.last_cmd_linear_x = float(linear_x)
+            self.last_cmd_angular_z = float(angular_z)
+            self.last_cmd_wall_time = time.time()
+            try:
+                self.last_cmd_sim_time = self.get_sim_time_sec()
+            except Exception:
+                self.last_cmd_sim_time = None
+        except Exception:
+            pass
         if self.cmd_pub is None:
             return
         msg = TwistStamped()
@@ -996,7 +1083,8 @@ class TurtleBot3RosInterface(Node):
             rclpy.spin_once(self, timeout_sec=0.05)
 
             if self.scan is not None and self.odom is not None:
-                self.get_logger().info("Received /scan and /odom.")
+                if not _quiet_startup_logs():
+                    self.get_logger().info("Received /scan and /odom.")
                 return True
 
         self.get_logger().error("Timeout while waiting for /scan and /odom.")
@@ -1018,19 +1106,22 @@ class TurtleBot3RosInterface(Node):
             rclpy.spin_once(self, timeout_sec=0.05)
 
             if self.slam_map is not None:
-                self.get_logger().info(f"Received SLAM map from {self.map_topic}.")
+                if not _quiet_startup_logs():
+                    self.get_logger().info(f"Received SLAM map from {self.map_topic}.")
                 return True
 
             now = time.time()
             if now - last_service_try >= 0.75:
                 last_service_try = now
                 if self._try_fetch_slam_map_service(timeout_sec=0.45, reason="wait_loop"):
-                    self.get_logger().info(f"Received SLAM map via GetMap service for {self.map_topic}.")
+                    if not _quiet_startup_logs():
+                        self.get_logger().info(f"Received SLAM map via GetMap service for {self.map_topic}.")
                     return True
 
         # One last hard service pull before declaring fallback mode.
         if self.slam_map is None and self._try_fetch_slam_map_service(timeout_sec=0.8, reason="wait_timeout_final"):
-            self.get_logger().info(f"Received SLAM map via GetMap service after topic wait timeout for {self.map_topic}.")
+            if not _quiet_startup_logs():
+                self.get_logger().info(f"Received SLAM map via GetMap service after topic wait timeout for {self.map_topic}.")
             return True
 
         self.get_logger().warn(
@@ -2157,17 +2248,105 @@ return options
 
         return rpy[2]
 
+    def get_frame_pose2d(
+        self,
+        target_frame: str,
+        source_frame: str,
+        stamp=None,
+        timeout_sec: float = 0.04,
+        allow_latest_fallback: bool = True,
+    ) -> Optional[tuple[np.ndarray, float]]:
+        """Return source_frame pose expressed in target_frame using TF.
+
+        This is the canonical source for map-layer coordinates.  It matches RViz:
+
+            target_frame -> source_frame
+
+        For confidence/priority/grid crop, use target_frame="map" and
+        source_frame="base_footprint".  For LiDAR ray origins, use
+        source_frame=scan.header.frame_id, usually "base_scan", at the scan
+        timestamp.
+        """
+        if self.tf_buffer is None:
+            return None
+        target_frame = str(target_frame or "").strip().lstrip("/")
+        source_frame = str(source_frame or "").strip().lstrip("/")
+        if not target_frame or not source_frame:
+            return None
+
+        query_time = rclpy.time.Time()
+        if stamp is not None:
+            try:
+                query_time = rclpy.time.Time.from_msg(stamp)
+            except Exception:
+                query_time = rclpy.time.Time()
+
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                target_frame,
+                source_frame,
+                query_time,
+                timeout=rclpy.duration.Duration(seconds=max(float(timeout_sec), 0.0)),
+            )
+        except Exception:
+            if not allow_latest_fallback:
+                return None
+            try:
+                transform = self.tf_buffer.lookup_transform(
+                    target_frame,
+                    source_frame,
+                    rclpy.time.Time(),
+                    timeout=rclpy.duration.Duration(seconds=0.02),
+                )
+            except Exception:
+                return None
+
+        t = transform.transform.translation
+        q = transform.transform.rotation
+        yaw = self._yaw_from_quaternion_xyzw(
+            float(q.x),
+            float(q.y),
+            float(q.z),
+            float(q.w),
+        )
+        return np.array([float(t.x), float(t.y)], dtype=np.float32), float(yaw)
+
     def get_pose2d(
         self,
         frame_id: Optional[str] = None,
     ) -> Optional[tuple[np.ndarray, float]]:
         """
-        로봇의 2D pose를 반환한다.
+        Return the robot base pose in the requested frame.
 
-        frame_id가 None이거나 odom frame과 같으면 odom pose를 그대로 반환한다.
-        frame_id가 map이면 TF의 map->odom 변환을 적용한다.
-        SLAM을 사용할 때는 frame_id="map"으로 호출하는 것이 맞다.
+        v11 policy:
+          - Prefer TF(target_frame -> base_footprint/base_link), because that is
+            exactly how RViz places the robot model on /map.
+          - Only if TF is unavailable, fall back to Odometry.pose and transform it.
+
+        This prevents confidence/priority/map crop from using a coordinate that
+        is close to, but not identical to, the RViz /map robot pose.
         """
+        target_frame = str(frame_id or "").strip().lstrip("/")
+        if not target_frame:
+            if self.odom is not None:
+                target_frame = str(getattr(self.odom.header, "frame_id", "") or "odom").strip().lstrip("/") or "odom"
+            else:
+                target_frame = "odom"
+
+        # First-choice: direct TF pose of the base frame in target_frame.
+        for base_frame in getattr(self, "base_frame_fallbacks", ["base_footprint", "base_link"]):
+            pose = self.get_frame_pose2d(
+                target_frame=target_frame,
+                source_frame=base_frame,
+                stamp=None,
+                timeout_sec=0.04,
+                allow_latest_fallback=True,
+            )
+            if pose is not None:
+                return pose
+
+        # Fallback: old odometry-message route.  This is allowed only when TF is
+        # not available; do not silently use odom coordinates as map coordinates.
         if self.odom is None:
             return None
 
@@ -2183,9 +2362,7 @@ return options
         )
 
         source_frame = self.odom.header.frame_id.strip() or "odom"
-        target_frame = frame_id.strip() if frame_id is not None else ""
-
-        if not target_frame or target_frame == source_frame:
+        if target_frame == source_frame:
             return odom_xy, float(odom_yaw)
 
         transformed = self._transform_pose2d(
@@ -2194,13 +2371,6 @@ return options
             source_frame=source_frame,
             target_frame=target_frame,
         )
-
-        if transformed is None:
-            # Do NOT silently return odom coordinates when the caller asked for map.
-            # Publishing map-frame markers or computing map-frame waypoints from
-            # odom fallback coordinates makes RViz layers appear to slide apart.
-            return None
-
         return transformed
 
     def _transform_pose2d(
@@ -2261,6 +2431,16 @@ return options
     def close(self):
         self._stop_background_map_mirror()
         self.stop_slam_toolbox()
+        try:
+            proc = getattr(self, "model_odom_bridge_proc", None)
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1.0)
+                except Exception:
+                    proc.kill()
+        except Exception:
+            pass
 
     def destroy_node(self):
         self.close()

@@ -189,6 +189,10 @@ class ExplorationGridMap:
         # does not dominate training logs, but it tells us whether /rl_priority_map
         # is empty because generation failed or because RViz is not drawing it.
         self._last_priority_publish_debug_step = -10_000_000
+        # v5 RViz diagnostics: report the exact canvas and nonzero counts that are
+        # sent on /rl_confidence_map. This separates internal update bugs from
+        # RViz display/canvas mismatch bugs.
+        self._last_confidence_publish_debug_step = -10_000_000
 
         # Cached index grids for vectorized SLAM sampling. Rebuilt only when
         # the auto-expanding map changes shape.
@@ -582,6 +586,8 @@ class ExplorationGridMap:
         robot_yaw: float,
         publish: bool = True,
         slam_map: Optional[OccupancyGrid] = None,
+        sensor_xy: Optional[np.ndarray] = None,
+        sensor_yaw: Optional[float] = None,
     ) -> MapUpdateStats:
         self.step_index += 1
         self._last_priority_invalidated_cells = 0
@@ -619,6 +625,12 @@ class ExplorationGridMap:
 
         prev_known = self.known_cell_count()
         prev_mean_conf = self.mean_confidence()
+        # Mean confidence over the full SLAM canvas is a poor per-step gain signal:
+        # when /map expands, the denominator changes and the mean can stay flat or
+        # even drop although newly visible LiDAR cells were filled.  Keep a local
+        # pre-update snapshot and later compute positive cell-wise confidence delta
+        # only over cells actually touched by this scan update.
+        prev_confidence_grid = np.asarray(self.confidence_grid, dtype=np.float32).copy()
         prev_priority_score = self.priority_score()
 
         stale_before = self._stale_mask()
@@ -667,9 +679,36 @@ class ExplorationGridMap:
         slam_canvas_locked = _is_slam_canvas_locked()
 
         robot_ix, robot_iy = self.world_to_map(float(robot_xy[0]), float(robot_xy[1]))
+        _prev_robot_ix_dbg = getattr(self, "_last_robot_ix", None)
+        _prev_robot_iy_dbg = getattr(self, "_last_robot_iy", None)
+        _prev_robot_yaw_dbg = getattr(self, "_last_robot_yaw", None)
         self._last_robot_ix = int(robot_ix)
         self._last_robot_iy = int(robot_iy)
         self._last_robot_yaw = float(robot_yaw)
+
+        # Camera/front confidence rule:
+        #   - FOV selection stays in LaserScan local coordinates: rel_angle around 0 rad only.
+        #   - World/map projection uses the current scan-frame yaw, not motion direction.
+        #   - No backward/motion-aligned confidence painting is performed here.
+        # The base pose remains the owner for visit count, crop center and episode
+        # bookkeeping; the scan pose owns only LiDAR/camera-front ray orientation.
+        ray_xy = np.asarray(robot_xy, dtype=np.float32)
+        ray_yaw = float(robot_yaw)
+        try:
+            if sensor_xy is not None:
+                _sxy = np.asarray(sensor_xy, dtype=np.float32).reshape(-1)
+                if _sxy.size >= 2 and np.all(np.isfinite(_sxy[:2])):
+                    ray_xy = _sxy[:2].astype(np.float32, copy=True)
+            if sensor_yaw is not None and math.isfinite(float(sensor_yaw)):
+                ray_yaw = float(sensor_yaw)
+        except Exception:
+            ray_xy = np.asarray(robot_xy, dtype=np.float32)
+            ray_yaw = float(robot_yaw)
+
+        ray_ix, ray_iy = self.world_to_map(float(ray_xy[0]), float(ray_xy[1]))
+        self._last_ray_ix = int(ray_ix)
+        self._last_ray_iy = int(ray_iy)
+        self._last_ray_yaw = float(ray_yaw)
 
         robot_visit_count = 0
         lidar_hit_cells_for_priority: list[tuple[int, int, int, float]] = []
@@ -738,9 +777,9 @@ class ExplorationGridMap:
                     hit = range_min <= r_raw < min(range_max, confirmation_range_max) * 0.98
                     r = float(np.clip(r_raw, range_min, confirmation_range_max))
 
-            beam_angle = robot_yaw + rel_angle
-            end_x = float(robot_xy[0]) + r * math.cos(beam_angle)
-            end_y = float(robot_xy[1]) + r * math.sin(beam_angle)
+            beam_angle = ray_yaw + rel_angle
+            end_x = float(ray_xy[0]) + r * math.cos(beam_angle)
+            end_y = float(ray_xy[1]) + r * math.sin(beam_angle)
 
             # Rays may point outside the current grid.  In map/map/map mode the
             # internal canvas must remain exactly locked to SLAM /map; do not grow
@@ -752,10 +791,10 @@ class ExplorationGridMap:
                 old_ox, old_oy = float(self.origin_x), float(self.origin_y)
                 old_w, old_h = int(self.width), int(self.height)
                 self._ensure_world_bounds(
-                    min(float(robot_xy[0]), end_x),
-                    max(float(robot_xy[0]), end_x),
-                    min(float(robot_xy[1]), end_y),
-                    max(float(robot_xy[1]), end_y),
+                    min(float(ray_xy[0]), end_x),
+                    max(float(ray_xy[0]), end_x),
+                    min(float(ray_xy[1]), end_y),
+                    max(float(ray_xy[1]), end_y),
                     padding_m=0.50,
                 )
                 if (old_w, old_h) != (int(self.width), int(self.height)) or abs(old_ox - float(self.origin_x)) > 1e-9 or abs(old_oy - float(self.origin_y)) > 1e-9:
@@ -774,12 +813,13 @@ class ExplorationGridMap:
                         pass
 
             robot_ix, robot_iy = self.world_to_map(float(robot_xy[0]), float(robot_xy[1]))
+            ray_ix, ray_iy = self.world_to_map(float(ray_xy[0]), float(ray_xy[1]))
             end_ix, end_iy = self.world_to_map(end_x, end_y)
 
-            if not self.in_bounds(robot_ix, robot_iy):
+            if not self.in_bounds(ray_ix, ray_iy):
                 continue
 
-            cells = self.bresenham(robot_ix, robot_iy, end_ix, end_iy)
+            cells = self.bresenham(ray_ix, ray_iy, end_ix, end_iy)
             if not cells:
                 continue
 
@@ -807,8 +847,8 @@ class ExplorationGridMap:
             if in_priority_clear_fov:
                 self._mark_priority_clear_ray(
                     priority_clear_mask,
-                    robot_ix,
-                    robot_iy,
+                    ray_ix,
+                    ray_iy,
                     free_cells,
                     angle_weight=self._priority_clear_angle_weight(rel_angle),
                 )
@@ -1018,7 +1058,25 @@ class ExplorationGridMap:
         self.prev_known_cells = known
 
         mean_conf = self.mean_confidence()
-        confidence_gain = max(mean_conf - prev_mean_conf, 0.0)
+        # Reward/stat gain is the positive local scan update, not the global mean
+        # difference.  Global mean is still exposed for observation/debug, but it is
+        # not reliable as a step delta while the SLAM canvas grows.  Unit: 100%-cell
+        # equivalents, e.g. ten cells rising by +20 confidence => gain 2.0.
+        try:
+            if (
+                isinstance(prev_confidence_grid, np.ndarray)
+                and prev_confidence_grid.shape == self.confidence_grid.shape
+                and observed_mask.shape == self.confidence_grid.shape
+            ):
+                positive_delta = np.maximum(
+                    np.asarray(self.confidence_grid, dtype=np.float32) - prev_confidence_grid,
+                    0.0,
+                )
+                confidence_gain = float(np.sum(positive_delta[observed_mask]) / 100.0)
+            else:
+                confidence_gain = max(mean_conf - prev_mean_conf, 0.0)
+        except Exception:
+            confidence_gain = max(mean_conf - prev_mean_conf, 0.0)
         self.prev_mean_confidence = mean_conf
 
         priority_score = self.priority_score()
@@ -1055,6 +1113,31 @@ class ExplorationGridMap:
         low_confidence_cells = self.low_confidence_count()
         base_free_cells = int(np.count_nonzero((self.base_grid >= 0) & (self.base_grid <= 35)))
         low_confidence_ratio = low_confidence_cells / max(float(base_free_cells), 1.0)
+
+        try:
+            dbg_n = int(os.environ.get("TB3_RL_CONFIDENCE_DEBUG_EVERY_N", "100"))
+        except Exception:
+            dbg_n = 100
+        if dbg_n > 0 and (int(self.step_index) <= 5 or int(self.step_index) % dbg_n == 0):
+            try:
+                observed_cells_dbg = int(np.count_nonzero(observed_mask)) if isinstance(observed_mask, np.ndarray) else -1
+                yaw_delta_dbg = normalize_angle(float(ray_yaw) - float(robot_yaw))
+                self.node.get_logger().info(
+                    "CONFIDENCE_UPDATE | "
+                    f"step={int(self.step_index)} mode=camera_front gain={float(confidence_gain):.4f} "
+                    f"mean={float(mean_conf):.3f} observed={observed_cells_dbg} "
+                    f"known={int(known)} low={int(low_confidence_cells)} "
+                    f"fov={math.degrees(float(self.front_fov_rad)):.1f}deg "
+                    f"robot=({int(robot_ix)},{int(robot_iy)}) ray=({int(ray_ix)},{int(ray_iy)}) "
+                    f"dCell=({int(robot_ix) - int(_prev_robot_ix_dbg) if _prev_robot_ix_dbg is not None else 0},"
+                    f"{int(robot_iy) - int(_prev_robot_iy_dbg) if _prev_robot_iy_dbg is not None else 0}) "
+                    f"baseYaw={math.degrees(float(robot_yaw)):.1f}deg "
+                    f"scanYaw={math.degrees(float(ray_yaw)):.1f}deg "
+                    f"scanBaseDelta={math.degrees(float(yaw_delta_dbg)):.1f}deg "
+                    f"slam_locked={bool(slam_canvas_locked)}"
+                )
+            except Exception:
+                pass
 
         stats = MapUpdateStats(
             known_cells=int(known),
@@ -1260,6 +1343,10 @@ class ExplorationGridMap:
             "origin_qw": float(getattr(q, "w", 1.0)),
             "origin_yaw": self._quat_to_yaw(q),
         }
+        try:
+            self._last_valid_slam_publish_ref = dict(self._slam_publish_ref)
+        except Exception:
+            pass
 
     def _resample_grid_to_slam_reference(
         self,
@@ -3380,18 +3467,34 @@ class ExplorationGridMap:
         seed_grid[invalid] = 0.0
         allowed_grid[invalid] = False
 
-        # One small persistent cluster approximately every 70 map updates.
-        # Each cluster has up to 3 nearby Gaussian seeds.  It persists until the
-        # robot clears it with a LiDAR-visible priority clear ray.
-        spawn_interval_steps = 70
-        max_seed_points = 24  # about 8 clusters * 3 seeds
+        # v24: keep the stable v5 priority mechanism, but slow down new cluster
+        # generation by default.  This is intentionally env-configurable so the
+        # algorithm can be tuned without changing the learned observation/reward
+        # semantics.
+        def _env_int(name: str, default: int) -> int:
+            try:
+                return int(os.environ.get(name, str(default)))
+            except Exception:
+                return int(default)
+
+        def _env_float(name: str, default: float) -> float:
+            try:
+                return float(os.environ.get(name, str(default)))
+            except Exception:
+                return float(default)
+
+        spawn_interval_steps = max(_env_int("TB3_RL_PRIORITY_CLUSTER_SPAWN_INTERVAL_STEPS", 900), 1)
+        max_seed_points = max(_env_int("TB3_RL_PRIORITY_MAX_SEED_POINTS", 6), 0)
+        spawn_min_range_m = max(_env_float("TB3_RL_PRIORITY_SPAWN_MIN_RANGE_M", 0.90), 0.0)
+        spawn_max_range_m = max(_env_float("TB3_RL_PRIORITY_SPAWN_MAX_RANGE_M", 2.40), spawn_min_range_m)
+
         active_seed_points = int(np.count_nonzero(seed_grid > 1e-4))
         due = int(self.step_index) - int(getattr(self, "_last_priority_cluster_spawn_step", -10_000_000)) >= spawn_interval_steps
 
         if due and active_seed_points < max_seed_points:
             yy, xx = np.ogrid[:self.height, :self.width]
             dist_m = np.sqrt((xx.astype(np.float32) - float(rix)) ** 2 + (yy.astype(np.float32) - float(riy)) ** 2) * float(self.resolution)
-            spawn_mask = passable & lidar_visible & (dist_m >= 0.55) & (dist_m <= 2.60)
+            spawn_mask = passable & lidar_visible & (dist_m >= spawn_min_range_m) & (dist_m <= spawn_max_range_m)
 
             if np.any(seed_grid > 1e-4):
                 near_existing = self._dilate_bool(seed_grid > 1e-4, radius=max(3, int(round(0.55 / max(self.resolution, 1e-6)))))
@@ -4394,27 +4497,119 @@ class ExplorationGridMap:
             # booting, publish the internal odom grid instead of hiding all debug
             # layers and spamming MAP_LOCKED_PUBLISH_WAITING_FOR_SLAM_REF.
             if ref is None:
-                now = time.time()
-                if now - float(getattr(self, "_last_waiting_slam_ref_log_time", 0.0)) > 5.0:
-                    self._last_waiting_slam_ref_log_time = now
-                    if self.node is not None:
-                        self.node.get_logger().warn(
-                            "MAP_LOCKED_PUBLISH_FALLBACK_INTERNAL | "
-                            "raw /map metadata is unavailable; publishing LiDAR-only RL layers on the internal pose frame instead"
-                        )
-                # Real robot / dry-run fallback: slam_toolbox may fail to produce
-                # /map because of LaserScan beam-count/QoS/TF issues.  Do not hide
-                # the RL debug layers in that case.  Publish the common internal
-                # grid in self.frame_id so confidence/priority/debug remain visible
-                # and the policy still receives LiDAR-updated observations.
-                self._publish_grid(self.grid, self.map_pub)
+                # v12 strict-map safety: never publish internal pose-frame RL layers
+                # under /rl_confidence_map, /rl_priority_map, or /rl_task_map while
+                # publish_slam_aligned=True.  That fallback was the source of
+                # long-run RViz drift/ghost confidence after SLAM reset failures.
+                # If a previous valid /map canvas exists, publish blank layers on
+                # that same canvas to clear stale RViz overlays; otherwise publish
+                # nothing until an accepted raw /map reference is available.
+                try:
+                    clear_stale = str(os.environ.get("TB3_RL_CLEAR_RVIZ_WHEN_MAP_MISSING", "1")).strip().lower() not in ("0", "false", "no", "off")
+                except Exception:
+                    clear_stale = True
+                last_ref = getattr(self, "_last_valid_slam_publish_ref", None)
+                if clear_stale and isinstance(last_ref, dict):
+                    try:
+                        h = int(last_ref["height"]); w = int(last_ref["width"])
+                        if h > 0 and w > 0:
+                            blank_task = np.full((h, w), self.UNKNOWN, dtype=np.int8)
+                            blank = np.zeros((h, w), dtype=np.int8)
+                            self._publish_grid_with_ref(blank_task, self.map_pub, last_ref)
+                            if self.legacy_memory_pub is not None:
+                                self._publish_grid_with_ref(blank_task, self.legacy_memory_pub, last_ref)
+                            self._publish_grid_with_ref(blank, self.confidence_pub, last_ref)
+                            if self.priority_pub is not None:
+                                self._publish_grid_with_ref(blank, self.priority_pub, last_ref)
+                            if self.filtered_slam_pub is not None:
+                                self._publish_grid_with_ref(blank_task, self.filtered_slam_pub, last_ref)
+                    except Exception:
+                        pass
+                try:
+                    warn_enabled = str(os.environ.get("TB3_RL_MAP_REF_MISSING_WARN", "0")).strip().lower() in ("1", "true", "yes", "on")
+                except Exception:
+                    warn_enabled = False
+                if warn_enabled:
+                    now = time.time()
+                    if now - float(getattr(self, "_last_waiting_slam_ref_log_time", 0.0)) > 5.0:
+                        self._last_waiting_slam_ref_log_time = now
+                        if self.node is not None:
+                            self.node.get_logger().warn(
+                                "MAP_LOCKED_PUBLISH_WAITING_FOR_SLAM_REF | "
+                                "raw /map metadata unavailable; not publishing internal fallback layers"
+                            )
+                return
+
+            # v25 safety path: if the internal canvas is already locked to the
+            # exact /map metadata, do not resample.  Resampling failures were the
+            # main reason /rl_confidence_map and /rl_priority_map appeared once
+            # and then stopped in RViz.  In this direct path every publish call
+            # sends the latest internal confidence/priority grids on the /map
+            # canvas.
+            try:
+                same_canvas = (
+                    int(self.width) == int(ref["width"])
+                    and int(self.height) == int(ref["height"])
+                    and abs(float(self.resolution) - float(ref["resolution"])) < 1e-9
+                    and abs(float(self.origin_x) - float(ref["origin_x"])) < max(1e-6, float(self.resolution) * 0.25)
+                    and abs(float(self.origin_y) - float(ref["origin_y"])) < max(1e-6, float(self.resolution) * 0.25)
+                    and str(self.frame_id or "").strip().lstrip("/") == str(ref.get("frame_id", "") or "").strip().lstrip("/")
+                )
+            except Exception:
+                same_canvas = False
+            if same_canvas:
+                raw_slam = getattr(self, "_slam_publish_raw_grid", None)
+                try:
+                    if raw_slam is not None and raw_slam.shape == confidence_grid.shape:
+                        raw_occ = np.asarray(raw_slam, dtype=np.int16) >= self._slam_occupied_threshold()
+                        if np.any(raw_occ):
+                            conf_pub_grid = np.asarray(confidence_grid, dtype=np.int8).copy()
+                            prio_pub_grid = np.asarray(priority_grid, dtype=np.int8).copy()
+                            raw_wall = self._dilate_bool(raw_occ, radius=1)
+                            conf_pub_grid[raw_wall] = 0
+                            prio_pub_grid[raw_wall] = 0
+                        else:
+                            conf_pub_grid = confidence_grid
+                            prio_pub_grid = priority_grid
+                    else:
+                        conf_pub_grid = confidence_grid
+                        prio_pub_grid = priority_grid
+                except Exception:
+                    conf_pub_grid = confidence_grid
+                    prio_pub_grid = priority_grid
+                filt_pub_grid = filtered_slam_grid
+                if raw_slam is not None and getattr(raw_slam, "shape", None) == filtered_slam_grid.shape:
+                    try:
+                        filt_pub_grid = np.asarray(raw_slam, dtype=np.int8)
+                    except Exception:
+                        pass
+                self._publish_grid_with_ref(self.grid, self.map_pub, ref)
                 if self.legacy_memory_pub is not None:
-                    self._publish_grid(self.grid, self.legacy_memory_pub)
-                self._publish_grid(confidence_grid, self.confidence_pub)
+                    self._publish_grid_with_ref(self.grid, self.legacy_memory_pub, ref)
+                try:
+                    dbg_n = int(os.environ.get("TB3_RL_CONFIDENCE_PUBLISH_DEBUG_EVERY_N", "20"))
+                except Exception:
+                    dbg_n = 20
+                if dbg_n > 0 and (int(getattr(self, "step_index", 0)) <= 5 or int(getattr(self, "step_index", 0)) - int(getattr(self, "_last_confidence_publish_debug_step", -10_000_000)) >= dbg_n):
+                    self._last_confidence_publish_debug_step = int(getattr(self, "step_index", 0))
+                    try:
+                        self.node.get_logger().info(
+                            "CONFIDENCE_PUBLISH | mode=slam_ref_direct "
+                            f"step={int(getattr(self, 'step_index', 0))} "
+                            f"nonzero={int(np.count_nonzero(conf_pub_grid > 0))} "
+                            f"max={float(np.max(conf_pub_grid)) if conf_pub_grid.size else 0.0:.1f} "
+                            f"frame={str(ref.get('frame_id', self.frame_id))} "
+                            f"size={int(ref['width'])}x{int(ref['height'])} "
+                            f"origin=({float(ref['origin_x']):.2f},{float(ref['origin_y']):.2f})"
+                        )
+                    except Exception:
+                        pass
+                self._publish_grid_with_ref(conf_pub_grid, self.confidence_pub, ref)
                 if self.priority_pub is not None:
-                    self._publish_grid(priority_grid, self.priority_pub)
+                    self._publish_grid_with_ref(prio_pub_grid, self.priority_pub, ref)
                 if self.filtered_slam_pub is not None:
-                    self._publish_grid(filtered_slam_grid, self.filtered_slam_pub)
+                    self._publish_grid_with_ref(filt_pub_grid, self.filtered_slam_pub, ref)
+                self._last_direct_map_publish_step = int(getattr(self, "step_index", 0))
                 return
 
             task_ref = self._resample_grid_to_slam_reference(self.grid, self.UNKNOWN, np.int8)
@@ -4459,13 +4654,42 @@ class ExplorationGridMap:
                 self._publish_grid_with_ref(task_ref, self.map_pub, ref)
                 if self.legacy_memory_pub is not None:
                     self._publish_grid_with_ref(task_ref, self.legacy_memory_pub, ref)
+                try:
+                    dbg_n = int(os.environ.get("TB3_RL_CONFIDENCE_PUBLISH_DEBUG_EVERY_N", "20"))
+                except Exception:
+                    dbg_n = 20
+                if dbg_n > 0 and (int(getattr(self, "step_index", 0)) <= 5 or int(getattr(self, "step_index", 0)) - int(getattr(self, "_last_confidence_publish_debug_step", -10_000_000)) >= dbg_n):
+                    self._last_confidence_publish_debug_step = int(getattr(self, "step_index", 0))
+                    try:
+                        self.node.get_logger().info(
+                            "CONFIDENCE_PUBLISH | mode=slam_ref_resampled "
+                            f"step={int(getattr(self, 'step_index', 0))} "
+                            f"nonzero={int(np.count_nonzero(conf_ref > 0))} "
+                            f"max={float(np.max(conf_ref)) if conf_ref.size else 0.0:.1f} "
+                            f"frame={str(ref.get('frame_id', self.frame_id))} "
+                            f"size={int(ref['width'])}x{int(ref['height'])} "
+                            f"origin=({float(ref['origin_x']):.2f},{float(ref['origin_y']):.2f})"
+                        )
+                    except Exception:
+                        pass
                 self._publish_grid_with_ref(conf_ref, self.confidence_pub, ref)
                 self._publish_grid_with_ref(prio_ref, self.priority_pub, ref)
                 self._publish_grid_with_ref(filt_ref, self.filtered_slam_pub, ref)
                 return
 
-            # If resampling failed, skip this publish rather than drawing a layer
-            # on the wrong origin/size. The next /map/live update will retry.
+            # v25 fallback: never let RViz map topics stop publishing.  If
+            # resampling failed, publish the common internal grid rather than
+            # silently skipping.  The direct same-canvas path above handles the
+            # normal map-locked case; this fallback keeps diagnostics alive if a
+            # transient /map metadata mismatch occurs.
+            self._publish_grid(self.grid, self.map_pub)
+            if self.legacy_memory_pub is not None:
+                self._publish_grid(self.grid, self.legacy_memory_pub)
+            self._publish_grid(confidence_grid, self.confidence_pub)
+            if self.priority_pub is not None:
+                self._publish_grid(priority_grid, self.priority_pub)
+            if self.filtered_slam_pub is not None:
+                self._publish_grid(filtered_slam_grid, self.filtered_slam_pub)
             return
 
         # Fallback path for non-map-locked modes only: publish all RL layers on

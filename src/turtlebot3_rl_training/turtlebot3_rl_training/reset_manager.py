@@ -1,4 +1,5 @@
 import math
+import os
 import random
 import re
 import subprocess
@@ -179,7 +180,11 @@ class ResetManager:
             yaw=float(yaw),
         )
 
-        ok = self.reset_to_pose(reset_pose)
+        try:
+            timeout_sec = float(os.environ.get("TB3_RL_RESET_POSE_TIMEOUT_SEC", "8.0"))
+        except Exception:
+            timeout_sec = 8.0
+        ok = self.reset_to_pose(reset_pose, timeout_sec=max(timeout_sec, 1.0))
         if not ok:
             return None
         return reset_pose
