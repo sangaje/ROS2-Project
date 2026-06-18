@@ -221,13 +221,20 @@ def _apply_real_robot_policy(cli_args):
     cli_args.waypoint_marker_topic = str(getattr(cli_args, "waypoint_marker_topic", "") or "/rl_debug_overlay")
     cli_args.waypoint_visual_publish_every_n = 1
 
-    if bool(getattr(cli_args, "real_robot_disable_priority", True)):
+    # v2: keep the policy observation distribution close to training.
+    # Older real-robot eval disabled priority by default, which zeroed the 5th
+    # CNN map channel for checkpoints trained with priority enabled.
+    if bool(getattr(cli_args, "real_robot_disable_priority", False)):
         cli_args.disable_priority_map = True
         cli_args.enable_corridor_priority_reward = False
         cli_args.corridor_priority_reward_weight = 0.0
         cli_args.post_reset_ready_require_priority = False
         cli_args.priority_stuck_restart = False
         cli_args.rl_priority_topic = ""
+    else:
+        cli_args.disable_priority_map = False
+        if not str(getattr(cli_args, "rl_priority_topic", "") or "").strip():
+            cli_args.rl_priority_topic = "/rl_priority_map"
 
     # Real robots need wall-clock pacing.  The Gazebo real-time fallback sleeps only
     # briefly by default to maximize sim throughput; that is unsafe on hardware.
@@ -235,9 +242,10 @@ def _apply_real_robot_policy(cli_args):
     cli_args.realtime_spin_timeout_sec = max(float(getattr(cli_args, "realtime_spin_timeout_sec", 0.002)), 0.002)
     cli_args.realtime_sleep_sec = max(float(getattr(cli_args, "realtime_sleep_sec", 0.0)), float(getattr(cli_args, "control_dt", 0.10)))
 
-    # Keep the first run slow unless the user explicitly overrides the CLI.
-    cli_args.max_linear_speed = min(float(getattr(cli_args, "max_linear_speed", 0.10)), 0.12)
-    cli_args.max_angular_speed = min(float(getattr(cli_args, "max_angular_speed", 0.45)), 0.50)
+    # v2: respect CLI speed bounds so eval action_space can match the checkpoint.
+    # The physical safety shield still clips dangerous commands downstream.
+    cli_args.max_linear_speed = float(getattr(cli_args, "max_linear_speed", 0.14))
+    cli_args.max_angular_speed = float(getattr(cli_args, "max_angular_speed", 0.50))
     cli_args.velocity_safety_backup = True
     cli_args.velocity_safety_penalty = float(getattr(cli_args, "velocity_safety_penalty", 10.0))
 
@@ -321,7 +329,7 @@ def parse_args():
     # and uses manual reset prompts between episodes.
     parser.add_argument("--real-robot", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--disable-priority-map", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--real-robot-disable-priority", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--real-robot-disable-priority", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
         "--manual-reset-prompt",
         action=argparse.BooleanOptionalAction,
@@ -597,7 +605,7 @@ def parse_args():
 
 
     parser.add_argument("--action-sync-reward-gate", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--action-sync-wait-timeout-sec", type=float, default=0.18)
+    parser.add_argument("--action-sync-wait-timeout-sec", type=float, default=0.06)
     parser.add_argument("--action-sync-min-scan-age-sec", type=float, default=0.0)
     parser.add_argument("--map-bounds-restart", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--map-bounds-margin-cells", type=int, default=2)
@@ -610,6 +618,15 @@ def parse_args():
     parser.add_argument("--use-map-cnn", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--map-obs-size", type=int, default=48)
     parser.add_argument("--map-obs-size-m", type=float, default=6.0)
+    parser.add_argument(
+        "--num-lidar-bins",
+        type=int,
+        default=60,
+        help=(
+            "Number of LiDAR bins in the policy observation. Must match the checkpoint. "
+            "v5 60-sector checkpoints need --num-lidar-bins 60. Legacy 360-bin checkpoints need 360."
+        ),
+    )
     parser.add_argument("--use-temporal-cnn", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--temporal-history-len", type=int, default=4)
     parser.add_argument("--front-fov-deg", type=float, default=80.0)
@@ -689,9 +706,19 @@ def parse_args():
     parser.add_argument("--shake-restart", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--shake-restart-steps", type=int, default=4)
     parser.add_argument("--shake-tilt-threshold", type=float, default=0.12)
-    parser.add_argument("--shake-angular-xy-threshold", type=float, default=0.80)
-    parser.add_argument("--shake-linear-z-threshold", type=float, default=0.10)
-    parser.add_argument("--shake-z-deviation-threshold", type=float, default=0.06)
+    parser.add_argument("--shake-angular-xy-threshold", type=float, default=0.70)
+    parser.add_argument("--shake-linear-z-threshold", type=float, default=0.08)
+    parser.add_argument("--shake-z-deviation-threshold", type=float, default=0.05)
+    parser.add_argument("--shake-ground-min-z", type=float, default=-0.02)
+    parser.add_argument("--shake-ground-max-z", type=float, default=0.13)
+    parser.add_argument("--shake-leaky-decay", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--shake-yaw-wobble", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--shake-yaw-rate-threshold", type=float, default=0.24)
+    parser.add_argument("--shake-cmd-flip-threshold", type=float, default=0.16)
+    parser.add_argument("--shake-wobble-window-steps", type=int, default=8)
+    parser.add_argument("--shake-wobble-min-flips", type=int, default=2)
+    parser.add_argument("--shake-wobble-max-net-motion-m", type=float, default=0.045)
+    parser.add_argument("--shake-spin-stall-restart-steps", type=int, default=18)
     parser.add_argument("--shake-restart-penalty", type=float, default=100.0)
 
     parser.add_argument("--confidence-reward-weight", type=float, default=2.0)
@@ -954,6 +981,7 @@ def main(args=None):
         map_obs_size=cli_args.map_obs_size,
         map_obs_size_m=cli_args.map_obs_size_m,
         use_temporal_cnn=cli_args.use_temporal_cnn,
+        num_lidar_bins=cli_args.num_lidar_bins,
         temporal_history_len=cli_args.temporal_history_len,
         front_fov_deg=cli_args.front_fov_deg,
         front_angle_sigma_deg=cli_args.front_angle_sigma_deg,
@@ -1041,6 +1069,16 @@ def main(args=None):
         shake_angular_xy_threshold=cli_args.shake_angular_xy_threshold,
         shake_linear_z_threshold=cli_args.shake_linear_z_threshold,
         shake_z_deviation_threshold=cli_args.shake_z_deviation_threshold,
+        shake_ground_min_z=cli_args.shake_ground_min_z,
+        shake_ground_max_z=cli_args.shake_ground_max_z,
+        shake_leaky_decay=cli_args.shake_leaky_decay,
+        shake_yaw_wobble=cli_args.shake_yaw_wobble,
+        shake_yaw_rate_threshold=cli_args.shake_yaw_rate_threshold,
+        shake_cmd_flip_threshold=cli_args.shake_cmd_flip_threshold,
+        shake_wobble_window_steps=cli_args.shake_wobble_window_steps,
+        shake_wobble_min_flips=cli_args.shake_wobble_min_flips,
+        shake_wobble_max_net_motion_m=cli_args.shake_wobble_max_net_motion_m,
+        shake_spin_stall_restart_steps=cli_args.shake_spin_stall_restart_steps,
         shake_restart_penalty=cli_args.shake_restart_penalty,
         reward_gamma=0.99,
     )

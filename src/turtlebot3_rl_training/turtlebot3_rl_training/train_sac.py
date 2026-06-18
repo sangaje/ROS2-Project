@@ -1095,7 +1095,7 @@ def parse_args():
     parser.add_argument("--post-reset-ready-min-lidar-beams", type=int, default=30)
     parser.add_argument("--post-reset-ready-require-priority", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--action-sync-reward-gate", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--action-sync-wait-timeout-sec", type=float, default=0.18)
+    parser.add_argument("--action-sync-wait-timeout-sec", type=float, default=0.06)
     parser.add_argument("--action-sync-min-scan-age-sec", type=float, default=0.0)
     parser.add_argument("--map-bounds-restart", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--map-bounds-margin-cells", type=int, default=2)
@@ -1185,11 +1185,21 @@ def parse_args():
 
     # Reset if the body is bouncing/tilting even before a full fall is detected.
     parser.add_argument("--shake-restart", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--shake-restart-steps", type=int, default=8)
-    parser.add_argument("--shake-tilt-threshold", type=float, default=0.22)
-    parser.add_argument("--shake-angular-xy-threshold", type=float, default=1.80)
-    parser.add_argument("--shake-linear-z-threshold", type=float, default=0.22)
-    parser.add_argument("--shake-z-deviation-threshold", type=float, default=0.12)
+    parser.add_argument("--shake-restart-steps", type=int, default=4)
+    parser.add_argument("--shake-tilt-threshold", type=float, default=0.12)
+    parser.add_argument("--shake-angular-xy-threshold", type=float, default=0.70)
+    parser.add_argument("--shake-linear-z-threshold", type=float, default=0.08)
+    parser.add_argument("--shake-z-deviation-threshold", type=float, default=0.05)
+    parser.add_argument("--shake-ground-min-z", type=float, default=-0.02)
+    parser.add_argument("--shake-ground-max-z", type=float, default=0.13)
+    parser.add_argument("--shake-leaky-decay", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--shake-yaw-wobble", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--shake-yaw-rate-threshold", type=float, default=0.24)
+    parser.add_argument("--shake-cmd-flip-threshold", type=float, default=0.16)
+    parser.add_argument("--shake-wobble-window-steps", type=int, default=8)
+    parser.add_argument("--shake-wobble-min-flips", type=int, default=2)
+    parser.add_argument("--shake-wobble-max-net-motion-m", type=float, default=0.045)
+    parser.add_argument("--shake-spin-stall-restart-steps", type=int, default=18)
     parser.add_argument("--shake-restart-penalty", type=float, default=100.0)
     parser.add_argument("--reset-hard-stabilize-reapply", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--reset-hard-stabilize-reapply-interval-sec", type=float, default=0.25)
@@ -1218,6 +1228,15 @@ def parse_args():
     parser.add_argument("--use-map-cnn", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--map-obs-size", type=int, default=48)
     parser.add_argument("--map-obs-size-m", type=float, default=6.0)
+    parser.add_argument(
+        "--num-lidar-bins",
+        type=int,
+        default=60,
+        help=(
+            "Number of LiDAR bins in the policy observation. v5 default is 60. "
+            "Checkpoints are only compatible with the same value used during training."
+        ),
+    )
     parser.add_argument("--cnn-features-dim", type=int, default=48)
     parser.add_argument("--vector-features-dim", type=int, default=128)
     parser.add_argument("--combined-features-dim", type=int, default=192)
@@ -1547,6 +1566,7 @@ def main(args=None):
         map_obs_size=cli_args.map_obs_size,
         map_obs_size_m=cli_args.map_obs_size_m,
         use_temporal_cnn=cli_args.use_temporal_cnn,
+        num_lidar_bins=cli_args.num_lidar_bins,
         temporal_history_len=cli_args.temporal_history_len,
         front_fov_deg=cli_args.front_fov_deg,
         front_angle_sigma_deg=cli_args.front_angle_sigma_deg,
@@ -1638,6 +1658,16 @@ def main(args=None):
         shake_angular_xy_threshold=cli_args.shake_angular_xy_threshold,
         shake_linear_z_threshold=cli_args.shake_linear_z_threshold,
         shake_z_deviation_threshold=cli_args.shake_z_deviation_threshold,
+        shake_ground_min_z=cli_args.shake_ground_min_z,
+        shake_ground_max_z=cli_args.shake_ground_max_z,
+        shake_leaky_decay=cli_args.shake_leaky_decay,
+        shake_yaw_wobble=cli_args.shake_yaw_wobble,
+        shake_yaw_rate_threshold=cli_args.shake_yaw_rate_threshold,
+        shake_cmd_flip_threshold=cli_args.shake_cmd_flip_threshold,
+        shake_wobble_window_steps=cli_args.shake_wobble_window_steps,
+        shake_wobble_min_flips=cli_args.shake_wobble_min_flips,
+        shake_wobble_max_net_motion_m=cli_args.shake_wobble_max_net_motion_m,
+        shake_spin_stall_restart_steps=cli_args.shake_spin_stall_restart_steps,
         shake_restart_penalty=cli_args.shake_restart_penalty,
         reset_hard_stabilize_reapply=cli_args.reset_hard_stabilize_reapply,
         reset_hard_stabilize_reapply_interval_sec=cli_args.reset_hard_stabilize_reapply_interval_sec,
@@ -1716,6 +1746,7 @@ def main(args=None):
                 temporal_features_dim=cli_args.temporal_features_dim,
                 combined_features_dim=cli_args.combined_features_dim,
                 use_temporal_cnn=cli_args.use_temporal_cnn,
+                lidar_dim=cli_args.num_lidar_bins,
             ),
         )
 
@@ -1723,7 +1754,7 @@ def main(args=None):
         "TRAIN_CONFIG | "
         f"profile={cli_args.training_profile} | "
         f"policy={policy_name} | "
-        f"map_cnn={cli_args.use_map_cnn} map=(5,{cli_args.map_obs_size},{cli_args.map_obs_size}) | "
+        f"map_cnn={cli_args.use_map_cnn} map=(5,{cli_args.map_obs_size},{cli_args.map_obs_size}) lidar_bins={cli_args.num_lidar_bins} | "
         f"temporal={cli_args.use_temporal_cnn} hist={cli_args.temporal_history_len} | "
         f"frames map={cli_args.map_frame} pose={cli_args.pose_frame} safety={cli_args.safety_boundary_frame} | "
         f"priority={cli_args.rl_priority_topic or '(off)'} filtered_slam={cli_args.rl_filtered_slam_topic or '(off)'} | "

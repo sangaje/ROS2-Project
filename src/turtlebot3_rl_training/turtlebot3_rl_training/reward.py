@@ -574,9 +574,11 @@ def compute_waypoint_macro_reward_adjustment(
         reward -= 0.24 * min(final_err_norm, 1.0)
 
     if timed_out:
-        # timeout은 강하게 억제한다. 특히 path가 있는데 못 가면 좋지 않다.
-        reward -= 0.75 if reachable else 0.42
-        reward -= 0.28 * min(final_err_norm, 1.0)
+        # v6: waypoint/controller timeout itself is not penalized.
+        # Remaining distance is already handled by the non-reached term above;
+        # adding a separate timeout penalty biases the policy against cautious
+        # long-horizon behavior and makes max-control-step cutoffs look like failures.
+        pass
 
     # 이전 waypoint와 방향이 크게 바뀌는 지그재그를 억제한다.
     # path-conditioned mode에서는 원칙적으로 path tangent 주변에서 움직여야 하므로 더 강하게 건다.

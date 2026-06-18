@@ -30,6 +30,69 @@ def _env_bool(name: str, default: bool = True) -> bool:
     return str(raw).strip().lower() not in {"0", "false", "no", "off", "disable", "disabled"}
 
 
+
+
+def _env_optional_int(name: str, default: int = 0, min_value: int = 0) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except Exception:
+        value = int(default)
+    return int(max(int(min_value), value))
+
+
+def _expand_sector_bins_to_policy_bins(
+    sector_ranges: np.ndarray,
+    output_bins: int,
+    sector_front_index: int,
+    output_front_index: int,
+    min_range: float,
+    max_range: float,
+    mode: str = "linear",
+) -> np.ndarray:
+    """Expand a low-dimensional canonical sector LiDAR vector to policy bins.
+
+    This is a compatibility bridge for checkpoints trained with 360 LiDAR bins.
+    It lets the real robot first aggregate noisy/sparse raw scans into stable
+    sectors, e.g. 60 sectors, and then present a 360-bin tensor with the same
+    shape expected by the existing SAC policy.
+
+    The angular semantics are preserved:
+      sector_ranges[sector_front_index] -> robot front
+      output[output_front_index]        -> robot front
+
+    `nearest` repeats sectors. `linear` circularly interpolates between sectors
+    to avoid a stair-step pattern in the existing 360-bin feature extractor.
+    """
+    values = np.asarray(sector_ranges, dtype=np.float32)
+    s = int(values.size)
+    o = max(int(output_bins), 1)
+    if s <= 0:
+        return np.ones(o, dtype=np.float32) * float(max_range)
+    if s == o and (int(sector_front_index) % s) == (int(output_front_index) % o):
+        return np.clip(values, min_range, max_range).astype(np.float32)
+
+    sector_front_index = int(sector_front_index) % s
+    output_front_index = int(output_front_index) % o
+    mode = str(mode or "linear").strip().lower()
+
+    # Output bin j has the same physical angle as sector coordinate x.
+    # j=output_front_index maps to x=sector_front_index.
+    j = np.arange(o, dtype=np.float32)
+    x = (j - float(output_front_index)) * (float(s) / float(o)) + float(sector_front_index)
+
+    if mode in {"nearest", "repeat", "hold"}:
+        idx = np.rint(x).astype(np.int64) % s
+        out = values[idx]
+    else:
+        x0 = np.floor(x).astype(np.int64)
+        frac = (x - x0.astype(np.float32)).astype(np.float32)
+        i0 = x0 % s
+        i1 = (x0 + 1) % s
+        out = (1.0 - frac) * values[i0] + frac * values[i1]
+
+    return np.clip(out, min_range, max_range).astype(np.float32)
+
+
 def _make_odd_kernel(value: int, *, min_value: int = 1, max_value: int = 31) -> int:
     value = int(max(min_value, min(max_value, value)))
     if value % 2 == 0:
@@ -199,6 +262,139 @@ def _uniform_angle_resample(
     return np.clip(pooled, min_range, max_range).astype(np.float32)
 
 
+
+def _canonical_angle_resample(
+    robust_ranges: np.ndarray,
+    smooth_ranges: np.ndarray,
+    num_bins: int,
+    min_range: float,
+    max_range: float,
+    obstacle_margin: float,
+    angle_min: float,
+    angle_increment: float,
+    angle_max: Optional[float] = None,
+    front_index: int = 0,
+) -> np.ndarray:
+    """Conservative angle-aware LiDAR resampling for policy input.
+
+    This is deliberately *not* a learned regression/super-resolution step.
+    A LaserScan already contains metric samples `(theta_i, r_i)`.  The policy,
+    however, expects a fixed 360-bin vector whose index semantics are stable.
+
+    Output convention:
+      output[front_index]                 = robot front, angle 0
+      output[front_index + num_bins / 4]  = robot left,  +pi/2
+      output[front_index + num_bins / 2]  = robot rear,  +/-pi
+      output[front_index + 3*num_bins/4] = robot right, -pi/2
+
+    Main difference from the older nearest/bin-center method:
+      - Each raw beam is treated as an angular cell, not a point sample.
+      - Each target policy bin is also an angular cell.
+      - A raw beam contributes to a target bin if the two angular cells overlap.
+      - Close obstacles are preserved by min-pooling robust ranges.
+      - Smooth ranges are overlap-weight averaged only for anti-aliasing.
+      - Final value is `min(weighted_smooth, raw_min + obstacle_margin)`.
+
+    This handles real LDS scans with 253/254 beams without leaving sparse holes
+    in the 360 policy vector and without hallucinating obstacles/free-space via
+    regression.
+    """
+    n = int(robust_ranges.size)
+    if n <= 0 or num_bins <= 0:
+        return np.ones(num_bins, dtype=np.float32) * max_range
+
+    angle_min = float(angle_min)
+    angle_increment = float(angle_increment)
+    if not np.isfinite(angle_min) or not np.isfinite(angle_increment) or abs(angle_increment) < 1e-12:
+        return _legacy_index_pool(
+            robust_ranges,
+            smooth_ranges,
+            num_bins,
+            min_range,
+            max_range,
+            obstacle_margin,
+        )
+
+    try:
+        front_index = int(front_index) % int(num_bins)
+    except Exception:
+        front_index = 0
+
+    # Full-circle LaserScan beams in the robot base frame.  ROS convention:
+    # angle=0 is forward, positive angle is counter-clockwise/left.
+    source_angles = angle_min + np.arange(n, dtype=np.float32) * angle_increment
+
+    # v9: explicit scan-convention correction.
+    # Some real LDS/driver paths use a different zero-angle or clockwise ordering
+    # than the Gazebo sensor used for training.  Do NOT bake this into TF; keep it
+    # local to the policy LiDAR preprocessing and RViz policy-scan debug.
+    #
+    #   TB3_RL_LIDAR_ANGLE_OFFSET_DEG : added to raw scan angles before binning
+    #   TB3_RL_LIDAR_FLIP_LR          : mirror left/right before offset
+    #
+    # Use offset/flip only after checking /rl_raw_scan_points vs /map.
+    if _env_bool("TB3_RL_LIDAR_FLIP_LR", False):
+        source_angles = -source_angles
+    angle_offset_deg = _env_float("TB3_RL_LIDAR_ANGLE_OFFSET_DEG", 0.0)
+    if abs(angle_offset_deg) > 1.0e-9:
+        source_angles = source_angles + math.radians(float(angle_offset_deg))
+
+    source_angles = np.arctan2(np.sin(source_angles), np.cos(source_angles)).astype(np.float32)
+
+    # Estimate angular support of each raw beam.  For an LDS with ~253 beams this
+    # is much wider than a 1-degree target bin; using this support avoids gaps.
+    source_half_width = 0.5 * abs(float(angle_increment))
+    if not np.isfinite(source_half_width) or source_half_width <= 1e-9:
+        source_half_width = math.pi / max(float(n), 1.0)
+
+    # Protect against malformed metadata.  If angle_max gives a clearly different
+    # increment, keep the larger support for safety/conservatism.
+    if angle_max is not None:
+        try:
+            meta_span = abs(float(angle_max) - float(angle_min))
+            if np.isfinite(meta_span) and n > 1:
+                meta_inc = meta_span / float(max(n - 1, 1))
+                if np.isfinite(meta_inc) and meta_inc > 1e-9:
+                    source_half_width = max(source_half_width, 0.5 * meta_inc)
+        except Exception:
+            pass
+
+    target_half_width = math.pi / float(num_bins)
+    support_width = source_half_width + target_half_width
+    eps = 1e-7
+
+    # For output bin j, choose the physical robot-frame angle assigned to that
+    # bin.  With front_index=0: j=0 front, j=90 left, j=180 rear, j=270 right.
+    bin_offsets = (np.arange(num_bins, dtype=np.float32) - float(front_index))
+    target_centers = 2.0 * math.pi * bin_offsets / float(num_bins)
+    target_centers = np.arctan2(np.sin(target_centers), np.cos(target_centers)).astype(np.float32)
+
+    pooled = np.empty(num_bins, dtype=np.float32)
+    for j, center in enumerate(target_centers):
+        diff = np.arctan2(np.sin(source_angles - center), np.cos(source_angles - center))
+        abs_diff = np.abs(diff)
+
+        # Angular cell-overlap criterion.  This is the key fix for 253/254-beam
+        # scans mapped into 360 policy bins.
+        mask = abs_diff <= (support_width + eps)
+        if not np.any(mask):
+            # Fallback only for malformed/non-full scans. Use nearest physical ray
+            # instead of index-space interpolation to preserve angular semantics.
+            nearest = int(np.argmin(abs_diff))
+            raw_min = float(robust_ranges[nearest])
+            smooth_mean = float(smooth_ranges[nearest])
+        else:
+            raw_min = float(np.min(robust_ranges[mask]))
+            # Triangular overlap-like weights.  These are for smooth anti-aliasing
+            # only; raw_min still prevents smoothing from hiding close obstacles.
+            weights = np.maximum((support_width + eps) - abs_diff[mask], eps).astype(np.float32)
+            smooth_vals = smooth_ranges[mask].astype(np.float32, copy=False)
+            smooth_mean = float(np.sum(weights * smooth_vals) / max(float(np.sum(weights)), eps))
+
+        pooled[j] = min(smooth_mean, raw_min + obstacle_margin)
+
+    return np.clip(pooled, min_range, max_range).astype(np.float32)
+
 def downsample_lidar(
     scan_ranges: Sequence[float],
     num_bins: int = 360,
@@ -217,6 +413,13 @@ def downsample_lidar(
     index-space pool if geometry metadata is missing.
 
     Runtime knobs:
+      TB3_RL_LIDAR_CANONICAL_FRONT_ZERO   default 1, set 0 to keep raw angle_min order
+      TB3_RL_LIDAR_FRONT_INDEX            default 0, 30 for 60-bin middle-front test
+      TB3_RL_LIDAR_ANGLE_OFFSET_DEG       default 0, raw scan angular correction before policy binning
+      TB3_RL_LIDAR_FLIP_LR                default 0, mirror raw scan left/right before policy binning
+      TB3_RL_LIDAR_SECTOR_BINS            optional intermediate sector count; leave 0 for direct output bins
+      TB3_RL_LIDAR_SECTOR_LOWPASS_KERNEL  default 3, sector-level conservative low-pass
+      TB3_RL_LIDAR_SECTOR_EXPAND_MODE     default linear, or nearest/repeat when sector bridge is used
       TB3_RL_LIDAR_UNIFORM_ANGLE_RESAMPLE default 1, set 0 to fallback
       TB3_RL_LIDAR_MEDIAN_KERNEL          default 3, set 1 to disable
       TB3_RL_LIDAR_LOWPASS_KERNEL         default 5, set 1 to disable
@@ -249,11 +452,77 @@ def downsample_lidar(
     robust_ranges = _circular_median_filter(ranges, median_kernel)
     smooth_ranges = _circular_lowpass_filter(robust_ranges, lowpass_kernel)
 
-    if _env_bool("TB3_RL_LIDAR_UNIFORM_ANGLE_RESAMPLE", True) and _valid_scan_geometry(
+    geometry_valid = _valid_scan_geometry(
         robust_ranges.size,
         scan_angle_min,
         scan_angle_increment,
-    ):
+    )
+
+    if geometry_valid and _env_bool("TB3_RL_LIDAR_CANONICAL_FRONT_ZERO", True):
+        try:
+            front_index = int(os.environ.get("TB3_RL_LIDAR_FRONT_INDEX", "0"))
+        except Exception:
+            front_index = 0
+        front_index = int(front_index) % int(num_bins)
+
+        # v4: optional stable-sector bridge.
+        # Existing 145000 checkpoint still requires 360 LiDAR inputs, but the
+        # real robot scan is only ~252 beams.  A direct 252->360 expansion is
+        # over-resolved and can amplify angular aliasing.  Instead:
+        #     raw scan -> filtered canonical sectors, e.g. 60 -> expand to 360
+        # This keeps the neural network input shape unchanged while reducing
+        # beam-count jitter and preserving obstacles conservatively.
+        sector_bins = _env_optional_int("TB3_RL_LIDAR_SECTOR_BINS", 0, min_value=0)
+        if sector_bins >= 2 and sector_bins != num_bins:
+            sector_front_index = int(round(float(front_index) * float(sector_bins) / float(num_bins))) % int(sector_bins)
+            sector_pooled = _canonical_angle_resample(
+                robust_ranges=robust_ranges,
+                smooth_ranges=smooth_ranges,
+                num_bins=sector_bins,
+                min_range=min_range,
+                max_range=max_range,
+                obstacle_margin=obstacle_margin,
+                angle_min=float(scan_angle_min),
+                angle_increment=float(scan_angle_increment),
+                angle_max=scan_angle_max,
+                front_index=sector_front_index,
+            )
+
+            sector_lowpass_kernel = _make_odd_kernel(
+                _env_int("TB3_RL_LIDAR_SECTOR_LOWPASS_KERNEL", 3),
+                min_value=1,
+            )
+            if sector_lowpass_kernel > 1 and sector_pooled.size > 2:
+                # Conservative sector-level low-pass: smooth free-space, but do
+                # not allow smoothing to erase a close obstacle by more than the
+                # existing obstacle margin.
+                sector_smooth = _circular_lowpass_filter(sector_pooled, sector_lowpass_kernel)
+                sector_pooled = np.minimum(sector_smooth, sector_pooled + obstacle_margin)
+                sector_pooled = np.clip(sector_pooled, min_range, max_range).astype(np.float32)
+
+            pooled = _expand_sector_bins_to_policy_bins(
+                sector_ranges=sector_pooled,
+                output_bins=num_bins,
+                sector_front_index=sector_front_index,
+                output_front_index=front_index,
+                min_range=min_range,
+                max_range=max_range,
+                mode=os.environ.get("TB3_RL_LIDAR_SECTOR_EXPAND_MODE", "linear"),
+            )
+        else:
+            pooled = _canonical_angle_resample(
+                robust_ranges=robust_ranges,
+                smooth_ranges=smooth_ranges,
+                num_bins=num_bins,
+                min_range=min_range,
+                max_range=max_range,
+                obstacle_margin=obstacle_margin,
+                angle_min=float(scan_angle_min),
+                angle_increment=float(scan_angle_increment),
+                angle_max=scan_angle_max,
+                front_index=front_index,
+            )
+    elif _env_bool("TB3_RL_LIDAR_UNIFORM_ANGLE_RESAMPLE", True) and geometry_valid:
         pooled = _uniform_angle_resample(
             robust_ranges=robust_ranges,
             smooth_ranges=smooth_ranges,

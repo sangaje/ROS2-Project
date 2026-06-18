@@ -25,7 +25,7 @@ from rclpy.qos import (
     ReliabilityPolicy,
 )
 from rosgraph_msgs.msg import Clock
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import LaserScan, Imu
 from std_srvs.srv import Empty
 
 try:
@@ -244,6 +244,8 @@ class TurtleBot3RosInterface(Node):
         scan_topic: str = "scan",
         odom_topic: str = "odom",
         cmd_vel_topic: str = "cmd_vel",
+        imu_topic: str = "imu",
+        model_odom_topic: str = "",
         clock_topic: str = "/clock",
         map_topic: str = "/map",
         enable_tf: bool = True,
@@ -266,6 +268,9 @@ class TurtleBot3RosInterface(Node):
         self.scan_topic = self._topic(scan_topic)
         self.odom_topic = self._topic(odom_topic)
         self.cmd_vel_topic = self._topic(cmd_vel_topic)
+        self.imu_topic = self._topic(imu_topic) if str(imu_topic or "").strip() else ""
+        _model_odom_env = os.environ.get("TB3_RL_MODEL_ODOM_TOPIC", "").strip()
+        self.model_odom_topic = str(model_odom_topic or _model_odom_env or "/model/burger/odometry").strip()
         self.clock_topic = clock_topic
         self.map_topic = map_topic.strip() if map_topic is not None else ""
         self.enable_cmd_vel_pub = bool(enable_cmd_vel_pub)
@@ -330,11 +335,15 @@ class TurtleBot3RosInterface(Node):
 
         self.scan: Optional[LaserScan] = None
         self.odom: Optional[Odometry] = None
+        self.imu: Optional[Imu] = None
+        self.model_odom: Optional[Odometry] = None
         self.clock: Optional[Clock] = None
         self.slam_map: Optional[OccupancyGrid] = None
 
         self.last_scan_time: Optional[float] = None
         self.last_odom_time: Optional[float] = None
+        self.last_imu_time: Optional[float] = None
+        self.last_model_odom_time: Optional[float] = None
         self.last_clock_time_sec: Optional[float] = None
         self.last_slam_map_time: Optional[float] = None
 
@@ -382,6 +391,24 @@ class TurtleBot3RosInterface(Node):
             self._odom_callback,
             sensor_qos,
         )
+
+        self.imu_sub = None
+        if self.imu_topic:
+            self.imu_sub = self.create_subscription(
+                Imu,
+                self.imu_topic,
+                self._imu_callback,
+                sensor_qos,
+            )
+
+        self.model_odom_sub = None
+        if self.model_odom_topic:
+            self.model_odom_sub = self.create_subscription(
+                Odometry,
+                self.model_odom_topic,
+                self._model_odom_callback,
+                sensor_qos,
+            )
 
         self.clock_sub = self.create_subscription(
             Clock,
@@ -447,6 +474,8 @@ class TurtleBot3RosInterface(Node):
 
         self.get_logger().info(f"scan topic    : {self.scan_topic}")
         self.get_logger().info(f"odom topic    : {self.odom_topic}")
+        self.get_logger().info(f"imu topic     : {self.imu_topic or '(disabled)'}")
+        self.get_logger().info(f"model odom    : {self.model_odom_topic or '(disabled)'}")
         self.get_logger().info(f"cmd_vel topic : {self.cmd_vel_topic}")
         self.get_logger().info(f"clock topic   : {self.clock_topic}")
         self.get_logger().info(f"slam map topic: {self.map_topic or '(disabled)'}")
@@ -518,6 +547,17 @@ class TurtleBot3RosInterface(Node):
             self.get_logger().warn(f"TF_GUARD | failed to start robot_state_publisher: {exc}")
             self.robot_state_publisher_proc = None
             return False
+
+    def _imu_callback(self, msg: Imu):
+        self.imu = msg
+        self.last_imu_time = time.time()
+
+    def _model_odom_callback(self, msg: Odometry):
+        # Gazebo model odometry carries the physical 6-DoF body pose more reliably
+        # than wheel odometry.  It is used only for floor-contact / body-instability
+        # checks, not for policy localization.
+        self.model_odom = msg
+        self.last_model_odom_time = time.time()
 
     def _publish_odom_tf_fallback(self, msg: Odometry) -> None:
         """Publish odom->base_footprint from /odom when Gazebo does not provide TF.
@@ -2000,14 +2040,8 @@ return options
         q = self.odom.pose.pose.orientation
         return float(q.x), float(q.y), float(q.z), float(q.w)
 
-    def get_roll_pitch_yaw(self) -> Optional[tuple[float, float, float]]:
-        quat = self.get_quaternion_xyzw()
-
-        if quat is None:
-            return None
-
-        x, y, z, w = quat
-
+    @staticmethod
+    def _quat_to_rpy_xyzw(x: float, y: float, z: float, w: float) -> tuple[float, float, float]:
         sinr_cosp = 2.0 * (w * x + y * z)
         cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
         roll = math.atan2(sinr_cosp, cosr_cosp)
@@ -2016,9 +2050,98 @@ return options
         sinp = max(-1.0, min(1.0, sinp))
         pitch = math.asin(sinp)
 
-        yaw = self._yaw_from_quaternion_xyzw(x, y, z, w)
-
+        yaw = TurtleBot3RosInterface._yaw_from_quaternion_xyzw(x, y, z, w)
         return roll, pitch, yaw
+
+    def get_roll_pitch_yaw(self) -> Optional[tuple[float, float, float]]:
+        quat = self.get_quaternion_xyzw()
+
+        if quat is None:
+            return None
+
+        x, y, z, w = quat
+        return self._quat_to_rpy_xyzw(x, y, z, w)
+
+    @staticmethod
+    def _quat_msg_valid(q) -> bool:
+        try:
+            n = float(q.x) * float(q.x) + float(q.y) * float(q.y) + float(q.z) * float(q.z) + float(q.w) * float(q.w)
+            return math.isfinite(n) and n > 0.25
+        except Exception:
+            return False
+
+    def get_body_roll_pitch_yaw(self) -> Optional[tuple[float, float, float]]:
+        """Return the physical body attitude for floor-contact checks.
+
+        Priority:
+          1. Gazebo model odometry (/model/burger/odometry) if present
+          2. IMU orientation (/imu) if present
+          3. normal /odom fallback
+
+        Policy localization still uses /odom/TF; this is only for detecting a
+        body that is tilted, airborne, or not stably planted on the floor.
+        """
+        try:
+            if self.model_odom is not None:
+                q = self.model_odom.pose.pose.orientation
+                if self._quat_msg_valid(q):
+                    return self._quat_to_rpy_xyzw(float(q.x), float(q.y), float(q.z), float(q.w))
+        except Exception:
+            pass
+        try:
+            if self.imu is not None:
+                q = self.imu.orientation
+                if self._quat_msg_valid(q):
+                    return self._quat_to_rpy_xyzw(float(q.x), float(q.y), float(q.z), float(q.w))
+        except Exception:
+            pass
+        return self.get_roll_pitch_yaw()
+
+    def get_body_z(self) -> Optional[float]:
+        try:
+            if self.model_odom is not None:
+                return float(self.model_odom.pose.pose.position.z)
+        except Exception:
+            pass
+        try:
+            if self.odom is not None:
+                return float(self.odom.pose.pose.position.z)
+        except Exception:
+            pass
+        return None
+
+    def get_body_angular_xy(self) -> tuple[float, float]:
+        try:
+            if self.imu is not None:
+                return float(self.imu.angular_velocity.x), float(self.imu.angular_velocity.y)
+        except Exception:
+            pass
+        try:
+            if self.model_odom is not None:
+                tw = self.model_odom.twist.twist
+                return float(tw.angular.x), float(tw.angular.y)
+        except Exception:
+            pass
+        try:
+            if self.odom is not None:
+                tw = self.odom.twist.twist
+                return float(tw.angular.x), float(tw.angular.y)
+        except Exception:
+            pass
+        return 0.0, 0.0
+
+    def get_body_vertical_velocity(self) -> float:
+        try:
+            if self.model_odom is not None:
+                return float(self.model_odom.twist.twist.linear.z)
+        except Exception:
+            pass
+        try:
+            if self.odom is not None:
+                return float(self.odom.twist.twist.linear.z)
+        except Exception:
+            pass
+        return 0.0
 
     def get_yaw(self, frame_id: Optional[str] = None) -> Optional[float]:
         pose = self.get_pose2d(frame_id=frame_id)

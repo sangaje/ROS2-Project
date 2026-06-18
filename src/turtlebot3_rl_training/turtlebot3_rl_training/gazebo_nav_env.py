@@ -17,6 +17,7 @@ import rclpy
 from builtin_interfaces.msg import Duration, Time as RosTime
 from geometry_msgs.msg import Point, PoseStamped
 from nav_msgs.msg import OccupancyGrid, Path as NavPath
+from sensor_msgs.msg import LaserScan
 from visualization_msgs.msg import Marker, MarkerArray
 from std_srvs.srv import Empty
 
@@ -217,7 +218,7 @@ class GazeboNavEnv(gym.Env):
         post_reset_ready_min_lidar_beams: int = 30,
         post_reset_ready_require_priority: bool = True,
         action_sync_reward_gate: bool = True,
-        action_sync_wait_timeout_sec: float = 0.18,
+        action_sync_wait_timeout_sec: float = 0.06,
         action_sync_min_scan_age_sec: float = 0.0,
         map_bounds_restart: bool = True,
         map_bounds_margin_cells: int = 2,
@@ -299,6 +300,7 @@ class GazeboNavEnv(gym.Env):
         map_obs_size: int = 48,
         map_obs_size_m: float = 6.0,
         use_temporal_cnn: bool = False,
+        num_lidar_bins: int = 60,
         temporal_history_len: int = 4,
         front_fov_deg: float = 80.0,
         confidence_decay_per_step: float = 0.0,
@@ -391,11 +393,21 @@ class GazeboNavEnv(gym.Env):
         velocity_spin_breaker_angular_scale: float = 0.35,
         velocity_spin_breaker_min_clearance_m: float = 0.48,
         shake_restart: bool = True,
-        shake_restart_steps: int = 8,
-        shake_tilt_threshold: float = 0.22,
-        shake_angular_xy_threshold: float = 1.80,
-        shake_linear_z_threshold: float = 0.22,
-        shake_z_deviation_threshold: float = 0.12,
+        shake_restart_steps: int = 4,
+        shake_tilt_threshold: float = 0.12,
+        shake_angular_xy_threshold: float = 0.70,
+        shake_linear_z_threshold: float = 0.08,
+        shake_z_deviation_threshold: float = 0.05,
+        shake_ground_min_z: float = -0.02,
+        shake_ground_max_z: float = 0.13,
+        shake_leaky_decay: bool = True,
+        shake_yaw_wobble: bool = False,
+        shake_yaw_rate_threshold: float = 0.24,
+        shake_cmd_flip_threshold: float = 0.16,
+        shake_wobble_window_steps: int = 8,
+        shake_wobble_min_flips: int = 2,
+        shake_wobble_max_net_motion_m: float = 0.045,
+        shake_spin_stall_restart_steps: int = 18,
         shake_restart_penalty: float = 100.0,
         reset_hard_stabilize_reapply: bool = True,
         reset_hard_stabilize_reapply_interval_sec: float = 0.25,
@@ -1055,7 +1067,10 @@ class GazeboNavEnv(gym.Env):
                 f"sim_steps_per_action={self.sim_steps_per_action}"
             )
 
-        self.num_lidar_bins = 360
+        # v5: policy LiDAR input can be reduced to 60 sectors.
+        # Existing 360-bin checkpoints are not compatible with this setting;
+        # train/evaluate checkpoints with the same --num-lidar-bins.
+        self.num_lidar_bins = max(int(num_lidar_bins), 1)
         self.obs_extra_dim = 10
         self.obs_dim = self.num_lidar_bins + self.obs_extra_dim
 
@@ -1201,6 +1216,63 @@ class GazeboNavEnv(gym.Env):
                 self.waypoint_path_topic,
                 10,
             )
+
+        # v2 real-robot LiDAR diagnostics: publish the exact 360-bin vector seen
+        # by the policy as a LaserScan. This is not fed back into SLAM.
+        self.policy_scan_topic = str(os.environ.get("TB3_RL_POLICY_SCAN_TOPIC", "/rl_policy_scan") or "").strip()
+        self.policy_scan_publish_every_n = max(
+            int(os.environ.get("TB3_RL_POLICY_SCAN_PUBLISH_EVERY_N", "5")),
+            1,
+        )
+        self.policy_scan_pub = None
+        if self.policy_scan_topic:
+            self.policy_scan_pub = self.ros.create_publisher(
+                LaserScan,
+                self.policy_scan_topic,
+                10,
+            )
+
+        # v5: explicit 60-sector debug topic.  When --num-lidar-bins=60 this is
+        # the exact vector slice fed to the policy, rendered as LaserScan in RViz.
+        self.policy_scan_60_topic = str(
+            os.environ.get("TB3_RL_POLICY_SCAN_60_TOPIC", "/rl_policy_scan_60") or ""
+        ).strip()
+        self.policy_scan_60_pub = None
+        if self.policy_scan_60_topic:
+            self.policy_scan_60_pub = self.ros.create_publisher(
+                LaserScan,
+                self.policy_scan_60_topic,
+                10,
+            )
+
+        # v7 RViz alignment debug: publish policy/raw scan endpoints directly in
+        # the map frame as MarkerArray.  LaserScan displays depend on RViz TF
+        # timing and scan frame orientation; map-frame markers make it explicit
+        # whether the mismatch is from TF/map alignment or LiDAR preprocessing.
+        self.policy_scan_marker_topic = str(
+            os.environ.get("TB3_RL_POLICY_SCAN_MARKER_TOPIC", "/rl_policy_scan_60_points") or ""
+        ).strip()
+        self.policy_scan_marker_pub = None
+        if self.policy_scan_marker_topic:
+            self.policy_scan_marker_pub = self.ros.create_publisher(
+                MarkerArray,
+                self.policy_scan_marker_topic,
+                10,
+            )
+
+        self.raw_scan_marker_topic = str(
+            os.environ.get("TB3_RL_RAW_SCAN_MARKER_TOPIC", "/rl_raw_scan_points") or ""
+        ).strip()
+        self.raw_scan_marker_pub = None
+        if self.raw_scan_marker_topic:
+            self.raw_scan_marker_pub = self.ros.create_publisher(
+                MarkerArray,
+                self.raw_scan_marker_topic,
+                10,
+            )
+
+        self._last_scan_geometry_log_time = 0.0
+        self._last_scan_geometry_debug = {}
 
         if self.debug_input_map and self.use_map_cnn:
             self._init_debug_input_map_publishers()
@@ -1355,7 +1427,22 @@ class GazeboNavEnv(gym.Env):
         self.shake_tilt_threshold = max(float(shake_tilt_threshold), 0.01)
         self.shake_angular_xy_threshold = max(float(shake_angular_xy_threshold), 0.01)
         self.shake_linear_z_threshold = max(float(shake_linear_z_threshold), 0.01)
-        self.shake_z_deviation_threshold = max(float(shake_z_deviation_threshold), 0.01)
+        self.shake_z_deviation_threshold = max(float(shake_z_deviation_threshold), 0.005)
+        self.shake_ground_min_z = float(shake_ground_min_z)
+        self.shake_ground_max_z = float(shake_ground_max_z)
+        if self.shake_ground_min_z > self.shake_ground_max_z:
+            self.shake_ground_min_z, self.shake_ground_max_z = self.shake_ground_max_z, self.shake_ground_min_z
+        self.shake_leaky_decay = bool(shake_leaky_decay)
+        # v10: "shake" means physical body instability: the robot is tilted,
+        # bouncing in z, or not planted on the floor.  Planar yaw oscillation is
+        # no longer counted as shake by default; use the spin breaker for that.
+        self.shake_yaw_wobble = bool(shake_yaw_wobble)
+        self.shake_yaw_rate_threshold = max(float(shake_yaw_rate_threshold), 0.01)
+        self.shake_cmd_flip_threshold = max(float(shake_cmd_flip_threshold), 0.01)
+        self.shake_wobble_window_steps = max(int(shake_wobble_window_steps), 3)
+        self.shake_wobble_min_flips = max(int(shake_wobble_min_flips), 1)
+        self.shake_wobble_max_net_motion_m = max(float(shake_wobble_max_net_motion_m), 0.0)
+        self.shake_spin_stall_restart_steps = max(int(shake_spin_stall_restart_steps), 0)
         self.shake_restart_penalty = max(float(shake_restart_penalty), 0.0)
         self.reset_hard_stabilize_reapply = bool(reset_hard_stabilize_reapply)
         self.reset_hard_stabilize_reapply_interval_sec = max(float(reset_hard_stabilize_reapply_interval_sec), 0.05)
@@ -1363,6 +1450,8 @@ class GazeboNavEnv(gym.Env):
         self._last_shake_active = False
         self._last_shake_restart = False
         self._last_shake_reason = "none"
+        self._shake_wobble_history = deque(maxlen=int(self.shake_wobble_window_steps))
+        self._shake_last_wobble_reason = "none"
         self._reset_nominal_z = float(reset_z)
 
         self.nav2_stuck_steps = 0
@@ -2261,6 +2350,11 @@ class GazeboNavEnv(gym.Env):
         self._last_shake_active = False
         self._last_shake_restart = False
         self._last_shake_reason = "none"
+        self._shake_last_wobble_reason = "none"
+        try:
+            self._shake_wobble_history.clear()
+        except Exception:
+            self._shake_wobble_history = deque(maxlen=int(getattr(self, "shake_wobble_window_steps", 8)))
         self.nav2_stuck_steps = 0
         self.nav2_backup_cooldown_steps = 0
         self._last_nav2_stuck_active = False
@@ -3224,18 +3318,15 @@ class GazeboNavEnv(gym.Env):
         if lidar_empty_restart:
             reward = -float(self.lidar_empty_restart_penalty)
 
-        # Time-limit is not a neutral ending in exploration.  Without this,
-        # a policy can prefer a low-risk local loop with many small negative
-        # rewards over taking informative Nav2 goals.  Penalize only non-success
-        # timeouts; collision/fallen/out-of-bounds are already -100 hard terminals.
+        # v6: Time-limit/episode timeout is a neutral truncation, not a penalty.
+        # Collision/fallen/drop/lidar-empty/stuck restarts can still terminate with
+        # their own penalties, but simply reaching max_episode_steps must not inject
+        # an additional negative reward.  This keeps long but safe exploration runs
+        # from being punished only because the episode horizon expired.
         will_truncate = bool((self.step_count + 1) >= self.max_episode_steps)
         if will_truncate and not (collision_like or fallen or coverage_done or priority_stuck_restart or lidar_empty_restart):
-            target_cov = max(float(self.target_coverage_ratio), 1e-6)
-            missing_cov = float(np.clip((target_cov - float(reward_map_stats.coverage_ratio)) / target_cov, 0.0, 1.0))
-            stall_norm = float(np.clip(float(self.explored_stall_steps) / 80.0, 0.0, 1.0))
-            timeout_penalty = 35.0 + 45.0 * missing_cov + 15.0 * stall_norm
-            reward -= timeout_penalty
-            self._last_terminal_reason = "timeout_low_coverage"
+            if self._last_terminal_reason == "none":
+                self._last_terminal_reason = "time_limit"
 
         priority_clear_reward, priority_recheck_reward, priority_check_reward = self._estimate_priority_check_reward_component(reward_map_stats)
         self._last_priority_clear_reward = float(priority_clear_reward)
@@ -6389,6 +6480,17 @@ class GazeboNavEnv(gym.Env):
             f"raw(v,w)=({fnum(raw[0]):+.3f},{fnum(raw[1]):+.3f})  "
             f"cmd=({fnum(exe[0]):+.3f},{fnum(exe[1]):+.3f})\n"
             f"front={front:.2f}m  actionObs={act_obs:.2f}m  score={act_score:.2f}  near={nearest:.2f}m\n"
+            f"scan raw={int(getattr(self, '_last_scan_geometry_debug', {}).get('raw_count', 0))} "
+            f"exp={int(getattr(self, '_last_scan_geometry_debug', {}).get('expected_by_meta', 0))} "
+            f"bins={int(getattr(self, '_last_scan_geometry_debug', {}).get('policy_bins', self.num_lidar_bins))} "
+            f"amin={float(getattr(self, '_last_scan_geometry_debug', {}).get('angle_min', 0.0)):+.2f} "
+            f"amax={float(getattr(self, '_last_scan_geometry_debug', {}).get('angle_max', 0.0)):+.2f} "
+            f"canon={int(bool(getattr(self, '_last_scan_geometry_debug', {}).get('canonical', False)))} "
+            f"frontIdx={int(getattr(self, '_last_scan_geometry_debug', {}).get('front_index', 0))} "
+            f"sector={int(getattr(self, '_last_scan_geometry_debug', {}).get('sector_bins', 0))} "
+            f"lp={int(getattr(self, '_last_scan_geometry_debug', {}).get('sector_lowpass_kernel', 0))} "
+            f"expand={str(getattr(self, '_last_scan_geometry_debug', {}).get('sector_expand_mode', ''))} "
+            f"pmin={float(getattr(self, '_last_scan_geometry_debug', {}).get('policy_min', 0.0)):.2f}\n"
             f"SAFE pen={safety_pen:.2f} slow={slowdown:.2f} cd={safety_cd} assist={int(bool(getattr(self, '_last_velocity_forward_assist', False)))} spinfix={int(bool(getattr(self, '_last_velocity_spin_breaker', False)))} limit={int(bool(getattr(self, '_last_velocity_command_limited', False)))}  {safety_reason} {str(getattr(self, '_last_velocity_command_limit_reason', 'none'))}\n"
             f"Shake={shake_steps}/{shake_limit} {shake_reason}  "
             f"Lempty={l_empty_steps}/{l_empty_timeout} beams={valid_beams}  "
@@ -7047,14 +7149,361 @@ class GazeboNavEnv(gym.Env):
         self._last_debug_input_map_publish_step = self.step_count
         self._last_debug_input_map_published = True
 
+    def _scan_float(self, value, default=0.0):
+        try:
+            out = float(value)
+            return out if math.isfinite(out) else float(default)
+        except Exception:
+            return float(default)
+
+    def _scan_bool_env(self, name: str, default: bool) -> bool:
+        raw = os.environ.get(name, "1" if default else "0")
+        return str(raw).strip().lower() not in {"0", "false", "no", "off", "disable", "disabled"}
+
+    def _policy_scan_front_index(self) -> int:
+        try:
+            return int(os.environ.get("TB3_RL_LIDAR_FRONT_INDEX", "0")) % max(int(self.num_lidar_bins), 1)
+        except Exception:
+            return 0
+
+    def _update_scan_geometry_debug(self, scan_msg, vector_obs: np.ndarray) -> None:
+        raw_ranges = getattr(scan_msg, "ranges", []) or []
+        raw_count = len(raw_ranges)
+        angle_min = self._scan_float(getattr(scan_msg, "angle_min", 0.0), 0.0)
+        angle_max = self._scan_float(getattr(scan_msg, "angle_max", 0.0), 0.0)
+        angle_inc = self._scan_float(getattr(scan_msg, "angle_increment", 0.0), 0.0)
+        canonical = self._scan_bool_env("TB3_RL_LIDAR_CANONICAL_FRONT_ZERO", True)
+        front_index = self._policy_scan_front_index()
+        metadata_valid = raw_count > 0 and math.isfinite(angle_min) and math.isfinite(angle_inc) and abs(angle_inc) > 1e-12
+        expected_by_meta = 0
+        if metadata_valid:
+            expected_by_meta = int(round(abs(angle_max - angle_min) / max(abs(angle_inc), 1e-12))) + 1
+
+        lidar_vec = np.asarray(vector_obs[: self.num_lidar_bins], dtype=np.float32)
+        finite = lidar_vec[np.isfinite(lidar_vec)]
+        lidar_min = float(np.min(finite)) if finite.size else float("nan")
+        lidar_mean = float(np.mean(finite)) if finite.size else float("nan")
+
+        self._last_scan_geometry_debug = {
+            "raw_count": int(raw_count),
+            "expected_by_meta": int(expected_by_meta),
+            "angle_min": float(angle_min),
+            "angle_max": float(angle_max),
+            "angle_increment": float(angle_inc),
+            "metadata_valid": bool(metadata_valid),
+            "canonical": bool(canonical),
+            "front_index": int(front_index),
+            "angle_offset_deg": float(math.degrees(self._policy_scan_angle_offset_rad())),
+            "flip_lr": bool(self._policy_scan_flip_lr()),
+            "sector_bins": int(os.environ.get("TB3_RL_LIDAR_SECTOR_BINS", "0") or "0") if str(os.environ.get("TB3_RL_LIDAR_SECTOR_BINS", "0")).lstrip("-+").isdigit() else 0,
+            "sector_lowpass_kernel": int(os.environ.get("TB3_RL_LIDAR_SECTOR_LOWPASS_KERNEL", "0") or "0") if str(os.environ.get("TB3_RL_LIDAR_SECTOR_LOWPASS_KERNEL", "0")).lstrip("-+").isdigit() else 0,
+            "sector_expand_mode": str(os.environ.get("TB3_RL_LIDAR_SECTOR_EXPAND_MODE", "")),
+            "policy_bins": int(self.num_lidar_bins),
+            "input_lidar_bins": int(self.num_lidar_bins),
+            "policy_min": float(lidar_min),
+            "policy_mean": float(lidar_mean),
+        }
+
+        now = time.time()
+        if now - float(getattr(self, "_last_scan_geometry_log_time", 0.0)) >= 5.0:
+            self._last_scan_geometry_log_time = now
+            try:
+                self.ros.get_logger().warn(
+                    "OBS_SCAN_GEOMETRY | "
+                    f"raw={raw_count} expected={expected_by_meta} input_bins={self.num_lidar_bins} "
+                    f"angle_min={angle_min:.6f} angle_max={angle_max:.6f} inc={angle_inc:.9f} "
+                    f"metadata_valid={metadata_valid} canonical={canonical} front_index={front_index} "
+                    f"policy_min={lidar_min:.3f} policy_mean={lidar_mean:.3f}"
+                )
+            except Exception:
+                pass
+
+
+    def _tf_pose2d_at(self, target_frame: str, source_frame: str, stamp=None) -> Optional[tuple[float, float, float]]:
+        """Return source_frame pose expressed in target_frame at the scan timestamp.
+
+        v8 used the latest TF for markers/policy-scan debug. During Cartographer
+        updates, map->odom can change even if the robot is physically stationary;
+        combining an old LaserScan with a latest pose makes debug points look like
+        they rotate or slide relative to /map. v9 uses the raw scan stamp first.
+        """
+        target_frame = str(target_frame or "map").strip().lstrip("/") or "map"
+        source_frame = str(source_frame or "base_scan").strip().lstrip("/") or "base_scan"
+        tf_buffer = getattr(self.ros, "tf_buffer", None)
+        if tf_buffer is None:
+            return None
+
+        query_time = rclpy.time.Time()
+        if stamp is not None:
+            try:
+                if int(getattr(stamp, "sec", 0)) != 0 or int(getattr(stamp, "nanosec", 0)) != 0:
+                    query_time = rclpy.time.Time.from_msg(stamp)
+            except Exception:
+                query_time = rclpy.time.Time()
+
+        try:
+            transform = tf_buffer.lookup_transform(
+                target_frame,
+                source_frame,
+                query_time,
+                timeout=rclpy.duration.Duration(seconds=0.04),
+            )
+        except Exception:
+            try:
+                transform = tf_buffer.lookup_transform(
+                    target_frame,
+                    source_frame,
+                    rclpy.time.Time(),
+                    timeout=rclpy.duration.Duration(seconds=0.02),
+                )
+            except Exception:
+                return None
+        t = transform.transform.translation
+        q = transform.transform.rotation
+        yaw = self._yaw_from_quaternion_xyzw_static(q.x, q.y, q.z, q.w)
+        return float(t.x), float(t.y), float(yaw)
+
+    def _tf_pose2d_latest(self, target_frame: str, source_frame: str) -> Optional[tuple[float, float, float]]:
+        return self._tf_pose2d_at(target_frame=target_frame, source_frame=source_frame, stamp=None)
+
+    def _policy_scan_angle_offset_rad(self) -> float:
+        try:
+            return math.radians(float(os.environ.get("TB3_RL_LIDAR_ANGLE_OFFSET_DEG", "0.0")))
+        except Exception:
+            return 0.0
+
+    def _policy_scan_flip_lr(self) -> bool:
+        return self._scan_bool_env("TB3_RL_LIDAR_FLIP_LR", False)
+
+    def _correct_scan_angles_for_policy(self, angles: np.ndarray) -> np.ndarray:
+        out = np.asarray(angles, dtype=np.float32)
+        if self._policy_scan_flip_lr():
+            out = -out
+        offset = self._policy_scan_angle_offset_rad()
+        if abs(offset) > 1.0e-12:
+            out = out + float(offset)
+        return np.arctan2(np.sin(out), np.cos(out)).astype(np.float32)
+
+    @staticmethod
+    def _marker_lifetime(sec: float = 0.35) -> Duration:
+        sec = max(float(sec), 0.0)
+        whole = int(sec)
+        nano = int(round((sec - whole) * 1_000_000_000.0))
+        return Duration(sec=whole, nanosec=nano)
+
+    def _make_scan_points_marker_array(
+        self,
+        *,
+        ranges: np.ndarray,
+        angles: np.ndarray,
+        target_frame: str,
+        source_frame: str,
+        namespace: str,
+        point_rgb: tuple[float, float, float],
+        ray_rgb: tuple[float, float, float],
+        point_scale: float = 0.055,
+        ray_scale: float = 0.010,
+        max_points: int = 720,
+        stamp=None,
+    ) -> Optional[MarkerArray]:
+        """Create map-frame scan endpoint/ray markers for RViz debugging.
+
+        The key difference from the LaserScan debug topic is that these markers
+        are already transformed into `target_frame` at publish time. If raw scan
+        markers fit the map but policy markers do not, the problem is the policy
+        resampler convention. If both are shifted, the problem is TF/Cartographer
+        pose/map alignment.
+        """
+        ranges = np.asarray(ranges, dtype=np.float32)
+        angles = np.asarray(angles, dtype=np.float32)
+        if ranges.size == 0 or angles.size == 0:
+            return None
+        n = int(min(ranges.size, angles.size))
+        if n <= 0:
+            return None
+        pose = self._tf_pose2d_at(target_frame=target_frame, source_frame=source_frame, stamp=stamp)
+        if pose is None:
+            return None
+        ox, oy, yaw = pose
+
+        # Downsample only if somebody accidentally publishes a very dense scan.
+        step = max(1, int(math.ceil(float(n) / float(max(max_points, 1)))))
+        idxs = range(0, n, step)
+
+        arr = MarkerArray()
+        marker_stamp = stamp if stamp is not None else self._latest_tf_stamp()
+        lifetime = self._marker_lifetime(0.45)
+
+        pts = Marker()
+        pts.header.frame_id = target_frame
+        pts.header.stamp = marker_stamp
+        pts.ns = namespace
+        pts.id = 0
+        pts.type = Marker.POINTS
+        pts.action = Marker.ADD
+        pts.pose.orientation.w = 1.0
+        pts.scale.x = float(point_scale)
+        pts.scale.y = float(point_scale)
+        self._set_marker_color(pts, point_rgb[0], point_rgb[1], point_rgb[2], 0.95)
+        pts.lifetime = lifetime
+
+        rays = Marker()
+        rays.header.frame_id = target_frame
+        rays.header.stamp = marker_stamp
+        rays.ns = namespace
+        rays.id = 1
+        rays.type = Marker.LINE_LIST
+        rays.action = Marker.ADD
+        rays.pose.orientation.w = 1.0
+        rays.scale.x = float(ray_scale)
+        self._set_marker_color(rays, ray_rgb[0], ray_rgb[1], ray_rgb[2], 0.35)
+        rays.lifetime = lifetime
+
+        origin = self._point_xyz(ox, oy, 0.07)
+        for i in idxs:
+            rr = float(ranges[i])
+            aa = float(angles[i])
+            if not math.isfinite(rr) or rr <= 0.0:
+                continue
+            gx = ox + rr * math.cos(yaw + aa)
+            gy = oy + rr * math.sin(yaw + aa)
+            p = self._point_xyz(gx, gy, 0.07)
+            pts.points.append(p)
+            rays.points.append(origin)
+            rays.points.append(p)
+
+        arr.markers.append(pts)
+        arr.markers.append(rays)
+        return arr
+
+    def _publish_policy_scan_map_debug(self, vector_obs: np.ndarray, raw_scan_msg) -> None:
+        if self.policy_scan_marker_pub is None and self.raw_scan_marker_pub is None:
+            return
+        try:
+            target_frame = str(self.map_frame or "map").strip().lstrip("/") or "map"
+            raw_header = getattr(raw_scan_msg, "header", None)
+            raw_stamp = getattr(raw_header, "stamp", None)
+            scan_frame = str(getattr(raw_header, "frame_id", "") or "base_scan").strip().lstrip("/") or "base_scan"
+
+            raw_min = self._scan_float(getattr(raw_scan_msg, "range_min", 0.12), 0.12)
+            raw_max = self._scan_float(getattr(raw_scan_msg, "range_max", 3.5), 3.5)
+            if raw_max <= raw_min + 1e-6:
+                raw_min, raw_max = 0.12, 3.5
+
+            # Policy vector markers: exactly the LiDAR slice the policy sees.
+            if self.policy_scan_marker_pub is not None:
+                num_bins = max(int(self.num_lidar_bins), 1)
+                norm = np.asarray(vector_obs[:num_bins], dtype=np.float32)
+                norm = np.nan_to_num(norm, nan=1.0, posinf=1.0, neginf=0.0)
+                policy_ranges = np.clip(norm, 0.0, 1.0) * (raw_max - raw_min) + raw_min
+                front_index = self._policy_scan_front_index()
+                policy_angles = 2.0 * math.pi * (np.arange(num_bins, dtype=np.float32) - float(front_index)) / float(num_bins)
+                policy_angles = np.arctan2(np.sin(policy_angles), np.cos(policy_angles)).astype(np.float32)
+                arr = self._make_scan_points_marker_array(
+                    ranges=policy_ranges,
+                    angles=policy_angles,
+                    target_frame=target_frame,
+                    source_frame=scan_frame,
+                    namespace="rl_policy_scan_60_map_points",
+                    point_rgb=(0.0, 1.0, 1.0),
+                    ray_rgb=(0.0, 0.7, 1.0),
+                    point_scale=0.075,
+                    ray_scale=0.012,
+                    max_points=max(num_bins, 1),
+                    stamp=raw_stamp,
+                )
+                if arr is not None:
+                    self.policy_scan_marker_pub.publish(arr)
+
+            # Raw scan markers: use this as the reference. It should match the
+            # SLAM map if Cartographer TF/map alignment is healthy.
+            if self.raw_scan_marker_pub is not None:
+                raw_ranges = np.asarray(getattr(raw_scan_msg, "ranges", []) or [], dtype=np.float32)
+                if raw_ranges.size > 0:
+                    raw_ranges = np.nan_to_num(raw_ranges, nan=raw_max, posinf=raw_max, neginf=raw_min)
+                    raw_ranges = np.clip(raw_ranges, raw_min, raw_max).astype(np.float32)
+                    angle_min = self._scan_float(getattr(raw_scan_msg, "angle_min", 0.0), 0.0)
+                    angle_inc = self._scan_float(getattr(raw_scan_msg, "angle_increment", 0.0), 0.0)
+                    raw_angles = angle_min + np.arange(raw_ranges.size, dtype=np.float32) * float(angle_inc)
+                    raw_angles = np.arctan2(np.sin(raw_angles), np.cos(raw_angles)).astype(np.float32)
+                    # Apply the same explicit convention correction used by the
+                    # policy resampler. Set TB3_RL_RAW_SCAN_MARKER_UNCORRECTED=1
+                    # to see the driver-native raw scan instead.
+                    if not self._scan_bool_env("TB3_RL_RAW_SCAN_MARKER_UNCORRECTED", False):
+                        raw_angles = self._correct_scan_angles_for_policy(raw_angles)
+                    arr = self._make_scan_points_marker_array(
+                        ranges=raw_ranges,
+                        angles=raw_angles,
+                        target_frame=target_frame,
+                        source_frame=scan_frame,
+                        namespace="rl_raw_scan_map_points",
+                        point_rgb=(1.0, 1.0, 1.0),
+                        ray_rgb=(1.0, 1.0, 1.0),
+                        point_scale=0.035,
+                        ray_scale=0.006,
+                        max_points=360,
+                        stamp=raw_stamp,
+                    )
+                    if arr is not None:
+                        self.raw_scan_marker_pub.publish(arr)
+        except Exception as exc:
+            try:
+                self.ros.get_logger().warn(f"SCAN_MAP_DEBUG_PUBLISH_FAILED | {exc}")
+            except Exception:
+                pass
+
+    def _publish_policy_scan(self, vector_obs: np.ndarray, raw_scan_msg) -> None:
+        if self.policy_scan_pub is None and self.policy_scan_60_pub is None:
+            return
+        if self.step_count % self.policy_scan_publish_every_n != 0:
+            return
+        try:
+            num_bins = max(int(self.num_lidar_bins), 1)
+            min_range = 0.12
+            max_range = 3.5
+            norm = np.asarray(vector_obs[:num_bins], dtype=np.float32)
+            norm = np.nan_to_num(norm, nan=1.0, posinf=1.0, neginf=0.0)
+            ranges = np.clip(norm, 0.0, 1.0) * (max_range - min_range) + min_range
+
+            msg = LaserScan()
+            raw_header = getattr(raw_scan_msg, "header", None)
+            raw_stamp = getattr(raw_header, "stamp", None)
+            msg.header.stamp = raw_stamp if raw_stamp is not None else self._latest_tf_stamp()
+            msg.header.frame_id = str(getattr(raw_header, "frame_id", "") or "base_scan")
+            front_index = self._policy_scan_front_index()
+            msg.angle_increment = float(2.0 * math.pi / float(num_bins))
+            msg.angle_min = float(-msg.angle_increment * float(front_index))
+            msg.angle_max = float(msg.angle_min + msg.angle_increment * float(num_bins - 1))
+            msg.time_increment = 0.0
+            msg.scan_time = 0.0
+            msg.range_min = min_range
+            msg.range_max = max_range
+            msg.ranges = [float(x) for x in ranges.tolist()]
+            msg.intensities = []
+            if self.policy_scan_pub is not None:
+                self.policy_scan_pub.publish(msg)
+            if self.policy_scan_60_pub is not None:
+                self.policy_scan_60_pub.publish(msg)
+            self._publish_policy_scan_map_debug(vector_obs, raw_scan_msg)
+        except Exception as exc:
+            try:
+                self.ros.get_logger().warn(f"POLICY_SCAN_PUBLISH_FAILED | {exc}")
+            except Exception:
+                pass
+
     def _get_obs(self):
         if self.ros.scan is None or self.ros.odom is None:
             return self._empty_observation()
 
         stats = self.last_map_stats
 
+        scan_msg = self.ros.scan
+        scan_angle_min = getattr(scan_msg, "angle_min", None)
+        scan_angle_increment = getattr(scan_msg, "angle_increment", None)
+        scan_angle_max = getattr(scan_msg, "angle_max", None)
+
         vector_obs = build_exploration_observation(
-            scan_ranges=self.ros.scan.ranges,
+            scan_ranges=scan_msg.ranges,
             coverage_ratio=stats.coverage_ratio,
             coverage_delta=stats.coverage_delta,
             frontier_distance=stats.frontier_distance,
@@ -7067,7 +7516,13 @@ class GazeboNavEnv(gym.Env):
             num_lidar_bins=self.num_lidar_bins,
             max_linear_speed=self.max_linear_speed,
             max_angular_speed=self.max_angular_speed,
+            scan_angle_min=scan_angle_min,
+            scan_angle_increment=scan_angle_increment,
+            scan_angle_max=scan_angle_max,
         ).astype(np.float32)
+
+        self._update_scan_geometry_debug(scan_msg, vector_obs)
+        self._publish_policy_scan(vector_obs, scan_msg)
 
         self._push_vector_history(vector_obs)
 
@@ -7188,56 +7643,202 @@ class GazeboNavEnv(gym.Env):
         return hit
 
     def _instantaneous_shake_reason(self) -> str:
-        """Return a non-'none' reason when the robot body is dynamically unstable."""
+        """Return a non-'none' reason when the body is not stably planted.
+
+        In this project "shake" is not planar spinning.  It means the physical
+        TurtleBot body is wobbling, tilted, bouncing, airborne, or otherwise not
+        properly attached to the floor.  Use the best available 6-DoF source:
+        Gazebo model odometry, IMU, then normal odometry as a fallback.
+        """
         if not bool(getattr(self, "shake_restart", True)):
             return "none"
         try:
-            rpy = self.ros.get_roll_pitch_yaw()
+            rpy = None
+            if hasattr(self.ros, "get_body_roll_pitch_yaw"):
+                rpy = self.ros.get_body_roll_pitch_yaw()
+            if rpy is None:
+                rpy = self.ros.get_roll_pitch_yaw()
             roll = pitch = 0.0
             if rpy is not None:
                 roll, pitch, _ = rpy
             tilt = max(abs(float(roll)), abs(float(pitch)))
 
-            wx = wy = vz = z_dev = 0.0
-            if self.ros.odom is not None:
+            wx = wy = 0.0
+            if hasattr(self.ros, "get_body_angular_xy"):
+                wx, wy = self.ros.get_body_angular_xy()
+            elif self.ros.odom is not None:
                 twist = self.ros.odom.twist.twist
                 wx = float(getattr(twist.angular, "x", 0.0))
                 wy = float(getattr(twist.angular, "y", 0.0))
-                vz = float(getattr(twist.linear, "z", 0.0))
-                z = float(self.ros.odom.pose.pose.position.z)
-                nominal_z = float(getattr(self, "_reset_nominal_z", 0.05))
-                z_dev = abs(z - nominal_z)
 
-            if tilt >= float(getattr(self, "shake_tilt_threshold", 0.22)):
-                return f"tilt:{tilt:.3f}"
-            if math.hypot(wx, wy) >= float(getattr(self, "shake_angular_xy_threshold", 1.80)):
-                return f"ang_xy:{math.hypot(wx, wy):.3f}"
-            if abs(vz) >= float(getattr(self, "shake_linear_z_threshold", 0.22)):
-                return f"vz:{vz:.3f}"
-            if z_dev >= float(getattr(self, "shake_z_deviation_threshold", 0.12)):
-                return f"z_dev:{z_dev:.3f}"
+            vz = 0.0
+            if hasattr(self.ros, "get_body_vertical_velocity"):
+                vz = self.ros.get_body_vertical_velocity()
+            elif self.ros.odom is not None:
+                vz = float(getattr(self.ros.odom.twist.twist.linear, "z", 0.0))
+
+            body_z = None
+            if hasattr(self.ros, "get_body_z"):
+                body_z = self.ros.get_body_z()
+            elif self.ros.odom is not None:
+                body_z = float(self.ros.odom.pose.pose.position.z)
+
+            nominal_z = float(getattr(self, "_reset_nominal_z", 0.05))
+            z_dev = 0.0 if body_z is None else abs(float(body_z) - nominal_z)
+            z_min = float(getattr(self, "shake_ground_min_z", -0.02))
+            z_max = float(getattr(self, "shake_ground_max_z", 0.13))
+
+            if tilt >= float(getattr(self, "shake_tilt_threshold", 0.12)):
+                return f"body_tilt:roll={roll:.3f},pitch={pitch:.3f}"
+            if body_z is not None and (float(body_z) < z_min or float(body_z) > z_max):
+                return f"body_z:{float(body_z):.3f}[{z_min:.2f},{z_max:.2f}]"
+            if body_z is not None and z_dev >= float(getattr(self, "shake_z_deviation_threshold", 0.05)):
+                return f"body_z_dev:{z_dev:.3f}"
+            ang_xy = math.hypot(float(wx), float(wy))
+            if ang_xy >= float(getattr(self, "shake_angular_xy_threshold", 0.70)):
+                return f"body_ang_xy:{ang_xy:.3f}"
+            if abs(float(vz)) >= float(getattr(self, "shake_linear_z_threshold", 0.08)):
+                return f"body_vz:{float(vz):.3f}"
         except Exception as exc:
             return f"shake_check_error:{type(exc).__name__}"
         return "none"
 
+    def _update_yaw_wobble_reason(self) -> str:
+        """Detect planar left/right wobble that does not show up as roll/pitch.
+
+        In Gazebo and on TurtleBot3 odometry, angular.x/y are often zero even
+        when the robot visibly wiggles.  The failure mode is repeated angular.z
+        sign flips or long in-place spinning with very small net displacement.
+        This helper uses a short pose/command window and returns a reason string
+        only when the motion is persistent enough to be unsafe or useless.
+        """
+        if not bool(getattr(self, "shake_yaw_wobble", True)):
+            return "none"
+
+        try:
+            cmd_v = float(getattr(self, "filtered_action", np.zeros(2, dtype=np.float32))[0])
+            cmd_w = float(getattr(self, "filtered_action", np.zeros(2, dtype=np.float32))[1])
+        except Exception:
+            cmd_v = 0.0
+            cmd_w = 0.0
+
+        odom_wz = 0.0
+        try:
+            if self.ros.odom is not None:
+                odom_wz = float(self.ros.odom.twist.twist.angular.z)
+        except Exception:
+            odom_wz = 0.0
+
+        # Prefer the actually published command when it is meaningful.  Fall
+        # back to odom angular.z when the controller or driver has already
+        # changed the command.
+        cmd_thr = float(getattr(self, "shake_cmd_flip_threshold", 0.16))
+        yaw_thr = float(getattr(self, "shake_yaw_rate_threshold", 0.24))
+        yaw_signal = cmd_w if abs(cmd_w) >= cmd_thr else odom_wz
+        yaw_mag = abs(float(yaw_signal))
+        yaw_sign = 1 if yaw_signal > yaw_thr else (-1 if yaw_signal < -yaw_thr else 0)
+
+        pose = None
+        try:
+            pose = self._get_robot_pose2d(frame_id=self.pose_frame)
+        except Exception:
+            pose = None
+
+        x = y = yaw = 0.0
+        if pose is not None:
+            try:
+                xy, yyaw = pose
+                x = float(xy[0])
+                y = float(xy[1])
+                yaw = float(yyaw)
+            except Exception:
+                x = y = yaw = 0.0
+
+        hist = getattr(self, "_shake_wobble_history", None)
+        if hist is None or getattr(hist, "maxlen", None) != int(getattr(self, "shake_wobble_window_steps", 8)):
+            hist = deque(maxlen=int(getattr(self, "shake_wobble_window_steps", 8)))
+            self._shake_wobble_history = hist
+
+        hist.append((int(getattr(self, "step_count", 0)), x, y, yaw, int(yaw_sign), float(yaw_mag), float(cmd_v), float(odom_wz)))
+        samples = list(hist)
+        if len(samples) < 3:
+            self._shake_last_wobble_reason = "warming"
+            return "none"
+
+        flips = 0
+        prev_sign = 0
+        for item in samples:
+            sign = int(item[4])
+            if sign == 0:
+                continue
+            if prev_sign != 0 and sign != prev_sign:
+                flips += 1
+            prev_sign = sign
+
+        net_disp = math.hypot(float(samples[-1][1]) - float(samples[0][1]), float(samples[-1][2]) - float(samples[0][2]))
+        yaw_accum = 0.0
+        for a, b in zip(samples[:-1], samples[1:]):
+            dyaw = self._normalize_angle(float(b[3]) - float(a[3]))
+            if math.isfinite(dyaw):
+                yaw_accum += abs(dyaw)
+
+        max_net = float(getattr(self, "shake_wobble_max_net_motion_m", 0.045))
+        min_flips = int(getattr(self, "shake_wobble_min_flips", 2))
+        low_motion = bool(net_disp <= max_net or abs(cmd_v) <= 0.025)
+        if flips >= min_flips and low_motion:
+            reason = f"yaw_wobble:flips={flips},net={net_disp:.3f},w={yaw_mag:.2f}"
+            self._shake_last_wobble_reason = reason
+            return reason
+
+        spin_limit = int(getattr(self, "shake_spin_stall_restart_steps", 0))
+        spin_steps = int(getattr(self, "sustained_rotation_steps", 0))
+        if spin_limit > 0 and spin_steps >= spin_limit:
+            reason = f"spin_stall:{spin_steps}/{spin_limit},net={net_disp:.3f},yaw={math.degrees(yaw_accum):.1f}"
+            self._shake_last_wobble_reason = reason
+            return reason
+
+        self._shake_last_wobble_reason = f"ok:flips={flips},net={net_disp:.3f},spin={spin_steps}"
+        return "none"
+
     def _update_shake_restart_state(self) -> bool:
-        """Restart when non-yaw body shake persists for N consecutive steps."""
+        """Restart when body shake or yaw wobble persists for N effective ticks.
+
+        v8 changes this from strict consecutive counting to a leaky integrator.
+        Real wobble often alternates between one bad and one borderline step, so
+        the old code reset the counter back to 0/8 forever.
+        """
         self._last_shake_restart = False
-        reason = self._instantaneous_shake_reason()
+        physical_reason = self._instantaneous_shake_reason()
+        wobble_reason = self._update_yaw_wobble_reason() if bool(getattr(self, "shake_yaw_wobble", False)) else "none"
+        reason = physical_reason if physical_reason != "none" else wobble_reason
+
+        limit = int(getattr(self, "shake_restart_steps_limit", 8))
+        limit = max(limit, 1)
+        current = int(getattr(self, "shake_steps", 0))
+
         if reason == "none":
-            self.shake_steps = 0
-            self._last_shake_active = False
-            self._last_shake_reason = "none"
+            if bool(getattr(self, "shake_leaky_decay", True)):
+                self.shake_steps = max(current - 1, 0)
+            else:
+                self.shake_steps = 0
+            self._last_shake_active = bool(self.shake_steps > 0)
+            if self.shake_steps <= 0:
+                self._last_shake_reason = "none"
+            else:
+                self._last_shake_reason = "decay:body_not_planted"
             return False
-        self.shake_steps += 1
+
+        inc = 1
+        self.shake_steps = min(current + inc, limit)
         self._last_shake_active = True
         self._last_shake_reason = reason
-        if self.shake_steps >= int(getattr(self, "shake_restart_steps_limit", 8)):
+        if self.shake_steps >= limit:
             self._last_shake_restart = True
             self.ros.get_logger().warn(
                 "SHAKE_RESTART | "
-                f"steps={self.shake_steps}/{int(getattr(self, 'shake_restart_steps_limit', 8))} | "
-                f"reason={reason}"
+                f"steps={self.shake_steps}/{limit} | "
+                f"reason={reason} | "
+                f"body_contact=tilt/z/angular_xy/vz | yaw_wobble={getattr(self, '_shake_last_wobble_reason', 'disabled')}"
             )
             return True
         return False
@@ -7910,7 +8511,7 @@ class GazeboNavEnv(gym.Env):
             return
 
         start = time.time()
-        timeout = float(getattr(self, "action_sync_wait_timeout_sec", 0.18))
+        timeout = float(getattr(self, "action_sync_wait_timeout_sec", 0.06))
         deadline = start + max(timeout, 0.0)
         scan_fresh = False
         odom_fresh = False

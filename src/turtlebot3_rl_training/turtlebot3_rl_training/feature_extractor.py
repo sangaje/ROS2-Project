@@ -32,17 +32,17 @@ class MapVectorFeatureExtractor(BaseFeaturesExtractor):
           channel 4    = priority
 
       - vector branch:
-          vector의 앞 360개 LiDAR bin은 항상 1D CNN으로 각도 방향 local pattern을 인코딩.
+          vector의 앞 lidar_dim개 LiDAR bin은 항상 1D CNN으로 각도 방향 local pattern을 인코딩.
           나머지 scalar stats는 MLP로 인코딩.
           [lidar_feature, stats_feature]를 concat한 뒤 vector feature로 projection.
 
       - temporal branch:
-          raw seq(B,T,370)를 그대로 Conv1d에 넣지 않는다.
+          raw seq(B,T,N)를 그대로 Conv1d에 넣지 않는다.
           각 time step마다 같은 LiDAR 1D CNN + stats MLP로 token을 만든다.
           token sequence (B,T,D)를 temporal 1D CNN으로 처리한다.
     """
 
-    LIDAR_DIM = 360
+    DEFAULT_LIDAR_DIM = 360
 
     def __init__(
         self,
@@ -52,6 +52,7 @@ class MapVectorFeatureExtractor(BaseFeaturesExtractor):
         temporal_features_dim: int = 128,
         combined_features_dim: int = 256,
         use_temporal_cnn: bool = True,
+        lidar_dim: int | None = None,
     ):
         if not isinstance(observation_space, spaces.Dict):
             raise TypeError(
@@ -66,14 +67,25 @@ class MapVectorFeatureExtractor(BaseFeaturesExtractor):
         map_channels = int(map_space.shape[0])
         vector_dim = int(vector_space.shape[0])
 
-        if vector_dim < self.LIDAR_DIM:
-            raise ValueError(
-                f"vector observation dim must be >= {self.LIDAR_DIM}, got {vector_dim}"
-            )
+        # v5: LiDAR dimensionality is no longer hard-coded to 360.
+        # The exploration observation layout is:
+        #   vector = [lidar_0 .. lidar_{B-1}, 10 scalar stats]
+        # where B is configurable through --num-lidar-bins.  This keeps the
+        # same extractor usable for both legacy 360-bin checkpoints and new
+        # 60-sector checkpoints.
+        if lidar_dim is None:
+            # Most project observations use 10 non-LiDAR scalar stats.  For a
+            # legacy 370-D vector this infers 360; for a new 70-D vector this
+            # infers 60.  If a different non-map observation is ever used, fall
+            # back to treating the whole vector as LiDAR rather than crashing.
+            inferred = int(vector_dim) - 10
+            if inferred <= 0:
+                inferred = min(int(vector_dim), int(self.DEFAULT_LIDAR_DIM))
+            lidar_dim = inferred
 
-        self.vector_dim = vector_dim
-        self.lidar_dim = self.LIDAR_DIM
-        self.stats_dim = vector_dim - self.LIDAR_DIM
+        self.vector_dim = int(vector_dim)
+        self.lidar_dim = max(1, min(int(lidar_dim), int(vector_dim)))
+        self.stats_dim = int(vector_dim) - int(self.lidar_dim)
         self.use_temporal_cnn = bool(
             use_temporal_cnn and "seq" in observation_space.spaces
         )
@@ -123,7 +135,7 @@ class MapVectorFeatureExtractor(BaseFeaturesExtractor):
         )
 
         # ------------------------------------------------------------------
-        # 2) LiDAR branch: 360-bin circular 1D signal encoder + GroupNorm
+        # 2) LiDAR branch: configurable-bin circular 1D signal encoder + GroupNorm
         # ------------------------------------------------------------------
         self.lidar_cnn = nn.Sequential(
             nn.Conv1d(
@@ -238,8 +250,8 @@ class MapVectorFeatureExtractor(BaseFeaturesExtractor):
         return lidar, stats
 
     def _encode_lidar_flat(self, lidar_flat: torch.Tensor) -> torch.Tensor:
-        # lidar_flat: (B, 360), already normalized to 0..1.
-        lidar_flat = torch.clamp(lidar_flat.float(), 0.0, 1.0).unsqueeze(1)  # (B, 1, 360)
+        # lidar_flat: (B, lidar_dim), already normalized to 0..1.
+        lidar_flat = torch.clamp(lidar_flat.float(), 0.0, 1.0).unsqueeze(1)  # (B, 1, lidar_dim)
         return self.lidar_cnn(lidar_flat)
 
     def _encode_stats_flat(
@@ -252,7 +264,7 @@ class MapVectorFeatureExtractor(BaseFeaturesExtractor):
         return self.stats_net(stats_flat)
 
     def _encode_vector_token_flat(self, vector_flat: torch.Tensor) -> torch.Tensor:
-        # vector_flat: (B, 370)
+        # vector_flat: (B, lidar_dim + scalar_stats_dim)
         vector_flat = self._sanitize_vector(vector_flat)
         lidar, stats = self._split_vector(vector_flat)
         lidar_features = self._encode_lidar_flat(lidar)

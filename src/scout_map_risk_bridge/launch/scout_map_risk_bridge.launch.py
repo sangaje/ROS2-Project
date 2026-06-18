@@ -3,21 +3,17 @@ from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
-
 def generate_launch_description():
     return LaunchDescription([
-        DeclareLaunchArgument('from_domain', default_value='30'),
-        DeclareLaunchArgument('to_domain', default_value='31'),
-
+        DeclareLaunchArgument('from_domain', default_value='21'),
+        DeclareLaunchArgument('to_domain', default_value='20'),
         DeclareLaunchArgument('map_in', default_value='/map'),
         DeclareLaunchArgument('risk_in', default_value='/risk/risk_map'),
-
         DeclareLaunchArgument('map_out', default_value='/scout/map'),
         DeclareLaunchArgument('risk_out', default_value='/scout/risk_map'),
-
+        DeclareLaunchArgument('status_out', default_value='/scout_bridge/status'),
         DeclareLaunchArgument('target_frame', default_value='scout_map'),
         DeclareLaunchArgument('republish_period_sec', default_value='1.0'),
-
         Node(
             package='scout_map_risk_bridge',
             executable='scout_map_risk_bridge_node',
@@ -30,6 +26,7 @@ def generate_launch_description():
                 '--risk-in', LaunchConfiguration('risk_in'),
                 '--map-out', LaunchConfiguration('map_out'),
                 '--risk-out', LaunchConfiguration('risk_out'),
+                '--status-out', LaunchConfiguration('status_out'),
                 '--target-frame', LaunchConfiguration('target_frame'),
                 '--republish-period-sec', LaunchConfiguration('republish_period_sec'),
             ],

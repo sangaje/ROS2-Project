@@ -1,8 +1,5 @@
 
-import argparse
-import signal
-import sys
-import time
+import argparse, signal, sys, time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -11,113 +8,88 @@ from rclpy.context import Context
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 from nav_msgs.msg import OccupancyGrid
+from std_msgs.msg import String
 
 
-def source_qos(depth: int = 10) -> QoSProfile:
-    # Source side should match ordinary live publishers robustly.
-    # Cartographer /map and risk map are expected to publish periodically.
-    return QoSProfile(
-        reliability=ReliabilityPolicy.RELIABLE,
-        durability=DurabilityPolicy.VOLATILE,
-        history=HistoryPolicy.KEEP_LAST,
-        depth=depth,
-    )
+def qos(rel, dur, depth):
+    return QoSProfile(reliability=rel, durability=dur, history=HistoryPolicy.KEEP_LAST, depth=depth)
 
 
-def target_qos(depth: int = 1) -> QoSProfile:
-    # Target side is latched-like so RViz can receive the latest map/risk.
-    return QoSProfile(
-        reliability=ReliabilityPolicy.RELIABLE,
-        durability=DurabilityPolicy.TRANSIENT_LOCAL,
-        history=HistoryPolicy.KEEP_LAST,
-        depth=depth,
-    )
+def source_qos_profiles(depth):
+    return [
+        qos(ReliabilityPolicy.RELIABLE, DurabilityPolicy.VOLATILE, depth),
+        qos(ReliabilityPolicy.RELIABLE, DurabilityPolicy.TRANSIENT_LOCAL, depth),
+        qos(ReliabilityPolicy.BEST_EFFORT, DurabilityPolicy.VOLATILE, depth),
+        qos(ReliabilityPolicy.BEST_EFFORT, DurabilityPolicy.TRANSIENT_LOCAL, depth),
+    ]
+
+
+def target_qos_profiles(depth):
+    return [
+        qos(ReliabilityPolicy.RELIABLE, DurabilityPolicy.TRANSIENT_LOCAL, depth),
+        qos(ReliabilityPolicy.RELIABLE, DurabilityPolicy.VOLATILE, depth),
+    ]
 
 
 @dataclass
-class BridgeState:
+class State:
     name: str
     in_topic: str
     out_topic: str
-    count_in: int = 0
-    count_out: int = 0
-    last_in_time: float = 0.0
-    last_out_time: float = 0.0
-    last_frame: str = ''
-    last_size: str = ''
-    last_msg: Optional[OccupancyGrid] = None
+    in_count: int = 0
+    out_count: int = 0
+    dup_count: int = 0
+    last_in: float = 0.0
+    last_out: float = 0.0
+    frame: str = ""
+    size: str = ""
+    key: str = ""
+    msg: Optional[OccupancyGrid] = None
 
 
-class ScoutMapRiskBridge:
-    """
-    Bridges exactly two scout products:
-      /map -> /scout/map
-      /risk/risk_map -> /scout/risk_map
-
-    v3:
-      - stores latest map/risk
-      - republishes cached latest messages periodically
-      - makes `ros2 topic echo --once` easier to debug
-    """
-
+class Bridge:
     def __init__(self, args):
         self.args = args
-
         self.ctx_from = Context()
         self.ctx_to = Context()
-
         rclpy.init(args=None, context=self.ctx_from, domain_id=args.from_domain)
         rclpy.init(args=None, context=self.ctx_to, domain_id=args.to_domain)
 
-        self.from_node = rclpy.create_node(
-            f'scout_map_risk_bridge_from_{args.from_domain}',
-            context=self.ctx_from,
-        )
-        self.to_node = rclpy.create_node(
-            f'scout_map_risk_bridge_to_{args.to_domain}',
-            context=self.ctx_to,
-        )
+        self.n_from = rclpy.create_node(f"scout_bridge_from_{args.from_domain}", context=self.ctx_from)
+        self.n_to = rclpy.create_node(f"scout_bridge_to_{args.to_domain}", context=self.ctx_to)
 
-        self.src_qos = source_qos(depth=args.source_qos_depth)
-        self.dst_qos = target_qos(depth=args.target_qos_depth)
+        self.map_state = State("map", args.map_in, args.map_out)
+        self.risk_state = State("risk", args.risk_in, args.risk_out)
 
-        self.map_state = BridgeState('map', args.map_in, args.map_out)
-        self.risk_state = BridgeState('risk', args.risk_in, args.risk_out)
+        tq = target_qos_profiles(args.target_qos_depth)
+        self.map_pubs = [self.n_to.create_publisher(OccupancyGrid, args.map_out, q) for q in tq]
+        self.risk_pubs = [self.n_to.create_publisher(OccupancyGrid, args.risk_out, q) for q in tq]
+        self.status_pubs = [self.n_to.create_publisher(String, args.status_out, q) for q in tq]
 
-        self.map_pub = self.to_node.create_publisher(OccupancyGrid, args.map_out, self.dst_qos)
-        self.risk_pub = self.to_node.create_publisher(OccupancyGrid, args.risk_out, self.dst_qos)
+        self.subs = []
+        for q in source_qos_profiles(args.source_qos_depth):
+            self.subs.append(self.n_from.create_subscription(
+                OccupancyGrid, args.map_in,
+                lambda msg, qq=q: self.on_msg(msg, self.map_pubs, self.map_state),
+                q))
+            self.subs.append(self.n_from.create_subscription(
+                OccupancyGrid, args.risk_in,
+                lambda msg, qq=q: self.on_msg(msg, self.risk_pubs, self.risk_state),
+                q))
 
-        self.map_sub = self.from_node.create_subscription(
-            OccupancyGrid,
-            args.map_in,
-            lambda msg: self.on_grid(msg, self.map_pub, self.map_state),
-            self.src_qos,
-        )
-        self.risk_sub = self.from_node.create_subscription(
-            OccupancyGrid,
-            args.risk_in,
-            lambda msg: self.on_grid(msg, self.risk_pub, self.risk_state),
-            self.src_qos,
-        )
+        self.n_from.create_timer(args.log_period_sec, self.log_status)
+        self.n_from.create_timer(args.republish_period_sec, self.republish_cached)
 
-        self.from_node.create_timer(args.log_period_sec, self.log_status)
-        if args.republish_period_sec > 0.0:
-            self.from_node.create_timer(args.republish_period_sec, self.republish_cached)
+        self.n_from.get_logger().info(f"ScoutMapRiskBridge v4 started | domain {args.from_domain} -> {args.to_domain}")
+        self.n_from.get_logger().info(f"MAP  : {args.map_in} -> {args.map_out}")
+        self.n_from.get_logger().info(f"RISK : {args.risk_in} -> {args.risk_out}")
+        self.n_from.get_logger().info(f"STATUS: {args.status_out}")
+        self.n_from.get_logger().info("QoS: source=4 profiles/topic, target=2 publishers/topic")
 
-        self.from_node.get_logger().info(
-            f'ScoutMapRiskBridge v3 started | domain {args.from_domain} -> {args.to_domain}'
-        )
-        self.from_node.get_logger().info(f'MAP  : {args.map_in} -> {args.map_out}')
-        self.from_node.get_logger().info(f'RISK : {args.risk_in} -> {args.risk_out}')
-        self.from_node.get_logger().info(
-            f'cached republish period: {args.republish_period_sec:.2f}s'
-        )
-        if args.rewrite_frame:
-            self.from_node.get_logger().info(
-                f'frame rewrite enabled: header.frame_id -> {args.target_frame}'
-            )
+    def make_key(self, msg):
+        return f"{msg.header.stamp.sec}.{msg.header.stamp.nanosec}:{msg.info.width}x{msg.info.height}:{len(msg.data)}"
 
-    def rewrite_and_copy(self, msg: OccupancyGrid) -> OccupancyGrid:
+    def copy_msg(self, msg):
         out = OccupancyGrid()
         out.header = msg.header
         out.info = msg.info
@@ -126,114 +98,107 @@ class ScoutMapRiskBridge:
             out.header.frame_id = self.args.target_frame
         return out
 
-    def on_grid(self, msg: OccupancyGrid, pub, state: BridgeState):
-        out = self.rewrite_and_copy(msg)
-        state.last_msg = out
-        state.count_in += 1
-        state.last_in_time = time.time()
-        state.last_frame = out.header.frame_id
-        state.last_size = f'{out.info.width}x{out.info.height}@{out.info.resolution:.3f}'
+    def publish_all(self, pubs, msg):
+        for p in pubs:
+            p.publish(msg)
 
-        pub.publish(out)
-        state.count_out += 1
-        state.last_out_time = time.time()
-
-    def republish_one(self, pub, state: BridgeState):
-        if state.last_msg is None:
+    def on_msg(self, msg, pubs, st):
+        key = self.make_key(msg)
+        if key == st.key:
+            st.dup_count += 1
             return
-        pub.publish(state.last_msg)
-        state.count_out += 1
-        state.last_out_time = time.time()
+        out = self.copy_msg(msg)
+        st.key = key
+        st.msg = out
+        st.in_count += 1
+        st.last_in = time.time()
+        st.frame = out.header.frame_id
+        st.size = f"{out.info.width}x{out.info.height}@{out.info.resolution:.3f}"
+        self.publish_all(pubs, out)
+        st.out_count += len(pubs)
+        st.last_out = time.time()
 
     def republish_cached(self):
-        self.republish_one(self.map_pub, self.map_state)
-        self.republish_one(self.risk_pub, self.risk_state)
+        for pubs, st in [(self.map_pubs, self.map_state), (self.risk_pubs, self.risk_state)]:
+            if st.msg is not None:
+                self.publish_all(pubs, st.msg)
+                st.out_count += len(pubs)
+                st.last_out = time.time()
+        self.publish_status()
+
+    def status(self):
+        now = time.time()
+        parts = [f"from_domain={self.args.from_domain}", f"to_domain={self.args.to_domain}"]
+        for st in [self.map_state, self.risk_state]:
+            age_in = -1.0 if st.last_in <= 0 else now - st.last_in
+            age_out = -1.0 if st.last_out <= 0 else now - st.last_out
+            parts.append(f"{st.name}:in={st.in_count},out={st.out_count},dup={st.dup_count},age_in={age_in:.1f},age_out={age_out:.1f},frame={st.frame},size={st.size},in_topic={st.in_topic},out_topic={st.out_topic}")
+        return " | ".join(parts)
+
+    def publish_status(self):
+        m = String()
+        m.data = self.status()
+        for p in self.status_pubs:
+            p.publish(m)
 
     def log_status(self):
-        now = time.time()
-        parts = []
-        for s in (self.map_state, self.risk_state):
-            age_in = -1.0 if s.last_in_time <= 0.0 else now - s.last_in_time
-            age_out = -1.0 if s.last_out_time <= 0.0 else now - s.last_out_time
-            parts.append(
-                f'{s.name}:in={s.count_in},out={s.count_out},age_in={age_in:.1f}s,'
-                f'age_out={age_out:.1f}s,frame={s.last_frame},size={s.last_size}'
-            )
-        self.from_node.get_logger().info('SCOUT_BRIDGE_STATUS | ' + ' | '.join(parts))
+        self.n_from.get_logger().info("SCOUT_BRIDGE_STATUS | " + self.status())
+        self.publish_status()
 
     def spin(self):
-        executor = SingleThreadedExecutor(context=self.ctx_from)
-        executor.add_node(self.from_node)
-
-        stop = {'value': False}
-
-        def on_signal(signum, frame):
-            stop['value'] = True
-
-        signal.signal(signal.SIGINT, on_signal)
-        signal.signal(signal.SIGTERM, on_signal)
-
+        ex = SingleThreadedExecutor(context=self.ctx_from)
+        ex.add_node(self.n_from)
+        stop = {"v": False}
+        def on_sig(*_): stop["v"] = True
+        signal.signal(signal.SIGINT, on_sig)
+        signal.signal(signal.SIGTERM, on_sig)
         try:
-            while rclpy.ok(context=self.ctx_from) and not stop['value']:
-                executor.spin_once(timeout_sec=0.1)
+            while rclpy.ok(context=self.ctx_from) and not stop["v"]:
+                ex.spin_once(timeout_sec=0.1)
         finally:
-            executor.remove_node(self.from_node)
-            self.from_node.destroy_node()
-            self.to_node.destroy_node()
+            ex.remove_node(self.n_from)
+            self.n_from.destroy_node()
+            self.n_to.destroy_node()
             rclpy.shutdown(context=self.ctx_from)
             rclpy.shutdown(context=self.ctx_to)
 
 
 def parse_args(argv):
-    p = argparse.ArgumentParser(
-        description='Bridge scout /map and /risk/risk_map between ROS 2 domains.',
-        allow_abbrev=False,
-    )
-
-    p.add_argument('--from-domain', type=int, required=True)
-    p.add_argument('--to-domain', type=int, required=True)
-
-    p.add_argument('--map-in', default='/map')
-    p.add_argument('--risk-in', default='/risk/risk_map')
-
-    p.add_argument('--map-out', default='/scout/map')
-    p.add_argument('--risk-out', default='/scout/risk_map')
-
-    p.add_argument('--rewrite-frame', action='store_true', default=True)
-    p.add_argument('--no-rewrite-frame', dest='rewrite_frame', action='store_false')
-    p.add_argument('--target-frame', default='scout_map')
-
-    p.add_argument('--source-qos-depth', type=int, default=10)
-    p.add_argument('--target-qos-depth', type=int, default=1)
-    p.add_argument('--republish-period-sec', type=float, default=1.0)
-    p.add_argument('--log-period-sec', type=float, default=2.0)
+    p = argparse.ArgumentParser(allow_abbrev=False)
+    p.add_argument("--from-domain", type=int, required=True)
+    p.add_argument("--to-domain", type=int, required=True)
+    p.add_argument("--map-in", default="/map")
+    p.add_argument("--risk-in", default="/risk/risk_map")
+    p.add_argument("--map-out", default="/scout/map")
+    p.add_argument("--risk-out", default="/scout/risk_map")
+    p.add_argument("--status-out", default="/scout_bridge/status")
+    p.add_argument("--rewrite-frame", action="store_true", default=True)
+    p.add_argument("--no-rewrite-frame", dest="rewrite_frame", action="store_false")
+    p.add_argument("--target-frame", default="scout_map")
+    p.add_argument("--source-qos-depth", type=int, default=10)
+    p.add_argument("--target-qos-depth", type=int, default=1)
+    p.add_argument("--republish-period-sec", type=float, default=1.0)
+    p.add_argument("--log-period-sec", type=float, default=2.0)
 
     cleaned = []
-    skip_ros_args = False
-    i = 0
-    while i < len(argv):
-        token = argv[i]
-        if token == '--ros-args':
-            skip_ros_args = True
-            i += 1
+    skip = False
+    for tok in argv:
+        if tok == "--ros-args":
+            skip = True
             continue
-        if skip_ros_args:
-            i += 1
+        if skip:
             continue
-        cleaned.append(token)
-        i += 1
-
+        cleaned.append(tok)
     args, unknown = p.parse_known_args(cleaned)
     if unknown:
-        print(f'[scout_map_risk_bridge] ignoring unknown args: {unknown}', file=sys.stderr)
+        print(f"[scout_map_risk_bridge] ignoring unknown args: {unknown}", file=sys.stderr)
     return args
 
 
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
-    bridge = ScoutMapRiskBridge(args)
-    bridge.spin()
+    Bridge(args).spin()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
