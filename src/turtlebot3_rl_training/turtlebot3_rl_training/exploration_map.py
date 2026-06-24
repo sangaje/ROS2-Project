@@ -66,19 +66,27 @@ class MapUpdateStats:
     slam_update_new_free_cells: int = 0
     slam_update_new_occupied_cells: int = 0
     slam_update_expand_known_cells: int = 0
+    # Confidence update diagnostics for RViz overlay/debug.
+    # observed = cells inside the camera/front ray mask, updated = cells whose
+    # confidence value actually increased in this update.
+    confidence_observed_cells: int = 0
+    confidence_updated_cells: int = 0
 
 
 class ExplorationGridMap:
     """
     SLAM-base + auto-expanding task/confidence/priority maps.
 
-    Map policy input is now 5-channel robot-centric local crop:
+    Map policy input is a robot-centric local crop.
 
       channel 0: SLAM free mask
       channel 1: SLAM unknown mask
       channel 2: SLAM occupied mask
       channel 3: confidence map, normalized 0..1
-      channel 4: priority map, normalized 0..1
+
+    If priority is enabled for backward compatibility, channel 4 may contain
+    the priority map.  In the no-priority training path, channel 4 is removed
+    entirely rather than zero-filled.
 
     The first three channels are one-hot geometry channels rather than a
     scalar-coded occupancy value. This avoids imposing a fake ordering such as
@@ -178,7 +186,20 @@ class ExplorationGridMap:
         self.origin_x = float(origin_x)
         self.origin_y = float(origin_y)
         self.frame_id = str(frame_id or "odom").strip() or "odom"
-        self.disable_priority_map = bool(disable_priority_map)
+        self.disable_priority_map = bool(disable_priority_map) or (
+            str(os.environ.get("TB3_RL_FORCE_NO_PRIORITY", "0")).strip().lower()
+            not in {"0", "false", "no", "off", "disable", "disabled"}
+        ) or (
+            str(os.environ.get("TB3_RL_NO_PRIORITY_MODEL_INPUT", "0")).strip().lower()
+            in {"1", "true", "yes", "on", "enable", "enabled"}
+        )
+        if self.disable_priority_map:
+            os.environ["TB3_RL_FORCE_NO_PRIORITY"] = "1"
+            os.environ["TB3_RL_NO_PRIORITY_MODEL_INPUT"] = "1"
+            priority_publish_topic = ""
+            priority_recompute_interval = 1_000_000_000
+            priority_visit_suppression_gain = 0.0
+            priority_observed_suppression_gain = 0.0
         self.lidar_stride = max(int(lidar_stride), 1)
         self.max_range = float(max_range)
 
@@ -218,6 +239,11 @@ class ExplorationGridMap:
         self._base_grid_needs_resample = True
         self._publish_resample_cache_key = None
         self._publish_resample_cache = None
+        # v18 runtime optimization: if the same OccupancyGrid object/stamp/canvas
+        # is passed through multiple env steps, do not re-copy and re-invalidate
+        # the SLAM-locked base grid every step.  ROS callbacks create a new message
+        # object when /map changes, so this is a safe no-op for unchanged maps.
+        self._last_slam_fast_lock_key = None
 
         self.min_known_confidence = float(min_known_confidence)
         self.low_confidence_threshold = float(low_confidence_threshold)
@@ -386,7 +412,7 @@ class ExplorationGridMap:
 
         self.publish_topic = str(publish_topic).strip()
         self.confidence_publish_topic = str(confidence_publish_topic).strip()
-        self.priority_publish_topic = str(priority_publish_topic).strip()
+        self.priority_publish_topic = "" if self.disable_priority_map else str(priority_publish_topic).strip()
         self.map_pub = None
         self.confidence_pub = None
         self.priority_pub = None
@@ -467,8 +493,8 @@ class ExplorationGridMap:
             self.publish()
 
         self.node.get_logger().info(
-            f"SLAM task/confidence/priority map publishers: "
-            f"task={publish_topic}, confidence={confidence_publish_topic}, priority={priority_publish_topic}, "
+            f"SLAM task/confidence map publishers: "
+            f"task={publish_topic}, confidence={confidence_publish_topic}, priority={(self.priority_publish_topic or '(disabled)')}, "
             f"frame_id={self.frame_id}, size={self.width}x{self.height}, resolution={self.resolution}, "
             f"front_fov_deg={math.degrees(self.front_fov_rad):.1f}, "
             f"front_angle_sigma_deg={math.degrees(self.front_angle_sigma_rad):.1f}, "
@@ -494,7 +520,7 @@ class ExplorationGridMap:
             f"path_topic={self.path_publish_topic or '(disabled)'}, "
             f"filtered_slam_topic={self.filtered_slam_publish_topic or '(disabled)'}, "
             f"publish_slam_aligned={self.publish_slam_aligned}, "
-            f"cnn_channels=5, "
+            f"cnn_channels={4 if self.disable_priority_map else 5}, "
             f"legacy_memory_alias={self.legacy_memory_topic or '(disabled)'}, "
             f"keepalive_publish_period={self.keepalive_publish_period_sec:.2f}s"
         )
@@ -733,6 +759,46 @@ class ExplorationGridMap:
         range_max = min(float(scan.range_max), self.max_range)
         confirmation_range_max = min(range_max, self.confidence_max_range)
 
+        # v111: use the same "front index = 0" convention as the policy LiDAR
+        # pipeline when requested.  Gazebo /scan metadata may describe angles as
+        # -pi..pi while the physical/policy convention treats beam 0 as the robot
+        # front.  If confidence uses raw LaserScan angles while the policy/debug
+        # scan uses canonical front-zero angles, the magenta cone follows the
+        # robot position but points in the wrong direction.
+        try:
+            _canon_default = str(os.environ.get("TB3_RL_LIDAR_CANONICAL_FRONT_ZERO", "0") or "0")
+            use_canonical_scan_angles = str(os.environ.get(
+                "TB3_RL_CONFIDENCE_USE_CANONICAL_SCAN_ANGLES", _canon_default
+            )).strip().lower() in {"1", "true", "yes", "on", "enable", "enabled"}
+        except Exception:
+            use_canonical_scan_angles = False
+        try:
+            canonical_front_index = int(os.environ.get("TB3_RL_LIDAR_FRONT_INDEX", "0") or 0)
+        except Exception:
+            canonical_front_index = 0
+        try:
+            canonical_flip_lr = str(os.environ.get("TB3_RL_LIDAR_FLIP_LR", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+        except Exception:
+            canonical_flip_lr = False
+        try:
+            _off_default = str(os.environ.get("TB3_RL_LIDAR_ANGLE_OFFSET_DEG", "0.0") or "0.0")
+            canonical_angle_offset_rad = math.radians(float(os.environ.get(
+                "TB3_RL_CONFIDENCE_SCAN_ANGLE_OFFSET_DEG", _off_default
+            ) or 0.0))
+        except Exception:
+            canonical_angle_offset_rad = 0.0
+
+        def _confidence_rel_angle_for_index(idx: int) -> float:
+            if use_canonical_scan_angles and ranges.size > 0:
+                n = max(int(ranges.size), 1)
+                fi = int(canonical_front_index) % n
+                a = (float(int(idx) - fi) * (2.0 * math.pi / float(n)))
+                if canonical_flip_lr:
+                    a = -a
+                a += float(canonical_angle_offset_rad)
+                return normalize_angle(a)
+            return normalize_angle(angle_min + float(idx) * angle_increment)
+
         # Hot path optimization only: structural occupancy is immutable during
         # this update call, so reuse it for all LiDAR ray occlusion checks.
         # This preserves semantics while avoiding thousands of _structural_grid()
@@ -752,7 +818,7 @@ class ExplorationGridMap:
             pass
 
         for i in range(0, ranges.size, self.lidar_stride):
-            rel_angle = normalize_angle(angle_min + float(i) * angle_increment)
+            rel_angle = _confidence_rel_angle_for_index(i)
 
             in_confidence_fov = abs(rel_angle) <= self.front_fov_rad * 0.5
             in_priority_clear_fov = abs(rel_angle) <= self.priority_clear_fov_rad * 0.5
@@ -914,19 +980,22 @@ class ExplorationGridMap:
             )
 
         if np.any(priority_clear_mask):
-            visibility_mask = self._slam_visibility_mask_from_robot(
-                robot_ix=robot_ix,
-                robot_iy=robot_iy,
-                robot_yaw=robot_yaw,
-                max_range_m=self.priority_clear_max_range_m,
-                fov_rad=self.priority_clear_fov_rad,
-            )
-            if visibility_mask.shape == priority_clear_mask.shape:
-                priority_clear_mask *= visibility_mask
-            else:
-                # Last-resort protection against stale temporary masks after a
-                # SLAM resize: never clear priority through an unknown-sized mask.
-                priority_clear_mask = np.zeros_like(self.priority_grid, dtype=np.float32)
+            extra_vis_raw = os.environ.get("TB3_RL_PRIORITY_CLEAR_EXTRA_VISIBILITY_MASK", "0")
+            extra_visibility_mask = str(extra_vis_raw).strip().lower() in {"1", "true", "yes", "on", "enable", "enabled"}
+            if extra_visibility_mask:
+                visibility_mask = self._slam_visibility_mask_from_robot(
+                    robot_ix=robot_ix,
+                    robot_iy=robot_iy,
+                    robot_yaw=robot_yaw,
+                    max_range_m=self.priority_clear_max_range_m,
+                    fov_rad=self.priority_clear_fov_rad,
+                )
+                if visibility_mask.shape == priority_clear_mask.shape:
+                    priority_clear_mask *= visibility_mask
+                else:
+                    # Last-resort protection against stale temporary masks after a
+                    # SLAM resize: never clear priority through an unknown-sized mask.
+                    priority_clear_mask = np.zeros_like(self.priority_grid, dtype=np.float32)
 
         # Store the current LiDAR-visible free-space mask for priority generation.
         # SLAM line-of-sight alone is not enough: freshly observed physical obstacles
@@ -1036,7 +1105,7 @@ class ExplorationGridMap:
                     self._last_priority_invalidated_gain += dropped_gain
                 self._priority_dirty = False
 
-                if (int(self.step_index) - int(getattr(self, "_last_priority_recompute_debug_step", -10_000_000))) >= max(priority_interval, 200):
+                if os.environ.get("TB3_RL_QUIET_PRIORITY_LOGS", "0").strip().lower() not in {"1", "true", "yes", "on"} and (int(self.step_index) - int(getattr(self, "_last_priority_recompute_debug_step", -10_000_000))) >= max(priority_interval, 200):
                     try:
                         active_cells = int(np.count_nonzero(new_active_priority >= max(self.priority_clear_min_value, 1.0)))
                         self.node.get_logger().info(
@@ -1058,6 +1127,12 @@ class ExplorationGridMap:
         self.prev_known_cells = known
 
         mean_conf = self.mean_confidence()
+        confidence_observed_cells = 0
+        confidence_updated_cells = 0
+        try:
+            confidence_observed_cells = int(np.count_nonzero(observed_mask)) if isinstance(observed_mask, np.ndarray) else 0
+        except Exception:
+            confidence_observed_cells = 0
         # Reward/stat gain is the positive local scan update, not the global mean
         # difference.  Global mean is still exposed for observation/debug, but it is
         # not reliable as a step delta while the SLAM canvas grows.  Unit: 100%-cell
@@ -1073,11 +1148,21 @@ class ExplorationGridMap:
                     0.0,
                 )
                 confidence_gain = float(np.sum(positive_delta[observed_mask]) / 100.0)
+                try:
+                    confidence_updated_cells = int(np.count_nonzero((positive_delta > 1e-4) & observed_mask))
+                except Exception:
+                    confidence_updated_cells = 0
             else:
                 confidence_gain = max(mean_conf - prev_mean_conf, 0.0)
         except Exception:
             confidence_gain = max(mean_conf - prev_mean_conf, 0.0)
         self.prev_mean_confidence = mean_conf
+        try:
+            self._last_confidence_observed_cells = int(confidence_observed_cells)
+            self._last_confidence_updated_cells = int(confidence_updated_cells)
+            self._last_confidence_gain_cells = float(confidence_gain)
+        except Exception:
+            pass
 
         priority_score = self.priority_score()
         priority_gain = max(priority_score - prev_priority_score, 0.0)
@@ -1155,6 +1240,8 @@ class ExplorationGridMap:
             low_confidence_ratio=float(low_confidence_ratio),
             stale_refresh_cells=int(stale_refresh_cells),
             confidence_gain=float(confidence_gain),
+            confidence_observed_cells=int(confidence_observed_cells),
+            confidence_updated_cells=int(confidence_updated_cells),
             target_priority=float(target_priority),
             target_type=str(target_type),
             target_switched=bool(self._last_target_switched),
@@ -1728,25 +1815,70 @@ class ExplorationGridMap:
 
         self.base_grid = np.full((h, w), self.UNKNOWN, dtype=np.int16)
         self.correction_logodds_grid = resample_old("correction_logodds_grid", 0.0, np.float32)
-        self.confidence_grid = resample_old("confidence_grid", 0.0, np.float32)
+
+        # v106: Confidence is not SLAM geometry; it is a record of policy-visible
+        # cells.  When Cartographer changes the /map canvas origin/size after a
+        # reset or pose-graph correction, nearest-neighbor resampling of old
+        # confidence can leave magenta blobs at physically wrong cells.  In the
+        # unified mode, keep /rl_confidence_map on the exact current /map canvas
+        # and clear the old confidence memory whenever the SLAM canvas changes.
+        # This makes the current confidence cone use the same pose/canvas that
+        # RViz uses for RobotModel and /map.
+        try:
+            _clear_conf_on_canvas_change = str(os.environ.get(
+                "TB3_RL_CLEAR_CONFIDENCE_ON_SLAM_CANVAS_CHANGE", "0"
+            )).strip().lower() in {"1", "true", "yes", "on", "enable", "enabled"}
+        except Exception:
+            _clear_conf_on_canvas_change = False
+
+        if _clear_conf_on_canvas_change:
+            self.confidence_grid = np.zeros((h, w), dtype=np.float32)
+            try:
+                self.last_seen_grid = np.full((h, w), -1, dtype=np.int32)
+                self.visit_grid = np.zeros((h, w), dtype=np.int32)
+                self._last_lidar_visible_free_mask = np.zeros((h, w), dtype=bool)
+                self._last_lidar_hit_wall_mask = np.zeros((h, w), dtype=bool)
+                self._last_lidar_priority_clear_weight = np.zeros((h, w), dtype=np.float32)
+            except Exception:
+                pass
+            try:
+                if str(os.environ.get("TB3_RL_CONFIDENCE_CANVAS_DEBUG", "0")).strip().lower() in {"1", "true", "yes", "on"}:
+                    self.node.get_logger().warn(
+                        "CONFIDENCE_CLEARED_ON_SLAM_CANVAS_CHANGE | "
+                        f"old={old_w}x{old_h}@({old_ox:+.3f},{old_oy:+.3f}) "
+                        f"new={w}x{h}@({float(slam_origin_x):+.3f},{float(slam_origin_y):+.3f})"
+                    )
+            except Exception:
+                pass
+        else:
+            self.confidence_grid = resample_old("confidence_grid", 0.0, np.float32)
+
         self.priority_grid = resample_old("priority_grid", 0.0, np.float32)
         self._persistent_priority_seed_grid = resample_old("_persistent_priority_seed_grid", 0.0, np.float32)
         self._persistent_priority_allowed_grid = resample_old("_persistent_priority_allowed_grid", False, bool)
         self.priority_suppression_grid = resample_old("priority_suppression_grid", 0.0, np.float32)
         self.priority_checked_grid = resample_old("priority_checked_grid", False, bool)
         self.priority_rechecked_rewarded_grid = resample_old("priority_rechecked_rewarded_grid", False, bool)
-        self._last_lidar_visible_free_mask = resample_old("_last_lidar_visible_free_mask", False, bool)
-        self._last_lidar_priority_clear_weight = resample_old("_last_lidar_priority_clear_weight", 0.0, np.float32)
-        self._last_lidar_hit_wall_mask = resample_old("_last_lidar_hit_wall_mask", False, bool)
+        if _clear_conf_on_canvas_change:
+            self._last_lidar_visible_free_mask = np.zeros((h, w), dtype=bool)
+            self._last_lidar_priority_clear_weight = np.zeros((h, w), dtype=np.float32)
+            self._last_lidar_hit_wall_mask = np.zeros((h, w), dtype=bool)
+            self.visit_grid = np.zeros((h, w), dtype=np.int32)
+            self.last_seen_grid = np.full((h, w), -1, dtype=np.int32)
+        else:
+            self._last_lidar_visible_free_mask = resample_old("_last_lidar_visible_free_mask", False, bool)
+            self._last_lidar_priority_clear_weight = resample_old("_last_lidar_priority_clear_weight", 0.0, np.float32)
+            self._last_lidar_hit_wall_mask = resample_old("_last_lidar_hit_wall_mask", False, bool)
+            self.visit_grid = resample_old("visit_grid", 0, np.int32)
+            self.last_seen_grid = resample_old("last_seen_grid", -1, np.int32)
         self._last_lidar_hit_cells_for_priority = []
-        self.visit_grid = resample_old("visit_grid", 0, np.int32)
-        self.last_seen_grid = resample_old("last_seen_grid", -1, np.int32)
         self.grid = np.full((h, w), self.UNKNOWN, dtype=np.int8)
 
         self._index_cache_shape = None
         self._index_cache = None
         self._publish_resample_cache_key = None
         self._publish_resample_cache = None
+        self._last_slam_fast_lock_key = None
         self._base_grid_needs_resample = True
         return True
 
@@ -1772,6 +1904,45 @@ class ExplorationGridMap:
         slam_origin_y = float(slam_map.info.origin.position.y)
         slam_origin_yaw = self._quat_to_yaw(slam_map.info.origin.orientation)
         slam_frame = str(getattr(getattr(slam_map, "header", None), "frame_id", "") or self.frame_id).strip() or self.frame_id
+
+        # v18 fast path: in map-locked mode the env calls update() much faster
+        # than Cartographer publishes a new /map.  Re-processing the same
+        # OccupancyGrid every step costs tens of milliseconds and repeatedly marks
+        # priority dirty even though no SLAM data changed.
+        try:
+            frame_fast = str(self.frame_id or "").strip().lstrip("/")
+            slam_frame_fast = str(slam_frame or "").strip().lstrip("/")
+            same_frame_fast = bool(frame_fast and slam_frame_fast and frame_fast == slam_frame_fast)
+            same_canvas_fast = (
+                int(getattr(self, "width", 0)) == int(slam_width)
+                and int(getattr(self, "height", 0)) == int(slam_height)
+                and abs(float(getattr(self, "resolution", slam_res)) - float(slam_res)) < 1e-9
+                and abs(float(getattr(self, "origin_x", slam_origin_x)) - float(slam_origin_x)) < 1e-6
+                and abs(float(getattr(self, "origin_y", slam_origin_y)) - float(slam_origin_y)) < 1e-6
+            )
+            fast_key = (
+                id(slam_map),
+                slam_stamp_key,
+                int(slam_width),
+                int(slam_height),
+                round(float(slam_res), 9),
+                round(float(slam_origin_x), 6),
+                round(float(slam_origin_y), 6),
+                str(slam_frame),
+            )
+            if (
+                same_frame_fast
+                and same_canvas_fast
+                and not bool(getattr(self, "_base_grid_needs_resample", False))
+                and getattr(self, "_last_slam_fast_lock_key", None) == fast_key
+            ):
+                self._last_slam_update_new_known_cells = 0
+                self._last_slam_update_new_free_cells = 0
+                self._last_slam_update_new_occupied_cells = 0
+                self._last_slam_update_expand_known_cells = 0
+                return
+        except Exception:
+            fast_key = None
 
         self._record_slam_map_update_delta(
             data=data,
@@ -1800,7 +1971,19 @@ class ExplorationGridMap:
             try:
                 occupied_internal = self.base_grid >= self._slam_occupied_threshold()
                 if np.any(occupied_internal):
-                    self.confidence_grid[occupied_internal] = 0.0
+                    # v111: confidence means "already inspected/seen by the policy".
+                    # Do not erase it every time SLAM later classifies a cell as
+                    # occupied; that made the magenta layer disappear and allowed
+                    # duplicate confidence-gain reward after repainting.  Keep the
+                    # old behavior only when explicitly requested.
+                    try:
+                        clear_conf_occ = str(os.environ.get(
+                            "TB3_RL_CLEAR_CONFIDENCE_ON_SLAM_OCCUPIED", "0"
+                        )).strip().lower() in {"1", "true", "yes", "on", "enable", "enabled"}
+                    except Exception:
+                        clear_conf_occ = False
+                    if clear_conf_occ:
+                        self.confidence_grid[occupied_internal] = 0.0
                     self.priority_grid[occupied_internal] = 0.0
                     self.priority_checked_grid[occupied_internal] = False
                     self.priority_suppression_grid[occupied_internal] = 0.0
@@ -1808,6 +1991,10 @@ class ExplorationGridMap:
                 pass
             self._invalidate_priority_from_slam_geometry()
             self._priority_dirty = True
+            try:
+                self._last_slam_fast_lock_key = fast_key
+            except Exception:
+                self._last_slam_fast_lock_key = None
             return
 
         # Fallback for odom/internal-frame operation: expand to known SLAM bounds
@@ -1878,6 +2065,10 @@ class ExplorationGridMap:
 
         self.base_grid.fill(self.UNKNOWN)
         self.base_grid[valid] = data[sy[valid], sx[valid]]
+        try:
+            self._last_slam_fast_lock_key = fast_key
+        except Exception:
+            self._last_slam_fast_lock_key = None
 
         # Hard wall mask for auxiliary layers. Confidence and priority are
         # traversable-space quantities; they must never occupy SLAM wall cells.
@@ -2358,6 +2549,33 @@ class ExplorationGridMap:
           - Destructively erase only confirmed SLAM wall cells so confidence never
             remains inside occupied geometry.
         """
+        fast_clamp_raw = os.environ.get("TB3_RL_FAST_STRICT_WALL_CLAMP", "1")
+        fast_clamp = str(fast_clamp_raw).strip().lower() not in {"0", "false", "no", "off", "disable", "disabled"}
+        if fast_clamp:
+            # v18: ray updates are already clipped by direct LiDAR/SLAM line-of-sight.
+            # The expensive full-map connected-component BFS is only needed as an
+            # extra conservative guard.  In the fast path, keep the stable wall
+            # cleanup but return a local write mask that excludes confirmed walls.
+            stable_wall = self._inflated_wall_mask(radius=1, include_lidar=False)
+            try:
+                if stable_wall.shape == self.confidence_grid.shape:
+                    self.confidence_grid[stable_wall] = 0.0
+                if stable_wall.shape == self.priority_grid.shape:
+                    self.priority_grid[stable_wall] = 0.0
+                if hasattr(self, "_persistent_priority_seed_grid") and isinstance(self._persistent_priority_seed_grid, np.ndarray) and self._persistent_priority_seed_grid.shape == stable_wall.shape:
+                    self._persistent_priority_seed_grid[stable_wall] = 0.0
+                if hasattr(self, "_persistent_priority_allowed_grid") and isinstance(self._persistent_priority_allowed_grid, np.ndarray) and self._persistent_priority_allowed_grid.shape == stable_wall.shape:
+                    self._persistent_priority_allowed_grid[stable_wall] = False
+                if self.priority_checked_grid.shape == stable_wall.shape:
+                    self.priority_checked_grid[stable_wall] = False
+                if self.priority_suppression_grid.shape == stable_wall.shape:
+                    self.priority_suppression_grid[stable_wall] = 0.0
+            except Exception:
+                pass
+            if stable_wall.shape == self.priority_grid.shape:
+                return (~stable_wall).astype(bool, copy=False)
+            return np.ones_like(self.priority_grid, dtype=bool)
+
         temp_wall = self._inflated_wall_mask(radius=2, include_lidar=True)
         component = self._reachable_component_from_robot(robot_ix, robot_iy, temp_wall)
         if component.shape != self.priority_grid.shape:
@@ -2662,29 +2880,43 @@ class ExplorationGridMap:
         if base_angle_weight <= 0.0:
             return
 
+        max_cells2 = int(max_cells) * int(max_cells)
+        max_range2 = max(float(self.priority_clear_max_range_m) * float(self.priority_clear_max_range_m), 1e-12)
+        res2 = float(self.resolution) * float(self.resolution)
         for cx, cy in cells:
-            if not self.in_bounds(cx, cy):
+            cx_i = int(cx)
+            cy_i = int(cy)
+            if cx_i < 0 or cx_i >= int(self.width) or cy_i < 0 or cy_i >= int(self.height):
                 continue
 
-            d_cells = math.sqrt(float((int(cx) - rix) ** 2 + (int(cy) - riy) ** 2))
-            if d_cells > max_cells:
+            dx = cx_i - rix
+            dy = cy_i - riy
+            d_cells2 = int(dx * dx + dy * dy)
+            if d_cells2 > max_cells2:
                 break
 
-            d_m = d_cells * self.resolution
-            radial_weight = 0.65 + 0.35 * math.exp(
-                -0.5 * (d_m / max(self.priority_clear_max_range_m, 1e-6)) ** 2
-            )
-            w = float(np.clip(base_angle_weight * radial_weight, 0.0, 1.0))
-            if w > weight_grid[int(cy), int(cx)]:
-                weight_grid[int(cy), int(cx)] = w
+            d_m2 = float(d_cells2) * res2
+            radial_weight = 0.65 + 0.35 * math.exp(-0.5 * d_m2 / max_range2)
+            w = base_angle_weight * radial_weight
+            if w > 1.0:
+                w = 1.0
+            elif w < 0.0:
+                w = 0.0
+            if w > weight_grid[cy_i, cx_i]:
+                weight_grid[cy_i, cx_i] = np.float32(w)
 
     def _update_priority_checked(self, clear_weight: Optional[np.ndarray]) -> tuple[int, float]:
         """
-        Clear active priority only when the robot physically reaches it.
+        Clear active priority when the robot directly checks it.
 
-        LiDAR rays still build a visibility mask elsewhere for confidence and
-        target spawning, but they do not clear priority by themselves.  Checked
-        cells are internal-only and render as 0 in /rl_priority_map.
+        v116 semantics:
+          - robot-body reach still clears priority;
+          - front-FOV LiDAR/camera-style visibility also clears priority;
+          - both paths are clipped by SLAM/LiDAR wall occlusion before reaching here.
+
+        This matches the confidence-map semantics: a priority spot is considered
+        checked when it lies in directly visible front free-space, not only when
+        the robot physically drives onto it.
         """
         if clear_weight is None or clear_weight.shape != self.priority_grid.shape:
             return 0, 0.0
@@ -2694,23 +2926,13 @@ class ExplorationGridMap:
         clear_weight = np.clip(clear_weight.astype(np.float32, copy=False), 0.0, 1.0)
         previous_priority = np.clip(self.priority_grid.astype(np.float32, copy=False), 0.0, 100.0)
 
-        # Priority is a physical target.  LiDAR rays may make a cluster visible
-        # and may be used for confidence/random-target spawning, but visibility
-        # alone must NOT clear priority.  A priority cluster is cleared only when
-        # the robot reaches its local neighborhood.
+        # v116: clear by direct front-FOV check as well as physical reach.
+        # `clear_weight` is produced only from:
+        #   1) robot-body reached cells, and
+        #   2) visible front-FOV ray free-space cells.
+        # The ray component is already truncated by SLAM/LiDAR occlusion, so this
+        # does not erase priority behind walls.
         visible_clear_mask = clear_weight >= self.priority_clear_min_weight
-
-        try:
-            visit_mask = self._priority_robot_reached_mask(
-                int(getattr(self, "_last_robot_ix", -1)),
-                int(getattr(self, "_last_robot_iy", -1)),
-            )
-            if visit_mask.shape == visible_clear_mask.shape:
-                visible_clear_mask &= visit_mask
-            else:
-                visible_clear_mask[:] = False
-        except Exception:
-            visible_clear_mask[:] = False
 
         # Final wall guard against stale/reshaped maps.
         try:
@@ -3483,7 +3705,13 @@ class ExplorationGridMap:
             except Exception:
                 return float(default)
 
-        spawn_interval_steps = max(_env_int("TB3_RL_PRIORITY_CLUSTER_SPAWN_INTERVAL_STEPS", 900), 1)
+        def _env_bool(name: str, default: bool = False) -> bool:
+            raw = os.environ.get(name, "1" if default else "0")
+            return str(raw).strip().lower() in {"1", "true", "yes", "on", "enable", "enabled"}
+
+        # `step_index` advances once per RL env update, not once per 0.01s live-map
+        # timer tick.  With the normal control_dt=0.10, 100 steps ~= 10 seconds.
+        spawn_interval_steps = max(_env_int("TB3_RL_PRIORITY_CLUSTER_SPAWN_INTERVAL_STEPS", 100), 1)
         max_seed_points = max(_env_int("TB3_RL_PRIORITY_MAX_SEED_POINTS", 6), 0)
         spawn_min_range_m = max(_env_float("TB3_RL_PRIORITY_SPAWN_MIN_RANGE_M", 0.90), 0.0)
         spawn_max_range_m = max(_env_float("TB3_RL_PRIORITY_SPAWN_MAX_RANGE_M", 2.40), spawn_min_range_m)
@@ -3494,7 +3722,17 @@ class ExplorationGridMap:
         if due and active_seed_points < max_seed_points:
             yy, xx = np.ogrid[:self.height, :self.width]
             dist_m = np.sqrt((xx.astype(np.float32) - float(rix)) ** 2 + (yy.astype(np.float32) - float(riy)) ** 2) * float(self.resolution)
-            spawn_mask = passable & lidar_visible & (dist_m >= spawn_min_range_m) & (dist_m <= spawn_max_range_m)
+
+            # v117: do not spawn a new random emergency priority inside the same
+            # front-FOV clear mask.  v116 used `passable & lidar_visible`, but that
+            # makes a freshly spawned spot immediately eligible for the confidence-like
+            # priority clear rule on the next update.  The default now places random
+            # spots in reachable, not-currently-visible cells.  They are still clipped
+            # by SLAM walls/reachability and are cleared only after the robot turns
+            # toward them and confirms them with the front FOV.
+            spawn_in_current_fov = _env_bool("TB3_RL_PRIORITY_SPAWN_IN_CURRENT_FOV", False)
+            spawn_visibility_mask = lidar_visible if spawn_in_current_fov else (~lidar_visible)
+            spawn_mask = passable & spawn_visibility_mask & (dist_m >= spawn_min_range_m) & (dist_m <= spawn_max_range_m)
 
             if np.any(seed_grid > 1e-4):
                 near_existing = self._dilate_bool(seed_grid > 1e-4, radius=max(3, int(round(0.55 / max(self.resolution, 1e-6)))))
@@ -3518,7 +3756,7 @@ class ExplorationGridMap:
                 cy = int(ys[pick])
 
                 allow_radius = max(3, int(round(0.55 / max(self.resolution, 1e-6))))
-                cluster_allowed = passable & lidar_visible & (
+                cluster_allowed = passable & spawn_visibility_mask & (
                     ((xx.astype(np.float32) - float(cx)) ** 2 + (yy.astype(np.float32) - float(cy)) ** 2)
                     <= float(allow_radius * allow_radius)
                 )
@@ -3589,7 +3827,7 @@ class ExplorationGridMap:
             if self.priority_checked_grid.shape == new_priority.shape:
                 new_priority[self.priority_checked_grid] = 0.0
 
-            if (int(self.step_index) - int(getattr(self, "_last_priority_birth_debug_step", -10_000_000))) >= max(int(self.priority_recompute_interval), 200):
+            if os.environ.get("TB3_RL_QUIET_PRIORITY_LOGS", "0").strip().lower() not in {"1", "true", "yes", "on"} and (int(self.step_index) - int(getattr(self, "_last_priority_birth_debug_step", -10_000_000))) >= max(int(self.priority_recompute_interval), 200):
                 try:
                     target_active = int(np.count_nonzero(target_priority >= max(self.priority_clear_min_value, 1.0)))
                     new_active = int(np.count_nonzero(new_priority >= max(self.priority_clear_min_value, 1.0)))
@@ -4673,7 +4911,8 @@ class ExplorationGridMap:
                     except Exception:
                         pass
                 self._publish_grid_with_ref(conf_ref, self.confidence_pub, ref)
-                self._publish_grid_with_ref(prio_ref, self.priority_pub, ref)
+                if self.priority_pub is not None:
+                    self._publish_grid_with_ref(prio_ref, self.priority_pub, ref)
                 self._publish_grid_with_ref(filt_ref, self.filtered_slam_pub, ref)
                 return
 
@@ -4698,7 +4937,8 @@ class ExplorationGridMap:
         if self.legacy_memory_pub is not None:
             self._publish_grid(self.grid, self.legacy_memory_pub)
         self._publish_grid(confidence_grid, self.confidence_pub)
-        self._publish_grid(priority_grid, self.priority_pub)
+        if self.priority_pub is not None:
+            self._publish_grid(priority_grid, self.priority_pub)
         self._publish_grid(filtered_slam_grid, self.filtered_slam_pub)
 
     def _refresh_publish_grid(self):
@@ -4781,13 +5021,15 @@ class ExplorationGridMap:
         rotate_to_robot: bool = True,
     ) -> np.ndarray:
         """
-        CNN input: 5-channel robot-centric local crop.
+        CNN input: robot-centric local crop.
 
-        shape = (5, output_size, output_size)
+        No-priority mode shape = (4, output_size, output_size)
           ch0: SLAM free mask
           ch1: SLAM unknown mask
           ch2: SLAM occupied mask
           ch3: confidence map
+
+        Backward-compatible priority mode shape = (5, output_size, output_size)
           ch4: priority/door-gap map
 
         The geometry part is one-hot encoded. Frontier-like structure is not a
@@ -4822,7 +5064,7 @@ class ExplorationGridMap:
         iy = np.floor((wy - self.origin_y) / max(self.resolution, 1e-6)).astype(np.int32)
         valid = (ix >= 0) & (ix < self.width) & (iy >= 0) & (iy < self.height)
 
-        out = np.zeros((5, output_size, output_size), dtype=np.float32)
+        out = np.zeros((int(channels.shape[0]), output_size, output_size), dtype=np.float32)
         if np.any(valid):
             out[:, valid] = channels[:, iy[valid], ix[valid]]
 
@@ -4834,7 +5076,12 @@ class ExplorationGridMap:
         base_free = (struct >= 0) & (struct <= 35)
         base_occupied = struct >= min(float(self.gap_occupied_threshold), 55.0)
 
-        channels = np.zeros((5, self.height, self.width), dtype=np.float32)
+        no_priority_policy_input = bool(getattr(self, "disable_priority_map", False)) or (
+            str(os.environ.get("TB3_RL_NO_PRIORITY_MODEL_INPUT", "0")).strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        channel_count = 4 if no_priority_policy_input else 5
+        channels = np.zeros((channel_count, self.height, self.width), dtype=np.float32)
 
         # One-hot SLAM geometry.
         # ch0/ch1/ch2 are mutually exclusive category masks rather than a scalar
@@ -4844,10 +5091,13 @@ class ExplorationGridMap:
         channels[1, base_unknown] = 1.0
         channels[2, base_occupied] = 1.0
 
-        # Semantic state maps. Checked priority cells are already removed by
-        # _active_priority_grid(), so CNN sees them as zero-priority regions.
+        # Semantic state map.  In no-priority mode, the actor/critic never sees
+        # a priority channel at all.  This is intentionally not a zero-filled
+        # compatibility channel, because the user wants priority removed from the
+        # model input rather than merely disabled at runtime.
         channels[3, :, :] = np.clip(self.confidence_grid / 100.0, 0.0, 1.0)
-        channels[4, :, :] = np.clip(self._active_priority_grid() / 100.0, 0.0, 1.0)
+        if channel_count > 4:
+            channels[4, :, :] = np.clip(self._active_priority_grid() / 100.0, 0.0, 1.0)
 
         return channels
 

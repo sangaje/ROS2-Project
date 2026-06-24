@@ -4,6 +4,7 @@ import os
 import signal
 import subprocess
 import time
+import math
 import re
 from collections import deque
 from pathlib import Path
@@ -12,6 +13,7 @@ from typing import Optional
 import rclpy
 from stable_baselines3 import SAC
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
+from stable_baselines3.common.buffers import DictReplayBuffer
 from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.monitor import Monitor
 
@@ -126,6 +128,21 @@ def _guess_replay_buffer_path(model_path: Path, model_dir: Path) -> Optional[Pat
 from turtlebot3_rl_training.feature_extractor import MapVectorFeatureExtractor
 from turtlebot3_rl_training.gazebo_nav_env import GazeboNavEnv
 from turtlebot3_rl_training.ros_interface import TurtleBot3RosInterface
+
+try:
+    from turtlebot3_rl_training.process_cleanup import (
+        clean_fastdds_shm,
+        ensure_non_shm_fastdds_profile,
+    )
+except Exception:  # pragma: no cover - allow running outside the package layout
+    try:
+        from process_cleanup import (  # type: ignore
+            clean_fastdds_shm,
+            ensure_non_shm_fastdds_profile,
+        )
+    except Exception:
+        clean_fastdds_shm = None
+        ensure_non_shm_fastdds_profile = None
 
 
 def _apply_training_profile(cli_args):
@@ -388,6 +405,128 @@ def _apply_rviz_origin_policy(cli_args):
     return cli_args
 
 
+class SkipStoreDictReplayBuffer(DictReplayBuffer):
+    """DictReplayBuffer that skips transitions flagged by the env.
+
+    SB3 stores every env.step() transition unconditionally.  For this project a
+    forced safety backup/hold is not a policy decision: the robot was reversed or
+    held still by the safety shield, not by the actor.  Storing those transitions
+    teaches SAC the wrong dynamics (a forward action that maps to a reverse/zero
+    motion) and dilutes the forward-driving signal.
+
+    When the env marks a step with info["skip_store"] == True (or
+    info["velocity_safety_skip_store"]), this buffer drops the transition instead
+    of adding it, so the safety motion never enters training.  The penalty still
+    reaches the agent on the *next* stored step boundary because the env already
+    applied it to the reward; here we simply avoid storing the forced-motion
+    transition itself.
+    """
+
+    @staticmethod
+    def _is_skip(info) -> bool:
+        if not isinstance(info, dict):
+            return False
+        return bool(info.get("skip_store", False) or info.get("velocity_safety_skip_store", False))
+
+    def add(self, obs, next_obs, action, reward, done, infos):
+        # infos is a list (one per parallel env).  With a single env, skip when
+        # that env's transition is flagged.  With multiple envs we conservatively
+        # only skip if ALL sub-envs are flagged, because add() writes one shared
+        # row for every env at once and partial skipping is not representable.
+        try:
+            if infos and all(self._is_skip(i) for i in infos):
+                return
+        except Exception:
+            # Never let a malformed info crash training; fall through to normal add.
+            pass
+        return super().add(obs, next_obs, action, reward, done, infos)
+
+
+class RotatingCheckpointCallback(CheckpointCallback):
+    """CheckpointCallback that keeps only the newest ``keep_last`` checkpoints.
+
+    After every periodic save it deletes older checkpoint files so the model
+    directory never accumulates more than ``keep_last`` model snapshots (plus the
+    matching replay-buffer / vecnormalize files for the same step).  Early in
+    training there may legitimately be 0 or 1 checkpoints; deletion only happens
+    once there are more than ``keep_last``.  All file removals tolerate a missing
+    file, so a race or an already-deleted file never raises.
+    """
+
+    def __init__(self, *args, keep_last: int = 2, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.keep_last = max(int(keep_last), 1)
+
+    def _prune_old_checkpoints(self) -> None:
+        try:
+            save_dir = Path(self.save_path)
+        except Exception:
+            return
+        if not save_dir.exists():
+            return
+        prefix = str(self.name_prefix)
+
+        # Group every checkpoint artifact by its step number so a kept step keeps
+        # all of its sidecar files and a pruned step removes all of them.
+        model_glob = f"{prefix}_*_steps.zip"
+        try:
+            model_files = list(save_dir.glob(model_glob))
+        except Exception:
+            return
+        if len(model_files) <= self.keep_last:
+            return
+
+        def _step_of(p: Path) -> int:
+            m = re.search(r"_(\d+)_steps\.zip$", p.name)
+            if m:
+                return int(m.group(1))
+            try:
+                return int(p.stat().st_mtime)
+            except Exception:
+                return -1
+
+        # Newest first; keep the first keep_last, delete the rest.
+        model_files.sort(key=_step_of, reverse=True)
+        to_delete = model_files[self.keep_last:]
+
+        for model_path in to_delete:
+            step = _step_of(model_path)
+            # Remove the model zip and any sidecar files saved for the same step.
+            sidecars = [
+                model_path,
+                save_dir / f"{prefix}_replay_buffer_{step}_steps.pkl",
+                save_dir / f"{prefix}_vecnormalize_{step}_steps.pkl",
+            ]
+            for f in sidecars:
+                try:
+                    f.unlink(missing_ok=True)  # py3.8+: never raises if absent
+                except TypeError:
+                    # Older Python without missing_ok: guard manually.
+                    try:
+                        if f.exists():
+                            f.unlink()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            try:
+                if self.verbose:
+                    print(f"[CKPT ROTATE] removed old checkpoint step={step}", flush=True)
+            except Exception:
+                pass
+
+    def _on_step(self) -> bool:
+        # Run the normal periodic save first, then prune.
+        result = super()._on_step()
+        try:
+            if self.save_freq > 0 and (self.n_calls % self.save_freq == 0):
+                self._prune_old_checkpoints()
+        except Exception:
+            # Pruning must never crash training.
+            pass
+        return result
+
+
 class DebugCallback(BaseCallback):
     def __init__(self, print_freq: int = 100, verbose: int = 0):
         super().__init__(verbose)
@@ -512,9 +651,18 @@ class TrainingProgressCallback(BaseCallback):
         self.target_timesteps = self.requested_total_timesteps
         self.recent_episode_rewards = deque(maxlen=self.window_size)
         self.recent_episode_lengths = deque(maxlen=self.window_size)
+        self.recent_episode_steps_per_wall_sec = deque(maxlen=self.window_size)
+        self.recent_episode_steps_per_sim_sec = deque(maxlen=self.window_size)
         self.recent_terminal_reasons = deque(maxlen=self.window_size)
         self._current_episode_reward = 0.0
         self._current_episode_len = 0
+        self._episode_start_wall_time = 0.0
+        self._episode_start_sim_time = None
+        self._last_episode_wall_sec = float("nan")
+        self._last_episode_sim_sec = float("nan")
+        self._last_episode_steps_per_wall_sec = float("nan")
+        self._last_episode_steps_per_sim_sec = float("nan")
+        self._episode_index = 0
         self._csv_file = None
 
     @staticmethod
@@ -531,6 +679,8 @@ class TrainingProgressCallback(BaseCallback):
 
     def _on_training_start(self) -> None:
         self.start_wall_time = time.time()
+        self._episode_start_wall_time = self.start_wall_time
+        self._episode_start_sim_time = None
         self.start_timesteps = int(self.model.num_timesteps)
         self.target_timesteps = self.start_timesteps + self.requested_total_timesteps
 
@@ -540,7 +690,9 @@ class TrainingProgressCallback(BaseCallback):
             self._csv_file = path.open("w", encoding="utf-8")
             self._csv_file.write(
                 "timesteps,progress_percent,fps,elapsed_sec,eta_sec,"
-                "mean_episode_reward,mean_episode_length,last_reward,last_done,"
+                "mean_episode_reward,mean_episode_length,last_episode_wall_sec,"
+                "last_episode_sps_wall,last_episode_sim_sec,last_episode_sps_sim,"
+                "mean_episode_sps_wall,mean_episode_sps_sim,last_reward,last_done,"
                 "terminal_reason,coverage_ratio,priority_score,priority_clear_gain,"
                 "priority_step_cleared_cells,priority_step_clear_gain,"
                 "priority_live_cleared_cells,priority_live_clear_gain,"
@@ -559,6 +711,14 @@ class TrainingProgressCallback(BaseCallback):
         done = bool(dones[0]) if len(dones) > 0 else False
         info = infos[0] if len(infos) > 0 else {}
 
+        if self._current_episode_len == 0:
+            self._episode_start_wall_time = time.time()
+            try:
+                sim_start = float(info.get("sim_time", float("nan")))
+            except Exception:
+                sim_start = float("nan")
+            self._episode_start_sim_time = sim_start if sim_start >= 0.0 and math.isfinite(sim_start) else None
+
         self._current_episode_reward += reward
         self._current_episode_len += 1
 
@@ -568,11 +728,71 @@ class TrainingProgressCallback(BaseCallback):
             episode_info = info.get("episode", {}) if isinstance(info, dict) else {}
             ep_reward = float(episode_info.get("r", self._current_episode_reward))
             ep_len = int(episode_info.get("l", self._current_episode_len))
+
+            ep_wall_sec = max(time.time() - float(self._episode_start_wall_time or self.start_wall_time), 1e-6)
+            ep_sps_wall = float(ep_len) / ep_wall_sec if ep_len > 0 else 0.0
+            ep_sim_sec = float("nan")
+            ep_sps_sim = float("nan")
+            try:
+                sim_end = float(info.get("sim_time", float("nan")))
+            except Exception:
+                sim_end = float("nan")
+            if self._episode_start_sim_time is not None and math.isfinite(sim_end):
+                ep_sim_sec = max(sim_end - float(self._episode_start_sim_time), 1e-6)
+                ep_sps_sim = float(ep_len) / ep_sim_sec if ep_len > 0 else 0.0
+
+            self._episode_index += 1
+            self._last_episode_wall_sec = ep_wall_sec
+            self._last_episode_sim_sec = ep_sim_sec
+            self._last_episode_steps_per_wall_sec = ep_sps_wall
+            self._last_episode_steps_per_sim_sec = ep_sps_sim
+
             self.recent_episode_rewards.append(ep_reward)
             self.recent_episode_lengths.append(ep_len)
+            self.recent_episode_steps_per_wall_sec.append(ep_sps_wall)
+            if math.isfinite(ep_sps_sim):
+                self.recent_episode_steps_per_sim_sec.append(ep_sps_sim)
             self.recent_terminal_reasons.append(str(info.get("terminal_reason", "done")))
+
+            # v32: put per-episode throughput metrics into the normal
+            # Stable-Baselines3 boxed logger table instead of printing a
+            # separate one-line episode log.  Since train_sac uses
+            # model.learn(..., log_interval=1), SB3 dumps this logger record
+            # at every finished episode.
+            try:
+                self.logger.record("rollout/ep_last_steps", ep_len)
+                self.logger.record("rollout/ep_last_wall_sec", ep_wall_sec)
+                self.logger.record("rollout/ep_last_sps_wall", ep_sps_wall)
+                if math.isfinite(ep_sim_sec):
+                    self.logger.record("rollout/ep_last_sim_sec", ep_sim_sec)
+                if math.isfinite(ep_sps_sim):
+                    self.logger.record("rollout/ep_last_sps_sim", ep_sps_sim)
+                self.logger.record("rollout/ep_last_reward", ep_reward)
+            except Exception:
+                pass
+
+            if str(os.environ.get("TB3_RL_EPISODE_SPS_LINE_LOG", "0")).strip().lower() in {"1", "true", "yes", "on"}:
+                print(
+                    "[SAC EPISODE] "
+                    f"ep={self._episode_index:d} | "
+                    f"steps={ep_len:d} | "
+                    f"wall={self._fmt_duration(ep_wall_sec)} | "
+                    f"steps/s_wall={ep_sps_wall:6.2f} | "
+                    f"sim_dt={ep_sim_sec:7.3f}s | "
+                    f"steps/s_sim={ep_sps_sim:6.2f} | "
+                    f"epR={ep_reward:+9.2f} | "
+                    f"term={info.get('terminal_reason', 'done')} | "
+                    f"cov={float(info.get('coverage_ratio', -1.0)):.3f} | "
+                    f"col={bool(info.get('collision', False))} "
+                    f"fall={bool(info.get('fallen', False))} "
+                    f"oob={bool(info.get('out_of_bounds', False))}",
+                    flush=True,
+                )
+
             self._current_episode_reward = 0.0
             self._current_episode_len = 0
+            self._episode_start_wall_time = time.time()
+            self._episode_start_sim_time = None
 
         elapsed = max(time.time() - self.start_wall_time, 1e-6)
         trained_steps = max(int(self.num_timesteps) - self.start_timesteps, 0)
@@ -596,6 +816,14 @@ class TrainingProgressCallback(BaseCallback):
             sum(self.recent_episode_lengths) / len(self.recent_episode_lengths)
             if self.recent_episode_lengths else float("nan")
         )
+        mean_ep_sps_wall = (
+            sum(self.recent_episode_steps_per_wall_sec) / len(self.recent_episode_steps_per_wall_sec)
+            if self.recent_episode_steps_per_wall_sec else float("nan")
+        )
+        mean_ep_sps_sim = (
+            sum(self.recent_episode_steps_per_sim_sec) / len(self.recent_episode_steps_per_sim_sec)
+            if self.recent_episode_steps_per_sim_sec else float("nan")
+        )
         terminal_reason = str(info.get("terminal_reason", "none"))
 
         if should_print:
@@ -609,6 +837,8 @@ class TrainingProgressCallback(BaseCallback):
                 f"eta={self._fmt_duration(eta)} | "
                 f"epR{self.window_size}={mean_ep_reward:8.2f} | "
                 f"epLen{self.window_size}={mean_ep_len:6.1f} | "
+                f"epSPSw{self.window_size}={mean_ep_sps_wall:6.2f} | "
+                f"lastEpSPSw={self._last_episode_steps_per_wall_sec:6.2f} | "
                 f"last_r={reward:+8.3f} | "
                 f"done={done} | "
                 f"term={terminal_reason} | "
@@ -636,7 +866,11 @@ class TrainingProgressCallback(BaseCallback):
         if self._csv_file is not None and (should_print or trained_steps % self.print_freq == 0):
             self._csv_file.write(
                 f"{trained_steps},{progress * 100.0:.6f},{fps:.6f},{elapsed:.6f},{eta:.6f},"
-                f"{mean_ep_reward:.6f},{mean_ep_len:.6f},{reward:.6f},{int(done)},"
+                f"{mean_ep_reward:.6f},{mean_ep_len:.6f},"
+                f"{self._last_episode_wall_sec:.6f},{self._last_episode_steps_per_wall_sec:.6f},"
+                f"{self._last_episode_sim_sec:.6f},{self._last_episode_steps_per_sim_sec:.6f},"
+                f"{mean_ep_sps_wall:.6f},{mean_ep_sps_sim:.6f},"
+                f"{reward:.6f},{int(done)},"
                 f"{terminal_reason},{float(info.get('coverage_ratio', -1.0)):.6f},"
                 f"{float(info.get('priority_score', -1.0)):.6f},"
                 f"{float(info.get('priority_clear_gain', 0.0)):.6f},"
@@ -769,7 +1003,15 @@ def _force_mandatory_slam_reset_policy(cli_args):
 
     if not str(getattr(cli_args, "rl_filtered_slam_topic", "") or "").strip():
         cli_args.rl_filtered_slam_topic = "/rl_filtered_slam_map"
-    if not str(getattr(cli_args, "rl_priority_topic", "") or "").strip():
+    if bool(getattr(cli_args, "disable_priority_map", False)):
+        # Priority is intentionally removed: do not publish /rl_priority_map and
+        # do not let the mandatory SLAM/map policy silently re-enable the topic.
+        cli_args.rl_priority_topic = ""
+        cli_args.enable_corridor_priority_reward = False
+        cli_args.corridor_priority_reward_weight = 0.0
+        cli_args.post_reset_ready_require_priority = False
+        cli_args.priority_stuck_restart = False
+    elif not str(getattr(cli_args, "rl_priority_topic", "") or "").strip():
         cli_args.rl_priority_topic = "/rl_priority_map"
     if not str(getattr(cli_args, "rl_map_topic", "") or "").strip():
         cli_args.rl_map_topic = "/rl_task_map"
@@ -780,6 +1022,48 @@ def _force_mandatory_slam_reset_policy(cli_args):
     cli_args.slam_map_max_age_sec = max(float(getattr(cli_args, "slam_map_max_age_sec", 3.0)), 3.0)
     return cli_args
 
+
+
+
+def _force_no_priority_policy(cli_args):
+    """v93: hard-remove priority from training runtime.
+
+    This is stronger than reward-only disablement:
+      - no /rl_priority_map publisher
+      - no priority channel in map CNN input
+      - no target_priority scalar in vector observation
+      - no priority reward / priority-stuck restart / priority reset gate
+
+    The policy is activated by --disable-priority-map,
+    TB3_RL_FORCE_NO_PRIORITY=1, or TB3_RL_NO_PRIORITY_MODEL_INPUT=1.
+    """
+    raw_force = str(os.environ.get("TB3_RL_FORCE_NO_PRIORITY", "0")).strip().lower()
+    raw_no_model = str(os.environ.get("TB3_RL_NO_PRIORITY_MODEL_INPUT", "0")).strip().lower()
+    force = raw_force not in {"0", "false", "no", "off", "disable", "disabled"}
+    no_model = raw_no_model in {"1", "true", "yes", "on", "enable", "enabled"}
+    if force or no_model or bool(getattr(cli_args, "disable_priority_map", False)):
+        cli_args.disable_priority_map = True
+        cli_args.enable_corridor_priority_reward = False
+        cli_args.corridor_priority_reward_weight = 0.0
+        cli_args.post_reset_ready_require_priority = False
+        cli_args.priority_stuck_restart = False
+        cli_args.priority_stuck_restart_sec = 0.0
+        cli_args.priority_stuck_restart_steps = 1_000_000_000
+        cli_args.priority_stuck_score_threshold = 1.0
+        cli_args.priority_stuck_clear_gain_threshold = 1.0
+        cli_args.priority_stuck_info_gain_threshold = 1.0
+        cli_args.priority_recompute_interval = 1_000_000_000
+        cli_args.priority_target_lock_steps = 1_000_000_000
+        cli_args.priority_target_switch_margin = 1.0
+        cli_args.priority_visit_suppression_gain = 0.0
+        cli_args.priority_observed_suppression_gain = 0.0
+        cli_args.priority_clear_min_weight = 1.0
+        cli_args.rl_priority_topic = ""
+        os.environ["TB3_RL_FORCE_NO_PRIORITY"] = "1"
+        os.environ["TB3_RL_NO_PRIORITY_MODEL_INPUT"] = "1"
+        os.environ["TB3_RL_PRIORITY_CLUSTER_SPAWN_INTERVAL_STEPS"] = "1000000000"
+        os.environ["TB3_RL_PRIORITY_MAX_SEED_POINTS"] = "0"
+    return cli_args
 
 def _force_odom_coordinate_policy(cli_args):
     """Backward-compatible hook.
@@ -883,6 +1167,22 @@ def parse_args():
         help="Tiny CPU-yield sleep after command publish when --disable-world-step is active.",
     )
     parser.add_argument(
+        "--realtime-enforce-control-dt",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "When --disable-world-step is active, throttle each env step/micro-step "
+            "to the requested control_dt in wall-clock time while spinning ROS callbacks. "
+            "Use this when step-count based timers must correspond to real seconds."
+        ),
+    )
+    parser.add_argument(
+        "--realtime-control-dt-wall-margin-sec",
+        type=float,
+        default=0.0,
+        help="Optional extra wall-clock margin added to control_dt when realtime-enforce-control-dt is enabled.",
+    )
+    parser.add_argument(
         "--disable-path-reward",
         action="store_true",
         help="Deprecated. Path reward/planning is permanently disabled in this build.",
@@ -891,6 +1191,16 @@ def parse_args():
         "--disable-wall-proximity-penalty",
         action="store_true",
         help="Disable reward penalties for being close to walls/obstacles. Collision/fallen terminal penalties remain enabled. Useful when Nav2 handles local obstacle clearance.",
+    )
+    parser.add_argument(
+        "--disable-priority-map",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Disable the priority map completely. Keeps observation shape compatible "
+            "by zeroing the priority channel, disables priority reward/restart logic, "
+            "and suppresses /rl_priority_map publishing unless a topic is explicitly forced."
+        ),
     )
     parser.add_argument(
         "--enable-corridor-priority-reward",
@@ -1160,6 +1470,14 @@ def parse_args():
     parser.add_argument("--lidar-empty-min-valid-beams", type=int, default=2)
     parser.add_argument("--lidar-empty-restart-penalty", type=float, default=100.0)
 
+    # v113: soft terminal for low-information episode tails.
+    parser.add_argument("--coverage-stall-terminal", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--coverage-stall-start-steps", type=int, default=1000)
+    parser.add_argument("--coverage-stall-window-steps", type=int, default=500)
+    parser.add_argument("--coverage-stall-min-slam-new-cells", type=int, default=5)
+    parser.add_argument("--coverage-stall-min-confidence-updated-cells", type=int, default=30)
+    parser.add_argument("--coverage-stall-terminal-penalty", type=float, default=-1.0)
+
     # Pure velocity SAC safety shield.  Used only when --action-mode velocity.
     # Policy action remains forward-only; the shield may publish a short reverse
     # TwistStamped when the front sector is too close to an obstacle.
@@ -1255,6 +1573,9 @@ def parse_args():
     parser.add_argument("--slam-map-update-reward-norm-cells", type=float, default=50.0)
     parser.add_argument("--slam-map-update-reward-cap", type=float, default=3.0)
     parser.add_argument("--slam-map-update-reward-grace-steps", type=int, default=10)
+    parser.add_argument("--reward-positive-log-compress", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--reward-positive-log-alpha", type=float, default=0.50)
+    parser.add_argument("--reward-positive-log-max", type=float, default=8.0)
     parser.add_argument("--suppress-gap-confidence", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--gap-occupied-threshold", type=float, default=65.0)
     parser.add_argument("--gap-check-radius-m", type=float, default=1.20)
@@ -1354,11 +1675,45 @@ def parse_args():
     parsed_args = _force_nav2_only_policy(parsed_args)
     parsed_args = _force_mandatory_slam_reset_policy(parsed_args)
     parsed_args = _force_odom_coordinate_policy(parsed_args)
+    parsed_args = _force_no_priority_policy(parsed_args)
     return parsed_args
 
 
 def main(args=None):
     cli_args = parse_args()
+
+    if bool(getattr(cli_args, "disable_priority_map", False)) or str(os.environ.get("TB3_RL_FORCE_NO_PRIORITY", "0")).strip().lower() not in {"0", "false", "no", "off"}:
+        # v93 hard no-priority observation contract.
+        os.environ["TB3_RL_FORCE_NO_PRIORITY"] = "1"
+        os.environ["TB3_RL_NO_PRIORITY_MODEL_INPUT"] = "1"
+        cli_args.disable_priority_map = True
+        cli_args.enable_corridor_priority_reward = False
+        cli_args.corridor_priority_reward_weight = 0.0
+        cli_args.post_reset_ready_require_priority = False
+        cli_args.priority_stuck_restart = False
+        cli_args.rl_priority_topic = ""
+
+    # Prevent FastDDS /dev/shm port exhaustion at the source: disable the
+    # shared-memory transport (UDPv4 loopback only) BEFORE rclpy.init / any
+    # participant is created.  This is the robust fix for the repeated
+    # open_and_lock_file / init_port fastrtps_portNNNN crashes that occur when
+    # Cartographer is restarted every episode.  Respects a user-provided
+    # FASTRTPS_DEFAULT_PROFILES_FILE if one is already set.
+    if str(os.environ.get("TB3_RL_DISABLE_SHM_TRANSPORT", "1")).strip().lower() not in {"0", "false", "no", "off"}:
+        try:
+            if ensure_non_shm_fastdds_profile is not None:
+                ensure_non_shm_fastdds_profile(logger=None)
+        except Exception:
+            pass
+
+    # One-time wipe of stale SHM lock files from previous crashed runs.  This is
+    # safe ONLY here, before we start ROS/Gazebo ourselves.  If an external
+    # Gazebo is already running we skip the wipe to avoid disturbing it.
+    try:
+        if bool(getattr(cli_args, "auto_start_gazebo", False)) and clean_fastdds_shm is not None:
+            clean_fastdds_shm(logger=None)
+    except Exception:
+        pass
 
     gazebo_proc = _start_gazebo_if_requested(cli_args)
 
@@ -1428,16 +1783,28 @@ def main(args=None):
         realtime_spin_steps=cli_args.realtime_spin_steps,
         realtime_spin_timeout_sec=cli_args.realtime_spin_timeout_sec,
         realtime_sleep_sec=cli_args.realtime_sleep_sec,
+        realtime_enforce_control_dt=cli_args.realtime_enforce_control_dt,
+        realtime_control_dt_wall_margin_sec=cli_args.realtime_control_dt_wall_margin_sec,
         disable_path_reward=True,
         disable_wall_proximity_penalty=cli_args.disable_wall_proximity_penalty,
-        enable_corridor_priority_reward=True,
-        corridor_priority_reward_weight=cli_args.corridor_priority_reward_weight,
+        enable_corridor_priority_reward=(
+            bool(getattr(cli_args, "enable_corridor_priority_reward", True))
+            and not bool(getattr(cli_args, "disable_priority_map", False))
+        ),
+        disable_priority_map=bool(getattr(cli_args, "disable_priority_map", False)),
+        corridor_priority_reward_weight=(
+            0.0 if bool(getattr(cli_args, "disable_priority_map", False))
+            else cli_args.corridor_priority_reward_weight
+        ),
         confidence_reward_weight=cli_args.confidence_reward_weight,
         slam_map_update_reward=cli_args.slam_map_update_reward,
         slam_map_update_reward_weight=cli_args.slam_map_update_reward_weight,
         slam_map_update_reward_norm_cells=cli_args.slam_map_update_reward_norm_cells,
         slam_map_update_reward_cap=cli_args.slam_map_update_reward_cap,
         slam_map_update_reward_grace_steps=cli_args.slam_map_update_reward_grace_steps,
+        reward_positive_log_compress=cli_args.reward_positive_log_compress,
+        reward_positive_log_alpha=cli_args.reward_positive_log_alpha,
+        reward_positive_log_max=cli_args.reward_positive_log_max,
         max_linear_speed=cli_args.max_linear_speed,
         max_angular_speed=cli_args.max_angular_speed,
         velocity_command_linear_limit=cli_args.velocity_command_linear_limit,
@@ -1633,6 +2000,12 @@ def main(args=None):
         lidar_empty_max_valid_range_m=cli_args.lidar_empty_max_valid_range_m,
         lidar_empty_min_valid_beams=cli_args.lidar_empty_min_valid_beams,
         lidar_empty_restart_penalty=cli_args.lidar_empty_restart_penalty,
+        coverage_stall_terminal=cli_args.coverage_stall_terminal,
+        coverage_stall_start_steps=cli_args.coverage_stall_start_steps,
+        coverage_stall_window_steps=cli_args.coverage_stall_window_steps,
+        coverage_stall_min_slam_new_cells=cli_args.coverage_stall_min_slam_new_cells,
+        coverage_stall_min_confidence_updated_cells=cli_args.coverage_stall_min_confidence_updated_cells,
+        coverage_stall_terminal_penalty=cli_args.coverage_stall_terminal_penalty,
         velocity_safety_backup=cli_args.velocity_safety_backup,
         velocity_safety_trigger_distance_m=cli_args.velocity_safety_trigger_distance_m,
         velocity_safety_stop_distance_m=cli_args.velocity_safety_stop_distance_m,
@@ -1705,6 +2078,25 @@ def main(args=None):
     model_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
 
+    # Fail fast if the model directory is not writable or is nearly out of space,
+    # so a long run does not crash only at the final save.
+    try:
+        _probe = model_dir / ".write_test"
+        _probe.write_text("ok")
+        _probe.unlink()
+    except Exception as _werr:
+        print(f"[WARN] model_dir may not be writable: {model_dir} | {type(_werr).__name__}: {_werr}", flush=True)
+    try:
+        import shutil as _shutil
+        _free_gib = _shutil.disk_usage(str(model_dir)).free / (1024 ** 3)
+        if _free_gib < 1.0:
+            print(f"[WARN] Low disk space for model_dir: ~{_free_gib:.2f} GiB free. "
+                  "Model/checkpoint saves may fail. Free up space before a long run.", flush=True)
+        else:
+            print(f"[INFO] model_dir free space: ~{_free_gib:.1f} GiB", flush=True)
+    except Exception:
+        pass
+
     if bool(getattr(cli_args, "resume_latest", False)) and not str(cli_args.load_model).strip():
         latest_model = _find_latest_sac_model(model_dir)
         if latest_model is None:
@@ -1754,7 +2146,7 @@ def main(args=None):
         "TRAIN_CONFIG | "
         f"profile={cli_args.training_profile} | "
         f"policy={policy_name} | "
-        f"map_cnn={cli_args.use_map_cnn} map=(5,{cli_args.map_obs_size},{cli_args.map_obs_size}) lidar_bins={cli_args.num_lidar_bins} | "
+        f"map_cnn={cli_args.use_map_cnn} map=({4 if bool(getattr(cli_args, 'disable_priority_map', False)) else 5},{cli_args.map_obs_size},{cli_args.map_obs_size}) lidar_bins={cli_args.num_lidar_bins} | "
         f"temporal={cli_args.use_temporal_cnn} hist={cli_args.temporal_history_len} | "
         f"frames map={cli_args.map_frame} pose={cli_args.pose_frame} safety={cli_args.safety_boundary_frame} | "
         f"priority={cli_args.rl_priority_topic or '(off)'} filtered_slam={cli_args.rl_filtered_slam_topic or '(off)'} | "
@@ -1794,6 +2186,78 @@ def main(args=None):
         f"weight_decay={cli_args.policy_weight_decay}"
     )
 
+    sac_device = str(os.environ.get("TB3_RL_SAC_DEVICE", "auto") or "auto").strip() or "auto"
+    ros.get_logger().info(f"SAC_DEVICE_REQUEST | device={sac_device}")
+
+    # ---- Replay-buffer memory guard -------------------------------------------
+    # SAC's DictReplayBuffer preallocates a dense numpy array for EVERY observation
+    # key: shape (buffer_size, n_envs, *key_shape) float32, and again for the next
+    # observation.  With temporal keys like map_seq (H,5,32,32) this explodes:
+    # e.g. buffer_size=500000 * (16*5*32*32) * 4B * 2 ~= 300+ GiB and the process
+    # is killed with numpy ArrayMemoryError before training starts.  Estimate the
+    # requirement up front and clamp buffer_size to fit a memory budget so the run
+    # starts instead of dying.  Disable with TB3_RL_DISABLE_BUFFER_GUARD=1.
+    if str(os.environ.get("TB3_RL_DISABLE_BUFFER_GUARD", "0")).strip().lower() in {"0", "false", "no", "off", ""}:
+        try:
+            import numpy as _np
+
+            obs_space = env.observation_space
+            per_step_obs_bytes = 0
+            if hasattr(obs_space, "spaces"):
+                for _k, _sp in obs_space.spaces.items():
+                    n = int(_np.prod(_sp.shape)) if _sp.shape else 1
+                    per_step_obs_bytes += n * 4  # float32
+            else:
+                n = int(_np.prod(obs_space.shape)) if obs_space.shape else 1
+                per_step_obs_bytes = n * 4
+
+            # obs + next_obs are both stored.
+            bytes_per_slot = per_step_obs_bytes * 2
+            requested = int(cli_args.buffer_size)
+            requested_bytes = bytes_per_slot * requested
+
+            # Memory budget: env override, else a fraction of total system RAM.
+            budget_gib_env = str(os.environ.get("TB3_RL_BUFFER_MEM_BUDGET_GIB", "")).strip()
+            if budget_gib_env:
+                budget_bytes = float(budget_gib_env) * (1024 ** 3)
+            else:
+                budget_bytes = None
+                try:
+                    page = os.sysconf("SC_PAGE_SIZE")
+                    total = os.sysconf("SC_PHYS_PAGES")
+                    if page > 0 and total > 0:
+                        budget_bytes = 0.35 * float(page) * float(total)
+                except Exception:
+                    budget_bytes = None
+                if budget_bytes is None:
+                    budget_bytes = 8.0 * (1024 ** 3)  # conservative fallback
+
+            req_gib = requested_bytes / (1024 ** 3)
+            bud_gib = budget_bytes / (1024 ** 3)
+            ros.get_logger().info(
+                f"REPLAY_BUFFER_MEM | per_step_obs={per_step_obs_bytes/1024:.1f}KiB "
+                f"requested_buffer={requested} (~{req_gib:.1f}GiB) budget=~{bud_gib:.1f}GiB"
+            )
+
+            if requested_bytes > budget_bytes and bytes_per_slot > 0:
+                safe_size = max(int(budget_bytes // bytes_per_slot), 1000)
+                safe_size = min(safe_size, requested)
+                if safe_size < requested:
+                    ros.get_logger().warn(
+                        "REPLAY_BUFFER_CLAMP | requested buffer_size="
+                        f"{requested} (~{req_gib:.1f}GiB) exceeds memory budget "
+                        f"(~{bud_gib:.1f}GiB); clamping to {safe_size}. "
+                        "Override with --buffer-size, TB3_RL_BUFFER_MEM_BUDGET_GIB, "
+                        "or disable via TB3_RL_DISABLE_BUFFER_GUARD=1."
+                    )
+                    cli_args.buffer_size = int(safe_size)
+        except Exception as _mem_exc:
+            try:
+                ros.get_logger().warn(f"REPLAY_BUFFER_MEM_GUARD_SKIPPED | {type(_mem_exc).__name__}: {_mem_exc}")
+            except Exception:
+                pass
+    # ---------------------------------------------------------------------------
+
     if cli_args.load_model:
         load_path = Path(cli_args.load_model).expanduser()
         if not load_path.exists():
@@ -1805,7 +2269,31 @@ def main(args=None):
             env=env,
             tensorboard_log=str(log_dir),
             print_system_info=False,
+            device=sac_device,
+            custom_objects={"replay_buffer_class": SkipStoreDictReplayBuffer},
         )
+        # Ensure the skip-store buffer class sticks even if the loaded checkpoint
+        # recorded the default DictReplayBuffer.  If the buffer is (re)created
+        # later it will use our subclass.
+        try:
+            model.replay_buffer_class = SkipStoreDictReplayBuffer
+            if getattr(model, "replay_buffer", None) is not None and not isinstance(model.replay_buffer, SkipStoreDictReplayBuffer):
+                # Rebuild an empty skip-store buffer with the same parameters so
+                # subsequent transitions honor skip_store.  A loaded buffer (via
+                # --load-replay-buffer below) overrides this afterward.
+                model.replay_buffer = SkipStoreDictReplayBuffer(
+                    model.buffer_size,
+                    model.observation_space,
+                    model.action_space,
+                    device=model.device,
+                    n_envs=model.n_envs,
+                    optimize_memory_usage=getattr(model, "optimize_memory_usage", False),
+                )
+        except Exception as _rb_exc:
+            try:
+                ros.get_logger().warn(f"SKIP_STORE_BUFFER_SETUP | could not enforce on load: {type(_rb_exc).__name__}: {_rb_exc}")
+            except Exception:
+                pass
         # Keep the loaded weights, but apply safe current CLI throughput knobs.
         # SB3 stores train_freq as an internal TrainFreq object, so use the
         # algorithm helper when available instead of assigning a raw tuple.
@@ -1849,7 +2337,14 @@ def main(args=None):
             verbose=1,
             tensorboard_log=str(log_dir),
             policy_kwargs=policy_kwargs,
+            device=sac_device,
+            replay_buffer_class=SkipStoreDictReplayBuffer,
         )
+
+    try:
+        ros.get_logger().info(f"SAC_DEVICE_ACTIVE | device={getattr(model, 'device', 'unknown')}")
+    except Exception:
+        pass
 
     debug_callback = DebugCallback(print_freq=cli_args.debug_print_freq)
 
@@ -1866,12 +2361,20 @@ def main(args=None):
             csv_path=progress_csv,
         )
 
-    checkpoint_callback = CheckpointCallback(
+    try:
+        keep_last_ckpts = int(os.environ.get("TB3_RL_KEEP_LAST_CHECKPOINTS", "2") or 2)
+    except Exception:
+        keep_last_ckpts = 2
+    keep_last_ckpts = max(int(keep_last_ckpts), 1)
+
+    checkpoint_callback = RotatingCheckpointCallback(
         save_freq=cli_args.checkpoint_freq,
         save_path=str(model_dir),
         name_prefix="sac_turtlebot3_burger_checkpoint",
         save_replay_buffer=bool(cli_args.save_replay_buffer),
         save_vecnormalize=bool(cli_args.save_vecnormalize),
+        keep_last=keep_last_ckpts,
+        verbose=1,
     )
 
     try:
@@ -1881,21 +2384,83 @@ def main(args=None):
         if cli_args.debug_print_freq > 0:
             callbacks.append(debug_callback)
 
-        model.learn(
-            total_timesteps=cli_args.timesteps,
-            callback=callbacks,
-            log_interval=1,
-            reset_num_timesteps=not bool(cli_args.continue_timesteps),
-        )
+        learn_error = None
+        try:
+            model.learn(
+                total_timesteps=cli_args.timesteps,
+                callback=callbacks,
+                log_interval=1,
+                reset_num_timesteps=not bool(cli_args.continue_timesteps),
+            )
+        except KeyboardInterrupt:
+            learn_error = "KeyboardInterrupt"
+            try:
+                ros.get_logger().warn(
+                    "TRAINING_INTERRUPTED | KeyboardInterrupt received; saving emergency checkpoint."
+                )
+            except Exception:
+                pass
+        except Exception as exc:
+            learn_error = f"{type(exc).__name__}: {exc}"
+            try:
+                ros.get_logger().error(
+                    f"TRAINING_ABORTED | learn() raised; saving emergency checkpoint | {learn_error}"
+                )
+            except Exception:
+                pass
 
+        if learn_error is not None:
+            # Best-effort emergency save so a long run is never lost on a late crash.
+            try:
+                emergency_path = model_dir / "sac_turtlebot3_burger_emergency"
+                model.save(str(emergency_path))
+                ros.get_logger().info(f"Saved emergency model to {emergency_path}.zip")
+                if bool(cli_args.save_replay_buffer):
+                    em_replay = model_dir / "sac_turtlebot3_burger_emergency_replay_buffer.pkl"
+                    model.save_replay_buffer(str(em_replay))
+                    ros.get_logger().info(f"Saved emergency replay buffer to {em_replay}")
+            except Exception as save_exc:
+                try:
+                    ros.get_logger().error(f"EMERGENCY_SAVE_FAILED | {type(save_exc).__name__}: {save_exc}")
+                except Exception:
+                    pass
+
+        # Final save.  Wrap in try/except so a late disk/permission error does not
+        # discard the trained model silently or crash before cleanup.  On failure,
+        # retry once into a timestamped fallback path so a long run is never lost.
         save_path = model_dir / "sac_turtlebot3_burger"
-        model.save(str(save_path))
-        if bool(cli_args.save_replay_buffer):
-            replay_path = model_dir / "sac_turtlebot3_burger_replay_buffer.pkl"
-            model.save_replay_buffer(str(replay_path))
-            ros.get_logger().info(f"Saved replay buffer to {replay_path}")
-
-        ros.get_logger().info(f"Saved model to {save_path}.zip")
+        try:
+            model.save(str(save_path))
+            if bool(cli_args.save_replay_buffer):
+                replay_path = model_dir / "sac_turtlebot3_burger_replay_buffer.pkl"
+                model.save_replay_buffer(str(replay_path))
+                ros.get_logger().info(f"Saved replay buffer to {replay_path}")
+            ros.get_logger().info(f"Saved model to {save_path}.zip")
+        except Exception as final_exc:
+            try:
+                ros.get_logger().error(
+                    f"FINAL_SAVE_FAILED | {type(final_exc).__name__}: {final_exc} | trying fallback path"
+                )
+            except Exception:
+                pass
+            try:
+                import time as _t
+                fb = model_dir / f"sac_turtlebot3_burger_savefail_{int(_t.time())}"
+                model.save(str(fb))
+                ros.get_logger().info(f"Saved model to fallback {fb}.zip")
+            except Exception as fb_exc:
+                # Last resort: try the home directory so the weights are not lost.
+                try:
+                    home_fb = Path.home() / f"sac_turtlebot3_burger_rescue_{int(time.time())}"
+                    model.save(str(home_fb))
+                    ros.get_logger().error(f"FINAL_SAVE_RESCUE | saved to {home_fb}.zip")
+                except Exception as rescue_exc:
+                    try:
+                        ros.get_logger().error(
+                            f"FINAL_SAVE_RESCUE_FAILED | {type(fb_exc).__name__}/{type(rescue_exc).__name__} | model weights could not be written"
+                        )
+                    except Exception:
+                        pass
 
     finally:
         ros.stop_robot()

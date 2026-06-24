@@ -640,6 +640,7 @@ def build_exploration_observation(
     scan_angle_min: Optional[float] = None,
     scan_angle_increment: Optional[float] = None,
     scan_angle_max: Optional[float] = None,
+    include_target_priority: bool = True,
 ) -> np.ndarray:
     """
     SLAM-assisted exploration observation.
@@ -650,7 +651,7 @@ def build_exploration_observation(
       coverage_delta_norm,
       frontier_distance_norm,
       frontier_angle_norm,
-      target_priority,
+      target_priority,    # omitted when include_target_priority=False
       mean_confidence_norm,
       stale_ratio,
       low_confidence_ratio,
@@ -700,25 +701,41 @@ def build_exploration_observation(
         1.0,
     )
 
-    obs = np.concatenate(
-        [
-            lidar,
-            np.array(
-                [
-                    coverage_ratio_norm,
-                    coverage_delta_norm,
-                    frontier_distance_norm,
-                    frontier_angle_norm,
-                    target_priority_norm,
-                    mean_confidence_norm,
-                    stale_ratio_norm,
-                    low_confidence_ratio_norm,
-                    prev_linear_norm,
-                    prev_angular_norm,
-                ],
-                dtype=np.float32,
-            ),
-        ]
-    )
+    if include_target_priority:
+        extra = np.array(
+            [
+                coverage_ratio_norm,
+                coverage_delta_norm,
+                frontier_distance_norm,
+                frontier_angle_norm,
+                target_priority_norm,
+                mean_confidence_norm,
+                stale_ratio_norm,
+                low_confidence_ratio_norm,
+                prev_linear_norm,
+                prev_angular_norm,
+            ],
+            dtype=np.float32,
+        )
+    else:
+        # No-priority policy input: remove target_priority from the actor/critic
+        # vector.  This changes vector dim from lidar+10 to lidar+9 and must be
+        # trained as a new model/checkpoint family.
+        extra = np.array(
+            [
+                coverage_ratio_norm,
+                coverage_delta_norm,
+                frontier_distance_norm,
+                frontier_angle_norm,
+                mean_confidence_norm,
+                stale_ratio_norm,
+                low_confidence_ratio_norm,
+                prev_linear_norm,
+                prev_angular_norm,
+            ],
+            dtype=np.float32,
+        )
+
+    obs = np.concatenate([lidar, extra])
 
     return obs.astype(np.float32)

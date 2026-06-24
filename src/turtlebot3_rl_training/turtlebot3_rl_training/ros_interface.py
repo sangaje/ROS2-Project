@@ -13,6 +13,7 @@ from typing import Optional
 import numpy as np
 import rclpy
 from geometry_msgs.msg import TransformStamped, TwistStamped
+from tf2_msgs.msg import TFMessage
 from nav_msgs.msg import OccupancyGrid, Odometry
 from nav_msgs.srv import GetMap
 from rclpy.executors import SingleThreadedExecutor
@@ -71,6 +72,11 @@ def _quiet_map_logs() -> bool:
 
 def _quiet_startup_logs() -> bool:
     raw = os.environ.get("TB3_RL_QUIET_STARTUP_LOGS", "0")
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _quiet_reset_logs() -> bool:
+    raw = os.environ.get("TB3_RL_QUIET_RESET_LOGS", "0")
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
@@ -312,10 +318,26 @@ class TurtleBot3RosInterface(Node):
 
         # RViz RobotModel/Nav2 need a complete TF chain.  Some Gazebo launches
         # publish /odom but not odom->base_footprint on /tf, and some custom
-        # runs omit robot_state_publisher.  Keep these guards enabled by default.
-        self.odom_tf_fallback_enabled = True
+        # runs omit robot_state_publisher.
+        #
+        # v109: do NOT publish this fallback by default during Cartographer/RViz
+        # debugging.  If this node also publishes odom->base_footprint, the TF
+        # tree can have duplicate odom->base edges from ros_gz_bridge and this
+        # node.  That makes the confidence pose ambiguous even though RViz has a
+        # valid map->base transform.  Enable it only when the Gazebo/robot stack
+        # really does not publish odom->base TF:
+        #
+        #   export TB3_RL_ODOM_TF_FALLBACK=1
+        #
+        _tf_fb = str(os.environ.get("TB3_RL_ODOM_TF_FALLBACK", "0") or "0").strip().lower()
+        self.odom_tf_fallback_enabled = _tf_fb in {"1", "true", "yes", "on", "enable", "enabled"}
         self.odom_tf_broadcaster = None
         self._odom_tf_fallback_logged = False
+        if not self.odom_tf_fallback_enabled:
+            try:
+                self.get_logger().info("TF_GUARD | odom TF fallback disabled by TB3_RL_ODOM_TF_FALLBACK=0")
+            except Exception:
+                pass
 
         self._slam_map_lock = threading.RLock()
         self._map_mirror_node = None
@@ -343,6 +365,17 @@ class TurtleBot3RosInterface(Node):
         # tuned for a 20 m lidar.  For real robot tests we launch slam_toolbox
         # with a generated safe config and feed it a fixed-length scan topic.
         self.slam_fixed_scan_topic = "/scan_fixed"
+        # Cartographer generated fallback must not depend on a missing base_scan TF.
+        # The relay can stamp /scan_fixed as base_footprint so Cartographer can
+        # consume LaserScan data even when robot_state_publisher/static base_scan
+        # is absent or late after reset.  Official turtlebot3_cartographer still
+        # consumes the raw /scan path by default.
+        self.slam_fixed_scan_frame = (
+            os.environ.get("TB3_RL_SLAM_SCAN_FIXED_FRAME", self.base_frame)
+            .strip()
+            .lstrip("/")
+            or self.base_frame
+        )
         # 0 means: lock to the first real /scan beam count, then keep it fixed.
         # This avoids Karto errors when the raw scan count jitters by +/- beams.
         self.slam_fixed_scan_count = 0
@@ -409,6 +442,35 @@ class TurtleBot3RosInterface(Node):
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE,
         )
+
+        # v110: independent, single-source TF cache.  This node must not
+        # publish TF during Cartographer confidence debugging; it only listens to
+        # /tf and /tf_static and composes map->base manually.
+        self.manual_tf_cache_enabled = str(os.environ.get("TB3_RL_MANUAL_TF_CACHE", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
+        self._manual_tf_lock = threading.RLock()
+        self._manual_tf = {}
+        self._manual_tf_static = {}
+        self.manual_tf_sub = None
+        self.manual_tf_static_sub = None
+        if self.manual_tf_cache_enabled:
+            tf_qos = QoSProfile(
+                history=HistoryPolicy.KEEP_LAST,
+                depth=200,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.VOLATILE,
+            )
+            tf_static_qos = QoSProfile(
+                history=HistoryPolicy.KEEP_LAST,
+                depth=100,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            )
+            self.manual_tf_sub = self.create_subscription(TFMessage, "/tf", self._manual_tf_callback, tf_qos)
+            self.manual_tf_static_sub = self.create_subscription(TFMessage, "/tf_static", self._manual_tf_static_callback, tf_static_qos)
+            try:
+                self.get_logger().info("TF_SINGLE_SOURCE | manual /tf cache enabled for confidence pose lookup")
+            except Exception:
+                pass
 
         self.scan_sub = self.create_subscription(
             LaserScan,
@@ -640,7 +702,8 @@ class TurtleBot3RosInterface(Node):
         odom->base_footprint edge even with minimal Gazebo launches.  The
         transform is exactly the pose already carried by /odom.
         """
-        if not self.odom_tf_fallback_enabled or tf2_ros is None:
+        unsafe_allow = str(os.environ.get("TB3_RL_ALLOW_SELF_TF_PUBLISH", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+        if (not unsafe_allow) or (not self.odom_tf_fallback_enabled) or tf2_ros is None:
             return
         if self.odom_tf_broadcaster is None:
             try:
@@ -723,10 +786,11 @@ class TurtleBot3RosInterface(Node):
             return False
         ok = self._recreate_tf_listener()
         if ok:
-            self.get_logger().info(
-                "TF buffer was recreated after pose reset. "
-                "This flushes local cached map->odom transforms only."
-            )
+            if not _quiet_reset_logs():
+                self.get_logger().info(
+                    "TF buffer was recreated after pose reset. "
+                    "This flushes local cached map->odom transforms only."
+                )
         return ok
 
     def _topic(self, name: str) -> str:
@@ -755,6 +819,117 @@ class TurtleBot3RosInterface(Node):
         siny_cosp = 2.0 * (w * z + x * y)
         cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
         return math.atan2(siny_cosp, cosy_cosp)
+
+    def _manual_tf_callback(self, msg: TFMessage) -> None:
+        self._store_manual_tf_message(msg, is_static=False)
+
+    def _manual_tf_static_callback(self, msg: TFMessage) -> None:
+        self._store_manual_tf_message(msg, is_static=True)
+
+    def _store_manual_tf_message(self, msg: TFMessage, is_static: bool = False) -> None:
+        try:
+            transforms = getattr(msg, "transforms", []) or []
+            if not transforms:
+                return
+            target = self._manual_tf_static if bool(is_static) else self._manual_tf
+            with self._manual_tf_lock:
+                for tr in transforms:
+                    try:
+                        parent = str(getattr(tr.header, "frame_id", "") or "").strip().lstrip("/")
+                        child = str(getattr(tr, "child_frame_id", "") or "").strip().lstrip("/")
+                        if not parent or not child or parent == child:
+                            continue
+                        t = tr.transform.translation
+                        q = tr.transform.rotation
+                        yaw = self._yaw_from_quaternion_xyzw(float(q.x), float(q.y), float(q.z), float(q.w))
+                        stamp = getattr(tr.header, "stamp", None)
+                        try:
+                            stamp_sec = self._stamp_to_sec(int(stamp.sec), int(stamp.nanosec))
+                        except Exception:
+                            stamp_sec = float(getattr(self, "last_clock_time_sec", 0.0) or 0.0)
+                        target[(parent, child)] = (float(t.x), float(t.y), float(getattr(t, "z", 0.0)), float(yaw), float(stamp_sec), bool(is_static))
+                    except Exception:
+                        continue
+        except Exception:
+            return
+
+    @staticmethod
+    def _tf2d_compose(a, b):
+        ax, ay, az, ayaw, astamp, astatic = a
+        bx, by, bz, byaw, bstamp, bstatic = b
+        c = math.cos(float(ayaw))
+        ss = math.sin(float(ayaw))
+        x = float(ax) + c * float(bx) - ss * float(by)
+        y = float(ay) + ss * float(bx) + c * float(by)
+        z = float(az) + float(bz)
+        yaw = math.atan2(math.sin(float(ayaw) + float(byaw)), math.cos(float(ayaw) + float(byaw)))
+        stamp = max(float(astamp), float(bstamp))
+        return (x, y, z, yaw, stamp, bool(astatic and bstatic))
+
+    @staticmethod
+    def _tf2d_inverse(a):
+        x, y, z, yaw, stamp, is_static = a
+        c = math.cos(float(yaw))
+        ss = math.sin(float(yaw))
+        ix = -c * float(x) - ss * float(y)
+        iy = ss * float(x) - c * float(y)
+        return (ix, iy, -float(z), -float(yaw), float(stamp), bool(is_static))
+
+    def get_frame_pose2d_manual(self, target_frame: str, source_frame: str, max_age_sec: float = 5.0) -> Optional[tuple[np.ndarray, float]]:
+        """Return source_frame pose in target_frame using the v110 manual TF cache.
+
+        This avoids the node's local tf2 Buffer for confidence placement.  It
+        composes latest /tf and /tf_static transforms and never publishes TF.
+        """
+        if not getattr(self, "manual_tf_cache_enabled", False):
+            return None
+        target_frame = str(target_frame or "").strip().lstrip("/")
+        source_frame = str(source_frame or "").strip().lstrip("/")
+        if not target_frame or not source_frame:
+            return None
+        if target_frame == source_frame:
+            return np.array([0.0, 0.0], dtype=np.float32), 0.0
+        try:
+            max_age_sec = float(max_age_sec)
+        except Exception:
+            max_age_sec = 5.0
+        now_sec = float(getattr(self, "last_clock_time_sec", 0.0) or 0.0)
+        with self._manual_tf_lock:
+            raw = {}
+            try:
+                raw.update(dict(getattr(self, "_manual_tf_static", {}) or {}))
+                raw.update(dict(getattr(self, "_manual_tf", {}) or {}))
+            except Exception:
+                return None
+        if not raw:
+            return None
+        graph = {}
+        for (parent, child), tf in raw.items():
+            try:
+                x, y, z, yaw, stamp_sec, is_static = tf
+                if not bool(is_static) and now_sec > 0.0 and max_age_sec >= 0.0:
+                    if float(stamp_sec) > 0.0 and (now_sec - float(stamp_sec)) > max_age_sec:
+                        continue
+                graph.setdefault(parent, []).append((child, tf))
+                graph.setdefault(child, []).append((parent, self._tf2d_inverse(tf)))
+            except Exception:
+                continue
+        if target_frame not in graph or source_frame not in graph:
+            return None
+        from collections import deque
+        identity = (0.0, 0.0, 0.0, 0.0, now_sec, True)
+        q = deque([(target_frame, identity)])
+        visited = {target_frame}
+        while q:
+            node, acc = q.popleft()
+            if node == source_frame:
+                return np.array([float(acc[0]), float(acc[1])], dtype=np.float32), float(acc[3])
+            for nxt, edge in graph.get(node, []):
+                if nxt in visited:
+                    continue
+                visited.add(nxt)
+                q.append((nxt, self._tf2d_compose(acc, edge)))
+        return None
 
     def _scan_callback(self, msg: LaserScan):
         self.scan = msg
@@ -1124,10 +1299,11 @@ class TurtleBot3RosInterface(Node):
                 self.get_logger().info(f"Received SLAM map via GetMap service after topic wait timeout for {self.map_topic}.")
             return True
 
-        self.get_logger().warn(
-            f"Timeout while waiting for SLAM map topic={self.map_topic} and GetMap service candidates={self._slam_map_service_candidates}. "
-            "RL memory map will still work with LiDAR-only updates."
-        )
+        if not _quiet_reset_logs():
+            self.get_logger().warn(
+                f"Timeout while waiting for SLAM map topic={self.map_topic} and GetMap service candidates={self._slam_map_service_candidates}. "
+                "RL memory map will still work with LiDAR-only updates."
+            )
         return False
 
 
@@ -1164,7 +1340,8 @@ class TurtleBot3RosInterface(Node):
             self.get_logger().warn(
                 "INTERNAL_SCAN_FIXED_RELAY_ACTIVE | "
                 f"{self.scan_topic} -> {self.slam_fixed_scan_topic} | "
-                f"fixed_count=auto_first_scan(current={self.slam_fixed_scan_count}) | used only by internally launched SLAM"
+                f"fixed_count=auto_first_scan(current={self.slam_fixed_scan_count}) "
+                f"frame={self.slam_fixed_scan_frame} | used only by internally launched SLAM"
             )
         return self.slam_fixed_scan_topic
 
@@ -1202,7 +1379,14 @@ class TurtleBot3RosInterface(Node):
 
         fixed_count = int(max(1, self.slam_fixed_scan_count))
         out = LaserScan()
-        out.header = msg.header
+        # Do not preserve msg.header.frame_id blindly.  In Gazebo/Cartographer
+        # training the LaserScan may advertise base_scan while no base_scan TF is
+        # available yet, producing: "base_scan passed to lookupTransform target_frame
+        # does not exist".  For the generated fallback, publish a geometrically
+        # identical scan in base_footprint by default; this is an identity-mounted
+        # SLAM scan for training stability, not a policy LiDAR transform.
+        out.header.stamp = msg.header.stamp
+        out.header.frame_id = str(getattr(self, "slam_fixed_scan_frame", "") or self.base_frame or "base_footprint")
         out.angle_min = float(self._scan_fixed_angle_min)
         out.angle_increment = float(self._scan_fixed_angle_increment)
         out.angle_max = float(self._scan_fixed_angle_max)
@@ -1325,6 +1509,7 @@ class TurtleBot3RosInterface(Node):
         is reset by killing and restarting cartographer_node + occupancy_grid_node.
         """
         scan_topic = str(scan_topic or self.scan_topic).strip() or "/scan"
+        tracking_frame = str(getattr(self, "slam_fixed_scan_frame", "") or self.base_frame or "base_footprint").strip().lstrip("/") or "base_footprint"
         lua = f"""
 include "map_builder.lua"
 include "trajectory_builder.lua"
@@ -1333,7 +1518,7 @@ options = {{
   map_builder = MAP_BUILDER,
   trajectory_builder = TRAJECTORY_BUILDER,
   map_frame = "map",
-  tracking_frame = "base_scan",
+  tracking_frame = "{tracking_frame}",
   published_frame = "odom",
   odom_frame = "odom",
   provide_odom_frame = false,
@@ -1406,7 +1591,8 @@ return options
             "CARTOGRAPHER_CONFIG_WRITTEN | "
             f"file={path} config_dir={tmp_dir} include_src={include_dir} "
             f"scan_topic={scan_topic} use_sim_time={self.slam_use_sim_time} "
-            "map_frame=map odom_frame=odom tracking_frame=base_scan"
+            f"map_frame=map odom_frame=odom tracking_frame={tracking_frame} "
+            f"scan_fixed_frame={getattr(self, 'slam_fixed_scan_frame', '')}"
         )
         return str(path)
 
@@ -1540,6 +1726,14 @@ return options
         grid_log = f"/tmp/tb3_rl_cartographer_fallback_{stamp_ms}.log"
         self._cartographer_last_log_files = (carto_log, grid_log)
 
+        # Per-episode Cartographer restarts create a fresh /tmp log file each
+        # time.  Over a long run these accumulate to thousands of files and can
+        # exhaust inodes on /tmp.  Keep only the most recent handful.
+        try:
+            self._prune_cartographer_logs(keep=12)
+        except Exception:
+            pass
+
         def _pkg_exists(pkg: str) -> bool:
             try:
                 subprocess.check_output(["ros2", "pkg", "prefix", pkg], text=True, stderr=subprocess.DEVNULL)
@@ -1547,8 +1741,23 @@ return options
             except Exception:
                 return False
 
-        prefer_generated = os.environ.get("TB3_RL_CARTOGRAPHER_GENERATED", "0").strip().lower() in ("1", "true", "yes", "on")
-        use_official = (not prefer_generated) and _pkg_exists("turtlebot3_cartographer")
+        # Old commands used TB3_RL_CARTOGRAPHER_GENERATED=1 to select the bare
+        # generated fallback.  That path is fragile on Jazzy because it can start
+        # cartographer_node while occupancy_grid_node never produces /map.  Treat
+        # the old variable as advisory only; use the official TB3 launch whenever
+        # it exists.  To force the generated fallback explicitly, set
+        # TB3_RL_CARTOGRAPHER_FORCE_GENERATED=1.
+        old_generated_requested = os.environ.get("TB3_RL_CARTOGRAPHER_GENERATED", "0").strip().lower() in ("1", "true", "yes", "on")
+        force_generated = os.environ.get("TB3_RL_CARTOGRAPHER_FORCE_GENERATED", "0").strip().lower() in ("1", "true", "yes", "on")
+        official_available = _pkg_exists("turtlebot3_cartographer")
+        use_official = official_available and not force_generated
+        if old_generated_requested and use_official:
+            self.get_logger().warn(
+                "CARTOGRAPHER_GENERATED_ENV_IGNORED | "
+                "TB3_RL_CARTOGRAPHER_GENERATED=1 is deprecated; using official "
+                "turtlebot3_cartographer because it is installed. Set "
+                "TB3_RL_CARTOGRAPHER_FORCE_GENERATED=1 only if you really need the fallback."
+            )
 
         if use_official:
             # Keep the scan_fixed relay alive for debugging, but the official TB3
@@ -1601,7 +1810,8 @@ return options
             cmd = ["bash", "-lc", shell_cmd]
             self.get_logger().warn(
                 "Starting generated Cartographer fallback internally: "
-                f"scan={slam_scan_topic} config={lua_path} use_sim_time={use_sim} "
+                f"scan={slam_scan_topic} scan_frame={getattr(self, 'slam_fixed_scan_frame', '')} "
+                f"config={lua_path} use_sim_time={use_sim} "
                 f"occupancy_period={publish_period}s log={grid_log}"
             )
 
@@ -1634,10 +1844,11 @@ return options
             # that and allowed training to continue with no /map.  Wait until
             # at least one OccupancyGrid is actually received.
             if self.slam_map is not None:
-                self.get_logger().warn(
-                    "CARTOGRAPHER_MAP_READY | /map received from Cartographer "
-                    f"after {time.time() - start:.2f}s node_seen={node_seen}"
-                )
+                if not _quiet_reset_logs():
+                    self.get_logger().warn(
+                        "CARTOGRAPHER_MAP_READY | /map received from Cartographer "
+                        f"after {time.time() - start:.2f}s node_seen={node_seen}"
+                    )
                 return True
 
         tail_msg = self._cartographer_logs_tail()
@@ -1663,6 +1874,29 @@ return options
         except Exception:
             pass
         return "logs_tail=(none)"
+
+    def _prune_cartographer_logs(self, keep: int = 12) -> None:
+        """Delete old per-episode Cartographer launch logs, keeping the newest few."""
+        import glob as _glob
+        keep = max(int(keep), 1)
+        patterns = [
+            "/tmp/tb3_rl_turtlebot3_cartographer_launch_*.log",
+            "/tmp/tb3_rl_cartographer_fallback_*.log",
+        ]
+        for pat in patterns:
+            try:
+                files = sorted(
+                    _glob.glob(pat),
+                    key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0.0,
+                    reverse=True,
+                )
+            except Exception:
+                continue
+            for old in files[keep:]:
+                try:
+                    os.remove(old)
+                except Exception:
+                    pass
 
     def start_slam_toolbox(self, timeout_sec: float = 8.0) -> bool:
         if not self.map_topic:
@@ -1751,14 +1985,23 @@ return options
             return False
 
         if self.slam_backend == "cartographer":
-            self.get_logger().warn(
-                "MANDATORY_CARTOGRAPHER_RESET | Cartographer has no per-episode map reset service; "
-                "restarting cartographer_node + occupancy_grid_node."
-            )
+            if not _quiet_reset_logs():
+                self.get_logger().warn(
+                    "MANDATORY_CARTOGRAPHER_RESET | Cartographer has no per-episode map reset service; "
+                    "restarting cartographer_node + occupancy_grid_node."
+                )
             self.reset_slam_state()
             self.stop_slam_toolbox()
             self._kill_external_cartographer()
-            time.sleep(0.35)
+            # Give the killed cartographer/occupancy_grid processes time to fully
+            # exit and release their DDS endpoints before relaunching.  Too short
+            # a delay can race the new node against the dying one.  Configurable
+            # via TB3_RL_CARTOGRAPHER_RESTART_DELAY_SEC.
+            try:
+                settle = float(os.environ.get("TB3_RL_CARTOGRAPHER_RESTART_DELAY_SEC", "0.8") or 0.8)
+            except Exception:
+                settle = 0.8
+            time.sleep(max(settle, 0.1))
             ok = self.start_cartographer(timeout_sec=timeout_sec)
             if ok:
                 self.wait_for_slam_map_ready(timeout_sec=max(float(timeout_sec), 1.0))
@@ -1956,9 +2199,18 @@ return options
             except Exception:
                 pass
         try:
-            self.get_logger().warn("CARTOGRAPHER_EXTERNAL_KILL_SENT | pkill -f cartographer_node/occupancy_grid_node/turtlebot3_cartographer")
+            if not _quiet_reset_logs():
+                self.get_logger().warn("CARTOGRAPHER_EXTERNAL_KILL_SENT | pkill -f cartographer_node/occupancy_grid_node/turtlebot3_cartographer")
         except Exception:
             pass
+        # NOTE: We intentionally do NOT sweep /dev/shm here.  FastDDS SHM port
+        # files are named by port number, not owner PID, so an age-based sweep
+        # cannot reliably distinguish a just-restarted node's live segment from a
+        # dead one and can destroy the segment of the cartographer we are about to
+        # start, causing init_port failures and a permanently missing /map.
+        # SHM exhaustion is instead prevented up front by forcing a non-SHM
+        # FastDDS transport (see process_cleanup.ensure_non_shm_fastdds_profile,
+        # applied before ROS init in train_sac/eval_policy).
 
     def stop_slam_toolbox(self):
         if self.slam_proc is None:
@@ -1968,7 +2220,8 @@ return options
             self.slam_proc = None
             return
 
-        self.get_logger().info(f"Stopping internally started SLAM backend: {self.slam_backend}...")
+        if not _quiet_reset_logs():
+            self.get_logger().info(f"Stopping internally started SLAM backend: {self.slam_backend}...")
 
         try:
             os.killpg(os.getpgid(self.slam_proc.pid), signal.SIGTERM)

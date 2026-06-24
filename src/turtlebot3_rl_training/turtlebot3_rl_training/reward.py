@@ -379,14 +379,24 @@ def compute_exploration_reward(
     # priority_gain은 새 영역이 생긴 것일 뿐, 로봇이 뭔가 잘한 증거가 아니다.
     # 따라서 reward에 넣지 않는다.
     priority_check_reward = 0.0
-    # priority는 '처음 직접 제거(clear)'했을 때만 보상한다.
-    # recheck는 원형 주행 중 같은 영역을 계속 훑으며 보상을 farm하는 경로라 제거한다.
-    if clear_sum > 0.0 or clear_cells > 0:
-        priority_check_reward += 0.010 * clear_sum
-        priority_check_reward += 0.00035 * min(clear_cells, 250)
-    reward += min(priority_check_reward, 0.60) * motion_gate
 
-    if recheck_sum > 0.0 or recheck_cells > 0:
+    # v114: emergency priority는 실제로 확인/제거(clear)했을 때 강하게 보상한다.
+    # 생성/존재/바라보기는 여전히 보상하지 않아서 랜덤 spot을 바라보기만 하는 farm은 막는다.
+    # corridor_priority_reward_weight를 priority clear reward scale로 다시 사용한다.
+    if bool(use_corridor_priority_reward) and (clear_sum > 0.0 or clear_cells > 0):
+        priority_strength = float(np.clip(max(float(target_priority), float(priority_score)), 0.0, 1.0))
+        priority_check_multiplier = 0.75 + 1.75 * priority_strength
+        priority_weight = max(float(corridor_priority_reward_weight), 0.0)
+
+        priority_check_reward += priority_weight * 0.045 * clear_sum * priority_check_multiplier
+        priority_check_reward += priority_weight * 0.0015 * min(clear_cells, 350)
+
+        # one-shot clear라서 motion_gate를 너무 강하게 걸면 실제 확인 보상도 죽는다.
+        # 그래도 정지/순수 회전 farm을 피하려고 최소 전진 기반 gate는 유지한다.
+        priority_motion_gate = float(np.clip(0.30 + 0.70 * motion_gate, 0.30, 1.0))
+        reward += min(priority_check_reward, 5.0) * priority_motion_gate
+
+    if bool(use_corridor_priority_reward) and (recheck_sum > 0.0 or recheck_cells > 0):
         # 재확인은 유용한 정보가 아니라 중복 관측에 가깝다.
         # 약한 비용을 줘서 뺑뺑이 중복 관측을 보상 루프로 쓰지 못하게 한다.
         reward -= min(0.35, 0.003 * recheck_sum + 0.00008 * min(recheck_cells, 400))
@@ -487,7 +497,7 @@ def compute_exploration_reward(
         reward -= 0.010 * min(float(low_confidence_ratio), 1.0)
 
     # Terminal은 위에서 -100으로 따로 반환한다. non-terminal dense reward는 bounded.
-    return float(np.clip(reward, -8.0, 3.0))
+    return float(np.clip(reward, -8.0, 8.0))
 
 
 def compute_waypoint_macro_reward_adjustment(

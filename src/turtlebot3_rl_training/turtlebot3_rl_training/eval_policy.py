@@ -82,6 +82,18 @@ from turtlebot3_rl_training.feature_extractor import MapVectorFeatureExtractor
 from turtlebot3_rl_training.gazebo_nav_env import GazeboNavEnv
 from turtlebot3_rl_training.ros_interface import TurtleBot3RosInterface
 
+try:
+    from turtlebot3_rl_training.process_cleanup import (
+        clean_fastdds_shm,
+        ensure_non_shm_fastdds_profile,
+    )
+except Exception:  # pragma: no cover
+    try:
+        from process_cleanup import clean_fastdds_shm, ensure_non_shm_fastdds_profile  # type: ignore
+    except Exception:
+        clean_fastdds_shm = None
+        ensure_non_shm_fastdds_profile = None
+
 
 def _apply_rviz_origin_policy(cli_args):
     if not bool(getattr(cli_args, "rviz_zero_robot_on_reset", False)):
@@ -727,6 +739,9 @@ def parse_args():
     parser.add_argument("--slam-map-update-reward-norm-cells", type=float, default=50.0)
     parser.add_argument("--slam-map-update-reward-cap", type=float, default=3.0)
     parser.add_argument("--slam-map-update-reward-grace-steps", type=int, default=10)
+    parser.add_argument("--reward-positive-log-compress", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--reward-positive-log-alpha", type=float, default=0.50)
+    parser.add_argument("--reward-positive-log-max", type=float, default=8.0)
 
     parsed_args, _ = parser.parse_known_args()
     parsed_args = _force_nav2_only_policy(parsed_args)
@@ -774,6 +789,21 @@ def main(args=None):
             _force_mandatory_slam_reset_policy(_apply_rviz_origin_policy(parse_args()))
         )
     )
+
+    # Disable FastDDS SHM transport before ROS init (same robust fix as training)
+    # so long eval sessions never hit open_and_lock_file / init_port failures.
+    if str(os.environ.get("TB3_RL_DISABLE_SHM_TRANSPORT", "1")).strip().lower() not in {"0", "false", "no", "off"}:
+        try:
+            if ensure_non_shm_fastdds_profile is not None:
+                ensure_non_shm_fastdds_profile(logger=None)
+        except Exception:
+            pass
+
+    try:
+        if bool(getattr(cli_args, "auto_start_gazebo", False)) and clean_fastdds_shm is not None:
+            clean_fastdds_shm(logger=None)
+    except Exception:
+        pass
 
     gazebo_proc = _start_gazebo_if_requested(cli_args)
 
@@ -856,6 +886,9 @@ def main(args=None):
         slam_map_update_reward_norm_cells=cli_args.slam_map_update_reward_norm_cells,
         slam_map_update_reward_cap=cli_args.slam_map_update_reward_cap,
         slam_map_update_reward_grace_steps=cli_args.slam_map_update_reward_grace_steps,
+        reward_positive_log_compress=cli_args.reward_positive_log_compress,
+        reward_positive_log_alpha=cli_args.reward_positive_log_alpha,
+        reward_positive_log_max=cli_args.reward_positive_log_max,
         max_linear_speed=cli_args.max_linear_speed,
         max_angular_speed=cli_args.max_angular_speed,
         velocity_command_linear_limit=cli_args.velocity_command_linear_limit,

@@ -287,6 +287,12 @@ class ResetManager:
                     "Pose reset failed on first pass; clearing transient failures and retrying once."
                 )
                 self.failed_entity_names.clear()
+                # If the first pass relied on the cached validated entity and that
+                # entity no longer resets correctly, drop the cache so the second
+                # pass performs full discovery again instead of looping on a stale
+                # name.  This preserves correctness while still avoiding discovery
+                # on the common (already-validated) happy path.
+                self.validated_entity_name = None
                 time.sleep(0.20)
 
         self.node.get_logger().error(
@@ -454,7 +460,19 @@ class ResetManager:
         if self.entity_name and self.entity_name != "turtlebot3_burger":
             raw_candidates.append(self.entity_name)
 
-        if self.auto_discover_entity:
+        # Once the robot entity has been validated, repeatedly invoking
+        # `ros2 topic list`, `gz model --list`, and `gz topic -e` every reset is
+        # wasteful and, more importantly, each call spins up a fresh DDS
+        # participant that leaks FastDDS shared-memory port files.  Over a long
+        # run that accumulation is a leading cause of open_and_lock_file /
+        # init_port crashes.  Skip discovery when we already know the entity.
+        skip_discovery = False
+        if self.validated_entity_name:
+            raw = str(os.environ.get("TB3_RL_RESET_REDISCOVER_EACH_EPISODE", "0")).strip().lower()
+            if raw in {"0", "false", "no", "off", ""}:
+                skip_discovery = True
+
+        if self.auto_discover_entity and not skip_discovery:
             raw_candidates.extend(self._ros_model_topic_names())
             raw_candidates.extend(self._gz_model_list())
             raw_candidates.extend(self._gz_pose_info_model_names())

@@ -15,7 +15,7 @@ from gymnasium import spaces
 import numpy as np
 import rclpy
 from builtin_interfaces.msg import Duration, Time as RosTime
-from geometry_msgs.msg import Point, PoseStamped
+from geometry_msgs.msg import Point, PoseStamped, PoseWithCovarianceStamped
 from nav_msgs.msg import OccupancyGrid, Path as NavPath
 from sensor_msgs.msg import LaserScan
 from visualization_msgs.msg import Marker, MarkerArray
@@ -53,6 +53,25 @@ from turtlebot3_rl_training.reward import (
     compute_waypoint_macro_reward_adjustment,
 )
 from turtlebot3_rl_training.sim_controller import GazeboSimController
+
+
+def _quiet_reset_logs() -> bool:
+    """When TB3_RL_QUIET_RESET_LOGS is set, suppress repetitive per-episode
+    reset/SLAM-wait WARN spam (STRICT_SLAM_MAP_WAITING, RESET_CANDIDATE_CHECK,
+    RESET_POSE_TRUTH, Safety boundary updates).  Diagnostic, not functional."""
+    return str(os.environ.get("TB3_RL_QUIET_RESET_LOGS", "0")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+class RecoverableResetError(RuntimeError):
+    """Reset/readiness failure that should retry the whole reset instead of killing SB3.
+
+    These errors are caused by transient reset races such as delayed Cartographer
+    /map, missing map->base TF immediately after teleport, or post-reset readiness
+    timeout.  They must not return an empty observation, because that would insert
+    a corrupted initial state into the replay buffer.  The environment reset wrapper
+    catches this exception, holds the robot still, clears transient TF/Nav2 state,
+    and retries the reset from the beginning.
+    """
 
 
 class GazeboNavEnv(gym.Env):
@@ -160,6 +179,8 @@ class GazeboNavEnv(gym.Env):
         realtime_spin_steps: int = 2,
         realtime_spin_timeout_sec: float = 0.0,
         realtime_sleep_sec: float = 0.001,
+        realtime_enforce_control_dt: bool = False,
+        realtime_control_dt_wall_margin_sec: float = 0.0,
         disable_path_reward: bool = True,
         disable_wall_proximity_penalty: bool = False,
         enable_corridor_priority_reward: bool = True,
@@ -171,6 +192,9 @@ class GazeboNavEnv(gym.Env):
         slam_map_update_reward_norm_cells: float = 80.0,
         slam_map_update_reward_cap: float = 1.0,
         slam_map_update_reward_grace_steps: int = 10,
+        reward_positive_log_compress: bool = False,
+        reward_positive_log_alpha: float = 0.50,
+        reward_positive_log_max: float = 8.0,
         max_linear_speed: float = 0.32,
         max_angular_speed: float = 0.90,
         velocity_command_linear_limit: float = 0.0,
@@ -373,6 +397,12 @@ class GazeboNavEnv(gym.Env):
         lidar_empty_max_valid_range_m: float = 3.35,
         lidar_empty_min_valid_beams: int = 2,
         lidar_empty_restart_penalty: float = 100.0,
+        coverage_stall_terminal: bool = False,
+        coverage_stall_start_steps: int = 1000,
+        coverage_stall_window_steps: int = 500,
+        coverage_stall_min_slam_new_cells: int = 5,
+        coverage_stall_min_confidence_updated_cells: int = 30,
+        coverage_stall_terminal_penalty: float = -1.0,
         velocity_safety_backup: bool = True,
         velocity_safety_trigger_distance_m: float = 0.28,
         velocity_safety_stop_distance_m: float = 0.36,
@@ -450,6 +480,9 @@ class GazeboNavEnv(gym.Env):
         self.realtime_spin_steps = max(int(realtime_spin_steps), 0)
         self.realtime_spin_timeout_sec = max(float(realtime_spin_timeout_sec), 0.0)
         self.realtime_sleep_sec = max(float(realtime_sleep_sec), 0.0)
+        self.realtime_enforce_control_dt = bool(realtime_enforce_control_dt)
+        self.realtime_control_dt_wall_margin_sec = max(float(realtime_control_dt_wall_margin_sec), 0.0)
+        self._last_realtime_step_wall_elapsed_sec = 0.0
         self._world_step_stale_count = 0
         # /rl_path based planning/reward is removed.  Keep the attribute for old
         # callers, but force it disabled at runtime.
@@ -457,7 +490,19 @@ class GazeboNavEnv(gym.Env):
         # Nav2-only training still needs a dense safety signal.  Nav2 owns /cmd_vel,
         # but the critic must see wall/obstacle risk before a hard collision terminal.
         self.disable_wall_proximity_penalty = False
-        self.disable_priority_map = bool(disable_priority_map)
+        # v93: hard no-priority mode.  When active, priority is removed from
+        # publishers, reward, reset gates, stuck restarts, and policy input.
+        force_no_priority = (
+            str(os.environ.get("TB3_RL_FORCE_NO_PRIORITY", "0")).strip().lower()
+            not in {"0", "false", "no", "off", "disable", "disabled"}
+        ) or (
+            str(os.environ.get("TB3_RL_NO_PRIORITY_MODEL_INPUT", "0")).strip().lower()
+            in {"1", "true", "yes", "on", "enable", "enabled"}
+        )
+        self.disable_priority_map = bool(disable_priority_map) or bool(force_no_priority)
+        if self.disable_priority_map:
+            os.environ["TB3_RL_FORCE_NO_PRIORITY"] = "1"
+            os.environ["TB3_RL_NO_PRIORITY_MODEL_INPUT"] = "1"
         self.enable_corridor_priority_reward = bool(enable_corridor_priority_reward) and (not self.disable_priority_map)
         self.corridor_priority_reward_weight = 0.0 if self.disable_priority_map else max(float(corridor_priority_reward_weight), 0.0)
         self.confidence_reward_weight = max(float(confidence_reward_weight), 0.0)
@@ -470,6 +515,16 @@ class GazeboNavEnv(gym.Env):
         self._last_slam_map_update_reward_raw = 0.0
         self._last_slam_map_update_reward_reason = "init"
         self._episode_slam_map_update_reward = 0.0
+
+        # v119: Optional positive reward log-compression.
+        # This keeps early large map-building rewards from dominating critic targets
+        # while preserving negative safety penalties and terminal penalties.
+        self.reward_positive_log_compress = bool(reward_positive_log_compress)
+        self.reward_positive_log_alpha = max(float(reward_positive_log_alpha), 1e-6)
+        self.reward_positive_log_max = max(float(reward_positive_log_max), 0.0)
+        self._last_reward_pre_log_compress = 0.0
+        self._last_reward_post_log_compress = 0.0
+        self._last_reward_log_compress_delta = 0.0
 
         self.max_linear_speed = float(max_linear_speed)
         self.max_angular_speed = float(max_angular_speed)
@@ -874,6 +929,83 @@ class GazeboNavEnv(gym.Env):
         self._confidence_cmd_last_time = None
         self._confidence_cmd_last_step = -1
 
+        # v101: AMCL pose source for confidence painting.
+        # /amcl_pose is already in the map frame when AMCL is running, so this
+        # mode can use the same pose that localization publishes instead of
+        # Cartographer TF, Gazebo model odom, or anchored odom deltas.
+        self.amcl_pose_topic = str(os.environ.get("TB3_RL_AMCL_POSE_TOPIC", "/amcl_pose") or "/amcl_pose").strip()
+        try:
+            self.amcl_pose_max_age_sec = max(float(os.environ.get("TB3_RL_AMCL_POSE_MAX_AGE_SEC", "1.0")), 0.0)
+        except Exception:
+            self.amcl_pose_max_age_sec = 1.0
+        self.amcl_fallback_pose_source = str(os.environ.get("TB3_RL_AMCL_FALLBACK_POSE_SOURCE", "none") or "none").strip().lower()
+        self._latest_amcl_pose = None
+        self._amcl_pose_sub = None
+        self._last_amcl_pose_warn_time = 0.0
+
+        # v102: AMCL-compatible pose shim.  During SLAM-only runs there is no
+        # real Nav2 AMCL node, but RViz still renders the robot from the TF chain
+        # map -> base_footprint.  For confidence painting we need an explicit
+        # /amcl_pose-style PoseWithCovarianceStamped source.  This publisher
+        # mirrors exactly that RViz TF pose into /amcl_pose so the confidence cone
+        # uses the same map-frame robot position visible in RViz, without starting
+        # full Nav2 localization or map_server.
+        try:
+            _pose_src = str(os.environ.get("TB3_RL_CONFIDENCE_POSE_SOURCE", self.confidence_pose_source) or "").strip().lower()
+        except Exception:
+            _pose_src = ""
+        _auto_amcl_default = _pose_src in {"amcl", "amcl_pose", "map_amcl", "amcl_map", "amcl_pose_topic", "nav2_amcl"}
+        self.auto_publish_amcl_pose_from_tf = self._scan_bool_env(
+            "TB3_RL_AUTO_PUBLISH_AMCL_POSE_FROM_TF",
+            _auto_amcl_default,
+        )
+        self.amcl_pose_tf_target_frame = str(
+            os.environ.get("TB3_RL_AMCL_POSE_TF_TARGET_FRAME", self.map_frame) or self.map_frame
+        ).strip().lstrip("/") or "map"
+        # v103 hotfix: GazeboNavEnv has no self.base_frame at this point.
+        # Use environment defaults only; the ROS interface owns the real base_frame.
+        # This prevents AttributeError during __init__ while keeping the same
+        # effective default used by RViz/TF: base_footprint.
+        _default_amcl_source_frame = str(
+            os.environ.get(
+                "TB3_RL_RVIZ_ROBOT_FRAME",
+                os.environ.get("TB3_RL_BASE_FRAME", "base_footprint"),
+            )
+            or "base_footprint"
+        ).strip().lstrip("/") or "base_footprint"
+        self.amcl_pose_tf_source_frame = str(
+            os.environ.get("TB3_RL_AMCL_POSE_TF_SOURCE_FRAME", _default_amcl_source_frame)
+            or _default_amcl_source_frame
+        ).strip().lstrip("/") or "base_footprint"
+        try:
+            self.amcl_pose_tf_publish_hz = max(float(os.environ.get("TB3_RL_AMCL_POSE_TF_PUBLISH_HZ", "20.0")), 0.0)
+        except Exception:
+            self.amcl_pose_tf_publish_hz = 20.0
+        try:
+            self.amcl_pose_tf_timeout_sec = max(float(os.environ.get("TB3_RL_AMCL_POSE_TF_TIMEOUT_SEC", "0.05")), 0.0)
+        except Exception:
+            self.amcl_pose_tf_timeout_sec = 0.05
+        try:
+            self.amcl_pose_cov_xy = max(float(os.environ.get("TB3_RL_AMCL_POSE_COV_XY", "0.0025")), 0.0)
+        except Exception:
+            self.amcl_pose_cov_xy = 0.0025
+        try:
+            self.amcl_pose_cov_yaw = max(float(os.environ.get("TB3_RL_AMCL_POSE_COV_YAW", "0.01")), 0.0)
+        except Exception:
+            self.amcl_pose_cov_yaw = 0.01
+        self._amcl_pose_tf_pub = None
+        self._amcl_pose_tf_timer = None
+        self._last_amcl_pose_tf_warn_time = 0.0
+        # v105: the TF bridge can be changed to an anchored odometry bridge.
+        # This is useful when Gazebo/model odometry moves but TF(map->base) is
+        # stale or delayed in the local TF buffer.  It still publishes a standard
+        # /amcl_pose message, but the pose is generated as:
+        #   initial map->base TF anchor + actual/model odom SE(2) delta.
+        self.amcl_pose_bridge_source = str(
+            os.environ.get("TB3_RL_AMCL_POSE_BRIDGE_SOURCE", "tf") or "tf"
+        ).strip().lower()
+        self._amcl_pose_odom_anchor = None
+
         # reset_x/reset_y는 실제 Gazebo reset target이다.  이전 패치에서
         # reset_pose_candidates가 (1.2, -2.2)로 하드코딩되어 CLI의
         # --reset-x/--reset-y가 무시되는 문제가 있었다.  기본값은 다시
@@ -916,7 +1048,7 @@ class GazeboNavEnv(gym.Env):
         self.seen_confidence_floor = float(seen_confidence_floor)
         self.priority_target_lock_steps = max(int(priority_target_lock_steps), 0)
         self.priority_target_switch_margin = float(np.clip(float(priority_target_switch_margin), 0.0, 1.0))
-        self.rl_priority_topic = str(rl_priority_topic).strip()
+        self.rl_priority_topic = "" if self.disable_priority_map else str(rl_priority_topic).strip()
         # Empty string intentionally disables RViz path publishing. Publishing a
         # nav_msgs/Path every RL step is useful for debugging but slows training.
         self.rl_path_topic = str(rl_path_topic).strip()
@@ -1098,8 +1230,15 @@ class GazeboNavEnv(gym.Env):
         # Existing 360-bin checkpoints are not compatible with this setting;
         # train/evaluate checkpoints with the same --num-lidar-bins.
         self.num_lidar_bins = max(int(num_lidar_bins), 1)
-        self.obs_extra_dim = 10
+        self.no_priority_model_input = bool(getattr(self, "disable_priority_map", False)) or (
+            str(os.environ.get("TB3_RL_NO_PRIORITY_MODEL_INPUT", "0")).strip().lower()
+            in {"1", "true", "yes", "on", "enable", "enabled"}
+        )
+        # Normal vector extras are 10.  No-priority mode removes target_priority
+        # from the policy vector, so the actor/critic sees lidar+9 instead.
+        self.obs_extra_dim = 9 if self.no_priority_model_input else 10
         self.obs_dim = self.num_lidar_bins + self.obs_extra_dim
+        self.map_channels = 4 if self.no_priority_model_input else 5
 
         self.exploration_map = ExplorationGridMap(
             node=self.ros,
@@ -1190,7 +1329,7 @@ class GazeboNavEnv(gym.Env):
                 "map": spaces.Box(
                     low=0.0,
                     high=1.0,
-                    shape=(5, self.map_obs_size, self.map_obs_size),
+                    shape=(self.map_channels, self.map_obs_size, self.map_obs_size),
                     dtype=np.float32,
                 ),
             }
@@ -1202,18 +1341,10 @@ class GazeboNavEnv(gym.Env):
                     shape=(self.temporal_history_len, self.obs_dim),
                     dtype=np.float32,
                 )
-                # v18: temporal CNN now sees map/confidence/priority history as
-                # well as vector history.  Each item is the same robot-centric
-                # 5-channel map tensor used by the current map branch.
                 obs_spaces["map_seq"] = spaces.Box(
                     low=0.0,
                     high=1.0,
-                    shape=(
-                        self.temporal_history_len,
-                        5,
-                        self.map_obs_size,
-                        self.map_obs_size,
-                    ),
+                    shape=(self.temporal_history_len, self.map_channels, self.map_obs_size, self.map_obs_size),
                     dtype=np.float32,
                 )
 
@@ -1253,6 +1384,29 @@ class GazeboNavEnv(gym.Env):
                 self.waypoint_marker_topic,
                 10,
             )
+
+        # v108: publish the exact pose actually used for confidence painting.
+        # This separates two failure classes in RViz:
+        #   A) origin marker != RobotModel  -> pose lookup/source problem
+        #   B) origin marker == RobotModel, but magenta grid elsewhere -> grid/canvas problem
+        self.confidence_origin_marker_topic = str(
+            os.environ.get("TB3_RL_CONFIDENCE_ORIGIN_TOPIC", "/rl_confidence_origin") or ""
+        ).strip()
+        try:
+            self.confidence_origin_marker_publish_every_n = max(
+                int(os.environ.get("TB3_RL_CONFIDENCE_ORIGIN_PUBLISH_EVERY_N", "1")),
+                1,
+            )
+        except Exception:
+            self.confidence_origin_marker_publish_every_n = 1
+        self.confidence_origin_marker_pub = None
+        if self.confidence_origin_marker_topic:
+            self.confidence_origin_marker_pub = self.ros.create_publisher(
+                MarkerArray,
+                self.confidence_origin_marker_topic,
+                10,
+            )
+        self._last_confidence_origin_marker_step = -10_000_000
 
         self.waypoint_path_pub = None
         if self.waypoint_path_topic:
@@ -1323,6 +1477,63 @@ class GazeboNavEnv(gym.Env):
         # stale or evaluated at a different timestamp.
         self.use_base_pose_for_raycast = self._scan_bool_env("TB3_RL_USE_BASE_POSE_FOR_RAYCAST", True)
         self.use_base_pose_for_scan_markers = self._scan_bool_env("TB3_RL_USE_BASE_POSE_FOR_SCAN_MARKERS", True)
+
+        # v101: subscribe to AMCL pose if requested.  The subscription is cheap
+        # even when /amcl_pose is absent; no messages simply means the confidence
+        # update will wait or use the configured fallback.
+        if self.amcl_pose_topic:
+            try:
+                self._amcl_pose_sub = self.ros.create_subscription(
+                    PoseWithCovarianceStamped,
+                    self.amcl_pose_topic,
+                    self._amcl_pose_callback,
+                    10,
+                )
+                self.ros.get_logger().info(
+                    "AMCL_POSE_CONFIDENCE_SUBSCRIBED | "
+                    f"topic={self.amcl_pose_topic} max_age={self.amcl_pose_max_age_sec:.2f}s "
+                    f"fallback={self.amcl_fallback_pose_source}"
+                )
+            except Exception as exc:
+                self._amcl_pose_sub = None
+                try:
+                    self.ros.get_logger().warn(
+                        f"AMCL_POSE_CONFIDENCE_SUBSCRIBE_FAILED | topic={self.amcl_pose_topic} err={exc}"
+                    )
+                except Exception:
+                    pass
+
+        # v102: publish /amcl_pose from the same TF used by RViz RobotModel.
+        # This is deliberately enabled by the run script for SLAM-only training,
+        # because launching full Nav2 AMCL together with Cartographer SLAM is not
+        # the right architecture.  The produced topic is AMCL-compatible and is
+        # consumed by the confidence pose source.
+        if bool(getattr(self, "auto_publish_amcl_pose_from_tf", False)) and self.amcl_pose_topic:
+            try:
+                self._amcl_pose_tf_pub = self.ros.create_publisher(
+                    PoseWithCovarianceStamped,
+                    self.amcl_pose_topic,
+                    10,
+                )
+                period = 1.0 / max(float(getattr(self, "amcl_pose_tf_publish_hz", 20.0)), 1e-3)
+                self._amcl_pose_tf_timer = self.ros.create_timer(
+                    period,
+                    self._publish_amcl_pose_from_tf_timer,
+                )
+                self.ros.get_logger().info(
+                    "AMCL_POSE_TF_BRIDGE_ACTIVE | "
+                    f"topic={self.amcl_pose_topic} "
+                    f"target={self.amcl_pose_tf_target_frame} "
+                    f"source={self.amcl_pose_tf_source_frame} "
+                    f"hz={float(getattr(self, 'amcl_pose_tf_publish_hz', 20.0)):.1f}"
+                )
+            except Exception as exc:
+                self._amcl_pose_tf_pub = None
+                self._amcl_pose_tf_timer = None
+                try:
+                    self.ros.get_logger().warn(f"AMCL_POSE_TF_BRIDGE_FAILED | err={exc}")
+                except Exception:
+                    pass
 
         self._last_scan_geometry_log_time = 0.0
         self._last_scan_geometry_debug = {}
@@ -1407,7 +1618,20 @@ class GazeboNavEnv(gym.Env):
         self._last_step_reward = 0.0
         self._episode_reward_sum = 0.0
         self.reward_gamma = float(np.clip(float(reward_gamma), 0.0, 1.0))
+        # v112 return/debug metrics.
+        # _episode_discounted_return is now the live/recent discounted return:
+        #   G_live[t] = gamma * G_live[t-1] + r_t
+        # This keeps late-episode rewards visible.  The old start-anchored return
+        # is kept separately for reference only:
+        #   G_start[t] = sum_i gamma^i r_i
         self._episode_discounted_return = 0.0
+        self._episode_start_discounted_return = 0.0
+        self._episode_reward_ema = 0.0
+        self._reward_ema_beta = float(np.clip(float(os.environ.get("TB3_RL_REWARD_EMA_BETA", str(self.reward_gamma))), 0.0, 0.999999))
+        self._reward_window_n = max(int(os.environ.get("TB3_RL_REWARD_WINDOW_N", "100") or "100"), 1)
+        self._recent_reward_window = deque(maxlen=self._reward_window_n)
+        self._recent_slam_new_window = deque(maxlen=self._reward_window_n)
+        self._recent_conf_update_window = deque(maxlen=self._reward_window_n)
         self._last_priority_clear_reward = 0.0
         self._last_priority_recheck_reward = 0.0
         self._last_priority_check_reward = 0.0
@@ -1453,6 +1677,25 @@ class GazeboNavEnv(gym.Env):
         self._last_lidar_empty_restart = False
         self._last_lidar_empty_reason = "none"
 
+        # v113: coverage-stall terminal.
+        # This is not an extra shaping reward. It cuts off long, low-information
+        # episode tails when both SLAM-map growth and confidence-map growth have
+        # stalled for a full window after warmup.
+        self.coverage_stall_terminal = bool(coverage_stall_terminal)
+        self.coverage_stall_start_steps = max(int(coverage_stall_start_steps), 0)
+        self.coverage_stall_window_steps = max(int(coverage_stall_window_steps), 1)
+        self.coverage_stall_min_slam_new_cells = max(int(coverage_stall_min_slam_new_cells), 0)
+        self.coverage_stall_min_confidence_updated_cells = max(int(coverage_stall_min_confidence_updated_cells), 0)
+        self.coverage_stall_terminal_penalty = float(coverage_stall_terminal_penalty)
+        self._coverage_stall_slam_window = deque(maxlen=self.coverage_stall_window_steps)
+        self._coverage_stall_conf_window = deque(maxlen=self.coverage_stall_window_steps)
+        self._last_coverage_stall_terminal = False
+        self._last_coverage_stall_active = False
+        self._last_coverage_stall_reason = "disabled"
+        self._last_coverage_stall_slam_window = 0
+        self._last_coverage_stall_conf_window = 0
+        self._last_coverage_stall_window_len = 0
+
         # Direct velocity safety shield.  The policy action space remains forward-only
         # [0, max_linear_speed] x [-max_angular_speed, max_angular_speed], but the
         # shield may temporarily publish a negative linear velocity to escape an
@@ -1469,8 +1712,19 @@ class GazeboNavEnv(gym.Env):
         self.velocity_safety_penalty = max(float(velocity_safety_penalty), 0.0)
         self.velocity_safety_block_penalty = max(float(velocity_safety_block_penalty), 0.0)
         self.velocity_safety_cooldown_steps = 0
+        # Sticky reverse escape lock.  When the safety shield starts a backup,
+        # the following Gym steps ignore the policy action and continue the
+        # reverse escape until the configured backup step budget is consumed or
+        # the rear sector becomes unsafe.  This prevents the next SAC action from
+        # immediately canceling a backup maneuver.
+        self.velocity_safety_backup_lock_steps = 0
+        self.velocity_safety_backup_lock_turn_sign = 1.0
+        self._last_velocity_safety_backup_lock_active = False
         self._last_velocity_safety_backup_triggered = False
+        self._last_velocity_safety_backup_lock_active = False
         self._last_velocity_safety_blocked = False
+        self._last_velocity_safety_skip_store = False
+        self._pending_skip_penalty = 0.0
         self._last_velocity_safety_slowdown = 1.0
         self._last_velocity_safety_penalty = 0.0
         self._last_velocity_safety_reason = "none"
@@ -1566,7 +1820,7 @@ class GazeboNavEnv(gym.Env):
         self.ros.get_logger().info(
             "ENV_CONFIG | "
             f"mode={self.action_mode} | frames map={self.map_frame} pose={self.pose_frame} safety={self.safety_boundary_frame} | "
-            f"obs={self.obs_dim} map_cnn={self.use_map_cnn} map=(5,{self.map_obs_size},{self.map_obs_size}) | "
+            f"obs={self.obs_dim} map_cnn={self.use_map_cnn} map=({self.map_channels},{self.map_obs_size},{self.map_obs_size}) | "
             f"temporal={self.use_temporal_cnn} hist={self.temporal_history_len} | "
             f"reset_mode={self.reset_pose_mode} candidates={len(self.reset_pose_candidates)} clearance={self.reset_pose_min_clearance_m:.2f}m | "
             f"priority_stuck={self.priority_stuck_restart}:{self.priority_stuck_restart_sec:.1f}s/{self.priority_stuck_restart_steps}steps | "
@@ -1802,44 +2056,71 @@ class GazeboNavEnv(gym.Env):
     def _post_reset_stabilize(self, reset_pose=None) -> None:
         """Hold the robot still after pose/SLAM reset before returning first observation.
 
-        This version waits for an actual stable window, not only for a fixed
-        duration.  If Gazebo leaves residual roll/pitch/angular-x/y motion after
-        SetEntityPose, the same pose is re-applied while /cmd_vel is held at zero
-        until the instantaneous shake detector reports `none` continuously.
+        v48 safety fix:
+          - The previous second flat-reset loop could extend its own deadline by
+            resetting ``second_start`` whenever a benign z-deviation was reported.
+            With TurtleBot3 Burger this can keep reset() at step=0 forever, so
+            the SAC loop never publishes a velocity command or RViz overlay.
+          - This implementation uses absolute deadlines and a bounded reapply
+            count.  A reset can delay the episode, but it cannot permanently
+            block motion.
         """
         sec = float(getattr(self, "post_reset_stabilize_sec", 0.0))
         if sec <= 0.0:
             return
-        stable_window_sec = 0.70
-        max_sec = max(sec + 3.0, 4.0)
+
+        try:
+            stable_window_sec = float(os.environ.get("TB3_RL_POST_RESET_STABLE_WINDOW_SEC", "0.35") or 0.35)
+        except Exception:
+            stable_window_sec = 0.35
+        stable_window_sec = float(np.clip(stable_window_sec, 0.10, 1.00))
+
+        try:
+            max_sec = float(os.environ.get("TB3_RL_POST_RESET_MAX_STABILIZE_SEC", str(max(sec + 2.0, 3.0))) or max(sec + 2.0, 3.0))
+        except Exception:
+            max_sec = max(sec + 2.0, 3.0)
+        max_sec = max(float(max_sec), min(sec + 2.0, 3.0))
+
+        try:
+            max_reapply = int(os.environ.get("TB3_RL_POST_RESET_MAX_REAPPLY", "4") or 4)
+        except Exception:
+            max_reapply = 4
+        max_reapply = max(int(max_reapply), 0)
+
         self.ros.get_logger().info(
             f"POST_RESET_STABILIZE | holding /cmd_vel=0 for {sec:.2f}s before episode start "
-            f"| stable_window={stable_window_sec:.2f}s max={max_sec:.2f}s"
+            f"| stable_window={stable_window_sec:.2f}s max={max_sec:.2f}s max_reapply={max_reapply}"
         )
+
         start = time.time()
+        deadline = start + max_sec
         next_reapply = start
+        reapply_count = 0
         stable_since = None
         last_reason = "none"
         ever_unstable = False
-        while time.time() - start < max_sec:
+
+        while time.time() < deadline:
             self.ros.stop_robot()
             now = time.time()
             if (
                 bool(getattr(self, "reset_hard_stabilize_reapply", True))
                 and reset_pose is not None
                 and self.reset_manager is not None
+                and reapply_count < max_reapply
                 and now >= next_reapply
             ):
                 try:
-                    self.reset_manager.reset_to_pose(reset_pose, timeout_sec=0.45)
+                    self.reset_manager.reset_to_pose(reset_pose, timeout_sec=0.35)
+                    reapply_count += 1
                 except Exception:
                     pass
-                # Re-apply faster than before while unstable.  This is the only
-                # available way with SetEntityPose to damp residual body wobble.
-                next_reapply = time.time() + min(
-                    float(getattr(self, "reset_hard_stabilize_reapply_interval_sec", 0.25)),
-                    0.18,
-                )
+                try:
+                    interval = float(getattr(self, "reset_hard_stabilize_reapply_interval_sec", 0.25))
+                except Exception:
+                    interval = 0.25
+                next_reapply = time.time() + float(np.clip(interval, 0.18, 0.75))
+
             self.ros.spin_steps(
                 num_spins=int(getattr(self, "post_reset_stabilize_spin_steps", 12)),
                 timeout_sec=0.002,
@@ -1856,50 +2137,62 @@ class GazeboNavEnv(gym.Env):
                 stable_since = None
             time.sleep(0.03)
 
-        # If the robot was wobbling/spinning during stabilization, do a second
-        # flat teleport after it has calmed down.  SetEntityPose can leave
-        # residual body twist; the second reset after a zero-cmd settle is the
-        # most reliable way to remove roll/pitch and angular-x/y motion.
+        # Bounded second flat reset.  This is allowed to improve pose settling,
+        # but it must never keep the environment at step=0 forever.
         if (
             bool(getattr(self, "reset_hard_stabilize_reapply", True))
             and reset_pose is not None
             and self.reset_manager is not None
             and ever_unstable
+            and max_reapply > 0
         ):
             self.ros.get_logger().warn(
                 f"POST_RESET_SECOND_FLAT_RESET | first_stabilize_reason={last_reason}; "
-                "re-applying flat reset pose after zero-cmd settle"
+                "bounded re-apply; reset will not block episode start indefinitely"
             )
             try:
                 self.ros.stop_robot()
-                self.reset_manager.reset_to_pose(reset_pose, timeout_sec=0.80)
+                self.reset_manager.reset_to_pose(reset_pose, timeout_sec=0.60)
             except Exception:
                 pass
-            second_start = time.time()
+
+            second_deadline = time.time() + max(0.80, min(1.60, sec))
             second_stable_since = None
-            while time.time() - second_start < max(1.20, min(2.50, sec)):
+            second_reapply_count = 0
+            second_next_reapply = time.time() + 0.35
+            while time.time() < second_deadline:
                 self.ros.stop_robot()
-                self.ros.spin_steps(num_spins=int(getattr(self, "post_reset_stabilize_spin_steps", 12)), timeout_sec=0.002)
+                self.ros.spin_steps(
+                    num_spins=int(getattr(self, "post_reset_stabilize_spin_steps", 12)),
+                    timeout_sec=0.002,
+                )
                 reason2 = self._instantaneous_shake_reason()
                 last_reason = reason2
                 if reason2 == "none":
                     if second_stable_since is None:
                         second_stable_since = time.time()
-                    if time.time() - second_stable_since >= 0.45:
+                    if time.time() - second_stable_since >= 0.30:
                         break
                 else:
                     second_stable_since = None
-                    try:
-                        if time.time() - second_start > 0.35:
-                            self.reset_manager.reset_to_pose(reset_pose, timeout_sec=0.45)
-                            second_start = time.time() - 0.10
-                    except Exception:
-                        pass
+                    if second_reapply_count < 2 and time.time() >= second_next_reapply:
+                        try:
+                            self.reset_manager.reset_to_pose(reset_pose, timeout_sec=0.35)
+                            second_reapply_count += 1
+                        except Exception:
+                            pass
+                        second_next_reapply = time.time() + 0.45
                 time.sleep(0.03)
+
+            if last_reason != "none":
+                self.ros.get_logger().warn(
+                    "POST_RESET_STABILIZE_SOFT_CONTINUE | "
+                    f"shake={last_reason}; starting episode anyway to avoid reset deadlock"
+                )
 
         # One final quiet hold after the last pose reapply.
         final_hold_start = time.time()
-        while time.time() - final_hold_start < 0.25:
+        while time.time() - final_hold_start < 0.15:
             self.ros.stop_robot()
             self.ros.spin_steps(num_spins=8, timeout_sec=0.002)
             time.sleep(0.02)
@@ -1912,7 +2205,9 @@ class GazeboNavEnv(gym.Env):
                 self._last_shake_restart = False
                 self._last_shake_reason = "none"
             else:
-                # Do not hide an unstable reset from the first training step.
+                # Keep diagnostic state, but do not block reset() here.  If the
+                # instability is real, _update_shake_restart_state() can still end
+                # the episode after actual control steps.
                 self.shake_steps = max(int(getattr(self, "shake_steps", 0)), 1)
                 self._last_shake_active = True
                 self._last_shake_reason = reason
@@ -1941,6 +2236,8 @@ class GazeboNavEnv(gym.Env):
             "known_cells": 0,
             "lidar_beams": 0,
             "priority_score": 0.0,
+            "confidence_cells": 0,
+            "confidence_updated_cells": 0,
             "slam_gate": str(getattr(self, "_last_slam_gate_reason", "unknown")),
         }
         try:
@@ -1986,6 +2283,11 @@ class GazeboNavEnv(gym.Env):
             ratio_eff = max(ratio, float(conf_known) / float(conf_local.size) if conf_local.size else 0.0)
             metrics["known_cells"] = int(known_eff)
             metrics["known_ratio"] = float(ratio_eff)
+            metrics["confidence_cells"] = int(conf_known)
+            try:
+                metrics["confidence_updated_cells"] = int(getattr(map_stats, "confidence_updated_cells", 0) if map_stats is not None else 0)
+            except Exception:
+                metrics["confidence_updated_cells"] = 0
 
             try:
                 metrics["priority_score"] = float(emap.priority_score())
@@ -1999,12 +2301,19 @@ class GazeboNavEnv(gym.Env):
         min_cells = int(getattr(self, "post_reset_ready_min_known_cells", 0))
         min_ratio = float(getattr(self, "post_reset_ready_min_known_ratio", 0.0))
         require_prio = bool(getattr(self, "post_reset_ready_require_priority", True))
+        try:
+            min_conf_cells = int(os.environ.get("TB3_RL_POST_RESET_READY_MIN_CONFIDENCE_CELLS", "0") or 0)
+        except Exception:
+            min_conf_cells = 0
 
         if metrics["lidar_beams"] < min_beams:
             metrics["reason"] = f"lidar_warmup:{metrics['lidar_beams']}/{min_beams}"
             return metrics
         if metrics["known_cells"] < min_cells and metrics["known_ratio"] < min_ratio:
             metrics["reason"] = f"map_warmup:known={metrics['known_cells']},ratio={metrics['known_ratio']:.3f}"
+            return metrics
+        if min_conf_cells > 0 and int(metrics.get("confidence_cells", 0)) < min_conf_cells:
+            metrics["reason"] = f"confidence_warmup:{int(metrics.get('confidence_cells', 0))}/{min_conf_cells}"
             return metrics
         if require_prio and float(metrics["priority_score"]) <= 0.01:
             metrics["reason"] = "priority_warmup"
@@ -2096,16 +2405,17 @@ class GazeboNavEnv(gym.Env):
 
             if now - last_log >= 1.0:
                 last_log = now
-                raw = getattr(self.ros, "slam_map", None)
-                known, ratio, total = self._slam_map_known_stats(raw)
-                last_time = getattr(self.ros, "last_slam_map_time", None)
-                age = (now - float(last_time)) if last_time is not None else -1.0
-                self.ros.get_logger().warn(
-                    "STRICT_SLAM_MAP_WAITING | "
-                    f"stage={stage} dt={now - start:.1f}/{timeout_sec:.1f}s gate={last_reason} "
-                    f"raw_map={raw is not None} age={age:.2f}s known={known}/{total} ratio={ratio:.4f} "
-                    f"delay_left={float(getattr(self, '_last_slam_map_delay_remaining_sec', 0.0)):.2f}s"
-                )
+                if not _quiet_reset_logs():
+                    raw = getattr(self.ros, "slam_map", None)
+                    known, ratio, total = self._slam_map_known_stats(raw)
+                    last_time = getattr(self.ros, "last_slam_map_time", None)
+                    age = (now - float(last_time)) if last_time is not None else -1.0
+                    self.ros.get_logger().warn(
+                        "STRICT_SLAM_MAP_WAITING | "
+                        f"stage={stage} dt={now - start:.1f}/{timeout_sec:.1f}s gate={last_reason} "
+                        f"raw_map={raw is not None} age={age:.2f}s known={known}/{total} ratio={ratio:.4f} "
+                        f"delay_left={float(getattr(self, '_last_slam_map_delay_remaining_sec', 0.0)):.2f}s"
+                    )
             time.sleep(0.03)
 
         self.ros.stop_robot()
@@ -2115,7 +2425,7 @@ class GazeboNavEnv(gym.Env):
             "Policy step is blocked because fallback LiDAR-only maps would corrupt the trained observation."
         )
         self.ros.get_logger().error(msg)
-        raise RuntimeError(msg)
+        raise RecoverableResetError(msg)
 
     def _wait_post_reset_ready(self, reset_pose=None) -> MapUpdateStats:
         """Block reset() until the first observation is trainable.
@@ -2208,7 +2518,7 @@ class GazeboNavEnv(gym.Env):
                     "POST_RESET_READY | "
                     f"dt={time.time() - start:.2f}s | slam={metrics.get('slam_gate')} | "
                     f"known={metrics.get('known_cells')},ratio={float(metrics.get('known_ratio', 0.0)):.3f} | "
-                    f"beams={metrics.get('lidar_beams')} | prio={float(metrics.get('priority_score', 0.0)):.3f}"
+                    f"beams={metrics.get('lidar_beams')} | conf={int(metrics.get('confidence_cells', 0))} | prio={float(metrics.get('priority_score', 0.0)):.3f}"
                 )
                 return last_stats
 
@@ -2219,22 +2529,53 @@ class GazeboNavEnv(gym.Env):
                     "POST_RESET_READY_WAITING | "
                     f"reason={metrics.get('reason')} | slam={metrics.get('slam_gate')} | "
                     f"known={metrics.get('known_cells')},ratio={float(metrics.get('known_ratio', 0.0)):.3f} | "
-                    f"beams={metrics.get('lidar_beams')} | prio={float(metrics.get('priority_score', 0.0)):.3f}"
+                    f"beams={metrics.get('lidar_beams')} | conf={int(metrics.get('confidence_cells', 0))} | prio={float(metrics.get('priority_score', 0.0)):.3f}"
                 )
             time.sleep(0.03)
 
         if bool(getattr(self, "strict_slam_map_required", False)):
-            self.ros.stop_robot()
             metrics = best_metrics or {"reason": "timeout_no_metrics"}
+            # v14: Strict SLAM should block missing/invalid /map, but it must not
+            # crash training only because the initial camera-front confidence cone
+            # is smaller than the requested warmup threshold.  In tight indoor
+            # poses the forward 60-degree view may contain only a few cells, or
+            # even 0 cells when facing a very close wall.  If SLAM, LiDAR and
+            # local map readiness are already valid, let the episode start and
+            # allow live confidence to grow after the policy moves/turns.
+            reason = str(metrics.get("reason", ""))
+            known_ok = (
+                int(metrics.get("known_cells", 0)) >= int(getattr(self, "post_reset_ready_min_known_cells", 0))
+                or float(metrics.get("known_ratio", 0.0)) >= float(getattr(self, "post_reset_ready_min_known_ratio", 0.0))
+            )
+            beams_ok = int(metrics.get("lidar_beams", 0)) >= int(getattr(self, "post_reset_ready_min_lidar_beams", 0))
+            slam_ok = str(metrics.get("slam_gate", "")).startswith("accepted") or str(metrics.get("slam_gate", "")) == "accepted"
+            allow_conf_timeout = bool(int(os.environ.get("TB3_RL_POST_RESET_READY_ALLOW_CONFIDENCE_TIMEOUT", "1") or 1))
+            if allow_conf_timeout and reason.startswith("confidence_warmup") and known_ok and beams_ok and bool(metrics.get("inside", False)):
+                self._last_post_reset_ready = True
+                self._last_post_reset_ready_reason = "timeout_confidence_soft_ready"
+                self._last_post_reset_ready_known_ratio = float(metrics.get("known_ratio", 0.0))
+                self._last_post_reset_ready_known_cells = int(metrics.get("known_cells", 0))
+                self._last_post_reset_ready_lidar_beams = int(metrics.get("lidar_beams", 0))
+                self._last_post_reset_ready_priority = float(metrics.get("priority_score", 0.0))
+                self.ros.get_logger().warn(
+                    "POST_RESET_READY_CONFIDENCE_TIMEOUT_SOFT_READY | "
+                    f"reason={reason} slam={metrics.get('slam_gate')} "
+                    f"known={metrics.get('known_cells')},ratio={float(metrics.get('known_ratio', 0.0)):.3f} "
+                    f"beams={metrics.get('lidar_beams')} conf={int(metrics.get('confidence_cells', 0))} "
+                    "| starting episode; live confidence will update after motion"
+                )
+                return soft_ready_stats if soft_ready_stats is not None else last_stats
+
+            self.ros.stop_robot()
             msg = (
                 "POST_RESET_READY_STRICT_TIMEOUT | "
                 f"reason={metrics.get('reason')} slam={metrics.get('slam_gate')} "
                 f"known={metrics.get('known_cells')},ratio={float(metrics.get('known_ratio', 0.0)):.3f} "
-                f"beams={metrics.get('lidar_beams')} prio={float(metrics.get('priority_score', 0.0)):.3f}. "
+                f"beams={metrics.get('lidar_beams')} conf={int(metrics.get('confidence_cells', 0))} prio={float(metrics.get('priority_score', 0.0)):.3f}. "
                 "Policy step blocked because SLAM map is required."
             )
             self.ros.get_logger().error(msg)
-            raise RuntimeError(msg)
+            raise RecoverableResetError(msg)
 
         # Timeout handling: prefer a map/LiDAR-ready observation even if priority
         # did not spawn.  Never return a completely empty post-reset observation
@@ -2251,7 +2592,7 @@ class GazeboNavEnv(gym.Env):
             f"soft_ready={soft_ready_metrics is not None} | reason={metrics.get('reason')} | "
             f"slam={metrics.get('slam_gate')} | known={metrics.get('known_cells')},"
             f"ratio={float(metrics.get('known_ratio', 0.0)):.3f} | beams={metrics.get('lidar_beams')} | "
-            f"prio={float(metrics.get('priority_score', 0.0)):.3f}"
+            f"conf={int(metrics.get('confidence_cells', 0))} | prio={float(metrics.get('priority_score', 0.0)):.3f}"
         )
         return soft_ready_stats if soft_ready_stats is not None else last_stats
 
@@ -2270,6 +2611,9 @@ class GazeboNavEnv(gym.Env):
         self._confidence_cmd_yaw = 0.0
         self._confidence_cmd_last_time = None
         self._confidence_cmd_last_step = -1
+        self._last_conf_rate_wall_time = 0.0
+        self._last_conf_rate_step = -1
+        self._last_conf_rate_ema = 0.0
         try:
             self._last_confidence_pose_warn_time = 0.0
         except Exception:
@@ -2337,7 +2681,232 @@ class GazeboNavEnv(gym.Env):
             return False
 
     def reset(self, seed=None, options=None):
+        """Gym reset with non-fatal recovery for transient SLAM/TF readiness failures.
+
+        Stable-Baselines3 calls reset() automatically after an episode ends.  A
+        transient Cartographer/TF/map race inside reset() must therefore not raise
+        out of the Gym API; otherwise the whole training job exits.  For
+        recoverable reset-readiness failures, retry the complete reset sequence
+        instead of returning a fake/empty observation.
+
+        Environment variables:
+          TB3_RL_RESET_RECOVERY_MAX_RETRIES_PER_CYCLE : default 8
+          TB3_RL_RESET_RECOVERY_FATAL_AFTER           : default 0 (never fatal)
+          TB3_RL_RESET_RECOVERY_BACKOFF_SEC           : default 0.35
+          TB3_RL_RESET_RECOVERY_HARD_BACKOFF_SEC      : default 2.0
+        """
+        try:
+            max_per_cycle = int(os.environ.get("TB3_RL_RESET_RECOVERY_MAX_RETRIES_PER_CYCLE", "8") or 8)
+        except Exception:
+            max_per_cycle = 8
+        max_per_cycle = max(int(max_per_cycle), 1)
+
+        try:
+            fatal_after = int(os.environ.get("TB3_RL_RESET_RECOVERY_FATAL_AFTER", "0") or 0)
+        except Exception:
+            fatal_after = 0
+        fatal_after = max(int(fatal_after), 0)
+
+        attempt = 0
+        last_exc = None
+        while rclpy.ok():
+            episode_before = int(getattr(self, "episode_index", 0))
+            try:
+                obs, info = self._reset_once(seed=seed, options=options)
+                if attempt > 0:
+                    try:
+                        if info is None:
+                            info = {}
+                        if isinstance(info, dict):
+                            info["reset_recovery_attempts"] = int(attempt)
+                            info["reset_recovery_last_error"] = str(last_exc) if last_exc is not None else ""
+                    except Exception:
+                        pass
+                    try:
+                        self.ros.get_logger().warn(
+                            "RESET_RECOVERY_SUCCEEDED | "
+                            f"attempts={attempt} episode={int(getattr(self, 'episode_index', 0))}"
+                        )
+                    except Exception:
+                        pass
+                return obs, info
+            except RecoverableResetError as exc:
+                last_exc = exc
+                attempt += 1
+                # The failed reset attempt did not produce a valid Gym episode;
+                # keep the public episode counter stable until reset succeeds.
+                try:
+                    self.episode_index = episode_before
+                except Exception:
+                    pass
+
+                try:
+                    self.ros.get_logger().warn(
+                        "RESET_RECOVERY_RETRY | "
+                        f"attempt={attempt} cycle_attempt={((attempt - 1) % max_per_cycle) + 1}/{max_per_cycle} "
+                        f"fatal_after={fatal_after if fatal_after > 0 else 'never'} | {exc}"
+                    )
+                except Exception:
+                    pass
+
+                if fatal_after > 0 and attempt >= fatal_after:
+                    try:
+                        self.ros.get_logger().error(
+                            "RESET_RECOVERY_FATAL | "
+                            f"attempt={attempt}/{fatal_after} | raising after configured fatal limit | {exc}"
+                        )
+                    except Exception:
+                        pass
+                    raise
+
+                hard_cycle = (attempt % max_per_cycle) == 0
+                self._prepare_reset_recovery(attempt=attempt, exc=exc, hard_cycle=hard_cycle)
+                continue
+
+            except KeyboardInterrupt:
+                raise
+
+            except Exception as exc:
+                # Non-Recoverable exceptions (transient ROS/Gazebo/SHM failures that
+                # were not wrapped as RecoverableResetError) must also not kill the
+                # whole training job.  Retry with the same recovery machinery, but
+                # cap unexpected failures separately so a genuine permanent fault
+                # still surfaces eventually.
+                last_exc = exc
+                attempt += 1
+                try:
+                    self.episode_index = episode_before
+                except Exception:
+                    pass
+
+                try:
+                    unexpected_fatal_after = int(
+                        os.environ.get("TB3_RL_RESET_UNEXPECTED_FATAL_AFTER", "40") or 40
+                    )
+                except Exception:
+                    unexpected_fatal_after = 40
+                unexpected_fatal_after = max(int(unexpected_fatal_after), 1)
+
+                try:
+                    self.ros.get_logger().warn(
+                        "RESET_RECOVERY_RETRY_UNEXPECTED | "
+                        f"attempt={attempt} unexpected_fatal_after={unexpected_fatal_after} | "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                except Exception:
+                    pass
+
+                if attempt >= unexpected_fatal_after:
+                    try:
+                        self.ros.get_logger().error(
+                            "RESET_RECOVERY_FATAL_UNEXPECTED | "
+                            f"attempt={attempt}/{unexpected_fatal_after} | "
+                            f"raising after unexpected-failure limit | {type(exc).__name__}: {exc}"
+                        )
+                    except Exception:
+                        pass
+                    raise
+
+                # Force a hard recovery cycle (includes SHM/TF/SLAM cleanup) for
+                # unexpected faults regardless of the normal cycle counter.
+                self._prepare_reset_recovery(attempt=attempt, exc=exc, hard_cycle=True)
+                continue
+
+        # rclpy shutdown/cancel path.  At this point the training process is
+        # already terminating externally, so propagating is appropriate.
+        raise RuntimeError("ROS shutdown while reset recovery was waiting")
+
+    def _prepare_reset_recovery(self, attempt: int, exc: Exception | None = None, hard_cycle: bool = False) -> None:
+        """Hold the robot still and clear transient state before retrying reset().
+
+        This function deliberately does not manufacture an observation.  Its job
+        is only to make the next full reset attempt more likely to succeed.
+        """
+        try:
+            self._map_live_update_paused = True
+        except Exception:
+            pass
+        try:
+            self.ros.stop_robot()
+        except Exception:
+            pass
+        try:
+            self._clear_waypoint_visualization()
+        except Exception:
+            pass
+        try:
+            if str(getattr(self, "action_mode", "")) == "nav2":
+                self._cancel_nav2_goal()
+                self._clear_nav2_costmaps(wait_timeout_sec=0.50)
+        except Exception:
+            pass
+        try:
+            if bool(getattr(self, "reset_tf_buffer_on_reset", True)) and hasattr(self.ros, "reset_tf_buffer"):
+                self.ros.reset_tf_buffer()
+        except Exception:
+            pass
+        try:
+            if hasattr(self.ros, "reset_slam_state"):
+                # Drop stale cached /map signatures.  The next _reset_once() still
+                # performs the mandatory per-episode SLAM reset/restart policy.
+                self.ros.reset_slam_state()
+        except Exception:
+            pass
+        if hard_cycle:
+            try:
+                rm = getattr(self, "reset_manager", None)
+                if rm is not None and hasattr(rm, "failed_entity_names"):
+                    rm.failed_entity_names.clear()
+            except Exception:
+                pass
+            # NOTE: No /dev/shm sweep here.  SHM exhaustion is prevented by forcing
+            # a non-SHM FastDDS transport before ROS init; an age-based sweep during
+            # active ROS can destroy a live participant's segment and is unsafe.
+            try:
+                self.ros.get_logger().warn(
+                    "RESET_RECOVERY_HARD_CYCLE | "
+                    f"attempt={attempt} | cleared transient TF/SLAM/entity blacklist; waiting before next reset"
+                )
+            except Exception:
+                pass
+        try:
+            self.ros.spin_steps(num_spins=max(int(getattr(self, "post_reset_stabilize_spin_steps", 12)), 8), timeout_sec=0.005)
+        except Exception:
+            pass
+        try:
+            self._advance_world_after_command(target_delta_sec=0.03)
+        except Exception:
+            pass
+        try:
+            backoff = float(os.environ.get(
+                "TB3_RL_RESET_RECOVERY_HARD_BACKOFF_SEC" if hard_cycle else "TB3_RL_RESET_RECOVERY_BACKOFF_SEC",
+                "2.0" if hard_cycle else "0.35",
+            ) or (2.0 if hard_cycle else 0.35))
+        except Exception:
+            backoff = 2.0 if hard_cycle else 0.35
+        if backoff > 0.0:
+            time.sleep(max(float(backoff), 0.0))
+
+    def _reset_once(self, seed=None, options=None):
         super().reset(seed=seed)
+        _reset_prof_on = str(os.environ.get("TB3_RL_RESET_PROFILER", "0")).strip().lower() in {"1", "true", "yes", "on"}
+        if _reset_prof_on:
+            _reset_prof_t0 = time.perf_counter()
+            _reset_prof_last = _reset_prof_t0
+            _reset_prof_parts = {}
+
+            def _reset_prof_mark(name: str) -> None:
+                nonlocal _reset_prof_last
+                now = time.perf_counter()
+                _reset_prof_parts[name] = _reset_prof_parts.get(name, 0.0) + float(now - _reset_prof_last)
+                _reset_prof_last = now
+        else:
+            _reset_prof_t0 = 0.0
+            _reset_prof_parts = {}
+
+            def _reset_prof_mark(name: str) -> None:
+                return
+
         self._map_live_update_paused = True
         self.episode_index += 1
 
@@ -2385,7 +2954,10 @@ class GazeboNavEnv(gym.Env):
                     f"lidar_min={gmin:.3f}, front={fmin:.3f}, rear={rmin:.3f}"
                 )
                 if clear:
-                    self.ros.get_logger().info(reset_check_msg)
+                    if _quiet_reset_logs():
+                        self.ros.get_logger().debug(reset_check_msg)
+                    else:
+                        self.ros.get_logger().info(reset_check_msg)
                     accepted_reason = reason
                     break
                 else:
@@ -2416,6 +2988,7 @@ class GazeboNavEnv(gym.Env):
                 requested_y=reset_y,
                 reset_pose=None,
             )
+        _reset_prof_mark("pose_reset")
 
         self.current_reset_xy = np.array([reset_x, reset_y], dtype=np.float32)
 
@@ -2441,6 +3014,19 @@ class GazeboNavEnv(gym.Env):
         self._last_step_reward = 0.0
         self._episode_reward_sum = 0.0
         self._episode_discounted_return = 0.0
+        self._episode_start_discounted_return = 0.0
+        self._episode_reward_ema = 0.0
+        self._recent_reward_window.clear()
+        self._recent_slam_new_window.clear()
+        self._recent_conf_update_window.clear()
+        self._coverage_stall_slam_window.clear()
+        self._coverage_stall_conf_window.clear()
+        self._last_coverage_stall_terminal = False
+        self._last_coverage_stall_active = False
+        self._last_coverage_stall_reason = "reset"
+        self._last_coverage_stall_slam_window = 0
+        self._last_coverage_stall_conf_window = 0
+        self._last_coverage_stall_window_len = 0
         self._last_priority_clear_reward = 0.0
         self._last_priority_recheck_reward = 0.0
         self._last_priority_check_reward = 0.0
@@ -2457,8 +3043,13 @@ class GazeboNavEnv(gym.Env):
         self._last_lidar_empty_restart = False
         self._last_lidar_empty_reason = "none"
         self.velocity_safety_cooldown_steps = 0
+        self.velocity_safety_backup_lock_steps = 0
+        self.velocity_safety_backup_lock_turn_sign = 1.0
+        self._last_velocity_safety_backup_lock_active = False
         self._last_velocity_safety_backup_triggered = False
         self._last_velocity_safety_blocked = False
+        self._last_velocity_safety_skip_store = False
+        self._pending_skip_penalty = 0.0
         self._last_velocity_safety_slowdown = 1.0
         self._last_velocity_safety_penalty = 0.0
         self._last_velocity_safety_reason = "none"
@@ -2564,6 +3155,7 @@ class GazeboNavEnv(gym.Env):
             # Make the reset barrier explicit: do not let a policy observation be
             # generated from an old pre-reset map or from LiDAR-only fallback.
             self._strict_wait_for_accepted_slam_map(stage="after_slam_reset")
+        _reset_prof_mark("slam_reset")
 
         # 3) Nav2는 Gazebo pose reset 이전 episode의 goal/costmap 상태를 물고 있을 수 있다.
         #    reset마다 goal을 취소하고 costmap을 비워야 reset 후 ABORTED 루프가 줄어든다.
@@ -2593,6 +3185,7 @@ class GazeboNavEnv(gym.Env):
                 self.ros.get_logger().info(
                     "NAV2_RESET_READY | goal canceled, manual costmap clear disabled"
                 )
+        _reset_prof_mark("post_reset_stabilize")
 
         # 5) RL memory/confidence map도 전부 초기화하고 Burger가 중앙에 오도록 origin을 재설정한다.
         robot_pose = self._get_robot_pose2d()
@@ -2609,6 +3202,7 @@ class GazeboNavEnv(gym.Env):
         # this episode anchors real odometry to this episode's map pose.
         self._sync_exploration_canvas_to_current_slam(reason="after_exploration_reset", publish=True)
         self._reset_confidence_pose_runtime_state()
+        _reset_prof_mark("map_reset")
 
         # 6) RESET 직후에는 바로 episode를 열지 않는다.
         #    SLAM /map이 reset 이후 실제로 채워지고, LiDAR/confidence/priority가
@@ -2620,6 +3214,7 @@ class GazeboNavEnv(gym.Env):
         self._sync_exploration_canvas_to_current_slam(reason="after_post_reset_ready", publish=True)
         self._last_live_map_update_wall = time.time()
         self._map_live_update_paused = False
+        _reset_prof_mark("ready_gate")
 
         obs = self._get_obs()
 
@@ -2629,6 +3224,20 @@ class GazeboNavEnv(gym.Env):
             fallen=self._check_fallen(),
             coverage_done=False,
         )
+        _reset_prof_mark("obs_info")
+
+        if _reset_prof_on:
+            total = float(time.perf_counter() - _reset_prof_t0)
+            _reset_prof_parts["total"] = total
+            order = ["pose_reset", "slam_reset", "post_reset_stabilize", "map_reset", "ready_gate", "obs_info", "total"]
+            txt = " ".join(
+                f"{k}={float(_reset_prof_parts.get(k, 0.0))*1000.0:.1f}ms"
+                for k in order if k in _reset_prof_parts
+            )
+            self.ros.get_logger().warn(
+                "RESET_PROFILE | "
+                f"episode={self.episode_index} reason={self._last_terminal_reason} | {txt}"
+            )
 
         return obs, info
 
@@ -3198,6 +3807,109 @@ class GazeboNavEnv(gym.Env):
         return False
 
     def step(self, action):
+        """Crash-safe wrapper around the real step implementation.
+
+        A transient ROS/Gazebo failure raised from inside the step (lost service,
+        dropped /scan, world-control timeout, SHM hiccup, etc.) would otherwise
+        propagate out of the Gym API and terminate the entire SB3 training run.
+        Here we catch any unexpected exception, stop the robot, and end the
+        episode via truncation so SB3 calls reset() and training continues.
+
+        The normal (no-exception) path is unchanged: it returns exactly what the
+        underlying implementation returns, and the model/observation/reward logic
+        is never altered.
+        """
+        try:
+            result = self._step_impl(action)
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            try:
+                self.ros.get_logger().error(
+                    "STEP_RECOVERY | unexpected exception in step(); truncating episode "
+                    f"to keep training alive | {type(exc).__name__}: {exc}"
+                )
+            except Exception:
+                pass
+            try:
+                self.ros.stop_robot()
+            except Exception:
+                pass
+            obs = self._safe_fallback_observation()
+            info = {
+                "step_recovery": True,
+                "step_recovery_error": f"{type(exc).__name__}: {exc}",
+                "TimeLimit.truncated": True,
+            }
+            try:
+                self.step_count = int(getattr(self, "step_count", 0)) + 1
+            except Exception:
+                pass
+            # terminated=False, truncated=True -> SB3 bootstraps then resets.
+            return obs, 0.0, False, True, info
+
+        # Cache the most recent valid observation for fallback reuse.
+        try:
+            self._last_valid_obs = result[0]
+        except Exception:
+            pass
+        return result
+
+    def _safe_fallback_observation(self):
+        """Return the last valid observation, or a zero-sample of the space."""
+        cached = getattr(self, "_last_valid_obs", None)
+        if cached is not None:
+            return cached
+        try:
+            return self.observation_space.sample() * 0
+        except Exception:
+            pass
+        try:
+            import numpy as _np
+            space = self.observation_space
+            if isinstance(space, spaces.Dict):
+                return {
+                    k: _np.zeros(v.shape, dtype=v.dtype)
+                    for k, v in space.spaces.items()
+                }
+            return _np.zeros(space.shape, dtype=space.dtype)
+        except Exception:
+            return None
+
+    def _step_impl(self, action):
+        if not hasattr(self, "_step_profiler_initialized"):
+            raw = str(os.environ.get("TB3_RL_STEP_PROFILER", "0")).strip().lower()
+            self._step_profiler_enabled = raw in {"1", "true", "yes", "on"}
+            try:
+                self._step_profiler_every_n = max(int(os.environ.get("TB3_RL_STEP_PROFILER_EVERY_N", "50")), 1)
+            except Exception:
+                self._step_profiler_every_n = 50
+            try:
+                self._step_profiler_slow_ms = max(float(os.environ.get("TB3_RL_STEP_PROFILER_SLOW_MS", "700")), 0.0)
+            except Exception:
+                self._step_profiler_slow_ms = 700.0
+            self._step_profiler_acc = {}
+            self._step_profiler_count = 0
+            self._step_profiler_initialized = True
+
+        _prof_on = bool(getattr(self, "_step_profiler_enabled", False))
+        if _prof_on:
+            _prof_t0 = time.perf_counter()
+            _prof_last = _prof_t0
+            _prof_parts = {}
+
+            def _prof_mark(name: str) -> None:
+                nonlocal _prof_last
+                now = time.perf_counter()
+                _prof_parts[name] = _prof_parts.get(name, 0.0) + float(now - _prof_last)
+                _prof_last = now
+        else:
+            _prof_t0 = 0.0
+            _prof_parts = {}
+
+            def _prof_mark(name: str) -> None:
+                return
+
         policy_action = np.asarray(action, dtype=np.float32)
         policy_action = np.clip(policy_action, self.action_space.low, self.action_space.high)
         self.raw_action = policy_action.astype(np.float32).copy()
@@ -3233,6 +3945,8 @@ class GazeboNavEnv(gym.Env):
                 lidar_action_obstacle_score = max(float(lidar_action_obstacle_score), float(s_obs))
                 lidar_front_obstacle_distance = float(f_obs)
 
+        _prof_mark("action_execute")
+
         # Reward와 observation에는 policy raw action이 아니라 실제 controller가 수행한 cmd_vel 평균을 넣는다.
         # 이렇게 해야 path alignment / obstacle penalty가 실제 궤적 기준으로 계산된다.
         action_for_reward = executed_action.astype(np.float32)
@@ -3248,12 +3962,14 @@ class GazeboNavEnv(gym.Env):
         # This is the B-plan sync path: reward uses scan/pose deltas, not delayed
         # RViz /map publication timing.
         self._wait_for_action_synced_observation(action_prev_scan_wall, action_prev_odom_wall)
+        _prof_mark("wait_sync")
 
         map_stats = self._update_exploration_map()
         self._update_explored_stall_steps(map_stats=map_stats, action=action_for_reward)
         self._update_confidence_stall_steps(map_stats=map_stats, action=action_for_reward)
         self._update_sustained_rotation_steps(action=action_for_reward)
         self._update_orbit_stall_steps(map_stats=map_stats, action=action_for_reward)
+        _prof_mark("map_update")
 
         collision = self._check_collision()
         fallen = self._check_fallen()
@@ -3266,6 +3982,7 @@ class GazeboNavEnv(gym.Env):
         coverage_done = map_stats.coverage_ratio >= self.target_coverage_ratio
         priority_stuck_restart = self._update_priority_stuck_restart_state(map_stats)
         lidar_empty_restart = self._update_lidar_empty_restart_state()
+        coverage_stall_terminal = False
 
         self._last_terminal_reason = "none"
         self._last_collision_restart_requested = False
@@ -3333,6 +4050,8 @@ class GazeboNavEnv(gym.Env):
             self.ros.stop_robot()
         elif coverage_done:
             self._last_terminal_reason = "coverage_done"
+
+        _prof_mark("terminal_checks")
 
         # Merge all priority clear/recheck events produced by the live 10Hz map
         # update timer while this waypoint was being executed.  Without this,
@@ -3408,6 +4127,7 @@ class GazeboNavEnv(gym.Env):
             corridor_priority_reward_weight=self.corridor_priority_reward_weight,
             confidence_reward_weight=self.confidence_reward_weight,
         )
+        _prof_mark("reward_compute")
 
         # Delayed SLAM /map update bonus.  This is intentionally separate from
         # the immediate LiDAR/confidence reward: it credits unknown->known cells
@@ -3417,6 +4137,26 @@ class GazeboNavEnv(gym.Env):
             reward_map_stats,
             unsafe_terminal=bool(collision_like or fallen or lidar_empty_restart),
         )
+
+        # v113: terminate low-information episode tails. This runs after the
+        # delayed SLAM map update has been merged into reward_map_stats, so the
+        # decision sees both SLAM growth and confidence growth for the action
+        # that just executed.
+        if not bool(collision_like or fallen or coverage_done or priority_stuck_restart or lidar_empty_restart):
+            coverage_stall_terminal = self._update_coverage_stall_terminal_state(reward_map_stats)
+            if coverage_stall_terminal:
+                reward += float(getattr(self, "coverage_stall_terminal_penalty", -1.0))
+                self._last_terminal_reason = "coverage_stall_terminal"
+                self._last_collision_restart_requested = False
+                try:
+                    self.ros.stop_robot()
+                except Exception:
+                    pass
+        else:
+            # Keep diagnostics current, but do not let this soft terminal
+            # override hard safety/success terminals.
+            self._update_coverage_stall_terminal_state(reward_map_stats)
+            coverage_stall_terminal = False
 
         if self.action_mode in {"waypoint", "nav2"}:
             reward += compute_waypoint_macro_reward_adjustment(
@@ -3443,11 +4183,33 @@ class GazeboNavEnv(gym.Env):
         if nav2_stuck_backup_triggered:
             reward -= float(getattr(self, "nav2_stuck_backup_penalty", 0.0))
         if self.action_mode == "velocity" and float(getattr(self, "_last_velocity_safety_penalty", 0.0)) > 0.0:
-            reward -= float(getattr(self, "_last_velocity_safety_penalty", 0.0))
+            # v117: a forced safety backup/hold step is dropped from the replay
+            # buffer (info.skip_store), so applying its penalty to THIS step's
+            # reward would discard the penalty too.  Instead, defer it: accumulate
+            # the penalty and subtract it from the next stored (non-skipped) step,
+            # so the policy still pays for driving into the wall, but SAC never
+            # learns from the forced-motion transition itself.
+            if bool(getattr(self, "_last_velocity_safety_skip_store", False)):
+                self._pending_skip_penalty = float(getattr(self, "_pending_skip_penalty", 0.0)) + float(getattr(self, "_last_velocity_safety_penalty", 0.0))
+            else:
+                # Non-skipped safety event (e.g. slowdown): apply immediately.
+                reward -= float(getattr(self, "_last_velocity_safety_penalty", 0.0))
+        # Drain any deferred backup penalty onto this step if it will be stored.
+        if self.action_mode == "velocity" and not bool(getattr(self, "_last_velocity_safety_skip_store", False)):
+            _pending = float(getattr(self, "_pending_skip_penalty", 0.0))
+            if _pending > 0.0:
+                reward -= _pending
+                self._pending_skip_penalty = 0.0
         if shake_restart:
             reward -= float(getattr(self, "shake_restart_penalty", 100.0))
         if lidar_empty_restart:
             reward = -float(self.lidar_empty_restart_penalty)
+
+        # v119: compress positive total reward after all positive bonuses and
+        # soft penalties have been combined.  Negative safety/terminal rewards
+        # are left unchanged by _apply_positive_reward_log_compression().
+        reward = self._apply_positive_reward_log_compression(reward)
+        _prof_mark("reward_post")
 
         # v6: Time-limit/episode timeout is a neutral truncation, not a penalty.
         # Collision/fallen/drop/lidar-empty/stuck restarts can still terminate with
@@ -3455,11 +4217,14 @@ class GazeboNavEnv(gym.Env):
         # an additional negative reward.  This keeps long but safe exploration runs
         # from being punished only because the episode horizon expired.
         will_truncate = bool((self.step_count + 1) >= self.max_episode_steps)
-        if will_truncate and not (collision_like or fallen or coverage_done or priority_stuck_restart or lidar_empty_restart):
+        if will_truncate and not (collision_like or fallen or coverage_done or coverage_stall_terminal or priority_stuck_restart or lidar_empty_restart):
             if self._last_terminal_reason == "none":
                 self._last_terminal_reason = "time_limit"
 
-        priority_clear_reward, priority_recheck_reward, priority_check_reward = self._estimate_priority_check_reward_component(reward_map_stats)
+        if bool(getattr(self, "disable_priority_map", False)):
+            priority_clear_reward = priority_recheck_reward = priority_check_reward = 0.0
+        else:
+            priority_clear_reward, priority_recheck_reward, priority_check_reward = self._estimate_priority_check_reward_component(reward_map_stats)
         self._last_priority_clear_reward = float(priority_clear_reward)
         self._last_priority_recheck_reward = float(priority_recheck_reward)
         self._last_priority_check_reward = float(priority_check_reward)
@@ -3470,7 +4235,24 @@ class GazeboNavEnv(gym.Env):
         reward = float(reward)
         self._last_step_reward = reward
         self._episode_reward_sum += reward
-        self._episode_discounted_return += (self.reward_gamma ** int(self.step_count)) * reward
+
+        # v112: use a live/recent discounted return for RViz/debug G.
+        # Old code used: G += gamma**step * r, which becomes visually flat in
+        # long episodes because gamma**step underflows toward zero.
+        gamma_dbg = float(np.clip(float(getattr(self, "reward_gamma", 0.99)), 0.0, 1.0))
+        self._episode_start_discounted_return += (gamma_dbg ** int(self.step_count)) * reward
+        self._episode_discounted_return = gamma_dbg * float(getattr(self, "_episode_discounted_return", 0.0)) + reward
+        beta_dbg = float(np.clip(float(getattr(self, "_reward_ema_beta", gamma_dbg)), 0.0, 0.999999))
+        self._episode_reward_ema = beta_dbg * float(getattr(self, "_episode_reward_ema", 0.0)) + (1.0 - beta_dbg) * reward
+        self._recent_reward_window.append(float(reward))
+        try:
+            self._recent_slam_new_window.append(int(max(0, getattr(reward_map_stats, "slam_update_new_known_cells", 0))))
+        except Exception:
+            self._recent_slam_new_window.append(0)
+        try:
+            self._recent_conf_update_window.append(int(max(0, getattr(reward_map_stats, "confidence_updated_cells", 0))))
+        except Exception:
+            self._recent_conf_update_window.append(0)
         self._last_reward_text_valid = True
 
         # Reward is only known after map update + reward.py evaluation.
@@ -3503,12 +4285,13 @@ class GazeboNavEnv(gym.Env):
                 lidar_action_obstacle_score=lidar_action_obstacle_score,
                 lidar_front_obstacle_distance=lidar_front_obstacle_distance,
             )
+        _prof_mark("debug_publish")
 
         self.step_count += 1
 
         # collision/fallen/drop are hard terminals.  restart_on_collision is kept
         # only for backward-compatible logging/config, not for suppressing reset.
-        terminated = bool(collision or out_of_bounds or fallen or shake_restart or coverage_done or priority_stuck_restart or lidar_empty_restart)
+        terminated = bool(collision or out_of_bounds or fallen or shake_restart or coverage_done or coverage_stall_terminal or priority_stuck_restart or lidar_empty_restart)
         truncated = bool(self.step_count >= self.max_episode_steps)
         if truncated and self._last_terminal_reason == "none":
             self._last_terminal_reason = "time_limit"
@@ -3517,6 +4300,7 @@ class GazeboNavEnv(gym.Env):
         self.last_map_stats = map_stats
 
         obs = self._get_obs()
+        _prof_mark("obs_build")
 
         if terminated or truncated:
             self.ros.stop_robot()
@@ -3534,8 +4318,237 @@ class GazeboNavEnv(gym.Env):
             fallen=fallen,
             coverage_done=coverage_done,
         )
+        _prof_mark("info_build")
+
+        if _prof_on:
+            total = float(time.perf_counter() - _prof_t0)
+            _prof_parts["total"] = total
+            self._step_profiler_count = int(getattr(self, "_step_profiler_count", 0)) + 1
+            acc = getattr(self, "_step_profiler_acc", {})
+            for k, v in _prof_parts.items():
+                acc[k] = float(acc.get(k, 0.0)) + float(v)
+            self._step_profiler_acc = acc
+            every_n = max(int(getattr(self, "_step_profiler_every_n", 50)), 1)
+            slow_ms = float(getattr(self, "_step_profiler_slow_ms", 700.0))
+            should_log = (self._step_profiler_count % every_n == 0) or (total * 1000.0 >= slow_ms)
+            if should_log:
+                order = [
+                    "action_execute", "wait_sync", "map_update", "terminal_checks",
+                    "reward_compute", "reward_post", "debug_publish", "obs_build",
+                    "info_build", "total",
+                ]
+                last_txt = " ".join(
+                    f"{k}={float(_prof_parts.get(k, 0.0))*1000.0:.1f}ms" for k in order if k in _prof_parts
+                )
+                avg_txt = " ".join(
+                    f"{k}={float(acc.get(k, 0.0))/max(self._step_profiler_count,1)*1000.0:.1f}ms"
+                    for k in order if k in acc
+                )
+                self.ros.get_logger().warn(
+                    "STEP_PROFILE | "
+                    f"episode={self.episode_index} step={self.step_count} count={self._step_profiler_count} "
+                    f"term={self._last_terminal_reason} collision={collision} truncated={truncated} | "
+                    f"last {last_txt} | avg {avg_txt}"
+                )
 
         return obs, float(reward), terminated, truncated, info
+
+    def _update_coverage_stall_terminal_state(self, map_stats: MapUpdateStats) -> bool:
+        """Return True when the episode tail has stopped producing new information.
+
+        The terminal is based on raw progress counts, not G/Glive, critic loss,
+        or total reward.  It fires only after warmup and after a full window is
+        available:
+
+            recent_slam_new <= threshold AND recent_conf_updated <= threshold
+
+        One progress source being alive is enough to keep the episode running.
+        """
+        self._last_coverage_stall_terminal = False
+        self._last_coverage_stall_active = False
+        self._last_coverage_stall_reason = "disabled"
+
+        slam_new = max(int(getattr(map_stats, "slam_update_new_known_cells", 0)), 0)
+        conf_new = max(int(getattr(map_stats, "confidence_updated_cells", 0)), 0)
+
+        if not bool(getattr(self, "coverage_stall_terminal", False)):
+            self._last_coverage_stall_slam_window = int(sum(getattr(self, "_coverage_stall_slam_window", [])))
+            self._last_coverage_stall_conf_window = int(sum(getattr(self, "_coverage_stall_conf_window", [])))
+            self._last_coverage_stall_window_len = int(len(getattr(self, "_coverage_stall_slam_window", [])))
+            return False
+
+        self._coverage_stall_slam_window.append(int(slam_new))
+        self._coverage_stall_conf_window.append(int(conf_new))
+
+        slam_sum = int(sum(self._coverage_stall_slam_window))
+        conf_sum = int(sum(self._coverage_stall_conf_window))
+        win_len = int(min(len(self._coverage_stall_slam_window), len(self._coverage_stall_conf_window)))
+        self._last_coverage_stall_slam_window = slam_sum
+        self._last_coverage_stall_conf_window = conf_sum
+        self._last_coverage_stall_window_len = win_len
+
+        step_after = int(getattr(self, "step_count", 0)) + 1
+        start_steps = int(getattr(self, "coverage_stall_start_steps", 0))
+        window_steps = int(getattr(self, "coverage_stall_window_steps", 1))
+
+        if step_after < start_steps:
+            self._last_coverage_stall_reason = f"warmup:{step_after}/{start_steps}"
+            return False
+        if win_len < window_steps:
+            self._last_coverage_stall_reason = f"window:{win_len}/{window_steps}"
+            return False
+
+        # v114: do not end an episode as coverage-stalled while an emergency
+        # priority spot is still active.  Priority is now an explicit task signal,
+        # so an unresolved active spot is progress-relevant even if SLAM/confidence
+        # are flat.
+        try:
+            if not bool(getattr(self, "disable_priority_map", False)):
+                prio = self.exploration_map._active_priority_grid()
+                prio_thr = max(float(getattr(self.exploration_map, "priority_clear_min_value", 5.0)), 1.0)
+                active_prio_cells = int(np.count_nonzero(np.asarray(prio) >= prio_thr))
+                if active_prio_cells > 0:
+                    self._last_coverage_stall_reason = f"priority_active:{active_prio_cells}"
+                    return False
+        except Exception:
+            pass
+
+        min_slam = int(getattr(self, "coverage_stall_min_slam_new_cells", 0))
+        min_conf = int(getattr(self, "coverage_stall_min_confidence_updated_cells", 0))
+        active = bool(slam_sum <= min_slam and conf_sum <= min_conf)
+        self._last_coverage_stall_active = active
+        self._last_coverage_stall_terminal = active
+        self._last_coverage_stall_reason = (
+            f"stall:slam={slam_sum}<={min_slam},conf={conf_sum}<={min_conf}"
+            if active else
+            f"progress:slam={slam_sum}>{min_slam} or conf={conf_sum}>{min_conf}"
+        )
+        return active
+
+    def _execute_velocity_safety_backup_sequence(
+        self,
+        *,
+        front_min: float,
+        rear_min: float,
+        turn_sign: float,
+        backup_v: float,
+        backup_turn_speed: float,
+        backup_steps_cfg: int,
+        rear_stop_dist: float,
+        lidar_action_obstacle_distance: float,
+        lidar_action_obstacle_score: float,
+        lidar_front_obstacle_distance: float,
+        reason_prefix: str,
+        log_label: str,
+    ) -> tuple[np.ndarray, float, float, float]:
+        """Execute the full safety backup as one environment transition.
+
+        This is intentionally synchronous.  Standard SB3 SAC samples an action
+        before every env.step(), so a sticky backup implemented over many Gym
+        steps would still call actor.forward() and store arbitrary policy actions
+        for forced-backup motion.  Running all backup ticks inside this one step
+        keeps replay cleaner: one unsafe policy action -> one forced recovery
+        transition -> one explicit penalty.
+        """
+        backup_steps_cfg = max(int(backup_steps_cfg), 1)
+        turn_sign = float(turn_sign)
+        if abs(turn_sign) < 1e-6:
+            turn_sign = 1.0
+        # v117: pure straight reverse only.  Mixing an angular term into the
+        # backup made the robot pivot while reversing, which both (a) changed the
+        # heading the policy is trying to learn forward motion for and (b) could
+        # swing the front back toward the wall.  The user wants "just back up a
+        # little", so the backup twist has zero angular component.
+        backup_w = 0.0
+        backup_v = -abs(float(backup_v))
+        cmd = np.array([backup_v, backup_w], dtype=np.float32)
+        rear_during_backup = float(rear_min)
+        stopped_by_rear = False
+        steps_done = 0
+
+        def _refresh_confidence_during_backup():
+            # confidence/priority maps are normally refreshed by the ROS live-update
+            # timer, but the backup loop only spins briefly, so the timer barely
+            # fires and the confidence origin lags behind the reversing robot.
+            # Drive the same update explicitly each micro-step so the overlay keeps
+            # up with the backup motion.
+            try:
+                self.ros.spin_steps(num_spins=4, timeout_sec=0.002)
+                if not bool(getattr(self, "_map_live_update_paused", False)):
+                    self._live_map_update_timer_callback()
+            except Exception:
+                pass
+
+        for _ in range(backup_steps_cfg):
+            self.ros.spin_steps(num_spins=2, timeout_sec=0.001)
+            scan_now = self.ros.scan
+            if scan_now is not None:
+                rear_during_backup = self._scan_min_distance_in_sector(
+                    scan=scan_now,
+                    center_angle=math.pi,
+                    half_width_rad=math.radians(45.0),
+                    max_considered_range=0.90,
+                )
+
+            if float(rear_during_backup) <= float(rear_stop_dist):
+                stopped_by_rear = True
+                cmd = np.array([0.0, backup_w], dtype=np.float32)
+                self.ros.publish_cmd_vel(float(cmd[0]), float(cmd[1]))
+                self.ros.spin_steps(num_spins=2, timeout_sec=0.001)
+                self._advance_world_after_command(target_delta_sec=self.control_dt)
+                _refresh_confidence_during_backup()
+                break
+
+            cmd = np.array([backup_v, backup_w], dtype=np.float32)
+            self.ros.publish_cmd_vel(float(cmd[0]), float(cmd[1]))
+            self.ros.spin_steps(num_spins=2, timeout_sec=0.001)
+            self._advance_world_after_command(target_delta_sec=self.control_dt)
+            _refresh_confidence_during_backup()
+            steps_done += 1
+
+        # CRITICAL: explicitly stop the robot at the end of the backup.
+        # cmd_vel is latched by the driver, so if we leave the last reverse
+        # command active the robot keeps coasting backward through the cooldown
+        # window and the next world-step advances, which is what produced the
+        # runaway multi-meter reverse.  Force a zero twist and settle it.
+        cmd = np.array([0.0, 0.0], dtype=np.float32)
+        self.ros.publish_cmd_vel(0.0, 0.0)
+        self.ros.spin_steps(num_spins=2, timeout_sec=0.001)
+        self._advance_world_after_command(target_delta_sec=self.control_dt)
+        try:
+            self.ros.stop_robot()
+        except Exception:
+            pass
+        _refresh_confidence_during_backup()
+
+        self.velocity_safety_backup_lock_steps = 0
+        self.velocity_safety_cooldown_steps = int(getattr(self, "velocity_safety_cooldown_steps_cfg", 8))
+        self._last_velocity_safety_backup_triggered = True
+        self._last_velocity_safety_backup_lock_active = False
+        self._last_velocity_safety_skip_store = True
+        self._last_velocity_safety_penalty = float(getattr(self, "velocity_safety_penalty", 10.0))
+        self._last_velocity_safety_sync_steps = int(steps_done)
+        self._last_velocity_safety_reason = (
+            f"{reason_prefix}{'_rear_stop' if stopped_by_rear else ''}:"
+            f"front={float(front_min):.3f},rear0={float(rear_min):.3f},"
+            f"rear={float(rear_during_backup):.3f},sync_steps={int(steps_done)}/{int(backup_steps_cfg)}"
+        )
+        self.ros.get_logger().warn(
+            f"{log_label} | "
+            f"front={float(front_min):.3f}m rear0={float(rear_min):.3f}m "
+            f"rear={float(rear_during_backup):.3f}m "
+            f"sync_steps={int(steps_done)}/{int(backup_steps_cfg)} "
+            f"cmd_last=({float(cmd[0]):+.3f},{float(cmd[1]):+.3f}) "
+            f"rear_stop={float(rear_stop_dist):.3f} "
+            f"penalty={float(self._last_velocity_safety_penalty):.2f} "
+            f"actor_forward_skipped_during_backup=1"
+        )
+        return (
+            cmd.astype(np.float32),
+            float(lidar_action_obstacle_distance),
+            float(max(lidar_action_obstacle_score, 1.0)),
+            float(lidar_front_obstacle_distance),
+        )
 
     def _execute_velocity_action(self, policy_action: np.ndarray) -> tuple[np.ndarray, float, float, float]:
         """
@@ -3545,9 +4558,12 @@ class GazeboNavEnv(gym.Env):
           action[0] = commanded forward linear velocity in [0, max_linear_speed]
           action[1] = commanded angular velocity in [-max_angular_speed, max_angular_speed]
 
-        The safety shield does not change the observation/action space.  It only
-        clamps unsafe forward commands and, when the front sector is already too
-        close to an obstacle, publishes a short reverse TwistStamped escape.
+        The safety shield does not change the observation/action space.  When an
+        unsafe forward command would collide, v115 executes the whole reverse
+        recovery inside this single Gym step.  That prevents SB3 from calling the
+        actor and adding replay-buffer transitions during the individual backup
+        ticks.  The replay buffer sees one transition: the unsafe action caused a
+        synchronous forced backup and a safety penalty.
         Collisions are still handled by _check_collision() and terminate/reset the
         episode exactly as before.
         """
@@ -3560,17 +4576,23 @@ class GazeboNavEnv(gym.Env):
 
         self._last_velocity_safety_backup_triggered = False
         self._last_velocity_safety_blocked = False
+        self._last_velocity_safety_skip_store = False
         self._last_velocity_safety_slowdown = 1.0
         self._last_velocity_safety_penalty = 0.0
         self._last_velocity_safety_reason = "none"
+        self._last_velocity_safety_sync_steps = 0
         self._last_velocity_forward_assist = False
         self._last_velocity_spin_breaker = False
 
-        if int(getattr(self, "velocity_safety_cooldown_steps", 0)) > 0:
-            self.velocity_safety_cooldown_steps = max(
-                int(getattr(self, "velocity_safety_cooldown_steps", 0)) - 1,
-                0,
-            )
+        # Cooldown prevents repeated new backup starts.  It must not consume the
+        # already-started sticky backup lock; otherwise the policy can re-enter
+        # and cancel the escape before the robot has physically moved backward.
+        if int(getattr(self, "velocity_safety_backup_lock_steps", 0)) <= 0:
+            if int(getattr(self, "velocity_safety_cooldown_steps", 0)) > 0:
+                self.velocity_safety_cooldown_steps = max(
+                    int(getattr(self, "velocity_safety_cooldown_steps", 0)) - 1,
+                    0,
+                )
 
         scan = self.ros.scan
         front_min = 999.0
@@ -3647,87 +4669,72 @@ class GazeboNavEnv(gym.Env):
         # into a wall or object while trying to avoid a front obstacle.
         rear_stop_dist = max(float(self.collision_threshold) + 0.14, 0.30)
         rear_warn_dist = max(rear_stop_dist + 0.10, 0.42)
+
+        backup_v_cfg = float(getattr(self, "velocity_safety_backup_speed_mps", 0.08))
+        backup_v = -min(max(backup_v_cfg, 0.0), 0.10)
+        backup_turn_speed = float(getattr(self, "velocity_safety_turn_speed", 0.35))
+        backup_steps_cfg = max(int(getattr(self, "velocity_safety_backup_steps", 4)), 1)
+
+        # v115: backup is synchronous inside the triggering Gym step.
+        # If a leftover lock exists from an older run/checkpoint, clear it so
+        # no future actor-forward step is consumed by forced backup.
+        lock_steps = int(getattr(self, "velocity_safety_backup_lock_steps", 0))
+        if lock_steps > 0:
+            self.velocity_safety_backup_lock_steps = 0
+            self.velocity_safety_cooldown_steps = int(getattr(self, "velocity_safety_cooldown_steps_cfg", 8))
+            self._last_velocity_safety_reason = f"cleared_legacy_backup_lock:{lock_steps}"
+
         can_backup = (
             bool(getattr(self, "velocity_safety_backup", True))
             and int(getattr(self, "velocity_safety_cooldown_steps", 0)) <= 0
             and float(rear_min) > rear_warn_dist
         )
 
-        # 1) Imminent front collision: override with short reverse recovery, but
-        # never continue reversing once the rear sector becomes unsafe.
+        # 1) Imminent front collision: start a sticky reverse recovery.
+        # Only the first reverse tick is executed in this Gym step; the rest are
+        # protected by velocity_safety_backup_lock_steps so later policy actions
+        # cannot cancel the reverse escape.
         if front_min < trigger_dist and can_backup:
-            backup_v_cfg = float(getattr(self, "velocity_safety_backup_speed_mps", 0.08))
-            backup_v = -min(max(backup_v_cfg, 0.0), 0.10)
-            backup_w = turn_sign * float(getattr(self, "velocity_safety_turn_speed", 0.35))
-            backup_steps = int(getattr(self, "velocity_safety_backup_steps", 4))
-            executed_backup_steps = 0
-            stopped_by_rear = False
-            rear_during_backup = float(rear_min)
-            for _ in range(max(backup_steps, 1)):
-                self.ros.spin_steps(num_spins=2, timeout_sec=0.001)
-                scan_now = self.ros.scan
-                if scan_now is not None:
-                    rear_during_backup = self._scan_min_distance_in_sector(
-                        scan=scan_now,
-                        center_angle=math.pi,
-                        half_width_rad=math.radians(45.0),
-                        max_considered_range=0.90,
-                    )
-                if float(rear_during_backup) <= rear_stop_dist:
-                    stopped_by_rear = True
-                    self.ros.publish_cmd_vel(0.0, backup_w)
-                    self._advance_world_after_command(target_delta_sec=self.control_dt)
-                    break
-                self.ros.publish_cmd_vel(backup_v, backup_w)
-                self.ros.spin_steps(num_spins=2, timeout_sec=0.001)
-                self._advance_world_after_command(target_delta_sec=self.control_dt)
-                executed_backup_steps += 1
-                if self._check_collision() or self._check_fallen():
-                    break
-
-            if stopped_by_rear or executed_backup_steps <= 0:
-                cmd = np.array([0.0, backup_w], dtype=np.float32)
-                reason_prefix = "backup_blocked_rear"
-            else:
-                cmd = np.array([backup_v, backup_w], dtype=np.float32)
-                reason_prefix = "backup"
-            self.ros.publish_cmd_vel(float(cmd[0]), float(cmd[1]))
-            self.velocity_safety_cooldown_steps = int(getattr(self, "velocity_safety_cooldown_steps_cfg", 8))
-            self._last_velocity_safety_backup_triggered = True
-            self._last_velocity_safety_penalty = float(getattr(self, "velocity_safety_penalty", 10.0))
-            self._last_velocity_safety_reason = (
-                f"{reason_prefix}:front={front_min:.3f},rear0={rear_min:.3f},"
-                f"rear={rear_during_backup:.3f},steps={executed_backup_steps}"
-            )
-            self.ros.get_logger().warn(
-                "VELOCITY_SAFETY_BACKUP | "
-                f"front={front_min:.3f}m rear0={rear_min:.3f}m rear={rear_during_backup:.3f}m "
-                f"steps={executed_backup_steps}/{backup_steps} cmd=({cmd[0]:+.3f},{cmd[1]:+.3f}) "
-                f"rear_stop={rear_stop_dist:.3f} penalty={self._last_velocity_safety_penalty:.2f}"
-            )
-            return (
-                cmd.astype(np.float32),
-                float(lidar_action_obstacle_distance),
-                float(max(lidar_action_obstacle_score, 1.0)),
-                float(lidar_front_obstacle_distance),
+            return self._execute_velocity_safety_backup_sequence(
+                front_min=float(front_min),
+                rear_min=float(rear_min),
+                turn_sign=float(turn_sign),
+                backup_v=float(backup_v),
+                backup_turn_speed=float(backup_turn_speed),
+                backup_steps_cfg=int(backup_steps_cfg),
+                rear_stop_dist=float(rear_stop_dist),
+                lidar_action_obstacle_distance=float(lidar_action_obstacle_distance),
+                lidar_action_obstacle_score=float(lidar_action_obstacle_score),
+                lidar_front_obstacle_distance=float(lidar_front_obstacle_distance),
+                reason_prefix="sync_backup_trigger",
+                log_label="VELOCITY_SAFETY_SYNC_BACKUP_START",
             )
 
         if front_min < trigger_dist and not can_backup:
-            # Front is dangerous but rear is not safe enough for reverse.  Rotate
-            # in place instead of backing into an unknown/occupied rear sector.
-            cmd = np.array([0.0, turn_sign * float(getattr(self, "velocity_safety_turn_speed", 0.35))], dtype=np.float32)
-            self.ros.publish_cmd_vel(float(cmd[0]), float(cmd[1]))
-            self.ros.spin_steps(num_spins=5, timeout_sec=0.001)
+            # Front is dangerous but a new backup is not allowed (cooldown active
+            # or rear unsafe).  Do NOT compute a rotation here: forcing an
+            # in-place spin pollutes the policy's forward-driving signal.  Just
+            # hold the robot still for this tick and mark it as a non-learning
+            # (skip-store) safety step so SAC never sees this forced transition.
+            cmd = np.array([0.0, 0.0], dtype=np.float32)
+            self.ros.publish_cmd_vel(0.0, 0.0)
+            self.ros.spin_steps(num_spins=3, timeout_sec=0.001)
             self._advance_world_after_command(target_delta_sec=self.control_dt)
+            try:
+                self.ros.stop_robot()
+            except Exception:
+                pass
             self._last_velocity_safety_blocked = True
+            self._last_velocity_safety_skip_store = True
             self._last_velocity_safety_penalty = float(getattr(self, "velocity_safety_penalty", 10.0))
             self._last_velocity_safety_reason = (
-                f"backup_denied_rear:front={front_min:.3f},rear={rear_min:.3f},rear_warn={rear_warn_dist:.3f}"
+                f"backup_denied_hold:front={front_min:.3f},rear={rear_min:.3f},"
+                f"rear_warn={rear_warn_dist:.3f},cooldown={int(getattr(self, 'velocity_safety_cooldown_steps', 0))}"
             )
             self.ros.get_logger().warn(
                 "VELOCITY_SAFETY_BACKUP_DENIED | "
                 f"front={front_min:.3f}m rear={rear_min:.3f}m rear_warn={rear_warn_dist:.3f} "
-                f"cmd=({cmd[0]:+.3f},{cmd[1]:+.3f}) penalty={self._last_velocity_safety_penalty:.2f}"
+                f"cooldown={int(getattr(self, 'velocity_safety_cooldown_steps', 0))} hold(no_rotate)"
             )
             return (
                 cmd.astype(np.float32),
@@ -3736,18 +4743,72 @@ class GazeboNavEnv(gym.Env):
                 float(lidar_front_obstacle_distance),
             )
 
-        # 2) Too close but cannot/should not reverse: block forward motion and rotate.
+        # 2) Stop band: do not silently erase the policy's forward command.
+        # v114: if the action would likely collide, execute an explicit reverse recovery
+        # and charge a penalty.  This makes the transition legible to SAC: the agent
+        # sees that an unsafe forward action caused a backup/penalty, instead of seeing
+        # its linear command clamped to zero with weak learning signal.
+        #
+        # v116 FIX: this band MUST also honor the backup cooldown.  Previously it
+        # ignored velocity_safety_cooldown_steps, so a robot wedged in front of a
+        # wall (front stays < stop_dist while the policy keeps commanding forward)
+        # re-triggered a full reverse every single step forever, never letting the
+        # cooldown count down.  Now: only start a new backup when the cooldown has
+        # elapsed; during cooldown, block the forward command and rotate in place
+        # so the robot turns away from the wall instead of endlessly reversing.
         if forward > 0.0 and (front_min < stop_dist or lidar_action_obstacle_distance < stop_dist):
-            cmd[0] = 0.0
-            if abs(float(cmd[1])) < 0.08:
-                cmd[1] = turn_sign * min(float(self.max_angular_speed), float(getattr(self, "velocity_safety_turn_speed", 0.35)))
+            cooldown_active = int(getattr(self, "velocity_safety_cooldown_steps", 0)) > 0
+            rear_ok = float(rear_min) > rear_warn_dist
+            if bool(getattr(self, "velocity_safety_backup", True)) and rear_ok and not cooldown_active:
+                return self._execute_velocity_safety_backup_sequence(
+                    front_min=float(front_min),
+                    rear_min=float(rear_min),
+                    turn_sign=float(turn_sign),
+                    backup_v=float(backup_v),
+                    backup_turn_speed=float(backup_turn_speed),
+                    backup_steps_cfg=int(backup_steps_cfg),
+                    rear_stop_dist=float(rear_stop_dist),
+                    lidar_action_obstacle_distance=float(lidar_action_obstacle_distance),
+                    lidar_action_obstacle_score=float(lidar_action_obstacle_score),
+                    lidar_front_obstacle_distance=float(lidar_front_obstacle_distance),
+                    reason_prefix="sync_stop_band_backup",
+                    log_label="VELOCITY_SAFETY_SYNC_STOP_BAND_BACKUP",
+                )
+
+            # Backup not taken (cooldown active, or rear unsafe).  Do NOT rotate:
+            # an in-place spin here teaches the policy to turn instead of drive
+            # forward.  Hold still for this tick and mark it skip-store so SAC
+            # never learns from this forced safety transition.
+            cooldown_active = int(getattr(self, "velocity_safety_cooldown_steps", 0)) > 0
+            cmd = np.array([0.0, 0.0], dtype=np.float32)
+            self.ros.publish_cmd_vel(0.0, 0.0)
+            self.ros.spin_steps(num_spins=3, timeout_sec=0.001)
+            self._advance_world_after_command(target_delta_sec=self.control_dt)
+            try:
+                self.ros.stop_robot()
+            except Exception:
+                pass
             self._last_velocity_safety_blocked = True
-            self._last_velocity_safety_penalty = float(getattr(self, "velocity_safety_block_penalty", 0.80))
+            self._last_velocity_safety_skip_store = True
+            self._last_velocity_safety_penalty = float(getattr(self, "velocity_safety_penalty", 10.0))
             self._last_velocity_safety_reason = (
-                f"block:front={front_min:.3f},action={lidar_action_obstacle_distance:.3f}"
+                f"stop_band_hold:front={front_min:.3f},action={lidar_action_obstacle_distance:.3f},"
+                f"rear={rear_min:.3f},rear_warn={rear_warn_dist:.3f},"
+                f"cooldown={'yes' if cooldown_active else 'no'}"
+            )
+            self.ros.get_logger().warn(
+                "VELOCITY_SAFETY_HOLD | "
+                f"front={front_min:.3f}m rear={rear_min:.3f}m "
+                f"cooldown={'yes' if cooldown_active else 'no'} hold(no_rotate)"
+            )
+            return (
+                cmd.astype(np.float32),
+                float(lidar_action_obstacle_distance),
+                float(max(lidar_action_obstacle_score, 1.0)),
+                float(lidar_front_obstacle_distance),
             )
 
-        # 3) Warning band: smoothly reduce forward speed before the hard stop band.
+        # 3) Warning band: smoothly reduce forward speed before the backup band.
         elif forward > 0.0 and lidar_action_obstacle_distance < slow_dist:
             denom = max(slow_dist - stop_dist, 1e-6)
             scale = float(np.clip((float(lidar_action_obstacle_distance) - stop_dist) / denom, 0.15, 1.0))
@@ -4979,7 +6040,10 @@ class GazeboNavEnv(gym.Env):
             f"truncated={bool(truncated)}",
             f"step={int(getattr(self, 'step_count', 0))}/{int(getattr(self, 'max_episode_steps', 0))}",
             f"r={float(reward):+.3f}",
-            f"Ggamma={float(getattr(self, '_episode_discounted_return', 0.0)):+.3f}",
+            f"Glive={float(getattr(self, '_episode_discounted_return', 0.0)):+.3f}",
+            f"Gstart={float(getattr(self, '_episode_start_discounted_return', 0.0)):+.3f}",
+            f"Gsum={float(getattr(self, '_episode_reward_sum', 0.0)):+.3f}",
+            f"R{int(getattr(self, '_reward_window_n', 100))}={sum(getattr(self, '_recent_reward_window', [])):+.3f}",
             f"coverage={float(getattr(map_stats, 'coverage_ratio', 0.0)):.3f}",
             f"priority={float(getattr(map_stats, 'priority_score', 0.0)):.3f}",
             f"target={str(getattr(map_stats, 'target_type', 'none'))}",
@@ -6438,7 +7502,7 @@ class GazeboNavEnv(gym.Env):
                         except (TypeError, ValueError):
                             er = float("nan")
                         if math.isfinite(er):
-                            reward_line = f"r={rv:+.3f} Gγ={er:+.2f} γ={self.reward_gamma:.2f} marker={marker_frame_id} pose={self.pose_frame} nav2=NavigateToPose"
+                            reward_line = f"r={rv:+.3f} Glive={er:+.2f} γ={self.reward_gamma:.2f} marker={marker_frame_id} pose={self.pose_frame} nav2=NavigateToPose"
 
             step_pclear = float(getattr(self, "_last_step_priority_clear_gain", 0.0)) + float(getattr(self, "_last_step_priority_rechecked_gain", 0.0))
             ep_pclear = float(getattr(self, "_episode_priority_clear_gain", 0.0)) + float(getattr(self, "_episode_priority_rechecked_gain", 0.0))
@@ -6516,7 +7580,15 @@ class GazeboNavEnv(gym.Env):
         """
         if self.waypoint_marker_pub is None:
             return
-        if self.step_count % self.waypoint_visual_publish_every_n != 0:
+        # Velocity debug overlay publish rate.  In velocity mode there is no
+        # waypoint, so reuse a dedicated env knob (default: every step) instead of
+        # the waypoint_visual_publish_every_n gate which defaults to ~never.
+        try:
+            overlay_every_n = int(os.environ.get("TB3_RL_DEBUG_OVERLAY_EVERY_N", "1"))
+        except Exception:
+            overlay_every_n = 1
+        overlay_every_n = max(int(overlay_every_n), 1)
+        if (int(self.step_count) % overlay_every_n) != 0:
             return
 
         # v14 default: velocity debug overlay is robot-attached.  The old map-frame
@@ -6554,6 +7626,13 @@ class GazeboNavEnv(gym.Env):
 
         reward = fnum(reward_value)
         g_return = fnum(episode_reward)
+        g_sum = fnum(getattr(self, "_episode_reward_sum", 0.0), 0.0)
+        g_start = fnum(getattr(self, "_episode_start_discounted_return", 0.0), 0.0)
+        g_ema = fnum(getattr(self, "_episode_reward_ema", 0.0), 0.0)
+        r_window_n = int(getattr(self, "_reward_window_n", 100))
+        r_window = fnum(sum(getattr(self, "_recent_reward_window", [])), 0.0)
+        slam_window = int(sum(getattr(self, "_recent_slam_new_window", [])))
+        conf_window = int(sum(getattr(self, "_recent_conf_update_window", [])))
         front = fnum(lidar_front_obstacle_distance, 999.0)
         act_obs = fnum(lidar_action_obstacle_distance, 999.0)
         act_score = fnum(lidar_action_obstacle_score, 0.0)
@@ -6563,18 +7642,40 @@ class GazeboNavEnv(gym.Env):
         conf = fnum(getattr(map_stats, "mean_confidence", 0.0), 0.0)
         stale_pct = 100.0 * fnum(getattr(map_stats, "stale_ratio", 0.0), 0.0)
         low = 100.0 * fnum(getattr(map_stats, "low_confidence_ratio", 0.0), 0.0)
-        prio_score = fnum(getattr(map_stats, "priority_score", 0.0), 0.0)
-        prio_gain = fnum(getattr(map_stats, "priority_gain", 0.0), 0.0)
-        prio_clear = fnum(getattr(map_stats, "priority_clear_gain", 0.0), 0.0)
-        prio_recheck = fnum(getattr(map_stats, "priority_rechecked_gain", 0.0), 0.0)
-        target_type = str(getattr(map_stats, "target_type", "none"))
-        target_prio = fnum(getattr(map_stats, "target_priority", 0.0), 0.0)
+        conf_updated_cells = int(max(0, fnum(getattr(map_stats, "confidence_updated_cells", 0), 0.0)))
+        now_conf_rate = time.time()
+        last_conf_rate_t = float(getattr(self, "_last_conf_rate_wall_time", 0.0) or 0.0)
+        last_conf_rate_step = int(getattr(self, "_last_conf_rate_step", -1))
+        conf_rate_ema = float(getattr(self, "_last_conf_rate_ema", 0.0) or 0.0)
+        if int(getattr(self, "step_count", 0)) != last_conf_rate_step:
+            dt_conf_rate = max(now_conf_rate - last_conf_rate_t, 1e-3) if last_conf_rate_t > 0.0 else max(float(getattr(self, "control_dt", 0.06)), 1e-3)
+            inst_conf_rate = float(conf_updated_cells) / dt_conf_rate
+            conf_rate_ema = inst_conf_rate if last_conf_rate_t <= 0.0 else (0.30 * inst_conf_rate + 0.70 * conf_rate_ema)
+            self._last_conf_rate_wall_time = now_conf_rate
+            self._last_conf_rate_step = int(getattr(self, "step_count", 0))
+            self._last_conf_rate_ema = conf_rate_ema
+        no_priority_overlay = bool(getattr(self, "disable_priority_map", False)) or (
+            str(os.environ.get("TB3_RL_FORCE_NO_PRIORITY", "0")).strip().lower()
+            not in {"0", "false", "no", "off", "disable", "disabled"}
+        )
+        if no_priority_overlay:
+            prio_score = prio_gain = prio_clear = prio_recheck = target_prio = 0.0
+            target_type = str(getattr(map_stats, "target_type", "none"))
+            if target_type == "priority_gap":
+                target_type = "none"
+        else:
+            prio_score = fnum(getattr(map_stats, "priority_score", 0.0), 0.0)
+            prio_gain = fnum(getattr(map_stats, "priority_gain", 0.0), 0.0)
+            prio_clear = fnum(getattr(map_stats, "priority_clear_gain", 0.0), 0.0)
+            prio_recheck = fnum(getattr(map_stats, "priority_rechecked_gain", 0.0), 0.0)
+            target_type = str(getattr(map_stats, "target_type", "none"))
+            target_prio = fnum(getattr(map_stats, "target_priority", 0.0), 0.0)
 
         l_empty_steps = int(getattr(self, "lidar_empty_steps", 0))
         l_empty_timeout = int(getattr(self, "lidar_empty_timeout_steps", 0))
         valid_beams = int(getattr(self, "_last_lidar_valid_beams", 0))
-        p_steps = int(getattr(self, "priority_stuck_steps", 0))
-        p_limit = int(getattr(self, "priority_stuck_restart_steps", 0))
+        p_steps = 0 if no_priority_overlay else int(getattr(self, "priority_stuck_steps", 0))
+        p_limit = 0 if no_priority_overlay else int(getattr(self, "priority_stuck_restart_steps", 0))
         safety_reason = str(getattr(self, "_last_velocity_safety_reason", "none"))
         safety_pen = fnum(getattr(self, "_last_velocity_safety_penalty", 0.0), 0.0)
         safety_cd = int(getattr(self, "velocity_safety_cooldown_steps", 0))
@@ -6590,13 +7691,10 @@ class GazeboNavEnv(gym.Env):
 
         arr = MarkerArray()
 
-        # Clear stale velocity markers from previous frame modes.
-        stale_velocity = Marker()
-        stale_velocity.header.frame_id = frame_id
-        stale_velocity.header.stamp = stamp
-        stale_velocity.ns = "rl_velocity_debug"
-        stale_velocity.action = Marker.DELETEALL
-        arr.markers.append(stale_velocity)
+        # NOTE: Do NOT mix a DELETEALL marker with ADD markers in the same
+        # MarkerArray.  RViz can report "Duplicate Marker in the same namespace"
+        # and drop the overlay.  Each ADD marker below uses a fixed (ns,id) so it
+        # is overwritten in place every frame; no DELETEALL is needed.
 
         # Delete old waypoint/goal markers from previous modes on this topic.
         for stale_id, stale_type in ((0, Marker.SPHERE), (1, Marker.LINE_STRIP), (2, Marker.ARROW), (3, Marker.TEXT_VIEW_FACING), (4, Marker.LINE_STRIP), (5, Marker.CYLINDER), (6, Marker.ARROW)):
@@ -6624,7 +7722,8 @@ class GazeboNavEnv(gym.Env):
         self._set_marker_color(text, 1.0, 1.0, 1.0, 0.98)
         text.text = (
             f"PURE VELOCITY SAC  step={int(self.step_count)}\n"
-            f"r={reward:+.3f}  Gγ={g_return:+.2f}  γ={self.reward_gamma:.2f}  term={term}\n"
+            f"r={reward:+.3f}  Glive={g_return:+.2f}  Gsum={g_sum:+.1f}  R{r_window_n}={r_window:+.2f}  γ={self.reward_gamma:.3f}  term={term}\n"
+            f"Gema={g_ema:+.3f}  Gstart(old)={g_start:+.2f}  slam{r_window_n}={slam_window}  conf{r_window_n}={conf_window}\n"
             f"raw(v,w)=({fnum(raw[0]):+.3f},{fnum(raw[1]):+.3f})  "
             f"cmd=({fnum(exe[0]):+.3f},{fnum(exe[1]):+.3f})\n"
             f"front={front:.2f}m  actionObs={act_obs:.2f}m  score={act_score:.2f}  near={nearest:.2f}m\n"
@@ -6643,14 +7742,13 @@ class GazeboNavEnv(gym.Env):
             f"SAFE pen={safety_pen:.2f} slow={slowdown:.2f} cd={safety_cd} assist={int(bool(getattr(self, '_last_velocity_forward_assist', False)))} spinfix={int(bool(getattr(self, '_last_velocity_spin_breaker', False)))} limit={int(bool(getattr(self, '_last_velocity_command_limited', False)))}  {safety_reason} {str(getattr(self, '_last_velocity_command_limit_reason', 'none'))}\n"
             f"Shake={shake_steps}/{shake_limit} {shake_reason}  "
             f"Lempty={l_empty_steps}/{l_empty_timeout} beams={valid_beams}  "
-            f"Pstuck={p_steps}/{p_limit} confStall={int(getattr(self, 'confidence_stall_steps', 0))} "
+            f"confStall={int(getattr(self, 'confidence_stall_steps', 0))} "
             f"spinStall={int(getattr(self, 'sustained_rotation_steps', 0))} "
             f"orbitStall={int(getattr(self, 'orbit_stall_steps', 0))} "
             f"eff={float(getattr(self, '_last_orbit_path_efficiency', 1.0)):.2f}\n"
-            f"cov={cov:.1f}% Δ={dcov:+.2f}%  conf={conf:.1f}  stale={stale_pct:.1f}% low={low:.1f}%\n"
-            f"prio score={prio_score:.2f} gain={prio_gain:.2f} clr={prio_clear:.2f} rechk={prio_recheck:.2f}\n"
+            f"cov={cov:.1f}% Δ={dcov:+.2f}%  conf={conf:.1f} conf/s={conf_rate_ema:.1f}  stale={stale_pct:.1f}% low={low:.1f}%\n"
             f"slamNew={slam_new_known} slamR={slam_r:+.3f}  "
-            f"target={target_type} tp={target_prio:.2f}  slam={slam_gate} age={map_age:.1f}s "
+            f"target={target_type}  slam={slam_gate} age={map_age:.1f}s "
             f"ready={str(getattr(self, '_last_post_reset_ready_reason', 'none'))}"
         )
         arr.markers.append(text)
@@ -7078,17 +8176,43 @@ class GazeboNavEnv(gym.Env):
 
         else:
             # Real-time fallback: Gazebo is already running unpaused in its own
-            # process/thread.  Do not block for control_dt here; blocking the RL
-            # process competes with Gazebo/SLAM/RViz on the same CPU and can drop
-            # the simulator real-time factor.  We only drain pending callbacks and
-            # yield the CPU briefly.
+            # process/thread.  Previous high-throughput builds only drained ROS
+            # callbacks and yielded the CPU briefly here, which made one Gym step
+            # much shorter than control_dt.  That is good for throughput but bad
+            # when step-count based events such as emergency priority spawning or
+            # synchronous backup are expected to represent physical time.
+            #
+            # v118: optional strict wall-clock control period.  When enabled, each
+            # env step/micro-step keeps the command active for approximately
+            # target_delta_sec seconds of wall-clock time while continuously
+            # spinning callbacks.  This makes, for example, control_dt=0.10 mean
+            # about 10 Hz from the policy/environment point of view.
+            start_wall = time.monotonic()
+
             if self.realtime_spin_steps > 0:
                 self.ros.spin_steps(
                     num_spins=self.realtime_spin_steps,
                     timeout_sec=self.realtime_spin_timeout_sec,
                 )
-            if self.realtime_sleep_sec > 0.0:
-                time.sleep(self.realtime_sleep_sec)
+
+            if bool(getattr(self, "realtime_enforce_control_dt", False)):
+                target_wall = max(float(target_delta_sec), 0.0) + float(getattr(self, "realtime_control_dt_wall_margin_sec", 0.0))
+                # Keep small spin/sleep slices so /clock, odom, scan, SLAM, and
+                # map timers can update while the command is being held.
+                while rclpy.ok():
+                    elapsed = time.monotonic() - start_wall
+                    remaining = target_wall - elapsed
+                    if remaining <= 0.0:
+                        break
+                    spin_timeout = min(max(float(remaining), 0.0), 0.005)
+                    self.ros.spin_steps(num_spins=1, timeout_sec=spin_timeout)
+                    if remaining > 0.001:
+                        time.sleep(min(0.001, max(remaining, 0.0)))
+                self._last_realtime_step_wall_elapsed_sec = float(time.monotonic() - start_wall)
+            else:
+                if self.realtime_sleep_sec > 0.0:
+                    time.sleep(self.realtime_sleep_sec)
+                self._last_realtime_step_wall_elapsed_sec = float(time.monotonic() - start_wall)
 
     def close(self):
         self._clear_waypoint_visualization()
@@ -7159,7 +8283,7 @@ class GazeboNavEnv(gym.Env):
                 f"z={float(reset_pose.z):.3f}, yaw={float(reset_pose.yaw):.3f})"
             )
 
-        self.ros.get_logger().info(
+        _reset_truth_msg = (
             "RESET_POSE_TRUTH | "
             f"candidate_requested=(x={float(requested_x):.3f}, y={float(requested_y):.3f}) | "
             f"entity='{entity}' | "
@@ -7168,6 +8292,10 @@ class GazeboNavEnv(gym.Env):
             f"odom_pose={odom_text} | "
             f"{self.pose_frame}_pose={map_text}"
         )
+        if _quiet_reset_logs():
+            self.ros.get_logger().debug(_reset_truth_msg)
+        else:
+            self.ros.get_logger().info(_reset_truth_msg)
 
     def _reset_slam_map_after_pose_reset(self) -> bool:
         if not hasattr(self.ros, "reset_slam_mapping"):
@@ -7375,25 +8503,42 @@ class GazeboNavEnv(gym.Env):
     def _get_map_base_pose2d_hard(self) -> Optional[tuple[np.ndarray, float]]:
         """Strict canonical robot anchor for every /map-aligned RL layer.
 
-        This intentionally bypasses Odometry/Gazebo pose fallbacks.  The returned
-        pose is exactly the TF pose RViz uses to place the robot on /map:
+        v29 rule: confidence/priority map writes use the *robot pose on the
+        SLAM map*, not the OccupancyGrid origin and not odometry treated as map.
+        This is exactly the TF transform RViz uses to place the robot model:
 
-            map_frame -> base_frame
+            target_frame = map
+            source_frame = base_footprint   # or configured base frame
 
-        If this TF is unavailable, the semantic maps must not update; using odom
-        coordinates as map coordinates is worse than skipping one update.
+        Internally this reads /tf through the tf2 buffer.  If that TF is
+        unavailable, semantic layers skip the update instead of painting at a
+        guessed map origin.
         """
-        target_frame = str(self.map_frame or "map").strip().lstrip("/") or "map"
+        target_frame = str(os.environ.get("TB3_RL_CONFIDENCE_TARGET_FRAME", self.map_frame or "map") or "map").strip().lstrip("/") or "map"
         base_candidates = []
+        # Highest priority: explicit confidence base frame.  This prevents an
+        # old launch environment or a fallback list from accidentally using a
+        # different base frame than RViz.
         try:
-            base_candidates.extend(list(getattr(self.ros, "base_frame_fallbacks", []) or []))
+            env_base = str(os.environ.get("TB3_RL_CONFIDENCE_BASE_FRAME", "") or "").strip().lstrip("/")
+            if env_base:
+                base_candidates.append(env_base)
         except Exception:
             pass
         try:
-            base_candidates.append(str(getattr(self.ros, "base_frame", "base_footprint") or "base_footprint"))
+            strict_base = str(os.environ.get("TB3_RL_CONFIDENCE_STRICT_BASE_FRAME", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
         except Exception:
-            pass
-        base_candidates.extend(["base_footprint", "base_link"])
+            strict_base = True
+        if not strict_base:
+            try:
+                base_candidates.extend(list(getattr(self.ros, "base_frame_fallbacks", []) or []))
+            except Exception:
+                pass
+            try:
+                base_candidates.append(str(getattr(self.ros, "base_frame", "base_footprint") or "base_footprint"))
+            except Exception:
+                pass
+            base_candidates.extend(["base_footprint", "base_link", "base_scan"])
 
         seen = set()
         for source_frame in base_candidates:
@@ -7403,14 +8548,51 @@ class GazeboNavEnv(gym.Env):
             seen.add(source_frame)
             pose = None
             try:
-                if hasattr(self.ros, "get_frame_pose2d"):
-                    pose = self.ros.get_frame_pose2d(
+                # RViz places the robot model using the live tf2 buffer
+                # (target=map, source=base_footprint), which time-synchronizes the
+                # full map->odom->base chain.  The manual /tf cache instead
+                # composes the latest value of each edge independently, so when
+                # map->odom (SLAM, low rate) and odom->base (odom, high rate) have
+                # different timestamps the confidence anchor lags / offsets from
+                # the RViz robot.  To make the confidence map origin EXACTLY match
+                # the RViz robot position, prefer the tf2 buffer and keep the
+                # manual cache only as a fallback for brief TF gaps.
+                prefer_tf_buffer = str(os.environ.get("TB3_RL_CONFIDENCE_PREFER_TF_BUFFER", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
+                use_manual = str(os.environ.get("TB3_RL_USE_MANUAL_TF_CACHE_FOR_CONFIDENCE", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
+                buffer_fallback = str(os.environ.get("TB3_RL_CONFIDENCE_TF_BUFFER_FALLBACK", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+                max_age = float(os.environ.get("TB3_RL_MANUAL_TF_MAX_AGE_SEC", "5.0") or 5.0)
+
+                def _lookup_tf_buffer():
+                    if not hasattr(self.ros, "get_frame_pose2d"):
+                        return None
+                    return self.ros.get_frame_pose2d(
                         target_frame=target_frame,
                         source_frame=source_frame,
                         stamp=None,
                         timeout_sec=0.05,
                         allow_latest_fallback=True,
                     )
+
+                def _lookup_manual():
+                    if not hasattr(self.ros, "get_frame_pose2d_manual"):
+                        return None
+                    return self.ros.get_frame_pose2d_manual(
+                        target_frame=target_frame,
+                        source_frame=source_frame,
+                        max_age_sec=max_age,
+                    )
+
+                if prefer_tf_buffer:
+                    # tf2 buffer first (RViz-identical), manual cache as fallback.
+                    pose = _lookup_tf_buffer()
+                    if pose is None and use_manual:
+                        pose = _lookup_manual()
+                else:
+                    # Legacy order: manual cache first, tf2 buffer as fallback.
+                    if use_manual:
+                        pose = _lookup_manual()
+                    if pose is None and buffer_fallback:
+                        pose = _lookup_tf_buffer()
             except Exception:
                 pose = None
             if pose is not None:
@@ -7574,6 +8756,45 @@ class GazeboNavEnv(gym.Env):
             return float(base_yaw)
         return 0.0
 
+    def _select_confidence_ray_yaw(
+        self,
+        *,
+        base_yaw: float,
+        scan_yaw: Optional[float] = None,
+        mode_hint: str = "",
+    ) -> float:
+        """Select the yaw used to paint the confidence cone.
+
+        v111 fix:
+          In map_base_tf mode the origin already follows TF(map->base_footprint),
+          but older code used TF(map->base_scan) yaw for the ray.  In the current
+          Gazebo/Cartographer setup that scan yaw can differ from the RobotModel
+          body yaw and the magenta cone points in the wrong direction.  Default
+          back to the robot/base yaw, while keeping a scan-yaw option for explicit
+          experiments.
+
+        Environment:
+          TB3_RL_CONFIDENCE_RAY_YAW_SOURCE=base|scan    default: base
+          TB3_RL_CONFIDENCE_YAW_OFFSET_DEG=<degrees>    default: 0
+        """
+        try:
+            source = str(os.environ.get("TB3_RL_CONFIDENCE_RAY_YAW_SOURCE", "base") or "base").strip().lower()
+        except Exception:
+            source = "base"
+        yaw = float(base_yaw) if math.isfinite(float(base_yaw)) else 0.0
+        if source in {"scan", "base_scan", "lidar", "laser", "sensor"}:
+            try:
+                if scan_yaw is not None and math.isfinite(float(scan_yaw)):
+                    yaw = float(scan_yaw)
+            except Exception:
+                pass
+        try:
+            offset_deg = float(os.environ.get("TB3_RL_CONFIDENCE_YAW_OFFSET_DEG", "0.0") or 0.0)
+        except Exception:
+            offset_deg = 0.0
+        yaw = float(yaw) + math.radians(float(offset_deg))
+        return math.atan2(math.sin(yaw), math.cos(yaw))
+
     def _pose2d_from_odometry_msg(self, msg, label: str) -> Optional[tuple[np.ndarray, float, str]]:
         """Extract an SE(2) pose from an Odometry-like message.
 
@@ -7669,6 +8890,222 @@ class GazeboNavEnv(gym.Env):
         self._confidence_cmd_yaw = float(yaw)
         return xy.copy(), float(yaw), "cmd_integrated"
 
+    def _amcl_pose_callback(self, msg) -> None:
+        self._latest_amcl_pose = msg
+
+    def _get_amcl_bridge_anchored_odom_pose2d(self, target_frame: str = "map") -> Optional[tuple[np.ndarray, float]]:
+        """Return an AMCL-compatible map pose from an anchored odometry delta.
+
+        This is intentionally not particle-filter AMCL.  It exists for SLAM
+        training runs where the user wants a /amcl_pose topic but the live
+        TF(map->base_footprint) seen by this node is stale.  The pose starts from
+        a verified map->base TF anchor and then follows actual/model odometry
+        deltas, which is the confidence mode that previously tracked movement
+        best in Gazebo.
+        """
+        try:
+            motion_pose = self._get_confidence_motion_pose2d()
+        except Exception:
+            motion_pose = None
+        if motion_pose is None:
+            return None
+        motion_xy, motion_yaw, motion_label = motion_pose
+        motion_xy = np.asarray(motion_xy, dtype=np.float32).reshape(-1)[:2]
+        motion_yaw = float(motion_yaw)
+        if motion_xy.size < 2 or not (np.all(np.isfinite(motion_xy)) and math.isfinite(motion_yaw)):
+            return None
+
+        anchor = getattr(self, "_amcl_pose_odom_anchor", None)
+        if anchor is None or str(anchor.get("motion_label", "")) != str(motion_label):
+            try:
+                hard_map_pose = self._get_map_base_pose2d_hard()
+            except Exception:
+                hard_map_pose = None
+            if hard_map_pose is None:
+                return None
+            map_xy0, map_yaw0 = hard_map_pose
+            map_xy0 = np.asarray(map_xy0, dtype=np.float32).reshape(-1)[:2]
+            map_yaw0 = float(map_yaw0)
+            if map_xy0.size < 2 or not (np.all(np.isfinite(map_xy0)) and math.isfinite(map_yaw0)):
+                return None
+            anchor = {
+                "map_xy0": map_xy0.copy(),
+                "map_yaw0": float(map_yaw0),
+                "motion_xy0": motion_xy.copy(),
+                "motion_yaw0": float(motion_yaw),
+                "motion_label": str(motion_label),
+            }
+            self._amcl_pose_odom_anchor = anchor
+            try:
+                if str(os.environ.get("TB3_RL_CONFIDENCE_POSE_WARN", "0")).strip().lower() in {"1", "true", "yes", "on"}:
+                    self.ros.get_logger().warn(
+                        "AMCL_POSE_ANCHORED_ODOM_ANCHOR_SET | "
+                        f"target={target_frame} source={motion_label} "
+                        f"map=({float(map_xy0[0]):+.3f},{float(map_xy0[1]):+.3f},{math.degrees(map_yaw0):+.1f}deg) "
+                        f"motion=({float(motion_xy[0]):+.3f},{float(motion_xy[1]):+.3f},{math.degrees(motion_yaw):+.1f}deg)"
+                    )
+            except Exception:
+                pass
+
+        theta = self._normalize_angle(float(anchor["map_yaw0"]) - float(anchor["motion_yaw0"]))
+        c = math.cos(theta)
+        ss = math.sin(theta)
+        dx = float(motion_xy[0]) - float(anchor["motion_xy0"][0])
+        dy = float(motion_xy[1]) - float(anchor["motion_xy0"][1])
+        out_x = float(anchor["map_xy0"][0]) + c * dx - ss * dy
+        out_y = float(anchor["map_xy0"][1]) + ss * dx + c * dy
+        out_yaw = self._normalize_angle(float(motion_yaw) + theta)
+        if not (math.isfinite(out_x) and math.isfinite(out_y) and math.isfinite(out_yaw)):
+            return None
+        return np.array([out_x, out_y], dtype=np.float32), float(out_yaw)
+
+    def _publish_amcl_pose_from_tf_timer(self) -> None:
+        """Publish an AMCL-compatible /amcl_pose from TF(map->base_footprint).
+
+        This is not a particle-filter AMCL estimate.  It is a deterministic
+        PoseWithCovarianceStamped bridge for SLAM training runs where the user
+        wants confidence to consume /amcl_pose but the pose that is actually
+        trustworthy is the same TF RViz uses to render RobotModel.
+        """
+        pub = getattr(self, "_amcl_pose_tf_pub", None)
+        if pub is None:
+            return
+        target_frame = str(getattr(self, "amcl_pose_tf_target_frame", "map") or "map").strip().lstrip("/") or "map"
+        source_frame = str(getattr(self, "amcl_pose_tf_source_frame", "base_footprint") or "base_footprint").strip().lstrip("/") or "base_footprint"
+        pose = None
+        bridge_source = str(getattr(self, "amcl_pose_bridge_source", "tf") or "tf").strip().lower()
+        if bridge_source in {"anchored", "anchored_odom", "real_odom_anchored", "actual_odom", "model_odom"}:
+            pose = self._get_amcl_bridge_anchored_odom_pose2d(target_frame=target_frame)
+        else:
+            try:
+                if hasattr(self.ros, "get_frame_pose2d"):
+                    pose = self.ros.get_frame_pose2d(
+                        target_frame=target_frame,
+                        source_frame=source_frame,
+                        stamp=None,
+                        timeout_sec=float(getattr(self, "amcl_pose_tf_timeout_sec", 0.05)),
+                        allow_latest_fallback=True,
+                    )
+            except Exception:
+                pose = None
+        if pose is None:
+            now = time.time()
+            if now - float(getattr(self, "_last_amcl_pose_tf_warn_time", 0.0)) > 2.0:
+                self._last_amcl_pose_tf_warn_time = now
+                try:
+                    self.ros.get_logger().warn(
+                        "AMCL_POSE_TF_BRIDGE_WAITING | "
+                        f"bridge_source={bridge_source} target={target_frame} source={source_frame} topic={getattr(self, 'amcl_pose_topic', '/amcl_pose')}"
+                    )
+                except Exception:
+                    pass
+            return
+        try:
+            # ros_interface.get_frame_pose2d() returns (xy: np.ndarray[2], yaw).
+            # Older v102/v103 code incorrectly treated it as (x, y, yaw), so
+            # float(pose[0]) tried to convert a 2-D numpy array and the AMCL
+            # bridge never published /amcl_pose.
+            xy = np.asarray(pose[0], dtype=np.float64).reshape(-1)
+            if xy.size < 2:
+                return
+            x = float(xy[0])
+            y = float(xy[1])
+            yaw = float(pose[1])
+            if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(yaw)):
+                return
+            msg = PoseWithCovarianceStamped()
+            try:
+                msg.header.stamp = self.ros.get_clock().now().to_msg()
+            except Exception:
+                pass
+            msg.header.frame_id = target_frame
+            msg.pose.pose.position.x = x
+            msg.pose.pose.position.y = y
+            msg.pose.pose.position.z = 0.0
+            qx, qy, qz, qw = self._yaw_to_quaternion_xyzw_static(yaw)
+            msg.pose.pose.orientation.x = float(qx)
+            msg.pose.pose.orientation.y = float(qy)
+            msg.pose.pose.orientation.z = float(qz)
+            msg.pose.pose.orientation.w = float(qw)
+            cov = [0.0] * 36
+            cov[0] = float(getattr(self, "amcl_pose_cov_xy", 0.0025))
+            cov[7] = float(getattr(self, "amcl_pose_cov_xy", 0.0025))
+            cov[35] = float(getattr(self, "amcl_pose_cov_yaw", 0.01))
+            msg.pose.covariance = cov
+            pub.publish(msg)
+            # Keep the confidence source immediately usable even before the ROS
+            # subscription callback loops this message back.
+            self._latest_amcl_pose = msg
+        except Exception as exc:
+            now = time.time()
+            if now - float(getattr(self, "_last_amcl_pose_tf_warn_time", 0.0)) > 2.0:
+                self._last_amcl_pose_tf_warn_time = now
+                try:
+                    self.ros.get_logger().warn(f"AMCL_POSE_TF_BRIDGE_PUBLISH_FAILED | bridge_source={bridge_source} err={exc}")
+                except Exception:
+                    pass
+
+    def _get_amcl_pose2d_map(self) -> Optional[tuple[np.ndarray, float, str]]:
+        """Return /amcl_pose as an SE(2) pose in the current map frame."""
+        msg = getattr(self, "_latest_amcl_pose", None)
+        if msg is None:
+            self._warn_amcl_pose_once("AMCL_POSE_UNAVAILABLE", "no /amcl_pose message received yet")
+            return None
+
+        try:
+            frame = str(getattr(getattr(msg, "header", None), "frame_id", "") or "map").strip().lstrip("/") or "map"
+            target = str(getattr(self, "map_frame", "map") or "map").strip().lstrip("/") or "map"
+            if frame != target:
+                self._warn_amcl_pose_once(
+                    "AMCL_POSE_FRAME_MISMATCH",
+                    f"header.frame_id={frame} expected={target}; skipping confidence update",
+                )
+                return None
+
+            # Reject stale AMCL poses when simulation time is available.  AMCL
+            # sometimes publishes with stamp=0 during startup; accept that.
+            stamp = getattr(getattr(msg, "header", None), "stamp", None)
+            if stamp is not None:
+                t_msg = float(getattr(stamp, "sec", 0)) + 1e-9 * float(getattr(stamp, "nanosec", 0))
+                if t_msg > 0.0 and float(getattr(self, "amcl_pose_max_age_sec", 0.0)) > 0.0:
+                    now = self._confidence_time_sec()
+                    if now > 0.0 and math.isfinite(float(now)):
+                        age = float(now) - float(t_msg)
+                        if age > float(self.amcl_pose_max_age_sec):
+                            self._warn_amcl_pose_once(
+                                "AMCL_POSE_STALE",
+                                f"age={age:.2f}s max_age={self.amcl_pose_max_age_sec:.2f}s",
+                            )
+                            return None
+
+            p = msg.pose.pose.position
+            q = msg.pose.pose.orientation
+            xy = np.array([float(p.x), float(p.y)], dtype=np.float32)
+            yaw = self._yaw_from_quaternion_xyzw_static(float(q.x), float(q.y), float(q.z), float(q.w))
+            if not (np.all(np.isfinite(xy)) and math.isfinite(float(yaw))):
+                self._warn_amcl_pose_once("AMCL_POSE_INVALID", "non-finite xy/yaw")
+                return None
+            return xy[:2], float(yaw), "amcl_pose"
+        except Exception as exc:
+            self._warn_amcl_pose_once("AMCL_POSE_PARSE_FAILED", str(exc))
+            return None
+
+    def _warn_amcl_pose_once(self, tag: str, detail: str) -> None:
+        try:
+            dbg = str(os.environ.get("TB3_RL_CONFIDENCE_POSE_WARN", "0")).strip().lower() in {"1", "true", "yes", "on"}
+        except Exception:
+            dbg = False
+        if not dbg:
+            return
+        now = time.time()
+        if now - float(getattr(self, "_last_amcl_pose_warn_time", 0.0)) < 2.0:
+            return
+        self._last_amcl_pose_warn_time = now
+        try:
+            self.ros.get_logger().warn(f"{tag} | {detail}")
+        except Exception:
+            pass
+
     def _get_confidence_motion_pose2d(self) -> Optional[tuple[np.ndarray, float, str]]:
         """Return an actual robot pose source for confidence map alignment.
 
@@ -7733,6 +9170,127 @@ class GazeboNavEnv(gym.Env):
                     pass
         return None
 
+    def _get_confidence_scan_stamped_tf_pose2d(self) -> Optional[tuple[np.ndarray, float, np.ndarray, float, str]]:
+        """Return a scan-timestamped map pose for confidence painting.
+
+        v107 rule:
+          - Confidence is generated from LaserScan data, therefore the pose used
+            to paint confidence must be the LiDAR pose at LaserScan.header.stamp.
+          - Do not mix a scan from time t with the latest map->base TF from time
+            t+dt.  That is what makes the magenta cone appear detached from the
+            RobotModel/map while the robot is moving.
+          - Ray origin/yaw: TF(map -> scan.header.frame_id) at scan.header.stamp.
+          - Robot/crop pose: TF(map -> base_footprint) at the same stamp when
+            available; otherwise use the scan pose as a conservative fallback
+            unless TB3_RL_SCAN_STAMPED_TF_REQUIRE_BASE=1.
+        """
+        try:
+            scan = getattr(self.ros, "scan", None)
+            if scan is None:
+                return None
+            header = getattr(scan, "header", None)
+            stamp = getattr(header, "stamp", None)
+            scan_frame = str(getattr(header, "frame_id", "") or "").strip().lstrip("/")
+            if not scan_frame:
+                scan_frame = str(os.environ.get("TB3_RL_SCAN_FRAME", getattr(self, "scan_frame", "base_scan")) or "base_scan").strip().lstrip("/") or "base_scan"
+            target_frame = str(os.environ.get("TB3_RL_CONFIDENCE_TARGET_FRAME", self.map_frame or "map") or "map").strip().lstrip("/") or "map"
+            base_frame = str(os.environ.get("TB3_RL_CONFIDENCE_BASE_FRAME", os.environ.get("TB3_RL_BASE_FRAME", "base_footprint")) or "base_footprint").strip().lstrip("/") or "base_footprint"
+            timeout_sec = float(os.environ.get("TB3_RL_SCAN_STAMPED_TF_TIMEOUT_SEC", "0.08") or 0.08)
+            allow_latest = str(os.environ.get("TB3_RL_SCAN_STAMPED_TF_ALLOW_LATEST_FALLBACK", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+            require_base = str(os.environ.get("TB3_RL_SCAN_STAMPED_TF_REQUIRE_BASE", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+        except Exception:
+            return None
+
+        if not hasattr(self.ros, "get_frame_pose2d"):
+            return None
+
+        scan_pose = None
+        try:
+            scan_pose = self.ros.get_frame_pose2d(
+                target_frame=target_frame,
+                source_frame=scan_frame,
+                stamp=stamp,
+                timeout_sec=max(float(timeout_sec), 0.0),
+                allow_latest_fallback=allow_latest,
+            )
+        except Exception:
+            scan_pose = None
+
+        if scan_pose is None:
+            try:
+                dbg = str(os.environ.get("TB3_RL_CONFIDENCE_POSE_WARN", "0")).strip().lower() in {"1", "true", "yes", "on"}
+            except Exception:
+                dbg = False
+            if dbg:
+                now = time.time()
+                if now - float(getattr(self, "_last_confidence_pose_warn_time", 0.0)) > 2.0:
+                    self._last_confidence_pose_warn_time = now
+                    try:
+                        self.ros.get_logger().warn(
+                            "CONFIDENCE_SCAN_STAMPED_TF_UNAVAILABLE | "
+                            f"target={target_frame} source={scan_frame} allow_latest={allow_latest}; "
+                            "skip confidence update"
+                        )
+                    except Exception:
+                        pass
+            return None
+
+        base_pose = None
+        try:
+            base_pose = self.ros.get_frame_pose2d(
+                target_frame=target_frame,
+                source_frame=base_frame,
+                stamp=stamp,
+                timeout_sec=max(float(timeout_sec), 0.0),
+                allow_latest_fallback=allow_latest,
+            )
+        except Exception:
+            base_pose = None
+
+        if base_pose is None and require_base:
+            try:
+                dbg = str(os.environ.get("TB3_RL_CONFIDENCE_POSE_WARN", "0")).strip().lower() in {"1", "true", "yes", "on"}
+            except Exception:
+                dbg = False
+            if dbg:
+                now = time.time()
+                if now - float(getattr(self, "_last_confidence_pose_warn_time", 0.0)) > 2.0:
+                    self._last_confidence_pose_warn_time = now
+                    try:
+                        self.ros.get_logger().warn(
+                            "CONFIDENCE_BASE_STAMPED_TF_UNAVAILABLE | "
+                            f"target={target_frame} source={base_frame} allow_latest={allow_latest}; "
+                            "skip confidence update"
+                        )
+                    except Exception:
+                        pass
+            return None
+
+        try:
+            scan_xy = np.asarray(scan_pose[0], dtype=np.float32).reshape(-1)[:2]
+            scan_yaw = float(scan_pose[1])
+            if scan_xy.size < 2 or not np.all(np.isfinite(scan_xy)) or not math.isfinite(scan_yaw):
+                return None
+            if base_pose is not None:
+                robot_xy = np.asarray(base_pose[0], dtype=np.float32).reshape(-1)[:2]
+                robot_yaw = float(base_pose[1])
+                if robot_xy.size < 2 or not np.all(np.isfinite(robot_xy)) or not math.isfinite(robot_yaw):
+                    robot_xy = scan_xy.copy()
+                    robot_yaw = scan_yaw
+                    label = f"scan_stamped_tf:{scan_frame}:base_fallback"
+                else:
+                    label = f"scan_stamped_tf:{scan_frame}:{base_frame}"
+            else:
+                robot_xy = scan_xy.copy()
+                robot_yaw = scan_yaw
+                label = f"scan_stamped_tf:{scan_frame}:scan_as_robot"
+            self._last_confidence_scan_stamped_frame = scan_frame
+            self._last_confidence_scan_stamped_xy = scan_xy.copy()
+            self._last_confidence_scan_stamped_yaw = float(scan_yaw)
+            return robot_xy.astype(np.float32), float(robot_yaw), scan_xy.astype(np.float32), float(scan_yaw), label
+        except Exception:
+            return None
+
     def _get_confidence_update_pose2d(self) -> Optional[tuple[np.ndarray, float, np.ndarray, float, str]]:
         """Return the pose used to paint camera-front confidence in /map.
 
@@ -7751,18 +9309,227 @@ class GazeboNavEnv(gym.Env):
         anchor = getattr(self, "_confidence_odom_anchor", None)
         hard_map_pose = None
 
+        # Direct TF robot-pose mode.  This is the intended map-aligned mode for
+        # confidence: OccupancyGrid frame stays /map, but the cone origin is read
+        # from TF instead of odometry integration.
+        #
+        # Important v96 split:
+        #   - map_base_tf:  robot/base origin + scan-frame yaw
+        #   - map_scan_tf:  robot/base pose for visit/crop, but ray origin+yaw
+        #                   from TF(map -> base_scan).  This is the correct mode
+        #                   when the confidence cone must coincide with the
+        #                   LaserScan geometry seen in RViz.
+        direct_tf_modes = {
+            "map", "map_tf", "tf", "cartographer",
+            "map_base_tf", "base_tf", "robot_tf", "tf_base",
+        }
+        # v100: exact RViz robot pose mode.  This mode deliberately bypasses
+        # the odom/model anchored estimators and also ignores
+        # TB3_RL_CONFIDENCE_TARGET_FRAME.  It samples the latest TF exactly as
+        # RViz places RobotModel in Fixed Frame=map:
+        #
+        #     target_frame = map
+        #     source_frame = base_footprint
+        #
+        # Use this when the confidence cone must originate from the robot that
+        # is visibly drawn in RViz, not from model odometry or an episode anchor.
+        rviz_tf_modes = {
+            "rviz_tf", "rviz_base_tf", "rviz_map_tf",
+            "map_rviz_tf", "actual_tf", "robot_model_tf",
+        }
+        scan_tf_modes = {
+            "map_scan_tf", "scan_tf", "base_scan_tf", "tf_scan",
+            "lidar_tf", "laser_tf", "map_lidar_tf", "map_laser_tf",
+        }
+        # v107: timestamp-synchronized scan pose mode.  This is the most
+        # consistent confidence-painting source for Cartographer: the pose is
+        # looked up at LaserScan.header.stamp, not at the latest TF time.
+        # The ray origin/yaw use TF(map -> scan.header.frame_id) at the scan
+        # stamp, so the confidence cone is painted from the sensor pose that
+        # actually produced the scan.
+        scan_stamped_tf_modes = {
+            "scan_stamped_tf", "stamped_scan_tf", "scan_stamp_tf",
+            "map_scan_stamped_tf", "map_base_scan_stamped_tf",
+            "lidar_stamped_tf", "laser_stamped_tf",
+        }
+        amcl_modes = {
+            "amcl", "amcl_pose", "map_amcl", "amcl_map",
+            "amcl_pose_topic", "nav2_amcl",
+        }
+
         # In the normal anchored mode, map->base TF is only needed to create the
-        # anchor.  Calling it on every update causes repeated TF warnings during
-        # Cartographer restarts even when the actual odom anchor is already valid.
-        if mode in {"map", "map_tf", "tf", "cartographer"} or anchor is None:
+        # anchor.  In direct TF mode, it is read on every update.
+        if mode in scan_stamped_tf_modes:
+            # v107 uses timestamped scan/base TF directly and should not prime a
+            # latest map->base anchor.
+            hard_map_pose = None
+        elif mode in direct_tf_modes or mode in scan_tf_modes or mode in rviz_tf_modes or anchor is None:
             hard_map_pose = self._get_map_base_pose2d_hard()
 
-        if mode in {"map", "map_tf", "tf", "cartographer"}:
+        if mode in amcl_modes:
+            amcl_pose = self._get_amcl_pose2d_map()
+            if amcl_pose is not None:
+                xy, yaw, label = amcl_pose
+                raw_scan_yaw = self._get_map_scan_yaw_hard(raw_scan_msg=self.ros.scan, base_yaw=float(yaw))
+                scan_yaw = self._select_confidence_ray_yaw(base_yaw=float(yaw), scan_yaw=raw_scan_yaw, mode_hint="amcl_pose")
+                try:
+                    dbg_n = int(os.environ.get("TB3_RL_CONFIDENCE_POSE_DEBUG_EVERY_N", "0"))
+                except Exception:
+                    dbg_n = 0
+                step = int(getattr(getattr(self, "exploration_map", None), "step_index", 0))
+                if dbg_n > 0 and (step <= 3 or step - int(getattr(self, "_last_confidence_pose_log_step", -10_000_000)) >= dbg_n):
+                    self._last_confidence_pose_log_step = step
+                    try:
+                        self.ros.get_logger().warn(
+                            "CONFIDENCE_POSE | "
+                            f"mode=amcl_pose topic={getattr(self, 'amcl_pose_topic', '/amcl_pose')} step={step} "
+                            f"map_xy=({float(xy[0]):+.3f},{float(xy[1]):+.3f}) "
+                            f"yaw={math.degrees(float(yaw)):+.1f}deg "
+                            f"scan_yaw={math.degrees(float(scan_yaw)):+.1f}deg"
+                        )
+                    except Exception:
+                        pass
+                return np.asarray(xy, dtype=np.float32), float(yaw), np.asarray(xy, dtype=np.float32), float(scan_yaw), "amcl_pose"
+
+            fallback = str(getattr(self, "amcl_fallback_pose_source", "none") or "none").strip().lower()
+            if fallback in {"", "none", "off", "disable", "disabled", "no"} or fallback in amcl_modes:
+                return None
+            mode = fallback
+            self.confidence_pose_source = mode
+            if mode in direct_tf_modes or mode in scan_tf_modes or mode in rviz_tf_modes or anchor is None:
+                hard_map_pose = self._get_map_base_pose2d_hard()
+
+        if mode in scan_stamped_tf_modes:
+            pose_pack = self._get_confidence_scan_stamped_tf_pose2d()
+            if pose_pack is None:
+                return None
+            robot_xy, robot_yaw, sensor_xy, sensor_yaw, label = pose_pack
+            try:
+                dbg_n = int(os.environ.get("TB3_RL_CONFIDENCE_POSE_DEBUG_EVERY_N", "0"))
+            except Exception:
+                dbg_n = 0
+            step = int(getattr(getattr(self, "exploration_map", None), "step_index", 0))
+            if dbg_n > 0 and (step <= 3 or step - int(getattr(self, "_last_confidence_pose_log_step", -10_000_000)) >= dbg_n):
+                self._last_confidence_pose_log_step = step
+                try:
+                    self.ros.get_logger().warn(
+                        "CONFIDENCE_POSE | "
+                        f"mode=scan_stamped_tf label={label} step={step} "
+                        f"robot_xy=({float(robot_xy[0]):+.3f},{float(robot_xy[1]):+.3f}) "
+                        f"sensor_xy=({float(sensor_xy[0]):+.3f},{float(sensor_xy[1]):+.3f}) "
+                        f"robot_yaw={math.degrees(float(robot_yaw)):+.1f}deg "
+                        f"sensor_yaw={math.degrees(float(sensor_yaw)):+.1f}deg"
+                    )
+                except Exception:
+                    pass
+            return robot_xy, float(robot_yaw), sensor_xy, float(sensor_yaw), label
+
+        if mode in rviz_tf_modes:
+            # Hard-code the target/source pair to the same frames the user sees
+            # in RViz.  This prevents an old confidence target-frame env var or
+            # fallback source-frame ordering from silently selecting odom,
+            # base_link, or base_scan.
+            target_frame = "map"
+            try:
+                source_frame = str(os.environ.get("TB3_RL_RVIZ_ROBOT_FRAME", "base_footprint") or "base_footprint").strip().lstrip("/")
+            except Exception:
+                source_frame = "base_footprint"
+            pose = None
+            try:
+                if hasattr(self.ros, "get_frame_pose2d"):
+                    pose = self.ros.get_frame_pose2d(
+                        target_frame=target_frame,
+                        source_frame=source_frame,
+                        stamp=None,
+                        timeout_sec=0.10,
+                        allow_latest_fallback=True,
+                    )
+            except Exception:
+                pose = None
+            if pose is None:
+                try:
+                    dbg = str(os.environ.get("TB3_RL_CONFIDENCE_POSE_WARN", "0")).strip().lower() in {"1", "true", "yes", "on"}
+                except Exception:
+                    dbg = False
+                if dbg:
+                    now = time.time()
+                    if now - float(getattr(self, "_last_confidence_pose_warn_time", 0.0)) > 2.0:
+                        self._last_confidence_pose_warn_time = now
+                        try:
+                            self.ros.get_logger().warn(
+                                "CONFIDENCE_RVIZ_TF_UNAVAILABLE | "
+                                f"target={target_frame} source={source_frame}; skip confidence update"
+                            )
+                        except Exception:
+                            pass
+                return None
+            xy, yaw = pose
+            xy = np.asarray(xy, dtype=np.float32)[:2]
+            try:
+                raw_scan_yaw = self._get_map_scan_yaw_hard(raw_scan_msg=self.ros.scan, base_yaw=float(yaw))
+                scan_yaw = self._select_confidence_ray_yaw(base_yaw=float(yaw), scan_yaw=raw_scan_yaw, mode_hint="amcl_pose")
+            except Exception:
+                scan_yaw = float(yaw)
+            try:
+                dbg_n = int(os.environ.get("TB3_RL_CONFIDENCE_POSE_DEBUG_EVERY_N", "0"))
+            except Exception:
+                dbg_n = 0
+            step = int(getattr(getattr(self, "exploration_map", None), "step_index", 0))
+            if dbg_n > 0 and (step <= 3 or step - int(getattr(self, "_last_confidence_pose_log_step", -10_000_000)) >= dbg_n):
+                self._last_confidence_pose_log_step = step
+                try:
+                    self.ros.get_logger().warn(
+                        "CONFIDENCE_POSE | "
+                        f"mode=rviz_base_tf source={source_frame} target={target_frame} step={step} "
+                        f"map_xy=({float(xy[0]):+.3f},{float(xy[1]):+.3f}) "
+                        f"yaw={math.degrees(float(yaw)):+.1f}deg "
+                        f"scan_yaw={math.degrees(float(scan_yaw)):+.1f}deg"
+                    )
+                except Exception:
+                    pass
+            return xy, float(yaw), xy.copy(), float(scan_yaw), "rviz_base_tf"
+
+        if mode in scan_tf_modes:
+            if hard_map_pose is None:
+                return None
+            scan_pose = self._get_scan_pose2d_for_map_update()
+            if scan_pose is None:
+                try:
+                    dbg = str(os.environ.get("TB3_RL_CONFIDENCE_POSE_WARN", "0")).strip().lower() in {"1", "true", "yes", "on"}
+                except Exception:
+                    dbg = False
+                if dbg:
+                    now = time.time()
+                    if now - float(getattr(self, "_last_confidence_pose_warn_time", 0.0)) > 2.0:
+                        self._last_confidence_pose_warn_time = now
+                        try:
+                            self.ros.get_logger().warn(
+                                "CONFIDENCE_SCAN_TF_UNAVAILABLE | "
+                                "mode=map_scan_tf; skip confidence update until TF(map->base_scan) is valid"
+                            )
+                        except Exception:
+                            pass
+                return None
+            base_xy, base_yaw = hard_map_pose
+            scan_xy, scan_yaw = scan_pose
+            return (
+                np.asarray(base_xy, dtype=np.float32),
+                float(base_yaw),
+                np.asarray(scan_xy, dtype=np.float32),
+                float(scan_yaw),
+                "map_scan_tf",
+            )
+
+        if mode in direct_tf_modes:
             if hard_map_pose is None:
                 return None
             xy, yaw = hard_map_pose
-            scan_yaw = self._get_map_scan_yaw_hard(raw_scan_msg=self.ros.scan, base_yaw=yaw)
-            return np.asarray(xy, dtype=np.float32), float(yaw), np.asarray(xy, dtype=np.float32), float(scan_yaw), "map_tf"
+            raw_scan_yaw = self._get_map_scan_yaw_hard(raw_scan_msg=self.ros.scan, base_yaw=yaw)
+            scan_yaw = self._select_confidence_ray_yaw(base_yaw=float(yaw), scan_yaw=raw_scan_yaw, mode_hint="map_base_tf")
+            # sensor_xy deliberately equals base xy in this mode.  Use
+            # TB3_RL_CONFIDENCE_POSE_SOURCE=map_scan_tf if the ray origin must be
+            # the LaserScan frame itself.
+            return np.asarray(xy, dtype=np.float32), float(yaw), np.asarray(xy, dtype=np.float32), float(scan_yaw), "map_base_tf"
 
         motion_pose = self._get_confidence_motion_pose2d()
         if motion_pose is None:
@@ -7786,7 +9553,8 @@ class GazeboNavEnv(gym.Env):
                             pass
                 return None
             xy, yaw = hard_map_pose
-            scan_yaw = self._get_map_scan_yaw_hard(raw_scan_msg=self.ros.scan, base_yaw=yaw)
+            raw_scan_yaw = self._get_map_scan_yaw_hard(raw_scan_msg=self.ros.scan, base_yaw=yaw)
+            scan_yaw = self._select_confidence_ray_yaw(base_yaw=float(yaw), scan_yaw=raw_scan_yaw, mode_hint="map_tf_fallback")
             return np.asarray(xy, dtype=np.float32), float(yaw), np.asarray(xy, dtype=np.float32), float(scan_yaw), "map_tf_fallback"
 
         motion_xy, motion_yaw, motion_label = motion_pose
@@ -7886,6 +9654,233 @@ class GazeboNavEnv(gym.Env):
                 pass
 
         return out_xy, float(out_yaw), out_xy.copy(), float(scan_yaw), f"real_odom_anchored:{motion_label}:{anchor.get('anchor_source', 'unknown')}"
+
+    def _publish_confidence_origin_marker(
+        self,
+        *,
+        robot_xy: np.ndarray,
+        robot_yaw: float,
+        sensor_xy: np.ndarray,
+        sensor_yaw: float,
+        label: str,
+    ) -> None:
+        """Publish the exact map-frame pose used by confidence update.
+
+        This marker is diagnostic only.  It must be compared against RViz
+        RobotModel with Fixed Frame=map:
+          - If the marker is not at the RobotModel, the pose source is wrong.
+          - If the marker is at the RobotModel but /rl_confidence_map is offset,
+            the OccupancyGrid origin/canvas conversion is wrong.
+        """
+        pub = getattr(self, "confidence_origin_marker_pub", None)
+        if pub is None:
+            return
+        try:
+            step = int(getattr(self, "step_count", 0))
+            every_n = max(int(getattr(self, "confidence_origin_marker_publish_every_n", 1)), 1)
+            if step > 3 and (step % every_n) != 0:
+                return
+            self._last_confidence_origin_marker_step = step
+            frame_id = str(os.environ.get("TB3_RL_CONFIDENCE_TARGET_FRAME", self.map_frame or "map") or "map").strip().lstrip("/") or "map"
+            stamp = self.ros.get_clock().now().to_msg()
+            rxy = np.asarray(robot_xy, dtype=np.float32).reshape(-1)[:2]
+            sxy = np.asarray(sensor_xy, dtype=np.float32).reshape(-1)[:2]
+            ryaw = float(robot_yaw)
+            syaw = float(sensor_yaw)
+            if rxy.size < 2 or sxy.size < 2:
+                return
+            if not (np.all(np.isfinite(rxy)) and np.all(np.isfinite(sxy)) and math.isfinite(ryaw) and math.isfinite(syaw)):
+                return
+
+            arr = MarkerArray()
+
+            clear = Marker()
+            clear.header.frame_id = frame_id
+            clear.header.stamp = stamp
+            clear.ns = "rl_confidence_origin"
+            clear.action = Marker.DELETEALL
+            arr.markers.append(clear)
+
+            # Robot/base confidence origin: red sphere.
+            base = Marker()
+            base.header.frame_id = frame_id
+            base.header.stamp = stamp
+            base.ns = "rl_confidence_origin"
+            base.id = 0
+            base.type = Marker.SPHERE
+            base.action = Marker.ADD
+            base.pose.position.x = float(rxy[0])
+            base.pose.position.y = float(rxy[1])
+            base.pose.position.z = 0.28
+            base.pose.orientation.w = 1.0
+            base.scale.x = 0.22
+            base.scale.y = 0.22
+            base.scale.z = 0.22
+            self._set_marker_color(base, 1.0, 0.05, 0.05, 0.95)
+            arr.markers.append(base)
+
+            # Sensor/raycast origin: cyan sphere.  In base-origin mode this will
+            # overlap the red sphere; in scan-frame mode it shows the LiDAR offset.
+            sensor = Marker()
+            sensor.header.frame_id = frame_id
+            sensor.header.stamp = stamp
+            sensor.ns = "rl_confidence_origin"
+            sensor.id = 1
+            sensor.type = Marker.SPHERE
+            sensor.action = Marker.ADD
+            sensor.pose.position.x = float(sxy[0])
+            sensor.pose.position.y = float(sxy[1])
+            sensor.pose.position.z = 0.34
+            sensor.pose.orientation.w = 1.0
+            sensor.scale.x = 0.16
+            sensor.scale.y = 0.16
+            sensor.scale.z = 0.16
+            self._set_marker_color(sensor, 0.0, 0.95, 1.0, 0.95)
+            arr.markers.append(sensor)
+
+            # Sensor forward arrow: same yaw that confidence raycast uses.
+            arrow = Marker()
+            arrow.header.frame_id = frame_id
+            arrow.header.stamp = stamp
+            arrow.ns = "rl_confidence_origin"
+            arrow.id = 2
+            arrow.type = Marker.ARROW
+            arrow.action = Marker.ADD
+            arrow.pose.orientation.w = 1.0
+            sx = float(sxy[0])
+            sy = float(sxy[1])
+            ex = sx + 0.85 * math.cos(syaw)
+            ey = sy + 0.85 * math.sin(syaw)
+            arrow.points = [self._point_xyz(sx, sy, 0.42), self._point_xyz(ex, ey, 0.42)]
+            arrow.scale.x = 0.055
+            arrow.scale.y = 0.16
+            arrow.scale.z = 0.22
+            self._set_marker_color(arrow, 1.0, 0.85, 0.0, 0.98)
+            arr.markers.append(arrow)
+
+            # Robot/body yaw arrow: blue.  If this differs from the yellow arrow,
+            # confidence is using a scan yaw different from base yaw.
+            body = Marker()
+            body.header.frame_id = frame_id
+            body.header.stamp = stamp
+            body.ns = "rl_confidence_origin"
+            body.id = 3
+            body.type = Marker.ARROW
+            body.action = Marker.ADD
+            body.pose.orientation.w = 1.0
+            bx = float(rxy[0])
+            by = float(rxy[1])
+            bex = bx + 0.60 * math.cos(ryaw)
+            bey = by + 0.60 * math.sin(ryaw)
+            body.points = [self._point_xyz(bx, by, 0.50), self._point_xyz(bex, bey, 0.50)]
+            body.scale.x = 0.040
+            body.scale.y = 0.13
+            body.scale.z = 0.18
+            self._set_marker_color(body, 0.05, 0.35, 1.0, 0.95)
+            arr.markers.append(body)
+
+            text = Marker()
+            text.header.frame_id = frame_id
+            text.header.stamp = stamp
+            text.ns = "rl_confidence_origin"
+            text.id = 4
+            text.type = Marker.TEXT_VIEW_FACING
+            text.action = Marker.ADD
+            text.pose.position.x = float(rxy[0])
+            text.pose.position.y = float(rxy[1])
+            text.pose.position.z = 0.90
+            text.pose.orientation.w = 1.0
+            text.scale.z = 0.16
+            self._set_marker_color(text, 1.0, 1.0, 1.0, 0.98)
+            text.text = (
+                f"CONF ORIGIN step={step}\n"
+                f"mode={label}\n"
+                f"base=({float(rxy[0]):+.2f},{float(rxy[1]):+.2f}) yaw={math.degrees(ryaw):+.1f}\n"
+                f"sensor=({float(sxy[0]):+.2f},{float(sxy[1]):+.2f}) yaw={math.degrees(syaw):+.1f}"
+            )
+            arr.markers.append(text)
+
+            # v109: publish raw TF comparison markers in the same MarkerArray.
+            # These markers are independent of the confidence pose calculation.
+            # If one of these matches RViz RobotModel while the red CONF marker
+            # does not, the confidence source-frame/env selection is wrong.
+            # If none of these match RobotModel, TF publishers are conflicting or
+            # RViz is displaying a different domain/process.
+            compare_frames = [
+                ("base_footprint", 20, (0.0, 1.0, 0.0, 0.95), 0.24),
+                ("base_link", 21, (1.0, 0.0, 1.0, 0.95), 0.24),
+                ("base_scan", 22, (0.0, 0.75, 1.0, 0.95), 0.20),
+            ]
+            compare_text_lines = []
+            for fname, mid, rgba, size in compare_frames:
+                try:
+                    pose_cmp = None
+                    if hasattr(self.ros, "get_frame_pose2d_manual"):
+                        pose_cmp = self.ros.get_frame_pose2d_manual(
+                            target_frame=frame_id,
+                            source_frame=fname,
+                            max_age_sec=float(os.environ.get("TB3_RL_MANUAL_TF_MAX_AGE_SEC", "5.0") or 5.0),
+                        )
+                    if pose_cmp is None and str(os.environ.get("TB3_RL_CONFIDENCE_TF_BUFFER_FALLBACK", "0") or "0").strip().lower() in {"1", "true", "yes", "on"} and hasattr(self.ros, "get_frame_pose2d"):
+                        pose_cmp = self.ros.get_frame_pose2d(
+                            target_frame=frame_id,
+                            source_frame=fname,
+                            stamp=None,
+                            timeout_sec=0.05,
+                            allow_latest_fallback=True,
+                        )
+                    if pose_cmp is None:
+                        compare_text_lines.append(f"{fname}=NA")
+                        continue
+                    cxy, cyaw = pose_cmp
+                    cxy = np.asarray(cxy, dtype=np.float32).reshape(-1)[:2]
+                    if cxy.size < 2 or not np.all(np.isfinite(cxy)):
+                        compare_text_lines.append(f"{fname}=bad")
+                        continue
+                    m = Marker()
+                    m.header.frame_id = frame_id
+                    m.header.stamp = stamp
+                    m.ns = "rl_confidence_tf_compare"
+                    m.id = int(mid)
+                    m.type = Marker.CUBE
+                    m.action = Marker.ADD
+                    m.pose.position.x = float(cxy[0])
+                    m.pose.position.y = float(cxy[1])
+                    m.pose.position.z = 0.62 + 0.04 * float(mid - 20)
+                    m.pose.orientation.w = 1.0
+                    m.scale.x = float(size)
+                    m.scale.y = float(size)
+                    m.scale.z = float(size)
+                    self._set_marker_color(m, float(rgba[0]), float(rgba[1]), float(rgba[2]), float(rgba[3]))
+                    arr.markers.append(m)
+                    compare_text_lines.append(f"{fname}=({float(cxy[0]):+.2f},{float(cxy[1]):+.2f})")
+                except Exception:
+                    compare_text_lines.append(f"{fname}=ERR")
+
+            if compare_text_lines:
+                ct = Marker()
+                ct.header.frame_id = frame_id
+                ct.header.stamp = stamp
+                ct.ns = "rl_confidence_tf_compare"
+                ct.id = 29
+                ct.type = Marker.TEXT_VIEW_FACING
+                ct.action = Marker.ADD
+                ct.pose.position.x = float(rxy[0])
+                ct.pose.position.y = float(rxy[1])
+                ct.pose.position.z = 1.20
+                ct.pose.orientation.w = 1.0
+                ct.scale.z = 0.13
+                self._set_marker_color(ct, 1.0, 1.0, 1.0, 0.95)
+                ct.text = "TF compare\n" + "\n".join(compare_text_lines)
+                arr.markers.append(ct)
+
+            pub.publish(arr)
+        except Exception as exc:
+            try:
+                if str(os.environ.get("TB3_RL_CONFIDENCE_ORIGIN_WARN", "0")).strip().lower() in {"1", "true", "yes", "on"}:
+                    self.ros.get_logger().warn(f"CONFIDENCE_ORIGIN_MARKER_FAILED | err={exc}")
+            except Exception:
+                pass
 
     def _make_scan_points_marker_array_at_pose(
         self,
@@ -8325,6 +10320,7 @@ class GazeboNavEnv(gym.Env):
             scan_angle_min=scan_angle_min,
             scan_angle_increment=scan_angle_increment,
             scan_angle_max=scan_angle_max,
+            include_target_priority=not bool(getattr(self, "no_priority_model_input", False)),
         ).astype(np.float32)
 
         self._update_scan_geometry_debug(scan_msg, vector_obs)
@@ -8338,7 +10334,7 @@ class GazeboNavEnv(gym.Env):
 
         if robot_pose is None:
             map_obs = np.zeros(
-                (5, self.map_obs_size, self.map_obs_size),
+                (self.map_channels, self.map_obs_size, self.map_obs_size),
                 dtype=np.float32,
             )
         else:
@@ -8353,8 +10349,6 @@ class GazeboNavEnv(gym.Env):
 
         self._publish_debug_input_map(map_obs)
 
-        # v18: push both current vector and current robot-centric map so the
-        # temporal branch can learn fused map/LiDAR/state dynamics.
         self._push_observation_history(vector_obs, map_obs)
 
         obs = {
@@ -8377,7 +10371,7 @@ class GazeboNavEnv(gym.Env):
         obs = {
             "vector": vector_obs,
             "map": np.zeros(
-                (5, self.map_obs_size, self.map_obs_size),
+                (self.map_channels, self.map_obs_size, self.map_obs_size),
                 dtype=np.float32,
             ),
         }
@@ -8388,7 +10382,7 @@ class GazeboNavEnv(gym.Env):
                 dtype=np.float32,
             )
             obs["map_seq"] = np.zeros(
-                (self.temporal_history_len, 5, self.map_obs_size, self.map_obs_size),
+                (self.temporal_history_len, self.map_channels, self.map_obs_size, self.map_obs_size),
                 dtype=np.float32,
             )
 
@@ -8413,12 +10407,9 @@ class GazeboNavEnv(gym.Env):
         if not self.vector_history:
             for _ in range(self.temporal_history_len):
                 self.vector_history.append(vector_obs.copy())
-        else:
-            self.vector_history.append(vector_obs.copy())
-        if not self.map_history:
-            for _ in range(self.temporal_history_len):
                 self.map_history.append(map_obs.copy())
         else:
+            self.vector_history.append(vector_obs.copy())
             self.map_history.append(map_obs.copy())
 
     def _sequence_observation(self) -> np.ndarray:
@@ -8433,7 +10424,7 @@ class GazeboNavEnv(gym.Env):
         return np.stack(seq[-self.temporal_history_len :], axis=0).astype(np.float32)
 
     def _map_sequence_observation(self) -> np.ndarray:
-        shape = (self.temporal_history_len, 5, self.map_obs_size, self.map_obs_size)
+        shape = (self.temporal_history_len, self.map_channels, self.map_obs_size, self.map_obs_size)
         if not hasattr(self, "map_history") or not self.map_history:
             return np.zeros(shape, dtype=np.float32)
         seq = list(self.map_history)
@@ -8538,7 +10529,13 @@ class GazeboNavEnv(gym.Env):
                 return f"body_tilt:roll={roll:.3f},pitch={pitch:.3f}"
             if body_z is not None and (float(body_z) < z_min or float(body_z) > z_max):
                 return f"body_z:{float(body_z):.3f}[{z_min:.2f},{z_max:.2f}]"
-            if body_z is not None and z_dev >= float(getattr(self, "shake_z_deviation_threshold", 0.05)):
+            # v48: Gazebo TurtleBot3 Burger normally reports body z around the
+            # wheel-contact height, not exactly the SetEntityPose request z.
+            # Treat z-deviation from reset_z as diagnostic only by default; only
+            # hard-fail it when explicitly requested.  The absolute ground range
+            # check above still catches airborne/fallen states.
+            z_dev_strict = str(os.environ.get("TB3_RL_SHAKE_Z_DEV_STRICT", "0")).strip().lower() in {"1", "true", "yes", "on"}
+            if z_dev_strict and body_z is not None and z_dev >= float(getattr(self, "shake_z_deviation_threshold", 0.05)):
                 return f"body_z_dev:{z_dev:.3f}"
             ang_xy = math.hypot(float(wx), float(wy))
             if ang_xy >= float(getattr(self, "shake_angular_xy_threshold", 0.70)):
@@ -8811,13 +10808,17 @@ class GazeboNavEnv(gym.Env):
             self.current_boundary_center_xy = np.asarray(requested_xy, dtype=np.float32).copy()
             source = "requested_pose_fallback"
 
-        self.ros.get_logger().info(
+        _boundary_msg = (
             "Safety boundary center updated: "
             f"frame={self.safety_boundary_frame}, "
             f"source={source}, "
             f"center=({self.current_boundary_center_xy[0]:.3f}, {self.current_boundary_center_xy[1]:.3f}), "
             f"requested=({float(requested_xy[0]):.3f}, {float(requested_xy[1]):.3f})"
         )
+        if _quiet_reset_logs():
+            self.ros.get_logger().debug(_boundary_msg)
+        else:
+            self.ros.get_logger().info(_boundary_msg)
 
 
     @staticmethod
@@ -9084,6 +11085,37 @@ class GazeboNavEnv(gym.Env):
         self._last_slam_gate_reason = "accepted"
         return slam_map
 
+    def _apply_positive_reward_log_compression(self, reward: float) -> float:
+        """Compress only positive non-terminal reward using sign-preserving log1p.
+
+        Large early map-discovery bonuses can produce high-variance TD targets.
+        Negative penalties are intentionally left unchanged so safety backup,
+        collision-like penalties, and terminal penalties keep their full scale.
+        
+        Formula for r > 0:
+            r' = log(1 + alpha * r) / alpha
+        with an optional positive cap after compression.
+        """
+        try:
+            r = float(reward)
+        except Exception:
+            return reward
+        self._last_reward_pre_log_compress = r
+        self._last_reward_post_log_compress = r
+        self._last_reward_log_compress_delta = 0.0
+        if not bool(getattr(self, "reward_positive_log_compress", False)):
+            return r
+        if not math.isfinite(r) or r <= 0.0:
+            return r
+        alpha = max(float(getattr(self, "reward_positive_log_alpha", 0.50)), 1e-6)
+        out = float(math.log1p(alpha * r) / alpha)
+        cap = max(float(getattr(self, "reward_positive_log_max", 0.0)), 0.0)
+        if cap > 0.0:
+            out = min(out, cap)
+        self._last_reward_post_log_compress = out
+        self._last_reward_log_compress_delta = out - r
+        return out
+
     def _compute_delayed_slam_map_update_reward(self, stats: MapUpdateStats, unsafe_terminal: bool = False) -> float:
         """Small capped bonus for delayed SLAM /map unknown->known updates.
 
@@ -9118,7 +11150,10 @@ class GazeboNavEnv(gym.Env):
         self._last_slam_map_update_reward = bonus
         self._last_slam_map_update_reward_reason = "new_known"
         self._episode_slam_map_update_reward += bonus
-        if bonus > 0.0 and int(getattr(self, "step_count", 0)) % 25 == 0:
+        slam_update_log_enabled = str(
+            os.environ.get("TB3_RL_SLAM_MAP_UPDATE_REWARD_LOG", "0")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if slam_update_log_enabled and bonus > 0.0 and int(getattr(self, "step_count", 0)) % 25 == 0:
             try:
                 self.ros.get_logger().info(
                     "SLAM_MAP_UPDATE_REWARD | "
@@ -9560,12 +11595,25 @@ class GazeboNavEnv(gym.Env):
         #     SLAM OccupancyGrid canvas.
         #   - use actual odometry deltas (/model odom preferred, /odom msg fallback)
         #     anchored once to the current map pose.
-        #   - no cmd_vel integration.  Set TB3_RL_CONFIDENCE_POSE_SOURCE=map_tf
-        #     only if Cartographer map->base TF is verified to move correctly.
+        #   - no cmd_vel integration.  Set TB3_RL_CONFIDENCE_POSE_SOURCE=map_base_tf
+        #     to force TF(map -> base_footprint) on every confidence update.
         pose_pack = self._get_confidence_update_pose2d()
         if pose_pack is None:
             return self.last_map_stats
         robot_xy, robot_yaw, sensor_xy, sensor_yaw, confidence_pose_mode = pose_pack
+
+        # v108 diagnostic: show the exact pose/yaw used by confidence in RViz.
+        # Compare /rl_confidence_origin against RobotModel in Fixed Frame=map.
+        try:
+            self._publish_confidence_origin_marker(
+                robot_xy=robot_xy,
+                robot_yaw=robot_yaw,
+                sensor_xy=sensor_xy,
+                sensor_yaw=sensor_yaw,
+                label=str(confidence_pose_mode),
+            )
+        except Exception:
+            pass
 
         # Optional legacy scan-pose origin path.  Default remains base-anchored:
         # confidence is conceptually camera/front FOV, but the ray starts at the
@@ -9614,7 +11662,8 @@ class GazeboNavEnv(gym.Env):
         v4 rule:
           - Do not use Odometry/Gazebo fallback for semantic map writes.
           - Use the same TF(map -> base_footprint) pose that RViz uses for the robot.
-          - Use TF(map -> base_scan) yaw only for LaserScan/camera-front ray direction.
+          - v111 default: use base_footprint yaw for the camera-front confidence ray;
+            base_scan yaw remains optional via TB3_RL_CONFIDENCE_RAY_YAW_SOURCE=scan.
 
         This fixes the failure mode where /rl_confidence_map keeps being painted
         around the first-step pose while the RViz robot has already moved/rotated.
@@ -9861,30 +11910,28 @@ class GazeboNavEnv(gym.Env):
             return 0.0, 0.0, 0.0
 
         priority_strength = float(np.clip(max(target_priority_norm, priority_score_norm), 0.0, 1.0))
-        priority_check_multiplier = 0.50 + 1.50 * priority_strength
-        corridor_priority_weight = float(getattr(self, "corridor_priority_reward_weight", 1.0))
+        priority_check_multiplier = 0.75 + 1.75 * priority_strength
+        corridor_priority_weight = max(float(getattr(self, "corridor_priority_reward_weight", 1.0)), 0.0)
 
         priority_clear_weighted_sum = max(priority_clear_gain, 0.0)
-        priority_rechecked_weighted_sum = max(priority_rechecked_gain, 0.0)
 
-        # Must mirror reward.py exactly.  This is telemetry only, not an extra
-        # reward path.  The gain terms are additive weighted sums over all cells
-        # cleared/rechecked during the current SAC macro-action.
+        # Must mirror reward.py approximately.  This is telemetry only, not an
+        # extra reward path.  reward.py additionally multiplies by priority_motion_gate.
         clear_reward = (
-            0.042
-            * corridor_priority_weight
+            corridor_priority_weight
+            * 0.045
             * priority_clear_weighted_sum
             * priority_check_multiplier
         )
-        clear_reward += 0.0012 * corridor_priority_weight * float(max(priority_cleared_cells, 0))
+        clear_reward += 0.0015 * corridor_priority_weight * float(max(priority_cleared_cells, 0))
+        clear_reward = min(float(clear_reward), 5.0)
 
-        recheck_reward = (
-            0.016
-            * corridor_priority_weight
-            * priority_rechecked_weighted_sum
-            * (0.50 + 0.75 * priority_strength)
-        )
-        recheck_reward += 0.004 * corridor_priority_weight * float(max(priority_rechecked_cells, 0))
+        # v114: recheck is no longer a positive reward path.
+        recheck_reward = -min(
+            0.35,
+            0.003 * max(float(priority_rechecked_gain), 0.0)
+            + 0.00008 * min(max(int(priority_rechecked_cells), 0), 400),
+        ) if (priority_rechecked_gain > 0.0 or priority_rechecked_cells > 0) else 0.0
 
         total = float(clear_reward + recheck_reward)
         return float(clear_reward), float(recheck_reward), total
@@ -9901,6 +11948,24 @@ class GazeboNavEnv(gym.Env):
             "coverage_ratio": float(map_stats.coverage_ratio),
             "episode_reward_sum": float(getattr(self, "_episode_reward_sum", 0.0)),
             "episode_discounted_return": float(getattr(self, "_episode_discounted_return", 0.0)),
+            "episode_live_discounted_return": float(getattr(self, "_episode_discounted_return", 0.0)),
+            "episode_start_discounted_return": float(getattr(self, "_episode_start_discounted_return", 0.0)),
+            "episode_reward_ema": float(getattr(self, "_episode_reward_ema", 0.0)),
+            "recent_reward_window_sum": float(sum(getattr(self, "_recent_reward_window", []))),
+            "recent_slam_new_cells": int(sum(getattr(self, "_recent_slam_new_window", []))),
+            "recent_confidence_updated_cells": int(sum(getattr(self, "_recent_conf_update_window", []))),
+            "coverage_stall_terminal_enabled": bool(getattr(self, "coverage_stall_terminal", False)),
+            "coverage_stall_terminal": bool(getattr(self, "_last_coverage_stall_terminal", False)),
+            "coverage_stall_active": bool(getattr(self, "_last_coverage_stall_active", False)),
+            "coverage_stall_reason": str(getattr(self, "_last_coverage_stall_reason", "none")),
+            "coverage_stall_window_steps": int(getattr(self, "coverage_stall_window_steps", 0)),
+            "coverage_stall_window_len": int(getattr(self, "_last_coverage_stall_window_len", 0)),
+            "coverage_stall_slam_new_cells": int(getattr(self, "_last_coverage_stall_slam_window", 0)),
+            "coverage_stall_confidence_updated_cells": int(getattr(self, "_last_coverage_stall_conf_window", 0)),
+            "coverage_stall_min_slam_new_cells": int(getattr(self, "coverage_stall_min_slam_new_cells", 0)),
+            "coverage_stall_min_confidence_updated_cells": int(getattr(self, "coverage_stall_min_confidence_updated_cells", 0)),
+            "coverage_stall_terminal_penalty": float(getattr(self, "coverage_stall_terminal_penalty", 0.0)),
+            "reward_window_n": int(getattr(self, "_reward_window_n", 100)),
             "reward_gamma": float(getattr(self, "reward_gamma", 0.99)),
             "coverage_delta": float(map_stats.coverage_delta),
             "new_known_cells": int(map_stats.new_known_cells),
@@ -10104,6 +12169,11 @@ class GazeboNavEnv(gym.Env):
             "debug_input_map_published": bool(getattr(self, "_last_debug_input_map_published", False)),
             "debug_input_map_topic_prefix": str(getattr(self, "debug_input_map_topic_prefix", "")),
             "debug_input_map_frame_id": str(getattr(self, "debug_input_map_frame_id", "")),
+            # v117: when a forced safety backup/hold ran this step, mark the
+            # transition so the custom replay buffer skips storing it.  SAC must
+            # not learn from forced-recovery motion that the policy did not choose.
+            "skip_store": bool(getattr(self, "_last_velocity_safety_skip_store", False)),
+            "velocity_safety_skip_store": bool(getattr(self, "_last_velocity_safety_skip_store", False)),
         }
 
         return info
