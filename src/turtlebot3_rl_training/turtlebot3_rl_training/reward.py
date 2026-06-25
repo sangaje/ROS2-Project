@@ -500,6 +500,34 @@ def compute_exploration_reward(
     return float(np.clip(reward, -8.0, 8.0))
 
 
+def compute_velocity_safety_slowdown_penalty(
+    *,
+    policy_linear_x: float,
+    max_linear_speed: float,
+    danger_score: float,
+    penalty_scale: float,
+    speed_power: float = 1.35,
+    danger_power: float = 1.10,
+) -> float:
+    """Penalty for commanding a large forward velocity in a local danger band.
+
+    This term is intentionally based on the *policy-requested* linear velocity,
+    not only on the shielded/executed velocity.  When the safety layer reduces
+    v near an obstacle, the executed transition becomes physically safer, but
+    the actor must still receive a learning signal that the original large-v
+    command was undesirable in that state.
+
+    danger_score: 0 outside the safety slow band, 1 near/inside the stop band.
+    """
+    max_v = max(float(max_linear_speed), 1e-6)
+    v_norm = float(np.clip(max(float(policy_linear_x), 0.0) / max_v, 0.0, 1.0))
+    danger = float(np.clip(float(danger_score), 0.0, 1.0))
+    scale = max(float(penalty_scale), 0.0)
+    sp = max(float(speed_power), 0.10)
+    dp = max(float(danger_power), 0.10)
+    return float(scale * (v_norm ** sp) * (danger ** dp))
+
+
 def compute_waypoint_macro_reward_adjustment(
     *,
     collision: bool,

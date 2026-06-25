@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TurtleBot3 SAC 학습 실행 스크립트 (안정화 패치 v3 반영)
+# TurtleBot3 SAC 학습 실행 스크립트 (v125 CUBE unified + velocity safety slowdown)
 #
 # 사용법:
 #   먼저 별도 터미널에서 Gazebo/TurtleBot3 시뮬레이션을 띄운 뒤,
@@ -81,23 +81,29 @@ export TB3_RL_PRIORITY_BIRTH_DELTA=6.0
 # ===== logging =====
 export TB3_RL_QUIET_MAP_LOGS=1
 export TB3_RL_QUIET_STARTUP_LOGS=1
-# confidence 맵 origin을 RViz 로봇 위치(tf2 buffer, map->base)와 정확히 일치시키기
-# tf2 우선 사용(RViz와 동일), TF 공백 시에만 manual 캐시 fallback
-export TB3_RL_CONFIDENCE_PREFER_TF_BUFFER=1
-export TB3_RL_USE_MANUAL_TF_CACHE_FOR_CONFIDENCE=1
-export TB3_RL_CONFIDENCE_TF_BUFFER_FALLBACK=1
-# ── confidence origin = TF 네모(CUBE)로 완전 통일 ─────────────────────────
-# 빨간 원(confidence pose)과 네모(map->base TF)를 하나의 값으로 합친다. 기준=네모.
-# 이 스위치가 켜지면 confidence 가 실제로 칠해지는 pose, 빨간 원 마커, 그리고
-# base_footprint 네모가 모두 동일한 live TF(map->base_footprint) 한 값에서 나오므로
-# 구조적으로 절대 어긋날 수 없다(odom 적분/anchor 미사용 → 드리프트 없음).
+# ===== confidence pose = TF CUBE 기준 단일화(v125) =====
+# v125 기준: 빨간/시안 원 제거, base_footprint CUBE 하나만 사용한다.
+# confidence update pose도 이 CUBE와 같은 manual TF cache 경로를 쓴다.
 export TB3_RL_CONFIDENCE_UNIFY_WITH_TF_CUBE=1
-# TF 가 잠깐 비면(예: paused Gazebo multi_step) 직전 TF 를 이 시간만 HOLD(적분 아님).
-export TB3_RL_CONFIDENCE_TF_HOLD_SEC=0.5
-# (참고) 통일 모드에서는 혼란을 줄이려 base_link/base_scan 비교 네모는 숨기고
-# base_footprint 네모 하나만 빨간 원과 겹쳐 표시한다.
-#
-# 아래 두 줄은 통일 스위치가 켜져 있으면 사용되지 않음(보조/대안 경로):
+export TB3_RL_CONFIDENCE_UNIFY_STRICT=1
+export TB3_RL_CONFIDENCE_SINGLE_CUBE_MARKER=1
+export TB3_RL_CONFIDENCE_CUBE_FRAME=base_footprint
+
+# CUBE 기준은 manual TF cache를 신뢰한다.
+# tf2 buffer fallback을 끄면 원/네모가 다시 서로 다른 TF 경로로 갈 가능성을 제거한다.
+export TB3_RL_CONFIDENCE_PREFER_TF_BUFFER=0
+export TB3_RL_USE_MANUAL_TF_CACHE_FOR_CONFIDENCE=1
+export TB3_RL_CONFIDENCE_TF_BUFFER_FALLBACK=0
+export TB3_RL_CONFIDENCE_CUBE_TF_BUFFER_FALLBACK=0
+
+# 후반에 네모가 잠깐 사라지는 현상 완화: TF가 잠깐 stale이어도 마지막 검증 pose를 짧게 hold.
+export TB3_RL_MANUAL_TF_MAX_AGE_SEC=15.0
+export TB3_RL_CONFIDENCE_TF_HOLD_SEC=1.5
+
+# 초반 검증용. 안정화 후 로그가 거슬리면 0으로 내려도 된다.
+export TB3_RL_TF_CUBE_POSE_WARN=1
+
+# legacy pose source는 통일 모드에서 실사용되지 않지만, 보조 경로 혼동 방지를 위해 명시만 유지한다.
 export TB3_RL_CONFIDENCE_POSE_SOURCE=map_base_tf
 export TB3_RL_CONFIDENCE_ANCHOR_RESYNC=1
 export TB3_RL_CONFIDENCE_ANCHOR_RESYNC_TOL_M=0.03
@@ -153,6 +159,11 @@ python3 -m turtlebot3_rl_training.train_sac \
     --velocity-safety-backup-steps 18 \
     --velocity-safety-cooldown-steps 10 \
     --velocity-safety-penalty 10.0 \
+    --velocity-safety-slowdown \
+    --velocity-safety-slow-min-scale 0.20 \
+    --velocity-safety-slow-penalty 1.80 \
+    --velocity-safety-slow-speed-power 1.35 \
+    --velocity-safety-slow-danger-power 1.10 \
     --slam-backend cartographer \
     --slam-map-topic /map \
     --map-frame map \

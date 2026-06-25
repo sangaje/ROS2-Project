@@ -705,6 +705,11 @@ def parse_args():
     parser.add_argument("--velocity-safety-cooldown-steps", type=int, default=8)
     parser.add_argument("--velocity-safety-penalty", type=float, default=10.0)
     parser.add_argument("--velocity-safety-block-penalty", type=float, default=0.80)
+    parser.add_argument("--velocity-safety-slowdown", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--velocity-safety-slow-min-scale", type=float, default=0.20)
+    parser.add_argument("--velocity-safety-slow-penalty", type=float, default=1.80)
+    parser.add_argument("--velocity-safety-slow-speed-power", type=float, default=1.35)
+    parser.add_argument("--velocity-safety-slow-danger-power", type=float, default=1.10)
     parser.add_argument("--velocity-forward-assist-mps", type=float, default=0.0)
     parser.add_argument("--velocity-forward-assist-angular-threshold", type=float, default=0.20)
     parser.add_argument("--velocity-forward-assist-min-clearance-m", type=float, default=0.45)
@@ -1087,6 +1092,11 @@ def main(args=None):
         velocity_safety_cooldown_steps=cli_args.velocity_safety_cooldown_steps,
         velocity_safety_penalty=cli_args.velocity_safety_penalty,
         velocity_safety_block_penalty=cli_args.velocity_safety_block_penalty,
+        velocity_safety_slowdown=cli_args.velocity_safety_slowdown,
+        velocity_safety_slow_min_scale=cli_args.velocity_safety_slow_min_scale,
+        velocity_safety_slow_penalty=cli_args.velocity_safety_slow_penalty,
+        velocity_safety_slow_speed_power=cli_args.velocity_safety_slow_speed_power,
+        velocity_safety_slow_danger_power=cli_args.velocity_safety_slow_danger_power,
         velocity_forward_assist_mps=cli_args.velocity_forward_assist_mps,
         velocity_forward_assist_angular_threshold=cli_args.velocity_forward_assist_angular_threshold,
         velocity_forward_assist_min_clearance_m=cli_args.velocity_forward_assist_min_clearance_m,

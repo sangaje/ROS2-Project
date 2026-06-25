@@ -6,38 +6,93 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from torch import nn
 
 
+class _FiLMTCNBlock(nn.Module):
+    """One residual temporal-conv block with FiLM conditioning from the map.
+
+    Input  : x (B, C, H)  channel-first temporal features
+             map_feat (B, map_dim)
+    Output : x' (B, C, H)
+
+    The map produces (gamma, beta) which modulate the conv output:
+        y = conv(x)
+        y = y * (1 + gamma) + beta
+        y = SiLU(y)
+        x' = x + y          (residual)
+
+    Same LiDAR-style circular padding is NOT used here because the axis is time,
+    not an angular axis; zero padding over the short history window is correct.
+    """
+
+    def __init__(self, channels: int, map_dim: int, kernel_size: int = 3, dropout: float = 0.0):
+        super().__init__()
+        padding = kernel_size // 2
+        self.conv = nn.Conv1d(channels, channels, kernel_size=kernel_size, padding=padding)
+        self.norm = nn.GroupNorm(num_groups=min(8, channels) if channels >= 8 else 1, num_channels=channels)
+        self.film = nn.Linear(map_dim, channels * 2)
+        self.act = nn.SiLU()
+        self.drop = nn.Dropout(p=float(dropout)) if dropout and dropout > 0.0 else None
+        # Initialize FiLM so the block starts near identity (gamma~0, beta~0).
+        nn.init.zeros_(self.film.weight)
+        nn.init.zeros_(self.film.bias)
+
+    def forward(self, x: torch.Tensor, map_feat: torch.Tensor) -> torch.Tensor:
+        y = self.conv(x)
+        y = self.norm(y)
+        gamma, beta = self.film(map_feat).chunk(2, dim=-1)
+        gamma = gamma.unsqueeze(-1)
+        beta = beta.unsqueeze(-1)
+        y = y * (1.0 + gamma) + beta
+        y = self.act(y)
+        if self.drop is not None:
+            y = self.drop(y)
+        return x + y
+
+
 class MapVectorFeatureExtractor(BaseFeaturesExtractor):
     """
     Dict observation feature extractor.
 
-    v26 model structure: GRU receives ONLY post-fusion features.
+    v27 model structure: Map-conditioned Delta-TCN (FiLM) replaces the v26 GRU.
 
       Per step k, the extractor first builds a learned fusion token:
         map_k         -> Map 2D CNN                  -> m_k
-        lidar_k       -> LiDAR 1D CNN over 60 bins    -> l_k
+        lidar_k       -> LiDAR 1D CNN over bins       -> l_k
         stats_k       -> Stats MLP                    -> s_k
         concat(m_k, l_k, s_k) -> Step Fusion MLP      -> z_k
 
-      Temporal branch:
-        Z = [z_{t-H+1}, ..., z_t]
-        Z only -> GRU over time -> q_t
+      Temporal branch (only when use_temporal_cnn=True):
+        From the post-fusion feature history Z = [z_{t-H+1}, ..., z_t]
+        and the delta history dZ_k = z_k - z_{k-1}, build a per-step token
+        and run a Map-conditioned Delta-TCN, FiLM-modulated by the CURRENT map
+        feature m_t:
+            S = [ concat(z_k, dz_k) ]_{k}
+            h_t = FiLM-TCN(S | m_t)
+        The current-step fusion token z_t is ALSO passed straight to the final
+        fusion as a skip connection, so the policy/critic never lose direct
+        access to the current observation even if the temporal branch is noisy.
 
       Final:
-        q_t -> final fusion -> SAC Actor / Twin Critic
+        concat(h_t, z_t) -> final fusion -> SAC Actor / Twin Critic
+        (non-temporal: z_t -> final fusion)
 
-    Important terminology:
-      - LiDAR 1D CNN is NOT temporal. It is Conv1D over the LiDAR bin/angular axis only.
-      - GRU never sees raw map_seq, raw LiDAR, or raw stats directly.
-        It receives only the post-fusion feature sequence Z.
-      - map_seq and seq still exist in the observation because SAC replay-buffer training
-        needs the raw history snapshots. They are used only to reconstruct z_k with the
-        current learned encoders before the GRU.
+    Why this is better than the GRU version:
+      - No recurrent hidden state: matches SAC replay-buffer re-encoding.
+      - Current step has a direct skip path to the head (no GRU bottleneck).
+      - The TCN reads recent *dynamics* (deltas), not a long memory.
+      - The map conditions the temporal interpretation via FiLM: the same LiDAR
+        change means different things in a corridor vs an open room.
 
-    Expected observation with 60-bin LiDAR:
+    Interface is unchanged from v26 so train_sac.py and SB3 SAC need no edits:
+      __init__(observation_space, map_features_dim, vector_features_dim,
+               temporal_features_dim, combined_features_dim, use_temporal_cnn,
+               lidar_dim)
+      forward(observations_dict) -> (B, combined_features_dim)
+
+    Expected observation:
       map     : (5, 32, 32)
-      vector  : (70,) = lidar(60) + stats(10)
-      map_seq : (H, 5, 32, 32)
-      seq     : (H, 70)
+      vector  : (vector_dim,) = lidar(L) + stats(S)
+      map_seq : (H, 5, 32, 32)   [only when use_temporal_cnn]
+      seq     : (H, vector_dim)  [only when use_temporal_cnn]
     """
 
     DEFAULT_LIDAR_DIM = 360
@@ -177,30 +232,43 @@ class MapVectorFeatureExtractor(BaseFeaturesExtractor):
         )
 
         if self.use_temporal_cnn:
-            # v26: recurrent temporal aggregator over post-fusion features only.
-            # Input shape at runtime: (B, H, vector_features_dim), where each z_k is
-            # Fusion(MapCNN(map_k), LiDARCNN(lidar_k), StatsMLP(stats_k)).
-            self.temporal_gru = nn.GRU(
-                input_size=vector_features_dim,
-                hidden_size=temporal_features_dim,
-                num_layers=1,
-                batch_first=True,
-                bidirectional=False,
+            # v27: Map-conditioned Delta-TCN over post-fusion features.
+            #
+            # Per-step temporal token is [z_k, dz_k] where dz_k = z_k - z_{k-1}.
+            # This gives the TCN both the current learned step feature and its
+            # delta, matching the "recent dynamics detector" role from the design
+            # note (delta/action sequence rather than long memory).
+            tcn_in_dim = vector_features_dim * 2  # concat(z_k, dz_k)
+            tcn_hidden = temporal_features_dim
+
+            self.temporal_input_proj = nn.Sequential(
+                nn.Linear(tcn_in_dim, tcn_hidden),
+                nn.LayerNorm(tcn_hidden),
+                nn.SiLU(),
             )
+            # FiLM is conditioned on the CURRENT map feature m_t.
+            self.temporal_block1 = _FiLMTCNBlock(tcn_hidden, map_features_dim, kernel_size=3, dropout=0.0)
+            self.temporal_block2 = _FiLMTCNBlock(tcn_hidden, map_features_dim, kernel_size=3, dropout=0.0)
+            self.temporal_pool = nn.AdaptiveAvgPool1d(1)
             self.temporal_head = nn.Sequential(
-                nn.LayerNorm(temporal_features_dim),
-                nn.SiLU(),
-                nn.Linear(temporal_features_dim, temporal_features_dim),
+                nn.Flatten(),
+                nn.Linear(tcn_hidden, temporal_features_dim),
                 nn.LayerNorm(temporal_features_dim),
                 nn.SiLU(),
             )
-            # Keep the old attribute name as None so old debug/introspection code does not
-            # accidentally treat the GRU as a raw-sequence Conv1D temporal block.
-            self.temporal_cnn = None
-            final_in_dim = temporal_features_dim
-        else:
+            # Kept as None so any old introspection that referenced these does not
+            # mistake the TCN for a GRU / raw-sequence Conv1D temporal block.
             self.temporal_gru = None
+            self.temporal_cnn = None
+            # Final input: temporal summary h_t  +  current-step skip token z_t.
+            final_in_dim = temporal_features_dim + vector_features_dim
+        else:
+            self.temporal_input_proj = None
+            self.temporal_block1 = None
+            self.temporal_block2 = None
+            self.temporal_pool = None
             self.temporal_head = None
+            self.temporal_gru = None
             self.temporal_cnn = None
             final_in_dim = vector_features_dim
 
@@ -213,6 +281,9 @@ class MapVectorFeatureExtractor(BaseFeaturesExtractor):
             nn.SiLU(),
         )
 
+    # ------------------------------------------------------------------ #
+    # Sanitizers
+    # ------------------------------------------------------------------ #
     def _sanitize_map(self, map_obs: torch.Tensor) -> torch.Tensor:
         map_obs = torch.nan_to_num(map_obs.float(), nan=0.0, posinf=1.0, neginf=0.0)
         return torch.clamp(map_obs, 0.0, 1.0)
@@ -231,6 +302,9 @@ class MapVectorFeatureExtractor(BaseFeaturesExtractor):
         stats = vector_obs[..., self.lidar_dim :] if self.stats_dim > 0 else None
         return lidar, stats
 
+    # ------------------------------------------------------------------ #
+    # Per-step encoders
+    # ------------------------------------------------------------------ #
     def _encode_map_flat(self, map_flat: torch.Tensor) -> torch.Tensor:
         return self.map_linear(self.map_cnn(self._sanitize_map(map_flat)))
 
@@ -259,28 +333,65 @@ class MapVectorFeatureExtractor(BaseFeaturesExtractor):
         vector_token = self._encode_vector_token_flat(vector_flat)
         return self.step_fusion(torch.cat([map_features, vector_token], dim=1))
 
-    def _encode_temporal_from_fusion_feature_history(self, map_seq: torch.Tensor, seq_obs: torch.Tensor) -> torch.Tensor:
-        if self.temporal_gru is None or self.temporal_head is None:
-            raise RuntimeError("Fusion-feature GRU requested but temporal_gru is None")
+    # ------------------------------------------------------------------ #
+    # Temporal branch: Map-conditioned Delta-TCN with FiLM
+    # ------------------------------------------------------------------ #
+    def _encode_temporal_map_conditioned_delta_tcn(
+        self, map_seq: torch.Tensor, seq_obs: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (h_t temporal summary, z_t current-step skip token).
+
+        Raw map_seq/seq are NOT fed to the temporal module directly. Each history
+        item first becomes z_k via the same learned step encoders, then the TCN
+        operates on [z_k, dz_k] with FiLM conditioning from the current map m_t.
+        """
+        if self.temporal_input_proj is None:
+            raise RuntimeError("Delta-TCN requested but temporal modules are None")
+
         map_seq = self._sanitize_map(map_seq)
         seq_obs = self._sanitize_vector(seq_obs)
+
         batch_size = int(seq_obs.shape[0])
         history_len = int(seq_obs.shape[1])
         flat_maps = map_seq.reshape(batch_size * history_len, *map_seq.shape[2:])
         flat_vecs = seq_obs.reshape(batch_size * history_len, -1)
-        # Build the learned post-fusion feature history first.
-        # Raw map_seq/seq are NOT fed to the temporal module directly.
-        # Each history item becomes z_k = Fusion(MapCNN(map_k), LiDARCNN(lidar_k), StatsMLP(stats_k)).
-        fusion_features = self._encode_full_step_flat(flat_maps, flat_vecs)
-        fusion_features = fusion_features.reshape(batch_size, history_len, self.vector_features_dim)
-        # GRU over time after fusion only: (B,H,D) -> last hidden state (B, temporal_features_dim).
-        _, h_n = self.temporal_gru(fusion_features.contiguous())
-        last_hidden = h_n[-1]
-        return self.temporal_head(last_hidden)
 
+        # z_k for every history step.
+        z_flat = self._encode_full_step_flat(flat_maps, flat_vecs)
+        z_seq = z_flat.reshape(batch_size, history_len, self.vector_features_dim)  # (B,H,D)
+
+        # Current-step token z_t (last in history) for the skip connection and
+        # for FiLM conditioning via its map feature.
+        z_t = z_seq[:, -1, :]  # (B, D)
+
+        # Delta over time: dz_k = z_k - z_{k-1}, with dz_0 = 0.
+        dz_seq = torch.zeros_like(z_seq)
+        if history_len > 1:
+            dz_seq[:, 1:, :] = z_seq[:, 1:, :] - z_seq[:, :-1, :]
+
+        # Per-step temporal token = concat(z_k, dz_k) -> (B,H,2D).
+        s_seq = torch.cat([z_seq, dz_seq], dim=-1)
+        s_proj = self.temporal_input_proj(s_seq)        # (B,H,hidden)
+        x = s_proj.transpose(1, 2).contiguous()         # (B,hidden,H)
+
+        # FiLM conditioning uses the CURRENT map feature m_t.
+        m_t = self._encode_map_flat(map_seq[:, -1])     # (B, map_features_dim)
+
+        x = self.temporal_block1(x, m_t)
+        x = self.temporal_block2(x, m_t)
+        x = self.temporal_pool(x)                       # (B,hidden,1)
+        h_t = self.temporal_head(x)                     # (B, temporal_features_dim)
+        return h_t, z_t
+
+    # ------------------------------------------------------------------ #
+    # Forward
+    # ------------------------------------------------------------------ #
     def forward(self, observations: dict[str, torch.Tensor]) -> torch.Tensor:
         if self.use_temporal_cnn and "map_seq" in observations and "seq" in observations:
-            features = self._encode_temporal_from_fusion_feature_history(observations["map_seq"], observations["seq"])
+            h_t, z_t = self._encode_temporal_map_conditioned_delta_tcn(
+                observations["map_seq"], observations["seq"]
+            )
+            features = torch.cat([h_t, z_t], dim=1)
         else:
             features = self._encode_full_step_flat(observations["map"], observations["vector"])
         return self.final_fusion(features)

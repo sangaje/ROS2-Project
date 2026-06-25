@@ -50,6 +50,7 @@ from turtlebot3_rl_training.observation import build_exploration_observation
 from turtlebot3_rl_training.reset_manager import ResetManager
 from turtlebot3_rl_training.reward import (
     compute_exploration_reward,
+    compute_velocity_safety_slowdown_penalty,
     compute_waypoint_macro_reward_adjustment,
 )
 from turtlebot3_rl_training.sim_controller import GazeboSimController
@@ -413,6 +414,11 @@ class GazeboNavEnv(gym.Env):
         velocity_safety_cooldown_steps: int = 8,
         velocity_safety_penalty: float = 10.0,
         velocity_safety_block_penalty: float = 0.80,
+        velocity_safety_slowdown: bool = True,
+        velocity_safety_slow_min_scale: float = 0.20,
+        velocity_safety_slow_penalty: float = 1.80,
+        velocity_safety_slow_speed_power: float = 1.35,
+        velocity_safety_slow_danger_power: float = 1.10,
         velocity_forward_assist_mps: float = 0.0,
         velocity_forward_assist_angular_threshold: float = 0.20,
         velocity_forward_assist_min_clearance_m: float = 0.45,
@@ -700,6 +706,29 @@ class GazeboNavEnv(gym.Env):
         self.map_bounds_grace_steps = max(int(map_bounds_grace_steps), 0)
         self.map_bounds_restart_penalty = max(float(map_bounds_restart_penalty), 0.0)
         self.map_bounds_bad_steps = 0
+        # Cells past an edge still treated as a transient canvas/pose mismatch
+        # (recoverable, grace-gated) rather than a genuine out-of-map (immediate
+        # restart).  Overridable via env for tuning without code edits.
+        try:
+            self.map_bounds_transient_outside_cells = max(
+                int(os.environ.get("TB3_RL_MAP_BOUNDS_TRANSIENT_OUTSIDE_CELLS", "24")), 0
+            )
+        except Exception:
+            self.map_bounds_transient_outside_cells = 24
+        # Pose that confidence/priority were last painted at, used to keep the
+        # map-bounds check consistent with the confidence canvas.
+        self._last_confidence_update_xy = None
+        self._last_confidence_update_yaw = 0.0
+        self._last_confidence_update_step = -10_000_000
+        # Last valid TF(map->base) pose for the direct map_base_tf confidence mode
+        # (used only as a short HOLD during brief TF gaps; never integrated).
+        self._last_direct_tf_pose_xy = None
+        self._last_direct_tf_pose_yaw = None
+        self._last_direct_tf_pose_wall = 0.0
+        # Exact pose confidence was painted at when unified with the TF cube; the
+        # origin marker reuses this so the red sphere == the cube.
+        self._confidence_unified_xy = None
+        self._confidence_unified_yaw = None
         self._last_map_bounds_restart = False
         self._last_map_bounds_reason = "none"
         self._last_map_bounds_local_known_ratio = 0.0
@@ -1711,6 +1740,11 @@ class GazeboNavEnv(gym.Env):
         self.velocity_safety_cooldown_steps_cfg = max(int(velocity_safety_cooldown_steps), 0)
         self.velocity_safety_penalty = max(float(velocity_safety_penalty), 0.0)
         self.velocity_safety_block_penalty = max(float(velocity_safety_block_penalty), 0.0)
+        self.velocity_safety_slowdown = bool(velocity_safety_slowdown)
+        self.velocity_safety_slow_min_scale = float(np.clip(float(velocity_safety_slow_min_scale), 0.02, 1.0))
+        self.velocity_safety_slow_penalty = max(float(velocity_safety_slow_penalty), 0.0)
+        self.velocity_safety_slow_speed_power = max(float(velocity_safety_slow_speed_power), 0.10)
+        self.velocity_safety_slow_danger_power = max(float(velocity_safety_slow_danger_power), 0.10)
         self.velocity_safety_cooldown_steps = 0
         # Sticky reverse escape lock.  When the safety shield starts a backup,
         # the following Gym steps ignore the policy action and continue the
@@ -1726,6 +1760,9 @@ class GazeboNavEnv(gym.Env):
         self._last_velocity_safety_skip_store = False
         self._pending_skip_penalty = 0.0
         self._last_velocity_safety_slowdown = 1.0
+        self._last_velocity_safety_slowdown_risk = 0.0
+        self._last_velocity_safety_policy_v = 0.0
+        self._last_velocity_safety_executed_v = 0.0
         self._last_velocity_safety_penalty = 0.0
         self._last_velocity_safety_reason = "none"
 
@@ -3051,6 +3088,9 @@ class GazeboNavEnv(gym.Env):
         self._last_velocity_safety_skip_store = False
         self._pending_skip_penalty = 0.0
         self._last_velocity_safety_slowdown = 1.0
+        self._last_velocity_safety_slowdown_risk = 0.0
+        self._last_velocity_safety_policy_v = 0.0
+        self._last_velocity_safety_executed_v = 0.0
         self._last_velocity_safety_penalty = 0.0
         self._last_velocity_safety_reason = "none"
         self.shake_steps = 0
@@ -3106,6 +3146,13 @@ class GazeboNavEnv(gym.Env):
         self._last_map_bounds_reason = "none"
         self._last_map_bounds_local_known_ratio = 0.0
         self._last_map_bounds_local_known_cells = 0
+        self._last_confidence_update_xy = None
+        self._last_confidence_update_step = -10_000_000
+        self._last_direct_tf_pose_xy = None
+        self._last_direct_tf_pose_yaw = None
+        self._last_direct_tf_pose_wall = 0.0
+        self._confidence_unified_xy = None
+        self._confidence_unified_yaw = None
 
         # Boundary center는 SLAM map frame이 아니라 reset-stable frame
         # self.safety_boundary_frame에서 실제 reset 후 pose로 잡는다.
@@ -4493,16 +4540,27 @@ class GazeboNavEnv(gym.Env):
             if float(rear_during_backup) <= float(rear_stop_dist):
                 stopped_by_rear = True
                 cmd = np.array([0.0, backup_w], dtype=np.float32)
+                self._last_velocity_safety_executed_v = float(cmd[0])
                 self.ros.publish_cmd_vel(float(cmd[0]), float(cmd[1]))
+                prev_scan_wall = getattr(self.ros, "last_scan_time", None)
                 self.ros.spin_steps(num_spins=2, timeout_sec=0.001)
                 self._advance_world_after_command(target_delta_sec=self.control_dt)
+                try:
+                    self.ros.wait_for_new_sensor_frame(prev_scan_wall, None, timeout_wall_sec=0.04)
+                except Exception:
+                    pass
                 _refresh_confidence_during_backup()
                 break
 
             cmd = np.array([backup_v, backup_w], dtype=np.float32)
+            prev_scan_wall = getattr(self.ros, "last_scan_time", None)
             self.ros.publish_cmd_vel(float(cmd[0]), float(cmd[1]))
             self.ros.spin_steps(num_spins=2, timeout_sec=0.001)
             self._advance_world_after_command(target_delta_sec=self.control_dt)
+            try:
+                self.ros.wait_for_new_sensor_frame(prev_scan_wall, None, timeout_wall_sec=0.04)
+            except Exception:
+                pass
             _refresh_confidence_during_backup()
             steps_done += 1
 
@@ -4512,14 +4570,32 @@ class GazeboNavEnv(gym.Env):
         # window and the next world-step advances, which is what produced the
         # runaway multi-meter reverse.  Force a zero twist and settle it.
         cmd = np.array([0.0, 0.0], dtype=np.float32)
+        prev_scan_wall = getattr(self.ros, "last_scan_time", None)
         self.ros.publish_cmd_vel(0.0, 0.0)
         self.ros.spin_steps(num_spins=2, timeout_sec=0.001)
         self._advance_world_after_command(target_delta_sec=self.control_dt)
+        try:
+            self.ros.wait_for_new_sensor_frame(prev_scan_wall, None, timeout_wall_sec=0.06)
+        except Exception:
+            pass
         try:
             self.ros.stop_robot()
         except Exception:
             pass
         _refresh_confidence_during_backup()
+
+        front_after_backup = float(front_min)
+        try:
+            scan_after = self.ros.scan
+            if scan_after is not None:
+                front_after_backup = self._scan_min_distance_in_sector(
+                    scan=scan_after,
+                    center_angle=0.0,
+                    half_width_rad=math.radians(28.0),
+                    max_considered_range=max(1.20, self.velocity_safety_slow_distance_m + 0.20),
+                )
+        except Exception:
+            pass
 
         self.velocity_safety_backup_lock_steps = 0
         self.velocity_safety_cooldown_steps = int(getattr(self, "velocity_safety_cooldown_steps_cfg", 8))
@@ -4530,13 +4606,14 @@ class GazeboNavEnv(gym.Env):
         self._last_velocity_safety_sync_steps = int(steps_done)
         self._last_velocity_safety_reason = (
             f"{reason_prefix}{'_rear_stop' if stopped_by_rear else ''}:"
-            f"front={float(front_min):.3f},rear0={float(rear_min):.3f},"
-            f"rear={float(rear_during_backup):.3f},sync_steps={int(steps_done)}/{int(backup_steps_cfg)}"
+            f"front0={float(front_min):.3f},front1={float(front_after_backup):.3f},"
+            f"rear0={float(rear_min):.3f},rear={float(rear_during_backup):.3f},"
+            f"sync_steps={int(steps_done)}/{int(backup_steps_cfg)}"
         )
         self.ros.get_logger().warn(
             f"{log_label} | "
-            f"front={float(front_min):.3f}m rear0={float(rear_min):.3f}m "
-            f"rear={float(rear_during_backup):.3f}m "
+            f"front0={float(front_min):.3f}m front1={float(front_after_backup):.3f}m "
+            f"rear0={float(rear_min):.3f}m rear={float(rear_during_backup):.3f}m "
             f"sync_steps={int(steps_done)}/{int(backup_steps_cfg)} "
             f"cmd_last=({float(cmd[0]):+.3f},{float(cmd[1]):+.3f}) "
             f"rear_stop={float(rear_stop_dist):.3f} "
@@ -4578,6 +4655,9 @@ class GazeboNavEnv(gym.Env):
         self._last_velocity_safety_blocked = False
         self._last_velocity_safety_skip_store = False
         self._last_velocity_safety_slowdown = 1.0
+        self._last_velocity_safety_slowdown_risk = 0.0
+        self._last_velocity_safety_policy_v = float(action[0]) if action.size > 0 else 0.0
+        self._last_velocity_safety_executed_v = float(action[0]) if action.size > 0 else 0.0
         self._last_velocity_safety_penalty = 0.0
         self._last_velocity_safety_reason = "none"
         self._last_velocity_safety_sync_steps = 0
@@ -4594,6 +4674,12 @@ class GazeboNavEnv(gym.Env):
                     0,
                 )
 
+        # Drain callbacks before reading safety distances.  The previous build
+        # could reuse a LaserScan from before/inside the synchronous backup, so
+        # front_min looked pinned (e.g. 0.206/0.224m) and the next policy step
+        # immediately triggered another backup.  Safety decisions below are made
+        # from the freshest live LaserScan available at this point.
+        self.ros.spin_steps(num_spins=4, timeout_sec=0.001)
         scan = self.ros.scan
         front_min = 999.0
         rear_min = 999.0
@@ -4625,18 +4711,33 @@ class GazeboNavEnv(gym.Env):
                 max_considered_range=0.90,
             )
 
-        lidar_action_obstacle_distance, lidar_action_obstacle_score, lidar_front_obstacle_distance = (
+        scan_front_min = float(front_min)
+        scan_rear_min = float(rear_min)
+
+        live_action_obstacle_distance, live_action_obstacle_score, live_front_obstacle_distance = (
             self._compute_lidar_action_obstacle_risk(action)
         )
         slam_action_distance, slam_front_distance = self._compute_slam_action_obstacle_distance(action)
-        lidar_action_obstacle_distance = min(float(lidar_action_obstacle_distance), float(slam_action_distance))
-        lidar_front_obstacle_distance = min(float(lidar_front_obstacle_distance), float(front_min), float(slam_front_distance))
-        front_min = min(float(front_min), float(slam_front_distance))
+
+        # Keep SLAM/map obstacle distances for reward diagnostics, but do NOT use
+        # them to trigger forced safety backup.  SLAM/map distance can lag after a
+        # reset/backup because it depends on map pose and occupancy-grid latency;
+        # using min(scan, slam) for the backup condition caused repeated reverse
+        # commands even when the live front scan had already cleared.
+        safety_front_min = float(scan_front_min)
+        safety_action_obstacle_distance = float(live_action_obstacle_distance)
+        safety_rear_min = float(scan_rear_min)
+
+        lidar_action_obstacle_distance = min(float(live_action_obstacle_distance), float(slam_action_distance))
+        lidar_front_obstacle_distance = min(float(live_front_obstacle_distance), float(scan_front_min), float(slam_front_distance))
+        front_min = float(scan_front_min)
         if float(lidar_action_obstacle_distance) < 0.60:
             warn_distance = 0.60
             hard_distance = 0.22
-            slam_risk = (warn_distance - float(lidar_action_obstacle_distance)) / max(warn_distance - hard_distance, 1e-6)
-            lidar_action_obstacle_score = max(float(lidar_action_obstacle_score), float(np.clip(slam_risk, 0.0, 1.0)))
+            obstacle_risk = (warn_distance - float(lidar_action_obstacle_distance)) / max(warn_distance - hard_distance, 1e-6)
+            lidar_action_obstacle_score = max(float(live_action_obstacle_score), float(np.clip(obstacle_risk, 0.0, 1.0)))
+        else:
+            lidar_action_obstacle_score = float(live_action_obstacle_score)
 
         cmd = action.astype(np.float32).copy()
         self._last_velocity_command_limited = False
@@ -4655,6 +4756,13 @@ class GazeboNavEnv(gym.Env):
                 )
         forward = float(cmd[0])
         angular = float(cmd[1])
+        # Safety backup must be causally tied to a meaningful forward policy command.
+        # A near-zero positive v from SAC exploration/noise should not repeatedly
+        # trigger forced backup transitions near a wall.  Those forced transitions
+        # are skip_store=True, but they still consume wall-clock time and can trap
+        # the robot in backup loops.
+        forward_backup_min = max(float(getattr(self, "linear_deadband", 0.015)), 0.04)
+        forward_backup_requested = bool(forward > forward_backup_min)
         turn_sign = 1.0 if float(left_min) >= float(right_min) else -1.0
         if abs(angular) > 1e-4:
             # Prefer the policy's turn direction if it already chose one.
@@ -4684,141 +4792,151 @@ class GazeboNavEnv(gym.Env):
             self.velocity_safety_cooldown_steps = int(getattr(self, "velocity_safety_cooldown_steps_cfg", 8))
             self._last_velocity_safety_reason = f"cleared_legacy_backup_lock:{lock_steps}"
 
+        # Safety-training policy:
+        #   - Do not use cooldown to force cmd=(0,0) holds.
+        #   - If rear is clear, execute backup immediately as a skip-store
+        #     recovery transition.
+        #   - If backup is unavailable, let the policy command pass through so
+        #     the normal collision/terminal reward, not a hidden command clamp,
+        #     provides the learning signal.
         can_backup = (
             bool(getattr(self, "velocity_safety_backup", True))
-            and int(getattr(self, "velocity_safety_cooldown_steps", 0)) <= 0
-            and float(rear_min) > rear_warn_dist
+            and float(safety_rear_min) > rear_warn_dist
         )
 
-        # 1) Imminent front collision: start a sticky reverse recovery.
-        # Only the first reverse tick is executed in this Gym step; the rest are
-        # protected by velocity_safety_backup_lock_steps so later policy actions
-        # cannot cancel the reverse escape.
-        if front_min < trigger_dist and can_backup:
+        cooldown_active = int(getattr(self, "velocity_safety_cooldown_steps", 0)) > 0
+        rear_ok = float(safety_rear_min) > rear_warn_dist
+
+        # Continuous danger score for the soft safety layer.
+        #   0.0: outside slow band
+        #   1.0: at/inside stop band
+        # We use the minimum of live front-scan and action-arc obstacle distance,
+        # so straight frontal collision and curved-action collision are both covered.
+        safety_slow_reference_distance = min(
+            float(safety_front_min),
+            float(safety_action_obstacle_distance),
+        )
+        slow_den = max(float(slow_dist) - float(stop_dist), 1e-6)
+        velocity_safety_slow_risk = float(
+            np.clip((float(slow_dist) - safety_slow_reference_distance) / slow_den, 0.0, 1.0)
+        )
+        self._last_velocity_safety_slowdown_risk = velocity_safety_slow_risk
+
+        # 1) Hard trigger band only: start a synchronous reverse recovery only
+        # when the policy is actually requesting meaningful forward motion.
+        #
+        # Important fix:
+        #   stop_dist is a diagnostic/warning boundary.  It must not itself start
+        #   backup.  With stop_dist=0.24 and trigger_dist=0.19, logs such as
+        #   front=0.224 were repeatedly entering the old STOP_BAND_BACKUP branch
+        #   even though they were outside the intended hard backup trigger.
+        #
+        # Cooldown is also backup-only: it suppresses repeated backup starts but
+        # never publishes a forced hold or clamp.  During cooldown, the policy
+        # command passes through unchanged and normal collision/terminal learning
+        # applies.
+        hard_backup_condition = bool(
+            forward_backup_requested
+            and (
+                float(safety_front_min) < float(trigger_dist)
+                or float(safety_action_obstacle_distance) < float(trigger_dist)
+            )
+        )
+
+        if hard_backup_condition and bool(getattr(self, "velocity_safety_backup", True)) and rear_ok and not cooldown_active:
             return self._execute_velocity_safety_backup_sequence(
-                front_min=float(front_min),
-                rear_min=float(rear_min),
+                front_min=float(safety_front_min),
+                rear_min=float(safety_rear_min),
                 turn_sign=float(turn_sign),
                 backup_v=float(backup_v),
                 backup_turn_speed=float(backup_turn_speed),
                 backup_steps_cfg=int(backup_steps_cfg),
                 rear_stop_dist=float(rear_stop_dist),
-                lidar_action_obstacle_distance=float(lidar_action_obstacle_distance),
-                lidar_action_obstacle_score=float(lidar_action_obstacle_score),
-                lidar_front_obstacle_distance=float(lidar_front_obstacle_distance),
-                reason_prefix="sync_backup_trigger",
-                log_label="VELOCITY_SAFETY_SYNC_BACKUP_START",
+                lidar_action_obstacle_distance=float(safety_action_obstacle_distance),
+                lidar_action_obstacle_score=float(live_action_obstacle_score),
+                lidar_front_obstacle_distance=float(live_front_obstacle_distance),
+                reason_prefix="sync_live_lidar_hard_trigger_backup",
+                log_label="VELOCITY_SAFETY_SYNC_LIVE_LIDAR_BACKUP",
             )
 
-        if front_min < trigger_dist and not can_backup:
-            # Front is dangerous but a new backup is not allowed (cooldown active
-            # or rear unsafe).  Do NOT compute a rotation here: forcing an
-            # in-place spin pollutes the policy's forward-driving signal.  Just
-            # hold the robot still for this tick and mark it as a non-learning
-            # (skip-store) safety step so SAC never sees this forced transition.
-            cmd = np.array([0.0, 0.0], dtype=np.float32)
-            self.ros.publish_cmd_vel(0.0, 0.0)
-            self.ros.spin_steps(num_spins=3, timeout_sec=0.001)
-            self._advance_world_after_command(target_delta_sec=self.control_dt)
-            try:
-                self.ros.stop_robot()
-            except Exception:
-                pass
-            self._last_velocity_safety_blocked = True
-            self._last_velocity_safety_skip_store = True
-            self._last_velocity_safety_penalty = float(getattr(self, "velocity_safety_penalty", 10.0))
+        if hard_backup_condition:
+            # No forced hold here.  If cooldown is active, rear is unsafe, backup
+            # is disabled, or the forward command is below the meaningful-action
+            # threshold, pass the policy command through unchanged.
+            self._last_velocity_safety_blocked = False
+            self._last_velocity_safety_skip_store = False
+            self._last_velocity_safety_penalty = 0.0
             self._last_velocity_safety_reason = (
-                f"backup_denied_hold:front={front_min:.3f},rear={rear_min:.3f},"
-                f"rear_warn={rear_warn_dist:.3f},cooldown={int(getattr(self, 'velocity_safety_cooldown_steps', 0))}"
-            )
-            self.ros.get_logger().warn(
-                "VELOCITY_SAFETY_BACKUP_DENIED | "
-                f"front={front_min:.3f}m rear={rear_min:.3f}m rear_warn={rear_warn_dist:.3f} "
-                f"cooldown={int(getattr(self, 'velocity_safety_cooldown_steps', 0))} hold(no_rotate)"
-            )
-            return (
-                cmd.astype(np.float32),
-                float(lidar_action_obstacle_distance),
-                float(max(lidar_action_obstacle_score, 1.0)),
-                float(lidar_front_obstacle_distance),
+                f"hard_trigger_no_backup_policy_passthrough:front_scan={safety_front_min:.3f},"
+                f"action_scan={safety_action_obstacle_distance:.3f},trigger={trigger_dist:.3f},"
+                f"rear_scan={safety_rear_min:.3f},rear_warn={rear_warn_dist:.3f},"
+                f"cooldown={cooldown_active},forward={forward:.3f},"
+                f"forward_min={forward_backup_min:.3f}"
             )
 
-        # 2) Stop band: do not silently erase the policy's forward command.
-        # v114: if the action would likely collide, execute an explicit reverse recovery
-        # and charge a penalty.  This makes the transition legible to SAC: the agent
-        # sees that an unsafe forward action caused a backup/penalty, instead of seeing
-        # its linear command clamped to zero with weak learning signal.
-        #
-        # v116 FIX: this band MUST also honor the backup cooldown.  Previously it
-        # ignored velocity_safety_cooldown_steps, so a robot wedged in front of a
-        # wall (front stays < stop_dist while the policy keeps commanding forward)
-        # re-triggered a full reverse every single step forever, never letting the
-        # cooldown count down.  Now: only start a new backup when the cooldown has
-        # elapsed; during cooldown, block the forward command and rotate in place
-        # so the robot turns away from the wall instead of endlessly reversing.
-        if forward > 0.0 and (front_min < stop_dist or lidar_action_obstacle_distance < stop_dist):
-            cooldown_active = int(getattr(self, "velocity_safety_cooldown_steps", 0)) > 0
-            rear_ok = float(rear_min) > rear_warn_dist
-            if bool(getattr(self, "velocity_safety_backup", True)) and rear_ok and not cooldown_active:
-                return self._execute_velocity_safety_backup_sequence(
-                    front_min=float(front_min),
-                    rear_min=float(rear_min),
-                    turn_sign=float(turn_sign),
-                    backup_v=float(backup_v),
-                    backup_turn_speed=float(backup_turn_speed),
-                    backup_steps_cfg=int(backup_steps_cfg),
-                    rear_stop_dist=float(rear_stop_dist),
-                    lidar_action_obstacle_distance=float(lidar_action_obstacle_distance),
-                    lidar_action_obstacle_score=float(lidar_action_obstacle_score),
-                    lidar_front_obstacle_distance=float(lidar_front_obstacle_distance),
-                    reason_prefix="sync_stop_band_backup",
-                    log_label="VELOCITY_SAFETY_SYNC_STOP_BAND_BACKUP",
-                )
-
-            # Backup not taken (cooldown active, or rear unsafe).  Do NOT rotate:
-            # an in-place spin here teaches the policy to turn instead of drive
-            # forward.  Hold still for this tick and mark it skip-store so SAC
-            # never learns from this forced safety transition.
-            cooldown_active = int(getattr(self, "velocity_safety_cooldown_steps", 0)) > 0
-            cmd = np.array([0.0, 0.0], dtype=np.float32)
-            self.ros.publish_cmd_vel(0.0, 0.0)
-            self.ros.spin_steps(num_spins=3, timeout_sec=0.001)
-            self._advance_world_after_command(target_delta_sec=self.control_dt)
-            try:
-                self.ros.stop_robot()
-            except Exception:
-                pass
-            self._last_velocity_safety_blocked = True
-            self._last_velocity_safety_skip_store = True
-            self._last_velocity_safety_penalty = float(getattr(self, "velocity_safety_penalty", 10.0))
+        # 2) Stop band: diagnostic only.  Do not start backup, hold, rotate, or
+        # scale v/w here.  This preserves action->executed-command consistency in
+        # replay.  If the policy actually drives into collision, the normal
+        # collision terminal/reward path supplies the learning signal.
+        if (not hard_backup_condition) and forward_backup_requested and (
+            float(safety_front_min) < float(stop_dist)
+            or float(safety_action_obstacle_distance) < float(stop_dist)
+        ):
+            self._last_velocity_safety_blocked = False
+            self._last_velocity_safety_skip_store = False
+            self._last_velocity_safety_penalty = 0.0
             self._last_velocity_safety_reason = (
-                f"stop_band_hold:front={front_min:.3f},action={lidar_action_obstacle_distance:.3f},"
-                f"rear={rear_min:.3f},rear_warn={rear_warn_dist:.3f},"
-                f"cooldown={'yes' if cooldown_active else 'no'}"
-            )
-            self.ros.get_logger().warn(
-                "VELOCITY_SAFETY_HOLD | "
-                f"front={front_min:.3f}m rear={rear_min:.3f}m "
-                f"cooldown={'yes' if cooldown_active else 'no'} hold(no_rotate)"
-            )
-            return (
-                cmd.astype(np.float32),
-                float(lidar_action_obstacle_distance),
-                float(max(lidar_action_obstacle_score, 1.0)),
-                float(lidar_front_obstacle_distance),
+                f"stop_band_policy_passthrough:front_scan={safety_front_min:.3f},"
+                f"action_scan={safety_action_obstacle_distance:.3f},stop={stop_dist:.3f},"
+                f"trigger={trigger_dist:.3f},rear_scan={safety_rear_min:.3f},"
+                f"cooldown={cooldown_active},forward={forward:.3f},"
+                f"forward_min={forward_backup_min:.3f}"
             )
 
-        # 3) Warning band: smoothly reduce forward speed before the backup band.
+        # 3) Soft slowdown band: reduce v continuously and penalize the raw
+        # policy-requested v.  This is the behavior requested for near-risk states:
+        # high v near an obstacle receives a large penalty, small v receives a
+        # small penalty, and the executed robot command is kept physically safer.
+        if (
+            bool(getattr(self, "velocity_safety_slowdown", True))
+            and forward > 0.0
+            and velocity_safety_slow_risk > 0.0
+            and not bool(getattr(self, "_last_velocity_safety_backup_triggered", False))
+        ):
+            old_v = float(cmd[0])
+            min_scale = float(getattr(self, "velocity_safety_slow_min_scale", 0.20))
+            # risk=0 -> 1.0, risk=1 -> min_scale.  Squaring the risk keeps the
+            # outer warning band permissive but clamps aggressively near stop_dist.
+            slowdown_scale = float(np.clip(1.0 - (1.0 - min_scale) * (velocity_safety_slow_risk ** 1.20), min_scale, 1.0))
+            cmd[0] = float(np.clip(float(cmd[0]) * slowdown_scale, 0.0, float(self.max_linear_speed)))
+            self._last_velocity_safety_slowdown = slowdown_scale
+            self._last_velocity_safety_executed_v = float(cmd[0])
+            slow_penalty = compute_velocity_safety_slowdown_penalty(
+                policy_linear_x=float(action[0]) if action.size > 0 else old_v,
+                max_linear_speed=float(self.max_linear_speed),
+                danger_score=float(velocity_safety_slow_risk),
+                penalty_scale=float(getattr(self, "velocity_safety_slow_penalty", 1.80)),
+                speed_power=float(getattr(self, "velocity_safety_slow_speed_power", 1.35)),
+                danger_power=float(getattr(self, "velocity_safety_slow_danger_power", 1.10)),
+            )
+            self._last_velocity_safety_penalty = max(
+                float(getattr(self, "_last_velocity_safety_penalty", 0.0)),
+                float(slow_penalty),
+            )
+            self._last_velocity_safety_reason = (
+                f"soft_slowdown:risk={velocity_safety_slow_risk:.3f},scale={slowdown_scale:.3f},"
+                f"v_policy={float(action[0]) if action.size > 0 else old_v:.3f},"
+                f"v_exec={float(cmd[0]):.3f},penalty={float(self._last_velocity_safety_penalty):.3f},"
+                f"front_scan={safety_front_min:.3f},action_scan={safety_action_obstacle_distance:.3f},"
+                f"slow={slow_dist:.3f},stop={stop_dist:.3f}"
+            )
         elif forward > 0.0 and lidar_action_obstacle_distance < slow_dist:
-            denom = max(slow_dist - stop_dist, 1e-6)
-            scale = float(np.clip((float(lidar_action_obstacle_distance) - stop_dist) / denom, 0.15, 1.0))
-            cmd[0] = float(cmd[0]) * scale
-            self._last_velocity_safety_slowdown = scale
-            if scale < 0.99:
-                self._last_velocity_safety_penalty = 0.25 * (1.0 - scale)
-                self._last_velocity_safety_reason = (
-                    f"slowdown:{scale:.2f},action={lidar_action_obstacle_distance:.3f}"
-                )
+            self._last_velocity_safety_slowdown = 1.0
+            self._last_velocity_safety_reason = (
+                f"warning_no_slowdown_disabled:action_scan={safety_action_obstacle_distance:.3f},"
+                f"action_reward={lidar_action_obstacle_distance:.3f},slow={slow_dist:.3f},"
+                f"cmd=({float(cmd[0]):+.3f},{float(cmd[1]):+.3f})"
+            )
 
         # Optional evaluation-time forward assist.  A weak checkpoint can learn to
         # rotate in place, especially when priority is disabled even though the
@@ -4890,6 +5008,7 @@ class GazeboNavEnv(gym.Env):
                     f"front={front_min:.3f} action={lidar_action_obstacle_distance:.3f}"
                 )
 
+        self._last_velocity_safety_executed_v = float(cmd[0])
         self.ros.publish_cmd_vel(float(cmd[0]), float(cmd[1]))
         self.ros.spin_steps(num_spins=5, timeout_sec=0.001)
         self._advance_world_after_command(target_delta_sec=self.control_dt)
@@ -7786,6 +7905,8 @@ class GazeboNavEnv(gym.Env):
             self._set_marker_color(arrow, 1.0, 0.15, 0.05, 0.95)
         elif bool(getattr(self, "_last_velocity_safety_blocked", False)):
             self._set_marker_color(arrow, 1.0, 0.75, 0.05, 0.95)
+        elif float(getattr(self, "_last_velocity_safety_slowdown", 1.0)) < 0.999:
+            self._set_marker_color(arrow, 1.0, 0.95, 0.10, 0.95)
         else:
             self._set_marker_color(arrow, 0.10, 1.0, 0.25, 0.95)
         arr.markers.append(arrow)
@@ -8499,6 +8620,111 @@ class GazeboNavEnv(gym.Env):
             except Exception:
                 pass
 
+
+    def _get_tf_cube_confidence_pose2d(self) -> Optional[tuple[np.ndarray, float]]:
+        """Pose used to UNIFY the confidence origin with the visible TF CUBE.
+
+        v125 rule:
+          - The green CUBE is the source of truth, because that is the marker the
+            user verified against RViz RobotModel.
+          - The confidence cone uses the exact same manual-TF lookup path as the
+            CUBE marker used to use: target=/map, source=base_footprint by default.
+          - tf2 Buffer lookup is only an optional fallback.  In the failing run the
+            tf2 path and manual path diverged, so the default must be manual-first.
+          - A short hold keeps both confidence and the marker from blinking when one
+            TF sample is late.  If the hold expires, unified mode skips the update
+            instead of falling back to an unrelated odom/anchor pose.
+        """
+        target_frame = str(os.environ.get(
+            "TB3_RL_CONFIDENCE_TARGET_FRAME", self.map_frame or "map"
+        ) or "map").strip().lstrip("/") or "map"
+
+        source_frame = str(os.environ.get(
+            "TB3_RL_CONFIDENCE_CUBE_FRAME",
+            os.environ.get("TB3_RL_CONFIDENCE_BASE_FRAME", "base_footprint"),
+        ) or "base_footprint").strip().lstrip("/") or "base_footprint"
+
+        try:
+            max_age = float(os.environ.get("TB3_RL_MANUAL_TF_MAX_AGE_SEC", "15.0") or 15.0)
+        except Exception:
+            max_age = 15.0
+
+        pose = None
+        # This is the important change: manual TF cache first, because the green
+        # compare CUBE that looked correct was generated from get_frame_pose2d_manual().
+        try:
+            if hasattr(self.ros, "get_frame_pose2d_manual"):
+                pose = self.ros.get_frame_pose2d_manual(
+                    target_frame=target_frame,
+                    source_frame=source_frame,
+                    max_age_sec=max_age,
+                )
+        except Exception:
+            pose = None
+
+        # Optional only.  Leave disabled by default so a tf2/manual mismatch cannot
+        # silently move confidence away from the verified CUBE pose.
+        try:
+            buffer_fallback = str(os.environ.get(
+                "TB3_RL_CONFIDENCE_CUBE_TF_BUFFER_FALLBACK", "0"
+            ) or "0").strip().lower() in {"1", "true", "yes", "on"}
+        except Exception:
+            buffer_fallback = False
+        if pose is None and buffer_fallback:
+            try:
+                if hasattr(self.ros, "get_frame_pose2d"):
+                    pose = self.ros.get_frame_pose2d(
+                        target_frame=target_frame,
+                        source_frame=source_frame,
+                        stamp=None,
+                        timeout_sec=0.02,
+                        allow_latest_fallback=True,
+                    )
+            except Exception:
+                pose = None
+
+        if pose is not None:
+            xy, yaw = pose
+            xy = np.asarray(xy, dtype=np.float32).reshape(-1)[:2]
+            if xy.size >= 2 and np.all(np.isfinite(xy)) and math.isfinite(float(yaw)):
+                self._last_direct_tf_pose_xy = xy.copy()
+                self._last_direct_tf_pose_yaw = float(yaw)
+                self._last_direct_tf_pose_wall = time.time()
+                self._last_direct_tf_pose_frame = source_frame
+                self._last_direct_tf_pose_source = "manual_cube" if not buffer_fallback else "manual_or_buffer_cube"
+                return xy.copy(), float(yaw)
+
+        # Hold the last verified CUBE pose across brief TF gaps.  This prevents the
+        # RViz marker from being DELETEALL-cleared and prevents one missed TF sample
+        # from forcing the confidence updater into a different pose source.
+        try:
+            hold_sec = float(os.environ.get("TB3_RL_CONFIDENCE_TF_HOLD_SEC", "1.5") or 1.5)
+        except Exception:
+            hold_sec = 1.5
+        held_xy = getattr(self, "_last_direct_tf_pose_xy", None)
+        held_yaw = getattr(self, "_last_direct_tf_pose_yaw", None)
+        held_wall = float(getattr(self, "_last_direct_tf_pose_wall", 0.0))
+        if (
+            isinstance(held_xy, np.ndarray)
+            and held_xy.size >= 2
+            and held_yaw is not None
+            and (time.time() - held_wall) <= max(hold_sec, 0.0)
+        ):
+            return held_xy.copy(), float(held_yaw)
+
+        try:
+            if self._scan_bool_env("TB3_RL_TF_CUBE_POSE_WARN", False):
+                now = time.time()
+                if now - float(getattr(self, "_last_tf_cube_pose_warn_time", 0.0)) > 2.0:
+                    self._last_tf_cube_pose_warn_time = now
+                    self.ros.get_logger().warn(
+                        "TF_CUBE_POSE_UNAVAILABLE | "
+                        f"target={target_frame} source={source_frame} max_age={max_age:.1f}s | "
+                        "skip unified confidence update until manual TF returns"
+                    )
+        except Exception:
+            pass
+        return None
 
     def _get_map_base_pose2d_hard(self) -> Optional[tuple[np.ndarray, float]]:
         """Strict canonical robot anchor for every /map-aligned RL layer.
@@ -9306,6 +9532,47 @@ class GazeboNavEnv(gym.Env):
         mode = str(os.environ.get("TB3_RL_CONFIDENCE_POSE_SOURCE", getattr(self, "confidence_pose_source", "real_odom_anchored")) or "real_odom_anchored").strip().lower()
         self.confidence_pose_source = mode
 
+        # ── Hard unification with the TF compare CUBE / RViz RobotModel ──────────
+        # The user wants ONE origin: the confidence cone must start at exactly the
+        # pose marked by the TF compare cube (live TF map->base_footprint), which
+        # is what RViz uses to place the robot.  When enabled (default), bypass all
+        # anchored/odom estimators and return that TF pose directly, with a short
+        # hold across brief TF gaps so confidence does not blink.  The marker code
+        # reuses self._confidence_unified_xy/_yaw so the red sphere is drawn from
+        # the SAME value as the cube -> they are guaranteed identical, not merely
+        # "close".  Disable with TB3_RL_CONFIDENCE_UNIFY_WITH_TF_CUBE=0.
+        try:
+            unify_cube = str(os.environ.get("TB3_RL_CONFIDENCE_UNIFY_WITH_TF_CUBE", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
+        except Exception:
+            unify_cube = True
+        if unify_cube:
+            cube_pose = self._get_tf_cube_confidence_pose2d()
+            if cube_pose is not None:
+                cxy, cyaw = cube_pose
+                raw_scan_yaw = self._get_map_scan_yaw_hard(raw_scan_msg=self.ros.scan, base_yaw=float(cyaw))
+                scan_yaw = self._select_confidence_ray_yaw(base_yaw=float(cyaw), scan_yaw=raw_scan_yaw, mode_hint="tf_cube_unified")
+                # Persist so the origin marker draws the sphere at the cube pose.
+                self._confidence_unified_xy = np.asarray(cxy, dtype=np.float32).copy()
+                self._confidence_unified_yaw = float(cyaw)
+                self.confidence_pose_source = "tf_cube_unified"
+                return (
+                    np.asarray(cxy, dtype=np.float32),
+                    float(cyaw),
+                    np.asarray(cxy, dtype=np.float32),
+                    float(scan_yaw),
+                    "tf_cube_unified",
+                )
+            # If the CUBE pose is unavailable, do NOT fall through to the legacy
+            # odom/anchor estimators by default.  The whole point of v125 is that
+            # confidence must use the same pose as the verified green CUBE, or skip
+            # the semantic write for this tick.  This prevents hidden source swaps.
+            if self._scan_bool_env("TB3_RL_CONFIDENCE_UNIFY_STRICT", True):
+                self._confidence_unified_xy = None
+                self._confidence_unified_yaw = None
+                return None
+            # Legacy escape hatch only when explicitly disabled.
+        # ────────────────────────────────────────────────────────────────────────
+
         anchor = getattr(self, "_confidence_odom_anchor", None)
         hard_map_pose = None
 
@@ -9521,9 +9788,44 @@ class GazeboNavEnv(gym.Env):
             )
 
         if mode in direct_tf_modes:
-            if hard_map_pose is None:
-                return None
-            xy, yaw = hard_map_pose
+            # Unify confidence origin with the TF compare cube / RViz RobotModel:
+            # position AND yaw come straight from TF(map->base_footprint) every
+            # step, with no odometry integration and no anchor.  The confidence
+            # cone therefore expands from exactly the pose the cube marks.
+            if hard_map_pose is not None:
+                xy, yaw = hard_map_pose
+                # Cache the last valid TF pose so a brief TF gap (e.g. paused
+                # Gazebo multi_step) does not skip the confidence update.  This is
+                # a short HOLD of the last true pose, NOT odometry integration, so
+                # it never drifts: at worst it repaints the same spot for a few ms
+                # until live TF returns.
+                try:
+                    self._last_direct_tf_pose_xy = np.asarray(xy, dtype=np.float32).reshape(-1)[:2].copy()
+                    self._last_direct_tf_pose_yaw = float(yaw)
+                    self._last_direct_tf_pose_wall = time.time()
+                except Exception:
+                    pass
+            else:
+                # No live TF this step: hold the last valid TF pose for a short
+                # window instead of returning None (which would skip the update).
+                try:
+                    hold_sec = float(os.environ.get("TB3_RL_CONFIDENCE_TF_HOLD_SEC", "0.5") or 0.5)
+                except Exception:
+                    hold_sec = 0.5
+                held_xy = getattr(self, "_last_direct_tf_pose_xy", None)
+                held_yaw = getattr(self, "_last_direct_tf_pose_yaw", None)
+                held_wall = float(getattr(self, "_last_direct_tf_pose_wall", 0.0))
+                if (
+                    isinstance(held_xy, np.ndarray)
+                    and held_xy.size >= 2
+                    and held_yaw is not None
+                    and (time.time() - held_wall) <= max(hold_sec, 0.0)
+                ):
+                    xy = held_xy.copy()
+                    yaw = float(held_yaw)
+                else:
+                    # TF has been missing too long; skip rather than paint stale.
+                    return None
             raw_scan_yaw = self._get_map_scan_yaw_hard(raw_scan_msg=self.ros.scan, base_yaw=yaw)
             scan_yaw = self._select_confidence_ray_yaw(base_yaw=float(yaw), scan_yaw=raw_scan_yaw, mode_hint="map_base_tf")
             # sensor_xy deliberately equals base xy in this mode.  Use
@@ -9635,6 +9937,68 @@ class GazeboNavEnv(gym.Env):
         scan_yaw = self._normalize_angle(out_yaw + float(anchor.get("scan_offset", 0.0)))
         out_xy = np.array([out_x, out_y], dtype=np.float32)
 
+        # v122 anchor re-sync (fixes the confidence-origin "jump"):
+        #
+        # The anchor map_xy0 is captured once from TF(map->base).  After that the
+        # pose is propagated purely by integrating odometry deltas.  But every
+        # time Cartographer runs a pose-graph correction / loop closure, the live
+        # map->base TF jumps, while the frozen anchor does not.  The integrated
+        # confidence origin (red sphere) then drifts away from the actual robot
+        # (the TF compare cube), which is exactly the reported symptom: the cube
+        # is correct, the sphere is offset.
+        #
+        # Fix: whenever a fresh, valid TF(map->base) is available, snap the anchor
+        # back onto it.  This keeps the odometry-integration benefit during brief
+        # TF gaps (paused Gazebo multi_step), but removes any accumulated drift
+        # the instant TF returns, so the sphere tracks the cube.  Disable with
+        # TB3_RL_CONFIDENCE_ANCHOR_RESYNC=0.
+        try:
+            resync_enabled = str(os.environ.get("TB3_RL_CONFIDENCE_ANCHOR_RESYNC", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
+        except Exception:
+            resync_enabled = True
+        if resync_enabled and hard_map_pose is None:
+            # hard_map_pose was only fetched when the anchor was (re)created above;
+            # in steady state we must read the live TF here to compare/resync.
+            try:
+                hard_map_pose = self._get_map_base_pose2d_hard()
+            except Exception:
+                hard_map_pose = None
+        if resync_enabled and hard_map_pose is not None:
+            try:
+                tf_xy, tf_yaw = hard_map_pose
+                tf_xy = np.asarray(tf_xy, dtype=np.float32).reshape(-1)[:2]
+                tf_yaw = float(tf_yaw)
+                if tf_xy.size >= 2 and np.all(np.isfinite(tf_xy)) and math.isfinite(tf_yaw):
+                    # Distance between the integrated origin and the live TF pose.
+                    drift = math.hypot(float(out_x) - float(tf_xy[0]), float(out_y) - float(tf_xy[1]))
+                    try:
+                        resync_tol = float(os.environ.get("TB3_RL_CONFIDENCE_ANCHOR_RESYNC_TOL_M", "0.03") or 0.03)
+                    except Exception:
+                        resync_tol = 0.03
+                    if drift > max(resync_tol, 0.0):
+                        # Re-anchor onto the live TF and zero the integration base
+                        # so subsequent odom deltas accumulate from here.
+                        try:
+                            scan_yaw0 = self._get_map_scan_yaw_hard(raw_scan_msg=self.ros.scan, base_yaw=tf_yaw)
+                            new_scan_offset = self._normalize_angle(float(scan_yaw0) - float(tf_yaw))
+                        except Exception:
+                            new_scan_offset = float(anchor.get("scan_offset", 0.0))
+                        anchor["map_xy0"] = tf_xy.astype(np.float32).copy()
+                        anchor["map_yaw0"] = float(tf_yaw)
+                        anchor["motion_xy0"] = motion_xy.copy()
+                        anchor["motion_yaw0"] = float(motion_yaw)
+                        anchor["scan_offset"] = float(new_scan_offset)
+                        anchor["anchor_source"] = "map_tf_resync"
+                        self._confidence_odom_anchor = anchor
+                        # Recompute the output pose from the freshly synced anchor.
+                        out_x = float(tf_xy[0])
+                        out_y = float(tf_xy[1])
+                        out_yaw = float(tf_yaw)
+                        scan_yaw = self._normalize_angle(out_yaw + float(new_scan_offset))
+                        out_xy = np.array([out_x, out_y], dtype=np.float32)
+            except Exception:
+                pass
+
         try:
             dbg_n = int(os.environ.get("TB3_RL_CONFIDENCE_POSE_DEBUG_EVERY_N", "0"))
         except Exception:
@@ -9687,9 +10051,66 @@ class GazeboNavEnv(gym.Env):
             sxy = np.asarray(sensor_xy, dtype=np.float32).reshape(-1)[:2]
             ryaw = float(robot_yaw)
             syaw = float(sensor_yaw)
+
+            # When confidence is unified with the TF compare cube, draw the origin
+            # markers from the EXACT same value the confidence update used (which is
+            # the live TF map->base pose).  This guarantees the red sphere sits on
+            # the cube/RobotModel instead of merely near it.
+            unified_xy = getattr(self, "_confidence_unified_xy", None)
+            unified_yaw = getattr(self, "_confidence_unified_yaw", None)
+            if (
+                isinstance(unified_xy, np.ndarray)
+                and unified_xy.size >= 2
+                and np.all(np.isfinite(unified_xy[:2]))
+                and unified_yaw is not None
+                and math.isfinite(float(unified_yaw))
+            ):
+                rxy = np.asarray(unified_xy, dtype=np.float32).reshape(-1)[:2]
+                ryaw = float(unified_yaw)
+                sxy = rxy.copy()
+
             if rxy.size < 2 or sxy.size < 2:
                 return
             if not (np.all(np.isfinite(rxy)) and np.all(np.isfinite(sxy)) and math.isfinite(ryaw) and math.isfinite(syaw)):
+                return
+
+            unified_now = bool(
+                isinstance(getattr(self, "_confidence_unified_xy", None), np.ndarray)
+                and getattr(self, "_confidence_unified_xy").size >= 2
+            )
+            single_cube = self._scan_bool_env("TB3_RL_CONFIDENCE_SINGLE_CUBE_MARKER", True)
+            if unified_now and single_cube:
+                arr = MarkerArray()
+
+                # Clear old red/cyan spheres/arrows/text and old compare markers,
+                # then publish exactly one marker: the verified CUBE pose that the
+                # confidence update actually used.  Do not perform another TF lookup
+                # here; repeated lookups were the source of sphere/cube divergence
+                # and can add latency in long runs.
+                clear = Marker()
+                clear.header.frame_id = frame_id
+                clear.header.stamp = stamp
+                clear.action = Marker.DELETEALL
+                arr.markers.append(clear)
+
+                m = Marker()
+                m.header.frame_id = frame_id
+                m.header.stamp = stamp
+                m.ns = "rl_confidence_tf_compare"
+                m.id = 20
+                m.type = Marker.CUBE
+                m.action = Marker.ADD
+                m.pose.position.x = float(rxy[0])
+                m.pose.position.y = float(rxy[1])
+                m.pose.position.z = 0.62
+                m.pose.orientation.w = 1.0
+                m.scale.x = 0.26
+                m.scale.y = 0.26
+                m.scale.z = 0.26
+                self._set_marker_color(m, 0.0, 1.0, 0.0, 0.98)
+                arr.markers.append(m)
+
+                pub.publish(arr)
                 return
 
             arr = MarkerArray()
@@ -9806,11 +10227,26 @@ class GazeboNavEnv(gym.Env):
             # does not, the confidence source-frame/env selection is wrong.
             # If none of these match RobotModel, TF publishers are conflicting or
             # RViz is displaying a different domain/process.
-            compare_frames = [
-                ("base_footprint", 20, (0.0, 1.0, 0.0, 0.95), 0.24),
-                ("base_link", 21, (1.0, 0.0, 1.0, 0.95), 0.24),
-                ("base_scan", 22, (0.0, 0.75, 1.0, 0.95), 0.20),
-            ]
+            #
+            # When confidence is unified with the TF cube, the red sphere is drawn
+            # from the live TF(map->base_footprint) pose itself, so only the
+            # base_footprint cube is meaningful here (it must coincide exactly with
+            # the sphere).  The base_link/base_scan cubes are at rigid offsets and
+            # only add visual confusion in unified mode, so they are dropped.
+            unified_now = bool(
+                isinstance(getattr(self, "_confidence_unified_xy", None), np.ndarray)
+                and getattr(self, "_confidence_unified_xy").size >= 2
+            )
+            if unified_now:
+                compare_frames = [
+                    ("base_footprint", 20, (0.0, 1.0, 0.0, 0.95), 0.24),
+                ]
+            else:
+                compare_frames = [
+                    ("base_footprint", 20, (0.0, 1.0, 0.0, 0.95), 0.24),
+                    ("base_link", 21, (1.0, 0.0, 1.0, 0.95), 0.24),
+                    ("base_scan", 22, (0.0, 0.75, 1.0, 0.95), 0.20),
+                ]
             compare_text_lines = []
             for fname, mid, rgba, size in compare_frames:
                 try:
@@ -11445,22 +11881,70 @@ class GazeboNavEnv(gym.Env):
             "reason": "unknown",
             "known_ratio": 0.0,
             "known_cells": 0,
+            "outside_cells": 0,
         }
         try:
             if self.exploration_map is None:
                 metrics["reason"] = "missing_exploration_map"
                 return metrics
+            emap = self.exploration_map
+
+            # Prefer the exact pose that the confidence/priority update just used
+            # on THIS canvas.  Falling back to a freshly fetched TF pose can read
+            # a slightly different stamp/anchor than the one the canvas was locked
+            # to, which (right after a SLAM canvas grow/origin-shift) yields a
+            # negative or out-of-range index even though the robot is inside the
+            # map.  That mismatch is the root cause of both the spurious
+            # pose_outside_rl_map restart and the confidence-origin "jump".
+            conf_xy = getattr(self, "_last_confidence_update_xy", None)
+            conf_step = int(getattr(self, "_last_confidence_update_step", -10_000_000))
+            use_conf_pose = (
+                isinstance(conf_xy, np.ndarray)
+                and conf_xy.size >= 2
+                and bool(np.all(np.isfinite(conf_xy[:2])))
+                and (int(getattr(self, "step_count", 0)) - conf_step) <= 1
+            )
+
             pose = self._get_robot_pose2d(frame_id=self.pose_frame)
-            if pose is None:
+            if pose is None and not use_conf_pose:
                 metrics["reason"] = "missing_pose"
                 return metrics
-            robot_xy, _ = pose
-            emap = self.exploration_map
-            rix, riy = emap.world_to_map(float(robot_xy[0]), float(robot_xy[1]))
+
+            if use_conf_pose:
+                robot_xy = np.asarray(conf_xy[:2], dtype=np.float32)
+            else:
+                robot_xy, _ = pose
+
+            # If the exploration map already recorded the cell it painted the
+            # robot at this update, trust that index: it is guaranteed consistent
+            # with the current canvas origin/size.  Only fall back to recomputing
+            # via world_to_map when that record is missing or stale.
+            rec_ix = getattr(emap, "_last_robot_ix", None)
+            rec_iy = getattr(emap, "_last_robot_iy", None)
+            if use_conf_pose and isinstance(rec_ix, (int, np.integer)) and isinstance(rec_iy, (int, np.integer)):
+                rix, riy = int(rec_ix), int(rec_iy)
+            else:
+                rix, riy = emap.world_to_map(float(robot_xy[0]), float(robot_xy[1]))
             margin = max(int(getattr(self, "map_bounds_margin_cells", 2)), 0)
             inside = bool(emap.in_bounds(int(rix), int(riy)))
             metrics["inside"] = inside
             if not inside:
+                # Quantify how far outside the canvas the index is, in cells.
+                # A robot that is genuinely off the map is many cells out; a
+                # transient canvas/pose mismatch is typically only a few cells
+                # past an edge (often a small negative index).  The restart logic
+                # uses this to avoid killing the episode on a brief mismatch.
+                ox = 0
+                oy = 0
+                if int(rix) < 0:
+                    ox = -int(rix)
+                elif int(rix) >= int(emap.width):
+                    ox = int(rix) - int(emap.width) + 1
+                if int(riy) < 0:
+                    oy = -int(riy)
+                elif int(riy) >= int(emap.height):
+                    oy = int(riy) - int(emap.height) + 1
+                metrics["outside_cells"] = int(max(ox, oy))
                 metrics["reason"] = f"pose_outside_rl_map:ix={int(rix)},iy={int(riy)},size={int(emap.width)}x{int(emap.height)}"
                 return metrics
 
@@ -11514,12 +11998,28 @@ class GazeboNavEnv(gym.Env):
         reason = str(metrics.get("reason", "unknown"))
         known_ratio = float(metrics.get("known_ratio", 0.0))
         known_cells = int(metrics.get("known_cells", 0))
+        outside_cells = int(metrics.get("outside_cells", 0))
         self._last_map_bounds_reason = reason
         self._last_map_bounds_local_known_ratio = known_ratio
         self._last_map_bounds_local_known_cells = known_cells
 
-        hard_bad = reason.startswith("pose_outside_rl_map") or reason in {"missing_pose", "empty_local_crop", "near_rl_map_edge"}
-        soft_bad = reason in {"local_known_cells_low", "local_known_ratio_low"}
+        # How many cells past an edge still counts as a transient canvas/pose
+        # mismatch rather than the robot truly leaving the map.  A brief mismatch
+        # right after a SLAM /map grow/origin-shift is only a few cells out and
+        # must NOT instantly end the episode; it recovers within a step or two
+        # once confidence re-locks to the new canvas.
+        transient_outside_tol = max(int(getattr(self, "map_bounds_transient_outside_cells", 24)), 0)
+
+        is_outside = reason.startswith("pose_outside_rl_map")
+        transient_outside = bool(is_outside and outside_cells <= transient_outside_tol)
+        genuine_outside = bool(is_outside and not transient_outside)
+
+        # Only a clearly out-of-map pose (or a missing/empty local crop) is an
+        # immediate hard restart now.  A small out-of-range index and being near
+        # the edge are treated as soft/recoverable and must persist for the grace
+        # window before they end the episode.
+        hard_bad = genuine_outside or reason in {"missing_pose", "empty_local_crop"}
+        soft_bad = reason in {"local_known_cells_low", "local_known_ratio_low", "near_rl_map_edge"} or transient_outside
         # No target and no map delta for many steps is effectively the same
         # failure mode: the robot is training in an uninformative outside-map
         # state.  Do not wait until max_episode_steps.
@@ -11548,7 +12048,8 @@ class GazeboNavEnv(gym.Env):
             self.ros.get_logger().warn(
                 "MAP_BOUNDS_RESTART | "
                 f"reason={reason} bad={self.map_bounds_bad_steps}/{grace} "
-                f"known={known_cells} ratio={known_ratio:.3f}"
+                f"known={known_cells} ratio={known_ratio:.3f} "
+                f"outside_cells={outside_cells} transient_tol={transient_outside_tol}"
             )
         return restart
 
@@ -11601,6 +12102,21 @@ class GazeboNavEnv(gym.Env):
         if pose_pack is None:
             return self.last_map_stats
         robot_xy, robot_yaw, sensor_xy, sensor_yaw, confidence_pose_mode = pose_pack
+
+        # Record the exact base pose that confidence/priority were painted at.
+        # The map-bounds restart check must evaluate the robot against the SAME
+        # pose source and the SAME canvas that confidence used; otherwise a
+        # transient mismatch between this pose and a separately-fetched TF pose
+        # (especially right after the SLAM /map canvas grows or its origin shifts)
+        # maps the robot to a negative cell index (e.g. iy=-12) and triggers a
+        # spurious pose_outside_rl_map restart.  It is also what makes the
+        # /rl_confidence_origin marker appear to "jump".
+        try:
+            self._last_confidence_update_xy = np.asarray(robot_xy, dtype=np.float32).copy()
+            self._last_confidence_update_yaw = float(robot_yaw)
+            self._last_confidence_update_step = int(getattr(self, "step_count", 0))
+        except Exception:
+            pass
 
         # v108 diagnostic: show the exact pose/yaw used by confidence in RViz.
         # Compare /rl_confidence_origin against RobotModel in Fixed Frame=map.
@@ -12099,6 +12615,9 @@ class GazeboNavEnv(gym.Env):
             "velocity_safety_backup_triggered": bool(getattr(self, "_last_velocity_safety_backup_triggered", False)),
             "velocity_safety_blocked": bool(getattr(self, "_last_velocity_safety_blocked", False)),
             "velocity_safety_slowdown": float(getattr(self, "_last_velocity_safety_slowdown", 1.0)),
+            "velocity_safety_slowdown_risk": float(getattr(self, "_last_velocity_safety_slowdown_risk", 0.0)),
+            "velocity_safety_policy_v": float(getattr(self, "_last_velocity_safety_policy_v", 0.0)),
+            "velocity_safety_executed_v": float(getattr(self, "_last_velocity_safety_executed_v", 0.0)),
             "velocity_safety_penalty": float(getattr(self, "_last_velocity_safety_penalty", 0.0)),
             "velocity_safety_reason": str(getattr(self, "_last_velocity_safety_reason", "none")),
             "velocity_safety_cooldown_steps": int(getattr(self, "velocity_safety_cooldown_steps", 0)),

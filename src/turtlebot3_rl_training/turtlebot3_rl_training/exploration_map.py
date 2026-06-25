@@ -805,17 +805,27 @@ class ExplorationGridMap:
         # rebuilds per second at 10Hz live-map update.
         occlusion_struct = self._structural_grid()
         occlusion_threshold = self._slam_occupied_threshold()
+        # Keep the raw (non-inflated) occupancy so close-range rays can be tested
+        # against real walls only.  Without this, the robot's own inflation halo
+        # truncates every confidence/priority ray at the first step whenever the
+        # robot is within the inflation radius of a wall (tight corridors, corners,
+        # reset noise), which is the "confidence stops updating" failure.
+        raw_occlusion_struct = occlusion_struct
+        occlusion_inflate_radius = 2
         # Use an inflated SLAM wall as the ray barrier.  A single-cell /map wall
         # can otherwise be bypassed by diagonal Bresenham rays and the auxiliary
         # confidence/priority layers look like they are going through the wall.
         try:
             _occ = occlusion_struct >= occlusion_threshold
-            _inflated = self._dilate_bool(_occ, radius=2)
+            _inflated = self._dilate_bool(_occ, radius=occlusion_inflate_radius)
             if np.any(_inflated):
                 occlusion_struct = np.asarray(occlusion_struct, dtype=np.int16).copy()
                 occlusion_struct[_inflated] = max(int(occlusion_threshold) + 20, 100)
         except Exception:
             pass
+        # Allow rays to pass the synthetic inflation halo for a few cells around
+        # the robot (radius + 1), but never past a real wall.
+        occlusion_near_skip_cells = int(occlusion_inflate_radius) + 1
 
         for i in range(0, ranges.size, self.lidar_stride):
             rel_angle = _confidence_rel_angle_for_index(i)
@@ -869,9 +879,10 @@ class ExplorationGridMap:
                     lidar_hit_wall_mask = _remap_update_mask(lidar_hit_wall_mask, old_ox, old_oy, old_w, old_h, False, bool)
                     occlusion_struct = self._structural_grid()
                     occlusion_threshold = self._slam_occupied_threshold()
+                    raw_occlusion_struct = occlusion_struct
                     try:
                         _occ = occlusion_struct >= occlusion_threshold
-                        _inflated = self._dilate_bool(_occ, radius=2)
+                        _inflated = self._dilate_bool(_occ, radius=occlusion_inflate_radius)
                         if np.any(_inflated):
                             occlusion_struct = np.asarray(occlusion_struct, dtype=np.int16).copy()
                             occlusion_struct[_inflated] = max(int(occlusion_threshold) + 20, 100)
@@ -897,6 +908,8 @@ class ExplorationGridMap:
                 include_blocking_cell=True,
                 struct=occlusion_struct,
                 occupied_threshold=occlusion_threshold,
+                near_skip_cells=occlusion_near_skip_cells,
+                raw_struct=raw_occlusion_struct,
             )
             if not visible_cells:
                 continue
@@ -2607,6 +2620,8 @@ class ExplorationGridMap:
         include_blocking_cell: bool = True,
         struct: Optional[np.ndarray] = None,
         occupied_threshold: Optional[float] = None,
+        near_skip_cells: int = 0,
+        raw_struct: Optional[np.ndarray] = None,
     ) -> tuple[list[tuple[int, int]], bool]:
         """
         Cut a ray at the first occupied SLAM /map cell.
@@ -2618,6 +2633,21 @@ class ExplorationGridMap:
 
         This prevents both confidence increase and priority checked(-1) updates from
         leaking into rooms/empty space behind a wall.
+
+        near_skip_cells / raw_struct:
+          ``struct`` is normally the *inflated* SLAM wall mask (occupied cells are
+          dilated by a few cells so a single-cell wall cannot be bypassed by a
+          diagonal Bresenham ray).  When the robot stands within the inflation
+          radius of a wall, the cell immediately after the ray origin becomes an
+          *inflated* (synthetic) wall, which truncates every ray at idx==1 and
+          stops confidence/priority from ever being painted in tight corridors,
+          corners, or near reset noise.
+
+          To fix this without letting rays leak through real walls, the first
+          ``near_skip_cells`` cells after the ray origin are tested against the
+          *raw* (non-inflated) occupancy ``raw_struct`` instead of the inflated
+          ``struct``.  Real SLAM walls still block immediately; only the synthetic
+          inflation halo around the robot is ignored at close range.
         """
         if not cells:
             return [], False
@@ -2625,6 +2655,8 @@ class ExplorationGridMap:
         if struct is None:
             struct = self._structural_grid()
         occ_thr = self._slam_occupied_threshold() if occupied_threshold is None else float(occupied_threshold)
+        near_skip_cells = max(int(near_skip_cells), 0)
+        use_near_skip = near_skip_cells > 0 and isinstance(raw_struct, np.ndarray) and raw_struct.shape == struct.shape
 
         visible: list[tuple[int, int]] = []
         width = int(self.width)
@@ -2637,10 +2669,17 @@ class ExplorationGridMap:
 
             # The robot's own cell can be occupied/noisy in SLAM after reset; do not
             # let it occlude the ray.
-            if idx > 0 and self._is_occupied_in_structural_grid(struct, occ_thr, cx_i, cy_i):
-                if include_blocking_cell:
-                    visible.append((cx_i, cy_i))
-                return visible, True
+            if idx > 0:
+                # Within the near zone, test against the raw (non-inflated) wall so
+                # the robot's own inflation halo does not block close-range rays.
+                if use_near_skip and idx <= near_skip_cells:
+                    occluded = self._is_occupied_in_structural_grid(raw_struct, occ_thr, cx_i, cy_i)
+                else:
+                    occluded = self._is_occupied_in_structural_grid(struct, occ_thr, cx_i, cy_i)
+                if occluded:
+                    if include_blocking_cell:
+                        visible.append((cx_i, cy_i))
+                    return visible, True
 
             visible.append((cx_i, cy_i))
 
