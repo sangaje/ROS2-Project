@@ -710,6 +710,10 @@ def parse_args():
     parser.add_argument("--velocity-safety-slow-penalty", type=float, default=1.80)
     parser.add_argument("--velocity-safety-slow-speed-power", type=float, default=1.35)
     parser.add_argument("--velocity-safety-slow-danger-power", type=float, default=1.10)
+    parser.add_argument("--velocity-safety-terminal", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--velocity-safety-terminal-distance-m", type=float, default=0.0)
+    parser.add_argument("--velocity-safety-terminal-penalty", type=float, default=40.0)
+    parser.add_argument("--velocity-safety-terminal-forward-min", type=float, default=0.03)
     parser.add_argument("--velocity-forward-assist-mps", type=float, default=0.0)
     parser.add_argument("--velocity-forward-assist-angular-threshold", type=float, default=0.20)
     parser.add_argument("--velocity-forward-assist-min-clearance-m", type=float, default=0.45)
@@ -1097,6 +1101,10 @@ def main(args=None):
         velocity_safety_slow_penalty=cli_args.velocity_safety_slow_penalty,
         velocity_safety_slow_speed_power=cli_args.velocity_safety_slow_speed_power,
         velocity_safety_slow_danger_power=cli_args.velocity_safety_slow_danger_power,
+        velocity_safety_terminal=cli_args.velocity_safety_terminal,
+        velocity_safety_terminal_distance_m=cli_args.velocity_safety_terminal_distance_m,
+        velocity_safety_terminal_penalty=cli_args.velocity_safety_terminal_penalty,
+        velocity_safety_terminal_forward_min=cli_args.velocity_safety_terminal_forward_min,
         velocity_forward_assist_mps=cli_args.velocity_forward_assist_mps,
         velocity_forward_assist_angular_threshold=cli_args.velocity_forward_assist_angular_threshold,
         velocity_forward_assist_min_clearance_m=cli_args.velocity_forward_assist_min_clearance_m,

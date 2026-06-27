@@ -25,11 +25,12 @@ def generate_launch_description():
     gui = LaunchConfiguration("gui")
     verbose = LaunchConfiguration("verbose")
 
-    world = os.path.join(
-        rl_training_share,
-        "worlds",
-        "fast_turtlebot3_world.world",
+    # 소스 경로와 설치 경로 모두 지원
+    _src_world = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "world", "fast_empty.sdf")
     )
+    _inst_world = os.path.join(rl_training_share, "world", "fast_empty.sdf")
+    world = _inst_world if os.path.exists(_inst_world) else _src_world
 
     declare_use_sim_time = DeclareLaunchArgument(
         "use_sim_time",
@@ -38,12 +39,12 @@ def generate_launch_description():
 
     declare_x_pose = DeclareLaunchArgument(
         "x_pose",
-        default_value="-2.0",
+        default_value="-2.80",
     )
 
     declare_y_pose = DeclareLaunchArgument(
         "y_pose",
-        default_value="-0.5",
+        default_value="0.96",
     )
 
     declare_gui = DeclareLaunchArgument(

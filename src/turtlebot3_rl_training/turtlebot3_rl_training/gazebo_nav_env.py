@@ -419,6 +419,10 @@ class GazeboNavEnv(gym.Env):
         velocity_safety_slow_penalty: float = 1.80,
         velocity_safety_slow_speed_power: float = 1.35,
         velocity_safety_slow_danger_power: float = 1.10,
+        velocity_safety_terminal: bool = False,
+        velocity_safety_terminal_distance_m: float = 0.0,
+        velocity_safety_terminal_penalty: float = 40.0,
+        velocity_safety_terminal_forward_min: float = 0.03,
         velocity_forward_assist_mps: float = 0.0,
         velocity_forward_assist_angular_threshold: float = 0.20,
         velocity_forward_assist_min_clearance_m: float = 0.45,
@@ -1745,6 +1749,16 @@ class GazeboNavEnv(gym.Env):
         self.velocity_safety_slow_penalty = max(float(velocity_safety_slow_penalty), 0.0)
         self.velocity_safety_slow_speed_power = max(float(velocity_safety_slow_speed_power), 0.10)
         self.velocity_safety_slow_danger_power = max(float(velocity_safety_slow_danger_power), 0.10)
+        # v130: training-time terminal for unsafe forward commands.
+        # This is separate from the physical backup shield and keeps replay causal:
+        # unsafe policy action -> terminal penalty, without forced reverse motion.
+        self.velocity_safety_terminal = bool(velocity_safety_terminal)
+        self.velocity_safety_terminal_distance_m = max(float(velocity_safety_terminal_distance_m), 0.0)
+        self.velocity_safety_terminal_penalty = max(float(velocity_safety_terminal_penalty), 0.0)
+        self.velocity_safety_terminal_forward_min = max(float(velocity_safety_terminal_forward_min), 0.0)
+        self._last_velocity_safety_terminal_triggered = False
+        self._last_velocity_safety_terminal_distance = 999.0
+        self._last_velocity_safety_terminal_threshold = 0.0
         self.velocity_safety_cooldown_steps = 0
         # Sticky reverse escape lock.  When the safety shield starts a backup,
         # the following Gym steps ignore the policy action and continue the
@@ -1765,6 +1779,9 @@ class GazeboNavEnv(gym.Env):
         self._last_velocity_safety_executed_v = 0.0
         self._last_velocity_safety_penalty = 0.0
         self._last_velocity_safety_reason = "none"
+        self._last_velocity_safety_terminal_triggered = False
+        self._last_velocity_safety_terminal_distance = 999.0
+        self._last_velocity_safety_terminal_threshold = 0.0
 
         self.shake_restart = bool(shake_restart)
         self.shake_restart_steps_limit = max(int(shake_restart_steps), 1)
@@ -3091,8 +3108,44 @@ class GazeboNavEnv(gym.Env):
         self._last_velocity_safety_slowdown_risk = 0.0
         self._last_velocity_safety_policy_v = 0.0
         self._last_velocity_safety_executed_v = 0.0
+        self._last_velocity_safety_policy_w = 0.0
+        self._last_velocity_safety_executed_w = 0.0
         self._last_velocity_safety_penalty = 0.0
         self._last_velocity_safety_reason = "none"
+        self._last_velocity_safety_terminal_triggered = False
+        self._last_velocity_safety_terminal_distance = 999.0
+        self._last_velocity_safety_terminal_threshold = 0.0
+        # v131 sensor freshness (reset per episode)
+        self._last_scan_age_sec = -1.0
+        self._last_scan_stamp_sec = -1.0
+        self._last_odom_age_sec = -1.0
+        self._last_obs_stale = False
+        self._last_scan_stale = False
+        self._last_map_stale = False
+        self._last_tf_pose_ok = False
+        self._last_confidence_pose_ok = False
+        self._last_confidence_update_called = False
+        self._last_confidence_pose_source_v131 = "none"
+        self._last_confidence_update_reason_if_zero = "none"
+        self._last_policy_scan_front = 999.0
+        self._last_policy_scan_left = 999.0
+        self._last_policy_scan_rear = 999.0
+        self._last_policy_scan_right = 999.0
+        self._last_raw_scan_front = 999.0
+        self._last_raw_scan_left = 999.0
+        self._last_raw_scan_rear = 999.0
+        self._last_raw_scan_right = 999.0
+        self._last_lidar60_stamp_delta_sec = 0.0
+        self._last_lidar60_raw_stamp_sec = -1.0
+        self._last_r_confidence = 0.0
+        self._last_r_slam = 0.0
+        self._last_r_priority = 0.0
+        self._last_r_wall = 0.0
+        self._last_r_safety_slow = 0.0
+        self._last_r_safety_terminal = 0.0
+        self._last_r_collision = 0.0
+        self._last_r_step = 0.0
+        self._last_reward_total = 0.0
         self.shake_steps = 0
         self._last_shake_active = False
         self._last_shake_restart = False
@@ -4029,6 +4082,7 @@ class GazeboNavEnv(gym.Env):
         coverage_done = map_stats.coverage_ratio >= self.target_coverage_ratio
         priority_stuck_restart = self._update_priority_stuck_restart_state(map_stats)
         lidar_empty_restart = self._update_lidar_empty_restart_state()
+        velocity_safety_terminal = bool(getattr(self, "_last_velocity_safety_terminal_triggered", False))
         coverage_stall_terminal = False
 
         self._last_terminal_reason = "none"
@@ -4092,6 +4146,14 @@ class GazeboNavEnv(gym.Env):
                 pass
             try:
                 self._clear_nav2_costmaps()
+            except Exception:
+                pass
+            self.ros.stop_robot()
+        elif velocity_safety_terminal:
+            self._last_terminal_reason = "velocity_safety_terminal"
+            self._last_collision_restart_requested = True
+            try:
+                self._cancel_nav2_goal_sync(reason="velocity_safety_terminal")
             except Exception:
                 pass
             self.ros.stop_robot()
@@ -4189,7 +4251,7 @@ class GazeboNavEnv(gym.Env):
         # delayed SLAM map update has been merged into reward_map_stats, so the
         # decision sees both SLAM growth and confidence growth for the action
         # that just executed.
-        if not bool(collision_like or fallen or coverage_done or priority_stuck_restart or lidar_empty_restart):
+        if not bool(collision_like or fallen or coverage_done or priority_stuck_restart or lidar_empty_restart or velocity_safety_terminal):
             coverage_stall_terminal = self._update_coverage_stall_terminal_state(reward_map_stats)
             if coverage_stall_terminal:
                 reward += float(getattr(self, "coverage_stall_terminal_penalty", -1.0))
@@ -4264,7 +4326,7 @@ class GazeboNavEnv(gym.Env):
         # an additional negative reward.  This keeps long but safe exploration runs
         # from being punished only because the episode horizon expired.
         will_truncate = bool((self.step_count + 1) >= self.max_episode_steps)
-        if will_truncate and not (collision_like or fallen or coverage_done or coverage_stall_terminal or priority_stuck_restart or lidar_empty_restart):
+        if will_truncate and not (collision_like or fallen or coverage_done or coverage_stall_terminal or priority_stuck_restart or lidar_empty_restart or velocity_safety_terminal):
             if self._last_terminal_reason == "none":
                 self._last_terminal_reason = "time_limit"
 
@@ -4282,6 +4344,27 @@ class GazeboNavEnv(gym.Env):
         reward = float(reward)
         self._last_step_reward = reward
         self._episode_reward_sum += reward
+        # v131: reward breakdown cache (approximate, based on dominant components)
+        try:
+            _r_conf = float(reward_map_stats.confidence_gain) * float(getattr(self, "confidence_reward_weight", 1.0))
+            _r_slam = float(getattr(self, "_last_slam_map_update_reward", 0.0))
+            _r_prio = float(getattr(self, "_last_priority_check_reward", 0.0))
+            _r_wall = -float(reward_map_stats.obstacle_proximity_score) if not self.disable_wall_proximity_penalty else 0.0
+            _r_safe_slow = -float(getattr(self, "_last_velocity_safety_penalty", 0.0)) if not bool(getattr(self, "_last_velocity_safety_terminal_triggered", False)) else 0.0
+            _r_safe_term = -float(getattr(self, "velocity_safety_terminal_penalty", 0.0)) if bool(getattr(self, "_last_velocity_safety_terminal_triggered", False)) else 0.0
+            _r_coll = -100.0 if collision_like else 0.0
+            _r_step = -0.01
+            self._last_r_confidence = float(_r_conf)
+            self._last_r_slam = float(_r_slam)
+            self._last_r_priority = float(_r_prio)
+            self._last_r_wall = float(_r_wall)
+            self._last_r_safety_slow = float(_r_safe_slow)
+            self._last_r_safety_terminal = float(_r_safe_term)
+            self._last_r_collision = float(_r_coll)
+            self._last_r_step = float(_r_step)
+            self._last_reward_total = reward
+        except Exception:
+            self._last_reward_total = reward
 
         # v112: use a live/recent discounted return for RViz/debug G.
         # Old code used: G += gamma**step * r, which becomes visually flat in
@@ -4338,7 +4421,7 @@ class GazeboNavEnv(gym.Env):
 
         # collision/fallen/drop are hard terminals.  restart_on_collision is kept
         # only for backward-compatible logging/config, not for suppressing reset.
-        terminated = bool(collision or out_of_bounds or fallen or shake_restart or coverage_done or coverage_stall_terminal or priority_stuck_restart or lidar_empty_restart)
+        terminated = bool(collision or out_of_bounds or fallen or shake_restart or coverage_done or coverage_stall_terminal or priority_stuck_restart or lidar_empty_restart or velocity_safety_terminal)
         truncated = bool(self.step_count >= self.max_episode_steps)
         if truncated and self._last_terminal_reason == "none":
             self._last_terminal_reason = "time_limit"
@@ -4610,16 +4693,23 @@ class GazeboNavEnv(gym.Env):
             f"rear0={float(rear_min):.3f},rear={float(rear_during_backup):.3f},"
             f"sync_steps={int(steps_done)}/{int(backup_steps_cfg)}"
         )
-        self.ros.get_logger().warn(
-            f"{log_label} | "
-            f"front0={float(front_min):.3f}m front1={float(front_after_backup):.3f}m "
-            f"rear0={float(rear_min):.3f}m rear={float(rear_during_backup):.3f}m "
-            f"sync_steps={int(steps_done)}/{int(backup_steps_cfg)} "
-            f"cmd_last=({float(cmd[0]):+.3f},{float(cmd[1]):+.3f}) "
-            f"rear_stop={float(rear_stop_dist):.3f} "
-            f"penalty={float(self._last_velocity_safety_penalty):.2f} "
-            f"actor_forward_skipped_during_backup=1"
-        )
+        # Safety backup is expected during early SAC exploration.  Keep the
+        # transition information in info/reward bookkeeping, but do not spam the
+        # ROS logger during long training unless explicitly requested.
+        quiet_safety_logs = str(
+            os.environ.get("TB3_RL_QUIET_VELOCITY_SAFETY_LOGS", "1")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if not quiet_safety_logs:
+            self.ros.get_logger().warn(
+                f"{log_label} | "
+                f"front0={float(front_min):.3f}m front1={float(front_after_backup):.3f}m "
+                f"rear0={float(rear_min):.3f}m rear={float(rear_during_backup):.3f}m "
+                f"sync_steps={int(steps_done)}/{int(backup_steps_cfg)} "
+                f"cmd_last=({float(cmd[0]):+.3f},{float(cmd[1]):+.3f}) "
+                f"rear_stop={float(rear_stop_dist):.3f} "
+                f"penalty={float(self._last_velocity_safety_penalty):.2f} "
+                f"actor_forward_skipped_during_backup=1"
+            )
         return (
             cmd.astype(np.float32),
             float(lidar_action_obstacle_distance),
@@ -4658,8 +4748,13 @@ class GazeboNavEnv(gym.Env):
         self._last_velocity_safety_slowdown_risk = 0.0
         self._last_velocity_safety_policy_v = float(action[0]) if action.size > 0 else 0.0
         self._last_velocity_safety_executed_v = float(action[0]) if action.size > 0 else 0.0
+        self._last_velocity_safety_policy_w = float(action[1]) if action.size > 1 else 0.0
+        self._last_velocity_safety_executed_w = float(action[1]) if action.size > 1 else 0.0
         self._last_velocity_safety_penalty = 0.0
         self._last_velocity_safety_reason = "none"
+        self._last_velocity_safety_terminal_triggered = False
+        self._last_velocity_safety_terminal_distance = 999.0
+        self._last_velocity_safety_terminal_threshold = 0.0
         self._last_velocity_safety_sync_steps = 0
         self._last_velocity_forward_assist = False
         self._last_velocity_spin_breaker = False
@@ -4843,6 +4938,54 @@ class GazeboNavEnv(gym.Env):
             )
         )
 
+        # v130: training-time safety terminal.  When enabled, stop-band entry is
+        # treated as a policy-caused terminal violation instead of a forced backup.
+        # Soft slowdown still only scales v; w is not reduced by the soft layer.
+        terminal_distance_cfg = float(getattr(self, "velocity_safety_terminal_distance_m", 0.0))
+        terminal_dist = terminal_distance_cfg if terminal_distance_cfg > 1e-6 else float(stop_dist)
+        terminal_forward_min = max(
+            float(getattr(self, "velocity_safety_terminal_forward_min", 0.03)),
+            float(forward_backup_min),
+        )
+        safety_terminal_condition = bool(
+            bool(getattr(self, "velocity_safety_terminal", False))
+            and float(forward) > float(terminal_forward_min)
+            and (
+                float(safety_front_min) < float(terminal_dist)
+                or float(safety_action_obstacle_distance) < float(terminal_dist)
+            )
+        )
+        if safety_terminal_condition:
+            terminal_ref = min(float(safety_front_min), float(safety_action_obstacle_distance))
+            self._last_velocity_safety_terminal_triggered = True
+            self._last_velocity_safety_terminal_distance = float(terminal_ref)
+            self._last_velocity_safety_terminal_threshold = float(terminal_dist)
+            self._last_velocity_safety_blocked = True
+            self._last_velocity_safety_skip_store = False
+            self._last_velocity_safety_slowdown = 0.0
+            self._last_velocity_safety_executed_v = 0.0
+            self._last_velocity_safety_penalty = max(
+                float(getattr(self, "_last_velocity_safety_penalty", 0.0)),
+                float(getattr(self, "velocity_safety_terminal_penalty", 40.0)),
+            )
+            self._last_velocity_safety_reason = (
+                f"safety_terminal:dist={terminal_ref:.3f},threshold={terminal_dist:.3f},"
+                f"front_scan={safety_front_min:.3f},action_scan={safety_action_obstacle_distance:.3f},"
+                f"v_policy={float(action[0]) if action.size > 0 else 0.0:.3f},"
+                f"penalty={float(self._last_velocity_safety_penalty):.2f}"
+            )
+            cmd[0] = 0.0
+            cmd[1] = 0.0
+            self.ros.publish_cmd_vel(0.0, 0.0)
+            self.ros.spin_steps(num_spins=2, timeout_sec=0.001)
+            self._advance_world_after_command(target_delta_sec=self.control_dt)
+            return (
+                cmd.astype(np.float32),
+                float(lidar_action_obstacle_distance),
+                float(lidar_action_obstacle_score),
+                float(lidar_front_obstacle_distance),
+            )
+
         if hard_backup_condition and bool(getattr(self, "velocity_safety_backup", True)) and rear_ok and not cooldown_active:
             return self._execute_velocity_safety_backup_sequence(
                 front_min=float(safety_front_min),
@@ -5009,6 +5152,7 @@ class GazeboNavEnv(gym.Env):
                 )
 
         self._last_velocity_safety_executed_v = float(cmd[0])
+        self._last_velocity_safety_executed_w = float(cmd[1])
         self.ros.publish_cmd_vel(float(cmd[0]), float(cmd[1]))
         self.ros.spin_steps(num_spins=5, timeout_sec=0.001)
         self._advance_world_after_command(target_delta_sec=self.control_dt)
@@ -10690,6 +10834,32 @@ class GazeboNavEnv(gym.Env):
                 pass
 
     def _publish_policy_scan(self, vector_obs: np.ndarray, raw_scan_msg) -> None:
+        # v131: cache front/left/rear/right policy scan values from the actual obs
+        # vector regardless of publish throttle (source of truth is obs vector, not topic).
+        try:
+            num_bins_c = max(int(self.num_lidar_bins), 1)
+            min_range_c = 0.12
+            max_range_c = 3.5
+            norm_c = np.asarray(vector_obs[:num_bins_c], dtype=np.float32)
+            norm_c = np.nan_to_num(norm_c, nan=1.0, posinf=1.0, neginf=0.0)
+            ranges_c = float(max_range_c - min_range_c) * np.clip(norm_c, 0.0, 1.0) + min_range_c
+            front_idx = self._policy_scan_front_index()
+            n4 = num_bins_c
+            self._last_policy_scan_front = float(ranges_c[int(front_idx) % n4])
+            self._last_policy_scan_left = float(ranges_c[int(front_idx + n4 // 4) % n4])
+            self._last_policy_scan_rear = float(ranges_c[int(front_idx + n4 // 2) % n4])
+            self._last_policy_scan_right = float(ranges_c[int(front_idx + 3 * n4 // 4) % n4])
+            # Stamp delta: raw scan stamp vs the cached obs-build wall time
+            raw_header_c = getattr(raw_scan_msg, "header", None)
+            raw_stamp_c = getattr(raw_header_c, "stamp", None) if raw_header_c is not None else None
+            if raw_stamp_c is not None:
+                raw_sec_c = float(getattr(raw_stamp_c, "sec", 0)) + float(getattr(raw_stamp_c, "nanosec", 0)) * 1e-9
+                self._last_lidar60_raw_stamp_sec = raw_sec_c
+                now_c = time.time()
+                self._last_lidar60_stamp_delta_sec = float(now_c - raw_sec_c)
+        except Exception:
+            pass
+
         if self.policy_scan_pub is None and self.policy_scan_60_pub is None:
             return
         if self.step_count % self.policy_scan_publish_every_n != 0:
@@ -10730,7 +10900,68 @@ class GazeboNavEnv(gym.Env):
 
     def _get_obs(self):
         if self.ros.scan is None or self.ros.odom is None:
+            self._last_obs_stale = True
+            self._last_scan_stale = True
             return self._empty_observation()
+
+        # v131: track sensor freshness
+        now_wall = time.time()
+        last_scan_wall = getattr(self.ros, "last_scan_time", None)
+        last_odom_wall = getattr(self.ros, "last_odom_time", None)
+        scan_age = float(now_wall - float(last_scan_wall)) if last_scan_wall is not None else -1.0
+        odom_age = float(now_wall - float(last_odom_wall)) if last_odom_wall is not None else -1.0
+        self._last_scan_age_sec = scan_age
+        self._last_odom_age_sec = odom_age
+        try:
+            raw_stamp = getattr(self.ros.scan.header, "stamp", None)
+            if raw_stamp is not None:
+                self._last_scan_stamp_sec = float(getattr(raw_stamp, "sec", 0)) + float(getattr(raw_stamp, "nanosec", 0)) * 1e-9
+        except Exception:
+            pass
+
+        # v131: max scan age guard (TB3_RL_MAX_SCAN_AGE_SEC, default 0.35)
+        try:
+            max_scan_age = float(os.environ.get("TB3_RL_MAX_SCAN_AGE_SEC", "0.35"))
+        except Exception:
+            max_scan_age = 0.35
+        scan_stale = bool(scan_age > max_scan_age and max_scan_age > 0.0 and scan_age >= 0.0)
+        self._last_scan_stale = scan_stale
+        self._last_obs_stale = scan_stale
+        if scan_stale:
+            # Do not crash; build obs from stale data but mark it in info
+            pass
+
+        # v131: cache raw scan sector values (bin0=front, independent of publish throttle)
+        try:
+            scan_msg_raw = self.ros.scan
+            _r_raw = np.asarray(getattr(scan_msg_raw, "ranges", []) or [], dtype=np.float32)
+            _angle_min_raw = float(getattr(scan_msg_raw, "angle_min", 0.0) or 0.0)
+            _angle_inc_raw = float(getattr(scan_msg_raw, "angle_increment", 0.0) or 0.0)
+            if _r_raw.size > 0 and _angle_inc_raw > 0.0:
+                _angles_raw = _angle_min_raw + np.arange(_r_raw.size, dtype=np.float32) * _angle_inc_raw
+                _range_min_r = float(getattr(scan_msg_raw, "range_min", 0.12) or 0.12)
+                _range_max_r = float(getattr(scan_msg_raw, "range_max", 3.5) or 3.5)
+                _r_raw = np.clip(np.where(np.isfinite(_r_raw), _r_raw, _range_max_r), _range_min_r, _range_max_r)
+
+                def _sector_min(center_rad, half_rad):
+                    diff = np.abs(np.arctan2(np.sin(_angles_raw - center_rad), np.cos(_angles_raw - center_rad)))
+                    mask = diff <= half_rad
+                    return float(np.min(_r_raw[mask])) if np.any(mask) else 999.0
+
+                hw = math.radians(30.0)
+                self._last_raw_scan_front = _sector_min(0.0, hw)
+                self._last_raw_scan_left = _sector_min(math.pi / 2.0, hw)
+                self._last_raw_scan_rear = _sector_min(math.pi, hw)
+                self._last_raw_scan_right = _sector_min(-math.pi / 2.0, hw)
+        except Exception:
+            pass
+
+        # v131: TF pose availability
+        try:
+            _pose_check = self._get_robot_pose2d()
+            self._last_tf_pose_ok = _pose_check is not None
+        except Exception:
+            self._last_tf_pose_ok = False
 
         stats = self.last_map_stats
 
@@ -12506,6 +12737,11 @@ class GazeboNavEnv(gym.Env):
             "low_confidence_ratio": float(map_stats.low_confidence_ratio),
             "stale_refresh_cells": int(map_stats.stale_refresh_cells),
             "confidence_gain": float(map_stats.confidence_gain),
+            "confidence_observed_cells": int(getattr(map_stats, "confidence_observed_cells", 0)),
+            "confidence_updated_cells": int(getattr(map_stats, "confidence_updated_cells", 0)),
+            "last_confidence_observed_cells": int(getattr(getattr(self, "exploration_map", None), "_last_confidence_observed_cells", 0)),
+            "last_confidence_updated_cells": int(getattr(getattr(self, "exploration_map", None), "_last_confidence_updated_cells", 0)),
+            "last_confidence_gain_cells": float(getattr(getattr(self, "exploration_map", None), "_last_confidence_gain_cells", 0.0)),
             "target_priority": float(map_stats.target_priority),
             "target_type": str(map_stats.target_type),
             "target_switched": bool(map_stats.target_switched),
@@ -12613,6 +12849,10 @@ class GazeboNavEnv(gym.Env):
             "lidar_action_obstacle_score": float(getattr(self, "_last_lidar_action_obstacle_score", 0.0)),
             "lidar_front_obstacle_distance": float(getattr(self, "_last_lidar_front_obstacle_distance", 999.0)),
             "velocity_safety_backup_triggered": bool(getattr(self, "_last_velocity_safety_backup_triggered", False)),
+            "velocity_safety_terminal_triggered": bool(getattr(self, "_last_velocity_safety_terminal_triggered", False)),
+            "velocity_safety_terminal_distance": float(getattr(self, "_last_velocity_safety_terminal_distance", 999.0)),
+            "velocity_safety_terminal_threshold": float(getattr(self, "_last_velocity_safety_terminal_threshold", 0.0)),
+            "velocity_safety_terminal_penalty": float(getattr(self, "velocity_safety_terminal_penalty", 0.0)),
             "velocity_safety_blocked": bool(getattr(self, "_last_velocity_safety_blocked", False)),
             "velocity_safety_slowdown": float(getattr(self, "_last_velocity_safety_slowdown", 1.0)),
             "velocity_safety_slowdown_risk": float(getattr(self, "_last_velocity_safety_slowdown_risk", 0.0)),
@@ -12693,9 +12933,49 @@ class GazeboNavEnv(gym.Env):
             # not learn from forced-recovery motion that the policy did not choose.
             "skip_store": bool(getattr(self, "_last_velocity_safety_skip_store", False)),
             "velocity_safety_skip_store": bool(getattr(self, "_last_velocity_safety_skip_store", False)),
+            # v131: environment invariants and diagnostic fields
+            "step_index": int(self.step_count),
+            "scan_age_sec": float(getattr(self, "_last_scan_age_sec", -1.0)),
+            "scan_stamp_sec": float(getattr(self, "_last_scan_stamp_sec", -1.0)),
+            "odom_age_sec": float(getattr(self, "_last_odom_age_sec", -1.0)),
+            "map_age_sec": float(getattr(self, "_last_slam_map_age_sec", -1.0)),
+            "obs_stale": bool(getattr(self, "_last_obs_stale", False)),
+            "scan_stale": bool(getattr(self, "_last_scan_stale", False)),
+            "map_stale": bool(
+                float(getattr(self, "_last_slam_map_age_sec", 0.0)) > float(getattr(self, "slam_map_max_age_sec", 3.0))
+                if float(getattr(self, "_last_slam_map_age_sec", -1.0)) >= 0.0 else False
+            ),
+            "tf_pose_ok": bool(getattr(self, "_last_tf_pose_ok", False)),
+            "confidence_pose_ok": bool(getattr(self, "_last_confidence_pose_ok", False)),
+            "confidence_update_called": bool(getattr(self, "_last_confidence_update_called", False)),
+            "confidence_pose_source": str(getattr(self, "_last_confidence_pose_source_v131", "none")),
+            "confidence_update_reason_if_zero": str(getattr(self, "_last_confidence_update_reason_if_zero", "none")),
+            "policy_scan_front": float(getattr(self, "_last_policy_scan_front", 999.0)),
+            "policy_scan_left": float(getattr(self, "_last_policy_scan_left", 999.0)),
+            "policy_scan_rear": float(getattr(self, "_last_policy_scan_rear", 999.0)),
+            "policy_scan_right": float(getattr(self, "_last_policy_scan_right", 999.0)),
+            "raw_scan_front": float(getattr(self, "_last_raw_scan_front", 999.0)),
+            "raw_scan_left": float(getattr(self, "_last_raw_scan_left", 999.0)),
+            "raw_scan_rear": float(getattr(self, "_last_raw_scan_rear", 999.0)),
+            "raw_scan_right": float(getattr(self, "_last_raw_scan_right", 999.0)),
+            "lidar60_stamp_delta_sec": float(getattr(self, "_last_lidar60_stamp_delta_sec", 0.0)),
+            "velocity_safety_terminal": bool(getattr(self, "_last_velocity_safety_terminal_triggered", False)),
+            "velocity_safety_distance": float(getattr(self, "_last_velocity_safety_terminal_distance", 999.0)),
+            "executed_v": float(getattr(self, "_last_velocity_safety_executed_v", 0.0)),
+            "executed_w": float(getattr(self, "_last_velocity_safety_executed_w", 0.0)),
+            "policy_v": float(getattr(self, "_last_velocity_safety_policy_v", 0.0)),
+            "policy_w": float(getattr(self, "_last_velocity_safety_policy_w", 0.0)),
+            # v131: reward breakdown
+            "r_confidence": float(getattr(self, "_last_r_confidence", 0.0)),
+            "r_slam": float(getattr(self, "_last_r_slam", 0.0)),
+            "r_priority": float(getattr(self, "_last_r_priority", 0.0)),
+            "r_wall": float(getattr(self, "_last_r_wall", 0.0)),
+            "r_safety_slow": float(getattr(self, "_last_r_safety_slow", 0.0)),
+            "r_safety_terminal": float(getattr(self, "_last_r_safety_terminal", 0.0)),
+            "r_collision": float(getattr(self, "_last_r_collision", 0.0)),
+            "r_step": float(getattr(self, "_last_r_step", 0.0)),
+            "reward_total": float(getattr(self, "_last_reward_total", 0.0)),
         }
-
-        return info
 
     @staticmethod
     def _empty_map_stats() -> MapUpdateStats:

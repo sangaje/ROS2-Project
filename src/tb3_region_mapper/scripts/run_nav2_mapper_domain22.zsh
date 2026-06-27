@@ -1,0 +1,10 @@
+#!/usr/bin/env zsh
+set +e
+unsetopt ERR_EXIT 2>/dev/null || true
+unsetopt PIPE_FAIL 2>/dev/null || true
+source /opt/ros/jazzy/setup.zsh
+source install/setup.zsh
+export ROS_DOMAIN_ID=22
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+export TURTLEBOT3_MODEL=burger
+ros2 launch tb3_region_mapper sim_region_nav2_mapper.launch.py use_sim_time:=true tb3_model:=burger slam_backend:=cartographer robot_frame:=base_footprint global_frame:=map auto_start:=true

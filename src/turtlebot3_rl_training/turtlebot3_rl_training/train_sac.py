@@ -625,12 +625,16 @@ class DebugCallback(BaseCallback):
 
 class TrainingProgressCallback(BaseCallback):
     """
-    Lightweight SAC training progress reporter.
+    Quiet SAC training progress reporter.
 
-    Stable-Baselines3 already writes TensorBoard logs, but ROS/Gazebo training
-    needs a terminal-level progress line that shows whether the robot is still
-    learning or just spinning/crashing.  This callback intentionally avoids a
-    tqdm/rich dependency so it works in plain ROS terminals.
+    Modes:
+      - line : low-frequency one-line print
+      - block: low-frequency multi-line compact status block
+      - tqdm : single tqdm progress bar with compact postfix
+      - quiet: CSV/TensorBoard only, no normal terminal progress
+
+    Severe ROS/Gazebo errors still go through the normal logger.  This callback
+    deliberately records only training history and compact state metrics.
     """
 
     def __init__(
@@ -639,6 +643,8 @@ class TrainingProgressCallback(BaseCallback):
         print_freq: int = 500,
         window_size: int = 20,
         csv_path: str = "",
+        progress_style: str = "line",
+        csv_flush_every: int = 20,
         verbose: int = 0,
     ):
         super().__init__(verbose)
@@ -646,6 +652,10 @@ class TrainingProgressCallback(BaseCallback):
         self.print_freq = max(int(print_freq), 1)
         self.window_size = max(int(window_size), 1)
         self.csv_path = str(csv_path or "").strip()
+        self.progress_style = str(progress_style or "line").strip().lower()
+        if self.progress_style not in {"line", "block", "tqdm", "quiet"}:
+            self.progress_style = "line"
+        self.csv_flush_every = max(int(csv_flush_every), 1)
         self.start_wall_time = 0.0
         self.start_timesteps = 0
         self.target_timesteps = self.requested_total_timesteps
@@ -664,18 +674,44 @@ class TrainingProgressCallback(BaseCallback):
         self._last_episode_steps_per_sim_sec = float("nan")
         self._episode_index = 0
         self._csv_file = None
+        self._csv_rows_since_flush = 0
+        self._pbar = None
+        self._last_pbar_n = 0
 
     @staticmethod
     def _fmt_duration(seconds: float) -> str:
         seconds = max(float(seconds), 0.0)
         h = int(seconds // 3600)
         m = int((seconds % 3600) // 60)
-        s = int(seconds % 60)
+        sec = int(seconds % 60)
         if h > 0:
-            return f"{h:d}h{m:02d}m{s:02d}s"
+            return f"{h:d}h{m:02d}m{sec:02d}s"
         if m > 0:
-            return f"{m:d}m{s:02d}s"
-        return f"{s:d}s"
+            return f"{m:d}m{sec:02d}s"
+        return f"{sec:d}s"
+
+    def _logger_value(self, key: str, default: float = float("nan")) -> float:
+        """Best-effort read from SB3 logger without forcing a dump."""
+        try:
+            logger = getattr(self.model, "logger", None)
+            values = getattr(logger, "name_to_value", {}) if logger is not None else {}
+            if key in values:
+                return float(values[key])
+            alt = key.replace("train/", "") if key.startswith("train/") else f"train/{key}"
+            if alt in values:
+                return float(values[alt])
+        except Exception:
+            pass
+        return float(default)
+
+    @staticmethod
+    def _finite_or_blank(x: float) -> str:
+        try:
+            if math.isfinite(float(x)):
+                return f"{float(x):.6f}"
+        except Exception:
+            pass
+        return ""
 
     def _on_training_start(self) -> None:
         self.start_wall_time = time.time()
@@ -690,17 +726,42 @@ class TrainingProgressCallback(BaseCallback):
             self._csv_file = path.open("w", encoding="utf-8")
             self._csv_file.write(
                 "timesteps,progress_percent,fps,elapsed_sec,eta_sec,"
+                "actor_loss,critic_loss,ent_coef_loss,ent_coef,learning_rate,"
                 "mean_episode_reward,mean_episode_length,last_episode_wall_sec,"
                 "last_episode_sps_wall,last_episode_sim_sec,last_episode_sps_sim,"
                 "mean_episode_sps_wall,mean_episode_sps_sim,last_reward,last_done,"
-                "terminal_reason,coverage_ratio,priority_score,priority_clear_gain,"
-                "priority_step_cleared_cells,priority_step_clear_gain,"
-                "priority_live_cleared_cells,priority_live_clear_gain,"
-                "episode_priority_cleared_cells,episode_priority_clear_gain,"
-                "priority_clear_reward,priority_check_reward,episode_priority_check_reward,"
-                "priority_direction_alignment,collision,fallen,out_of_bounds\n"
+                "terminal_reason,coverage_ratio,confidence_gain,confidence_updated_cells,"
+                "confidence_observed_cells,priority_score,collision,fallen,out_of_bounds,"
+                "step_recovery,"
+                "scan_age_sec,odom_age_sec,map_age_sec,obs_stale,scan_stale,map_stale,"
+                "tf_pose_ok,confidence_pose_ok,"
+                "policy_scan_front,policy_scan_left,policy_scan_rear,policy_scan_right,"
+                "raw_scan_front,raw_scan_left,raw_scan_rear,raw_scan_right,"
+                "lidar60_stamp_delta_sec,"
+                "velocity_safety_terminal,velocity_safety_distance,"
+                "executed_v,executed_w,policy_v,policy_w,"
+                "r_confidence,r_slam,r_priority,r_wall,"
+                "r_safety_slow,r_safety_terminal,r_collision,r_step,reward_total,"
+                "safety_terminal_count_ep,collision_count_ep\n"
             )
             self._csv_file.flush()
+
+        if self.progress_style == "tqdm":
+            try:
+                from tqdm.auto import tqdm  # type: ignore
+                self._pbar = tqdm(
+                    total=self.requested_total_timesteps,
+                    initial=0,
+                    dynamic_ncols=True,
+                    smoothing=0.05,
+                    mininterval=0.5,
+                    desc="SAC",
+                    unit="step",
+                    leave=True,
+                )
+            except Exception:
+                self._pbar = None
+                self.progress_style = "line"
 
     def _on_step(self) -> bool:
         rewards = self.locals.get("rewards", [])
@@ -710,6 +771,8 @@ class TrainingProgressCallback(BaseCallback):
         reward = float(rewards[0]) if len(rewards) > 0 else 0.0
         done = bool(dones[0]) if len(dones) > 0 else False
         info = infos[0] if len(infos) > 0 else {}
+        if not isinstance(info, dict):
+            info = {}
 
         if self._current_episode_len == 0:
             self._episode_start_wall_time = time.time()
@@ -722,9 +785,13 @@ class TrainingProgressCallback(BaseCallback):
         self._current_episode_reward += reward
         self._current_episode_len += 1
 
+        # v131: per-episode safety terminal and collision counters
+        if info.get("velocity_safety_terminal", False):
+            self._current_ep_safety_terminal_count = int(getattr(self, "_current_ep_safety_terminal_count", 0)) + 1
+        if info.get("collision", False):
+            self._current_ep_collision_count = int(getattr(self, "_current_ep_collision_count", 0)) + 1
+
         if done:
-            # Monitor wrapper supplies info["episode"]. Fall back to the local
-            # accumulator if it is not present.
             episode_info = info.get("episode", {}) if isinstance(info, dict) else {}
             ep_reward = float(episode_info.get("r", self._current_episode_reward))
             ep_len = int(episode_info.get("l", self._current_episode_len))
@@ -754,11 +821,6 @@ class TrainingProgressCallback(BaseCallback):
                 self.recent_episode_steps_per_sim_sec.append(ep_sps_sim)
             self.recent_terminal_reasons.append(str(info.get("terminal_reason", "done")))
 
-            # v32: put per-episode throughput metrics into the normal
-            # Stable-Baselines3 boxed logger table instead of printing a
-            # separate one-line episode log.  Since train_sac uses
-            # model.learn(..., log_interval=1), SB3 dumps this logger record
-            # at every finished episode.
             try:
                 self.logger.record("rollout/ep_last_steps", ep_len)
                 self.logger.record("rollout/ep_last_wall_sec", ep_wall_sec)
@@ -774,23 +836,18 @@ class TrainingProgressCallback(BaseCallback):
             if str(os.environ.get("TB3_RL_EPISODE_SPS_LINE_LOG", "0")).strip().lower() in {"1", "true", "yes", "on"}:
                 print(
                     "[SAC EPISODE] "
-                    f"ep={self._episode_index:d} | "
-                    f"steps={ep_len:d} | "
-                    f"wall={self._fmt_duration(ep_wall_sec)} | "
-                    f"steps/s_wall={ep_sps_wall:6.2f} | "
-                    f"sim_dt={ep_sim_sec:7.3f}s | "
-                    f"steps/s_sim={ep_sps_sim:6.2f} | "
-                    f"epR={ep_reward:+9.2f} | "
-                    f"term={info.get('terminal_reason', 'done')} | "
-                    f"cov={float(info.get('coverage_ratio', -1.0)):.3f} | "
-                    f"col={bool(info.get('collision', False))} "
-                    f"fall={bool(info.get('fallen', False))} "
-                    f"oob={bool(info.get('out_of_bounds', False))}",
+                    f"ep={self._episode_index:d} steps={ep_len:d} "
+                    f"wall={self._fmt_duration(ep_wall_sec)} sps={ep_sps_wall:6.2f} "
+                    f"epR={ep_reward:+9.2f} term={info.get('terminal_reason', 'done')}",
                     flush=True,
                 )
 
             self._current_episode_reward = 0.0
             self._current_episode_len = 0
+            self._last_ep_safety_terminal_count = int(getattr(self, "_current_ep_safety_terminal_count", 0))
+            self._last_ep_collision_count = int(getattr(self, "_current_ep_collision_count", 0))
+            self._current_ep_safety_terminal_count = 0
+            self._current_ep_collision_count = 0
             self._episode_start_wall_time = time.time()
             self._episode_start_sim_time = None
 
@@ -800,13 +857,6 @@ class TrainingProgressCallback(BaseCallback):
         fps = trained_steps / elapsed if trained_steps > 0 else 0.0
         remaining = max(self.requested_total_timesteps - trained_steps, 0)
         eta = remaining / fps if fps > 1e-6 else 0.0
-
-        should_print = (
-            trained_steps == 1
-            or trained_steps % self.print_freq == 0
-            or trained_steps >= self.requested_total_timesteps
-            or done
-        )
 
         mean_ep_reward = (
             sum(self.recent_episode_rewards) / len(self.recent_episode_rewards)
@@ -826,79 +876,153 @@ class TrainingProgressCallback(BaseCallback):
         )
         terminal_reason = str(info.get("terminal_reason", "none"))
 
-        if should_print:
+        actor_loss = self._logger_value("train/actor_loss")
+        critic_loss = self._logger_value("train/critic_loss")
+        ent_coef_loss = self._logger_value("train/ent_coef_loss")
+        ent_coef = self._logger_value("train/ent_coef")
+        learning_rate = self._logger_value("train/learning_rate")
+
+        should_emit = (
+            trained_steps == 1
+            or trained_steps % self.print_freq == 0
+            or trained_steps >= self.requested_total_timesteps
+            or done
+        )
+
+        if self.progress_style == "tqdm" and self._pbar is not None:
+            delta = trained_steps - int(self._last_pbar_n)
+            if delta > 0:
+                self._pbar.update(delta)
+                self._last_pbar_n = trained_steps
+            if should_emit:
+                self._pbar.set_postfix({
+                    "fps": f"{fps:.1f}",
+                    "Qloss": "nan" if not math.isfinite(critic_loss) else f"{critic_loss:.2f}",
+                    "Aloss": "nan" if not math.isfinite(actor_loss) else f"{actor_loss:.2f}",
+                    "epR": "nan" if not math.isfinite(mean_ep_reward) else f"{mean_ep_reward:.1f}",
+                    "conf": int(info.get("confidence_updated_cells", 0)),
+                    "term": terminal_reason[:14],
+                })
+        elif self.progress_style == "block" and should_emit:
+            # Multi-line block mode is intentionally not a live-overwriting tqdm
+            # line.  It is easier to read in narrow terminals and survives copied
+            # logs, while CSV remains the authoritative dense history.
+            def _num(x: float, width: int = 8, prec: int = 3) -> str:
+                try:
+                    if math.isfinite(float(x)):
+                        return f"{float(x):{width}.{prec}f}"
+                except Exception:
+                    pass
+                return "nan".rjust(width)
+
             print(
-                "[SAC PROGRESS] "
-                f"{progress * 100.0:6.2f}% | "
+                "\n"
+                f"[SAC] {progress * 100.0:6.2f}%  step={trained_steps}/{self.requested_total_timesteps}  "
+                f"fps={fps:6.2f}  eta={self._fmt_duration(eta)}\n"
+                f"      loss: Q={_num(critic_loss)}  actor={_num(actor_loss)}  "
+                f"alpha={_num(ent_coef, 7, 4)}  lr={_num(learning_rate, 9, 6)}\n"
+                f"      ep  : R{self.window_size}={_num(mean_ep_reward, 9, 2)}  "
+                f"len={_num(mean_ep_len, 7, 1)}  sps={_num(mean_ep_sps_wall, 7, 2)}  "
+                f"r_now={reward:+8.3f}\n"
+                f"      env : conf={int(info.get('confidence_updated_cells', 0)):5d}/"
+                f"{int(info.get('confidence_observed_cells', 0)):5d}  "
+                f"recent={int(info.get('recent_confidence_updated_cells', 0)):6d}  "
+                f"conf_gain={float(info.get('confidence_gain', 0.0)):7.3f}  "
+                f"cov={float(info.get('coverage_ratio', -1.0)):6.3f}  "
+                f"term={terminal_reason}  err={bool(info.get('step_recovery', False))}",
+                flush=True,
+            )
+        elif self.progress_style == "line" and should_emit:
+            print(
+                "[SAC] "
+                f"{progress * 100.0:6.2f}% "
                 f"step={trained_steps}/{self.requested_total_timesteps} "
-                f"abs={self.num_timesteps}/{self.target_timesteps} | "
-                f"fps={fps:6.1f} | "
-                f"elapsed={self._fmt_duration(elapsed)} | "
-                f"eta={self._fmt_duration(eta)} | "
-                f"epR{self.window_size}={mean_ep_reward:8.2f} | "
-                f"epLen{self.window_size}={mean_ep_len:6.1f} | "
-                f"epSPSw{self.window_size}={mean_ep_sps_wall:6.2f} | "
-                f"lastEpSPSw={self._last_episode_steps_per_wall_sec:6.2f} | "
-                f"last_r={reward:+8.3f} | "
-                f"done={done} | "
-                f"term={terminal_reason} | "
-                f"cov={float(info.get('coverage_ratio', -1.0)):.3f} | "
-                f"prio={float(info.get('priority_score', -1.0)):.2f} | "
-                f"Wclr={int(info.get('priority_step_cleared_cells', info.get('priority_cleared_cells', 0)))}:"
-                f"{float(info.get('priority_step_clear_gain', info.get('priority_clear_gain', 0.0))):.2f} | "
-                f"liveWclr={int(info.get('priority_live_cleared_cells', 0))}:"
-                f"{float(info.get('priority_live_clear_gain', 0.0)):.2f} | "
-                f"epWclr={int(info.get('episode_priority_cleared_cells', 0))}:"
-                f"{float(info.get('episode_priority_clear_gain', 0.0)):.1f} | "
-                f"wclrR={float(info.get('priority_check_reward', 0.0)):+.2f}/"
-                f"{float(info.get('episode_priority_check_reward', 0.0)):+.2f} | "
-                f"p_align={float(info.get('priority_direction_alignment', 0.0)):.2f} | "
-                f"col={bool(info.get('collision', False))} "
-                f"fall={bool(info.get('fallen', False))} "
-                f"oob={bool(info.get('out_of_bounds', False))} "
-                f"bound={info.get('safety_boundary_frame', 'n/a')}:"
-                f"c=({float(info.get('safety_boundary_center_x', 0.0)):+.2f},{float(info.get('safety_boundary_center_y', 0.0)):+.2f}):"
-                f"p=({float(info.get('out_of_bounds_x', 0.0)):+.2f},{float(info.get('out_of_bounds_y', 0.0)):+.2f}):"
-                f"why={info.get('out_of_bounds_reason', 'none')}",
+                f"fps={fps:6.1f} eta={self._fmt_duration(eta)} "
+                f"Qloss={critic_loss:7.3f} Aloss={actor_loss:7.3f} alpha={ent_coef:7.4f} "
+                f"epR{self.window_size}={mean_ep_reward:8.2f} epLen={mean_ep_len:6.1f} "
+                f"sps={mean_ep_sps_wall:5.2f} r={reward:+7.3f} "
+                f"conf={int(info.get('confidence_updated_cells', 0))}/{int(info.get('confidence_observed_cells', 0))} "
+                f"cov={float(info.get('coverage_ratio', -1.0)):.3f} "
+                f"term={terminal_reason} "
+                f"err={bool(info.get('step_recovery', False))}",
                 flush=True,
             )
 
-        if self._csv_file is not None and (should_print or trained_steps % self.print_freq == 0):
+        if self._csv_file is not None and should_emit:
             self._csv_file.write(
                 f"{trained_steps},{progress * 100.0:.6f},{fps:.6f},{elapsed:.6f},{eta:.6f},"
-                f"{mean_ep_reward:.6f},{mean_ep_len:.6f},"
-                f"{self._last_episode_wall_sec:.6f},{self._last_episode_steps_per_wall_sec:.6f},"
-                f"{self._last_episode_sim_sec:.6f},{self._last_episode_steps_per_sim_sec:.6f},"
-                f"{mean_ep_sps_wall:.6f},{mean_ep_sps_sim:.6f},"
+                f"{self._finite_or_blank(actor_loss)},{self._finite_or_blank(critic_loss)},"
+                f"{self._finite_or_blank(ent_coef_loss)},{self._finite_or_blank(ent_coef)},"
+                f"{self._finite_or_blank(learning_rate)},"
+                f"{self._finite_or_blank(mean_ep_reward)},{self._finite_or_blank(mean_ep_len)},"
+                f"{self._finite_or_blank(self._last_episode_wall_sec)},"
+                f"{self._finite_or_blank(self._last_episode_steps_per_wall_sec)},"
+                f"{self._finite_or_blank(self._last_episode_sim_sec)},"
+                f"{self._finite_or_blank(self._last_episode_steps_per_sim_sec)},"
+                f"{self._finite_or_blank(mean_ep_sps_wall)},{self._finite_or_blank(mean_ep_sps_sim)},"
                 f"{reward:.6f},{int(done)},"
                 f"{terminal_reason},{float(info.get('coverage_ratio', -1.0)):.6f},"
+                f"{float(info.get('confidence_gain', 0.0)):.6f},"
+                f"{int(info.get('confidence_updated_cells', 0))},"
+                f"{int(info.get('confidence_observed_cells', 0))},"
                 f"{float(info.get('priority_score', -1.0)):.6f},"
-                f"{float(info.get('priority_clear_gain', 0.0)):.6f},"
-                f"{int(info.get('priority_step_cleared_cells', 0))},"
-                f"{float(info.get('priority_step_clear_gain', 0.0)):.6f},"
-                f"{int(info.get('priority_live_cleared_cells', 0))},"
-                f"{float(info.get('priority_live_clear_gain', 0.0)):.6f},"
-                f"{int(info.get('episode_priority_cleared_cells', 0))},"
-                f"{float(info.get('episode_priority_clear_gain', 0.0)):.6f},"
-                f"{float(info.get('priority_clear_reward', 0.0)):.6f},"
-                f"{float(info.get('priority_check_reward', 0.0)):.6f},"
-                f"{float(info.get('episode_priority_check_reward', 0.0)):.6f},"
-                f"{float(info.get('priority_direction_alignment', 0.0)):.6f},"
                 f"{int(bool(info.get('collision', False)))},"
                 f"{int(bool(info.get('fallen', False)))},"
-                f"{int(bool(info.get('out_of_bounds', False)))}\n"
+                f"{int(bool(info.get('out_of_bounds', False)))},"
+                f"{int(bool(info.get('step_recovery', False)))},"
+                f"{self._finite_or_blank(float(info.get('scan_age_sec', -1.0)))},"
+                f"{self._finite_or_blank(float(info.get('odom_age_sec', -1.0)))},"
+                f"{self._finite_or_blank(float(info.get('map_age_sec', -1.0)))},"
+                f"{int(bool(info.get('obs_stale', False)))},"
+                f"{int(bool(info.get('scan_stale', False)))},"
+                f"{int(bool(info.get('map_stale', False)))},"
+                f"{int(bool(info.get('tf_pose_ok', False)))},"
+                f"{int(bool(info.get('confidence_pose_ok', False)))},"
+                f"{self._finite_or_blank(float(info.get('policy_scan_front', 999.0)))},"
+                f"{self._finite_or_blank(float(info.get('policy_scan_left', 999.0)))},"
+                f"{self._finite_or_blank(float(info.get('policy_scan_rear', 999.0)))},"
+                f"{self._finite_or_blank(float(info.get('policy_scan_right', 999.0)))},"
+                f"{self._finite_or_blank(float(info.get('raw_scan_front', 999.0)))},"
+                f"{self._finite_or_blank(float(info.get('raw_scan_left', 999.0)))},"
+                f"{self._finite_or_blank(float(info.get('raw_scan_rear', 999.0)))},"
+                f"{self._finite_or_blank(float(info.get('raw_scan_right', 999.0)))},"
+                f"{self._finite_or_blank(float(info.get('lidar60_stamp_delta_sec', 0.0)))},"
+                f"{int(bool(info.get('velocity_safety_terminal', False)))},"
+                f"{self._finite_or_blank(float(info.get('velocity_safety_distance', 999.0)))},"
+                f"{self._finite_or_blank(float(info.get('executed_v', 0.0)))},"
+                f"{self._finite_or_blank(float(info.get('executed_w', 0.0)))},"
+                f"{self._finite_or_blank(float(info.get('policy_v', 0.0)))},"
+                f"{self._finite_or_blank(float(info.get('policy_w', 0.0)))},"
+                f"{self._finite_or_blank(float(info.get('r_confidence', 0.0)))},"
+                f"{self._finite_or_blank(float(info.get('r_slam', 0.0)))},"
+                f"{self._finite_or_blank(float(info.get('r_priority', 0.0)))},"
+                f"{self._finite_or_blank(float(info.get('r_wall', 0.0)))},"
+                f"{self._finite_or_blank(float(info.get('r_safety_slow', 0.0)))},"
+                f"{self._finite_or_blank(float(info.get('r_safety_terminal', 0.0)))},"
+                f"{self._finite_or_blank(float(info.get('r_collision', 0.0)))},"
+                f"{self._finite_or_blank(float(info.get('r_step', 0.0)))},"
+                f"{self._finite_or_blank(float(info.get('reward_total', 0.0)))},"
+                f"{int(getattr(self, '_last_ep_safety_terminal_count', 0))},"
+                f"{int(getattr(self, '_last_ep_collision_count', 0))}\n"
             )
-            self._csv_file.flush()
+            self._csv_rows_since_flush += 1
+            if self._csv_rows_since_flush >= self.csv_flush_every:
+                self._csv_file.flush()
+                self._csv_rows_since_flush = 0
 
         return True
 
     def _on_training_end(self) -> None:
+        if self._pbar is not None:
+            try:
+                self._pbar.close()
+            except Exception:
+                pass
+            self._pbar = None
         if self._csv_file is not None:
             self._csv_file.flush()
             self._csv_file.close()
             self._csv_file = None
-
-
 
 
 def _force_nav2_only_policy(cli_args):
@@ -1496,6 +1620,15 @@ def parse_args():
     parser.add_argument("--velocity-safety-slow-penalty", type=float, default=1.80)
     parser.add_argument("--velocity-safety-slow-speed-power", type=float, default=1.35)
     parser.add_argument("--velocity-safety-slow-danger-power", type=float, default=1.10)
+    parser.add_argument("--velocity-safety-terminal", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--velocity-safety-terminal-distance-m", type=float, default=0.0)
+    parser.add_argument("--velocity-safety-terminal-penalty", type=float, default=40.0)
+    parser.add_argument("--velocity-safety-terminal-forward-min", type=float, default=0.03)
+    # v131: explicit no-backup flag (alias for --no-velocity-safety-backup)
+    # --no-velocity-safety-backup is already handled by BooleanOptionalAction above.
+    # --max-scan-age-sec: observation freshness guard (sets TB3_RL_MAX_SCAN_AGE_SEC)
+    parser.add_argument("--max-scan-age-sec", type=float, default=0.35,
+                        help="Max allowed scan age (sec) before obs is marked stale. Set via env TB3_RL_MAX_SCAN_AGE_SEC. Default 0.35.")
     parser.add_argument("--velocity-forward-assist-mps", type=float, default=0.0)
     parser.add_argument("--velocity-forward-assist-angular-threshold", type=float, default=0.20)
     parser.add_argument("--velocity-forward-assist-min-clearance-m", type=float, default=0.45)
@@ -1641,9 +1774,12 @@ def parse_args():
     parser.add_argument("--log-dir", type=str, default="rl_logs")
     parser.add_argument("--debug-print-freq", type=int, default=0)
     parser.add_argument("--show-training-progress", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--progress-style", type=str, default="line", choices=["line", "block", "tqdm", "quiet"])
     parser.add_argument("--progress-print-freq", type=int, default=2000)
     parser.add_argument("--progress-window", type=int, default=20)
     parser.add_argument("--progress-csv", type=str, default="")
+    parser.add_argument("--progress-csv-flush-every", type=int, default=20)
+    parser.add_argument("--sac-verbose", type=int, default=0)
     parser.add_argument("--checkpoint-freq", type=int, default=50_000)
     parser.add_argument("--save-replay-buffer", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--save-vecnormalize", action=argparse.BooleanOptionalAction, default=False)
@@ -1721,6 +1857,11 @@ def main(args=None):
         pass
 
     gazebo_proc = _start_gazebo_if_requested(cli_args)
+
+    # v131: propagate --max-scan-age-sec to environment variable used in _get_obs
+    _max_scan_age = float(getattr(cli_args, "max_scan_age_sec", 0.35))
+    if _max_scan_age > 0.0:
+        os.environ["TB3_RL_MAX_SCAN_AGE_SEC"] = str(_max_scan_age)
 
     rclpy.init(args=args)
 
@@ -2026,6 +2167,10 @@ def main(args=None):
         velocity_safety_slow_penalty=cli_args.velocity_safety_slow_penalty,
         velocity_safety_slow_speed_power=cli_args.velocity_safety_slow_speed_power,
         velocity_safety_slow_danger_power=cli_args.velocity_safety_slow_danger_power,
+        velocity_safety_terminal=cli_args.velocity_safety_terminal,
+        velocity_safety_terminal_distance_m=cli_args.velocity_safety_terminal_distance_m,
+        velocity_safety_terminal_penalty=cli_args.velocity_safety_terminal_penalty,
+        velocity_safety_terminal_forward_min=cli_args.velocity_safety_terminal_forward_min,
         velocity_forward_assist_mps=cli_args.velocity_forward_assist_mps,
         velocity_forward_assist_angular_threshold=cli_args.velocity_forward_assist_angular_threshold,
         velocity_forward_assist_min_clearance_m=cli_args.velocity_forward_assist_min_clearance_m,
@@ -2344,7 +2489,7 @@ def main(args=None):
             train_freq=(max(int(cli_args.train_freq_steps), 1), "step"),
             gradient_steps=max(int(cli_args.gradient_steps), 0),
             ent_coef="auto",
-            verbose=1,
+            verbose=int(getattr(cli_args, "sac_verbose", 0)),
             tensorboard_log=str(log_dir),
             policy_kwargs=policy_kwargs,
             device=sac_device,
@@ -2369,6 +2514,8 @@ def main(args=None):
             print_freq=cli_args.progress_print_freq,
             window_size=cli_args.progress_window,
             csv_path=progress_csv,
+            progress_style=str(getattr(cli_args, "progress_style", "line")),
+            csv_flush_every=int(getattr(cli_args, "progress_csv_flush_every", 20)),
         )
 
     try:
