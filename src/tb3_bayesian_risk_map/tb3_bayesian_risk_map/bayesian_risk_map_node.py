@@ -314,7 +314,7 @@ class RoomAwareRiskMapNode(Node):
             depth=1,
         )
         self.qos_image_pub = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE,
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
@@ -900,7 +900,11 @@ class RoomAwareRiskMapNode(Node):
         self.update_detection_capture_pose(header)
 
         overlay = self.make_overlay(frame, detections)
-        if overlay is not None:
+        if overlay is None:
+            # Fallback: publish raw frame even when overlay failed or YOLO is off
+            if self.publish_debug_image and self.publish_yolo_debug_even_without_detection:
+                self.pub_debug_image.publish(self.bgr8_to_image_msg(frame, header))
+        else:
             if self.publish_overlay:
                 self.pub_overlay.publish(self.bgr8_to_image_msg(overlay, header))
             if self.publish_debug_image:

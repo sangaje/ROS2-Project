@@ -30,7 +30,7 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('use_sim_time', default_value='false'),
         DeclareLaunchArgument('model_path', default_value='yolo11n.pt'),
-        DeclareLaunchArgument('camera_device', default_value='/dev/video0'),
+        DeclareLaunchArgument('camera_device', default_value='/dev/video1'),
         DeclareLaunchArgument('camera_width', default_value='640'),
         DeclareLaunchArgument('camera_height', default_value='480'),
         DeclareLaunchArgument('camera_fps', default_value='15'),
