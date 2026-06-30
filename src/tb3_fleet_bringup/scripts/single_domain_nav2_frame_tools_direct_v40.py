@@ -129,7 +129,14 @@ class SingleDomainNav2FrameTools(Node):
         t2.child_frame_id = self.scan_frame
         t2.transform.translation.z = self.scan_z
         t2.transform.rotation.w = 1.0
-        self.static_tf_broadcaster.sendTransform([t1, t2])
+
+        # Static fallback for odom->base_footprint so Nav2 can initialize
+        # before Gazebo odometry arrives. Dynamic _on_odom overrides this.
+        t0 = TransformStamped()
+        t0.header.frame_id = self.odom_frame
+        t0.child_frame_id = self.base_frame
+        t0.transform.rotation.w = 1.0
+        self.static_tf_broadcaster.sendTransform([t0, t1, t2])
 
         self.create_timer(self.initial_pose_period_sec, self._initial_pose_tick)
         self.get_logger().info(

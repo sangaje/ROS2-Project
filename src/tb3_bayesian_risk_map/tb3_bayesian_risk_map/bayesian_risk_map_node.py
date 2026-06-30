@@ -2,6 +2,7 @@
 import json
 import math
 import os
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -119,6 +120,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.conf_threshold = float(self.declare_parameter('conf_threshold', 0.20).value)
         self.yolo_imgsz = int(self.declare_parameter('yolo_imgsz', 640).value)
         self.yolo_max_rate_hz = float(self.declare_parameter('yolo_max_rate_hz', 3.0).value)
+        self.yolo_async = self.declare_bool_parameter('yolo_async', True)
         self.detection_timeout_sec = float(self.declare_parameter('detection_timeout_sec', 0.8).value)
         self.detection_reuse_max_distance_m = float(
             self.declare_parameter('detection_reuse_max_distance_m', 0.50).value
@@ -130,6 +132,10 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.opencv_camera_width = int(self.declare_parameter('opencv_camera_width', 640).value)
         self.opencv_camera_height = int(self.declare_parameter('opencv_camera_height', 480).value)
         self.opencv_camera_fps = float(self.declare_parameter('opencv_camera_fps', 15.0).value)
+        self.opencv_camera_buffer_size = int(
+            self.declare_parameter('opencv_camera_buffer_size', 1).value
+        )
+        self.opencv_async_capture = self.declare_bool_parameter('opencv_async_capture', True)
         self.opencv_reopen_after_failures = int(
             self.declare_parameter('opencv_reopen_after_failures', 5).value
         )
@@ -211,6 +217,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
 
         # Occupancy policy
         self.allow_unknown = self.declare_bool_parameter('allow_unknown', False)
+        self.risk_persist_in_unknown = self.declare_bool_parameter('risk_persist_in_unknown', True)
         self.free_threshold = int(self.declare_parameter('free_threshold', 30).value)
         self.occupied_threshold = int(self.declare_parameter('occupied_threshold', 65).value)
 
@@ -229,6 +236,12 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         ).strip()
         self.debug_compressed_jpeg_quality = int(
             self.declare_parameter('debug_compressed_jpeg_quality', 70).value
+        )
+        self.debug_compressed_resize_width = int(
+            self.declare_parameter('debug_compressed_resize_width', 480).value
+        )
+        self.debug_compressed_publish_rate_hz = float(
+            self.declare_parameter('debug_compressed_publish_rate_hz', 3.0).value
         )
         self.debug_show_opencv = self.declare_bool_parameter('debug_show_opencv', False)
         self.debug_save_images = self.declare_bool_parameter('debug_save_images', False)
@@ -278,10 +291,18 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.last_yolo_ros_sec = None
         self.last_fake_wall_sec = 0.0
         self.last_debug_save_wall_sec = 0.0
+        self.last_debug_compressed_publish_wall_sec = 0.0
         self.pose_history = deque()
         self.latest_detection_pose = None
         self.latest_detection_capture_sec = None
         self.latest_detection_delay_ms = -1.0
+        self.detection_lock = threading.Lock()
+        self.pose_lock = threading.Lock()
+        self.yolo_condition = threading.Condition()
+        self.yolo_pending_frame = None
+        self.yolo_worker_stop = False
+        self.yolo_worker_thread = None
+        self.yolo_drop_count = 0
 
         self.external_detection_rx_count = 0
         self.image_rx_count = 0
@@ -293,6 +314,13 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.opencv_camera_timer = None
         self.opencv_camera_warned = False
         self.opencv_read_fail_count = 0
+        self.opencv_frame_lock = threading.Lock()
+        self.opencv_latest_frame = None
+        self.opencv_latest_capture_sec = 0.0
+        self.opencv_latest_seq = 0
+        self.opencv_consumed_seq = 0
+        self.opencv_capture_thread = None
+        self.opencv_capture_stop = False
 
         self.evidence_points: List[EvidencePoint] = []
         self.next_evidence_id = 1
@@ -399,6 +427,8 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             except Exception as e:
                 self.get_logger().error(f'YOLO load failed: {e}')
                 self.enable_yolo = False
+        if self.enable_yolo and self.yolo is not None and self.yolo_async:
+            self.start_yolo_worker()
         # Start camera capture independently of YOLO.
         # Frames are always captured; YOLO inference runs on top when available.
         if self.use_opencv_camera:
@@ -419,7 +449,8 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             f'detection_source={self.detection_source} external_detection_topic={self.external_detection_topic} '
             f'teleop_mode={self.teleop_mode} risk_publish_rate_hz={self.risk_publish_rate_hz:.2f} '
             f'debug_raw={self.publish_debug_image}:{self.debug_image_topic} '
-            f'debug_compressed={self.publish_debug_compressed_image}:{self.debug_compressed_image_topic}'
+            f'debug_compressed={self.publish_debug_compressed_image}:{self.debug_compressed_image_topic} '
+            f'yolo_async={self.yolo_async}'
         )
 
     # ---------------- Image conversion without cv_bridge ----------------
@@ -482,9 +513,16 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         try:
             import cv2
             quality = clamp(int(self.debug_compressed_jpeg_quality), 1, 100)
+            encode_img = img
+            resize_width = int(self.debug_compressed_resize_width)
+            if resize_width > 0:
+                h, w = img.shape[:2]
+                if w > 0 and w != resize_width:
+                    scale = resize_width / float(w)
+                    encode_img = cv2.resize(img, (resize_width, max(1, int(h * scale))))
             ok, encoded = cv2.imencode(
                 '.jpg',
-                img,
+                encode_img,
                 [int(cv2.IMWRITE_JPEG_QUALITY), quality],
             )
             if not ok:
@@ -499,6 +537,12 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         if self.publish_debug_image:
             self.pub_debug_image.publish(self.bgr8_to_image_msg(img, header))
         if self.publish_debug_compressed_image:
+            now = time.time()
+            if self.debug_compressed_publish_rate_hz > 0.0:
+                min_period = 1.0 / max(0.1, self.debug_compressed_publish_rate_hz)
+                if now - self.last_debug_compressed_publish_wall_sec < min_period:
+                    return
+            self.last_debug_compressed_publish_wall_sec = now
             msg = self.bgr8_to_compressed_image_msg(img, header)
             if msg is not None:
                 self.pub_debug_compressed_image.publish(msg)
@@ -570,8 +614,9 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                 self.risk_map = np.zeros((h, w), dtype=np.float32)
 
                 free = self.valid_free_mask()
+                memory_mask = self.risk_memory_mask()
                 self.detection_candidate_map[~free] = 0.0
-                self.positive_memory_map[~free] = 0.0
+                self.positive_memory_map[~memory_mask] = 0.0
                 self.observed_empty_map[~free] = 0.0
                 self.visual_seen_map[~free] = 0.0
 
@@ -690,6 +735,12 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             return occ < self.occupied_threshold
         return (occ >= 0) & (occ <= self.free_threshold)
 
+    def risk_memory_mask(self):
+        occ = self.occ_grid
+        if self.risk_persist_in_unknown:
+            return occ < self.occupied_threshold
+        return self.valid_free_mask()
+
     def traversable(self, gy: int, gx: int):
         v = int(self.occ_grid[gy, gx])
         if v == -1:
@@ -740,15 +791,19 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             y=float(pose[1]),
             yaw=float(pose[2]),
         )
-        self.pose_history.append(sample)
-        cutoff = sample.stamp_sec - max(1.0, self.pose_history_duration_sec)
-        while len(self.pose_history) > 2 and self.pose_history[0].stamp_sec < cutoff:
-            self.pose_history.popleft()
+        with self.pose_lock:
+            self.pose_history.append(sample)
+            cutoff = sample.stamp_sec - max(1.0, self.pose_history_duration_sec)
+            while len(self.pose_history) > 2 and self.pose_history[0].stamp_sec < cutoff:
+                self.pose_history.popleft()
 
     def lookup_pose_at(self, stamp_sec: float):
-        if stamp_sec <= 0.0 or not self.pose_history:
+        if stamp_sec <= 0.0:
             return None
-        samples = self.pose_history
+        with self.pose_lock:
+            samples = list(self.pose_history)
+        if not samples:
+            return None
         oldest = samples[0]
         newest = samples[-1]
         max_error = max(0.0, self.pose_history_max_error_sec)
@@ -780,6 +835,62 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
 
     # ---------------- Detection ----------------
 
+    def start_yolo_worker(self):
+        if self.yolo_worker_thread is not None:
+            return
+        self.yolo_worker_stop = False
+        self.yolo_worker_thread = threading.Thread(
+            target=self.yolo_worker_loop,
+            name='risk_map_latest_yolo_worker',
+            daemon=True,
+        )
+        self.yolo_worker_thread.start()
+        self.get_logger().info('YOLO worker thread started | latest-frame-only=true')
+
+    def stop_yolo_worker(self):
+        thread = self.yolo_worker_thread
+        if thread is None:
+            return
+        with self.yolo_condition:
+            self.yolo_worker_stop = True
+            self.yolo_condition.notify_all()
+        thread.join(timeout=2.0)
+        self.yolo_worker_thread = None
+
+    def yolo_worker_loop(self):
+        while True:
+            with self.yolo_condition:
+                while self.yolo_pending_frame is None and not self.yolo_worker_stop:
+                    self.yolo_condition.wait(timeout=0.5)
+                if self.yolo_worker_stop:
+                    return
+                item = self.yolo_pending_frame
+                self.yolo_pending_frame = None
+            if item is None:
+                continue
+            frame, encoding, header, capture_sec = item
+            self.process_yolo_frame(frame, encoding=encoding, header=header, capture_sec=capture_sec)
+
+    def enqueue_yolo_frame(self, frame, encoding='bgr8', header=None, capture_sec=None):
+        if not self.enable_yolo or self.yolo is None:
+            return False
+        now_wall = time.time()
+        if (
+            self.yolo_max_rate_hz > 0.0
+            and now_wall - self.last_yolo_wall_sec < 1.0 / self.yolo_max_rate_hz
+        ):
+            return False
+        self.last_yolo_wall_sec = now_wall
+        if not self.yolo_async:
+            self.process_yolo_frame(frame, encoding=encoding, header=header, capture_sec=capture_sec)
+            return True
+        with self.yolo_condition:
+            if self.yolo_pending_frame is not None:
+                self.yolo_drop_count += 1
+            self.yolo_pending_frame = (frame, encoding, header, capture_sec)
+            self.yolo_condition.notify()
+        return True
+
     def bbox_center_to_bearing(self, bbox, image_w):
         x1, y1, x2, y2 = bbox
         cx = 0.5 * (x1 + x2)
@@ -805,6 +916,8 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         try:
             import cv2
             self.opencv_cap = cv2.VideoCapture(self.opencv_device_arg())
+            if self.opencv_camera_buffer_size > 0:
+                self.opencv_cap.set(cv2.CAP_PROP_BUFFERSIZE, int(self.opencv_camera_buffer_size))
             if self.opencv_camera_fourcc:
                 fourcc = self.opencv_camera_fourcc.upper()[:4]
                 if len(fourcc) == 4:
@@ -823,10 +936,13 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             self.get_logger().info(
                 f'OpenCV camera opened directly: device={self.opencv_camera_device} '
                 f'size={self.opencv_camera_width}x{self.opencv_camera_height} '
-                f'fps={self.opencv_camera_fps:.1f} fourcc={self.opencv_camera_fourcc or "default"}'
+                f'fps={self.opencv_camera_fps:.1f} fourcc={self.opencv_camera_fourcc or "default"} '
+                f'async_capture={self.opencv_async_capture}'
             )
             self.opencv_read_fail_count = 0
             self.opencv_camera_warned = False
+            if self.opencv_async_capture:
+                self.start_opencv_capture_worker()
             return True
         except Exception as e:
             self.get_logger().error(f'OpenCV camera setup failed: {e}')
@@ -834,6 +950,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             return False
 
     def reset_opencv_camera(self):
+        self.stop_opencv_capture_worker()
         cap = self.opencv_cap
         self.opencv_cap = None
         if cap is not None:
@@ -841,6 +958,55 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                 cap.release()
             except Exception:
                 pass
+
+    def start_opencv_capture_worker(self):
+        if self.opencv_capture_thread is not None:
+            return
+        self.opencv_capture_stop = False
+        self.opencv_capture_thread = threading.Thread(
+            target=self.opencv_capture_loop,
+            name='risk_map_latest_camera_worker',
+            daemon=True,
+        )
+        self.opencv_capture_thread.start()
+        self.get_logger().info('OpenCV camera worker started | latest-frame-only=true')
+
+    def stop_opencv_capture_worker(self):
+        thread = self.opencv_capture_thread
+        if thread is None:
+            return
+        self.opencv_capture_stop = True
+        thread.join(timeout=2.0)
+        self.opencv_capture_thread = None
+
+    def opencv_capture_loop(self):
+        while not self.opencv_capture_stop:
+            cap = self.opencv_cap
+            if cap is None or not cap.isOpened():
+                time.sleep(0.05)
+                continue
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                self.opencv_read_fail_count += 1
+                if self.opencv_read_fail_count >= max(1, int(self.opencv_reopen_after_failures)):
+                    self.get_logger().warn(
+                        f'OpenCV camera worker read failed {self.opencv_read_fail_count} times',
+                        throttle_duration_sec=2.0,
+                    )
+                time.sleep(0.02)
+                continue
+            capture_sec = self.get_clock().now().nanoseconds * 1e-9
+            with self.opencv_frame_lock:
+                self.opencv_latest_frame = frame
+                self.opencv_latest_capture_sec = capture_sec
+                self.opencv_latest_seq += 1
+            self.opencv_read_fail_count = 0
+
+    def latest_opencv_frame(self):
+        with self.opencv_frame_lock:
+            if self.opencv_latest_frame is None:
+                return None, 0.0, 0
+            return self.opencv_latest_frame.copy(), self.opencv_latest_capture_sec, self.opencv_latest_seq
 
     def on_opencv_camera_timer(self):
         if not self.use_opencv_camera:
@@ -854,24 +1020,34 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             self.open_opencv_camera()
             return
 
-        ok, frame = self.opencv_cap.read()
-        if not ok or frame is None:
-            self.opencv_read_fail_count += 1
-            self.get_logger().warn('OpenCV camera frame read failed', throttle_duration_sec=2.0)
-            if self.opencv_read_fail_count >= max(1, int(self.opencv_reopen_after_failures)):
-                self.get_logger().warn(
-                    f'OpenCV camera read failed {self.opencv_read_fail_count} times; reopening camera',
-                    throttle_duration_sec=2.0,
-                )
-                self.reset_opencv_camera()
-                self.open_opencv_camera()
-            return
-
-        self.opencv_read_fail_count = 0
+        capture_sec = None
+        if self.opencv_async_capture:
+            frame, capture_sec, seq = self.latest_opencv_frame()
+            if frame is None:
+                self.get_logger().warn('waiting for latest OpenCV camera frame...', throttle_duration_sec=2.0)
+                return
+            if seq == self.opencv_consumed_seq:
+                return
+            self.opencv_consumed_seq = seq
+        else:
+            ok, frame = self.opencv_cap.read()
+            if not ok or frame is None:
+                self.opencv_read_fail_count += 1
+                self.get_logger().warn('OpenCV camera frame read failed', throttle_duration_sec=2.0)
+                if self.opencv_read_fail_count >= max(1, int(self.opencv_reopen_after_failures)):
+                    self.get_logger().warn(
+                        f'OpenCV camera read failed {self.opencv_read_fail_count} times; reopening camera',
+                        throttle_duration_sec=2.0,
+                    )
+                    self.reset_opencv_camera()
+                    self.open_opencv_camera()
+                return
+            self.opencv_read_fail_count = 0
+            capture_sec = self.get_clock().now().nanoseconds * 1e-9
 
         # Always run YOLO if available; otherwise publish raw frame as debug image.
         if self.enable_yolo and self.yolo is not None:
-            self.process_yolo_frame(frame, encoding='opencv_bgr8', header=None)
+            self.enqueue_yolo_frame(frame, encoding='opencv_bgr8', header=None, capture_sec=capture_sec)
         else:
             self.image_rx_count += 1
             self.last_image_encoding = 'opencv_bgr8_raw'
@@ -882,10 +1058,6 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
     def on_image(self, msg: Image):
         if not self.enable_yolo or self.yolo is None:
             return
-        now_wall = time.time()
-        if self.yolo_max_rate_hz > 0.0 and now_wall - self.last_yolo_wall_sec < 1.0 / self.yolo_max_rate_hz:
-            return
-        self.last_yolo_wall_sec = now_wall
 
         try:
             frame = self.image_msg_to_bgr8(msg)
@@ -893,7 +1065,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             self.get_logger().warn(f'image conversion failed: {e}', throttle_duration_sec=2.0)
             return
 
-        self.process_yolo_frame(frame, encoding=msg.encoding, header=msg.header)
+        self.enqueue_yolo_frame(frame, encoding=msg.encoding, header=msg.header)
 
     def header_to_sec(self, header):
         if header is None:
@@ -904,9 +1076,10 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         except Exception:
             return None
 
-    def update_detection_capture_pose(self, header=None):
+    def update_detection_capture_pose(self, header=None, capture_sec=None):
         now_ros_sec = self.get_clock().now().nanoseconds * 1e-9
-        capture_sec = self.header_to_sec(header)
+        if capture_sec is None:
+            capture_sec = self.header_to_sec(header)
         if capture_sec is None:
             capture_sec = now_ros_sec
         self.latest_detection_capture_sec = capture_sec
@@ -916,7 +1089,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             self.latest_detection_pose = self.get_robot_pose()
         self.latest_detection_delay_ms = max(0.0, (now_ros_sec - capture_sec) * 1000.0)
 
-    def process_yolo_frame(self, frame, encoding='bgr8', header=None):
+    def process_yolo_frame(self, frame, encoding='bgr8', header=None, capture_sec=None):
         self.image_rx_count += 1
         self.last_image_encoding = encoding
 
@@ -933,8 +1106,6 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                 device=self.device,
                 verbose=False,
             )
-            self.yolo_frame_count += 1
-
             if results and results[0].boxes is not None:
                 xyxy = results[0].boxes.xyxy.cpu().numpy()
                 confs = results[0].boxes.conf.cpu().numpy()
@@ -953,10 +1124,12 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             self.get_logger().warn(f'YOLO failed: {e}', throttle_duration_sec=2.0)
             return
 
-        self.yolo_det_count += len(detections)
-        self.latest_detections = detections
-        self.last_yolo_ros_sec = self.get_clock().now().nanoseconds * 1e-9
-        self.update_detection_capture_pose(header)
+        with self.detection_lock:
+            self.yolo_frame_count += 1
+            self.yolo_det_count += len(detections)
+            self.latest_detections = detections
+            self.last_yolo_ros_sec = self.get_clock().now().nanoseconds * 1e-9
+            self.update_detection_capture_pose(header, capture_sec)
 
         overlay = self.make_overlay(frame, detections)
         if overlay is None:
@@ -1027,23 +1200,24 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                 range_hat_m=float(range_hat) if range_hat is not None else self.bbox_height_to_range(bbox, image_h),
             ))
 
-        self.yolo_frame_count += 1
-        self.yolo_det_count += len(detections)
-        self.latest_detections = detections
-        self.last_yolo_ros_sec = self.get_clock().now().nanoseconds * 1e-9
         capture_sec = float(
             payload.get('capture_ros_sec')
             or payload.get('capture_wall_sec')
             or 0.0
         )
-        self.latest_detection_capture_sec = capture_sec if capture_sec > 0.0 else None
-        self.latest_detection_pose = self.lookup_pose_at(capture_sec)
-        if capture_sec > 0.0:
-            self.latest_detection_delay_ms = max(
-                0.0, (self.last_yolo_ros_sec - capture_sec) * 1000.0
-            )
-        else:
-            self.latest_detection_delay_ms = -1.0
+        with self.detection_lock:
+            self.yolo_frame_count += 1
+            self.yolo_det_count += len(detections)
+            self.latest_detections = detections
+            self.last_yolo_ros_sec = self.get_clock().now().nanoseconds * 1e-9
+            self.latest_detection_capture_sec = capture_sec if capture_sec > 0.0 else None
+            self.latest_detection_pose = self.lookup_pose_at(capture_sec)
+            if capture_sec > 0.0:
+                self.latest_detection_delay_ms = max(
+                    0.0, (self.last_yolo_ros_sec - capture_sec) * 1000.0
+                )
+            else:
+                self.latest_detection_delay_ms = -1.0
         self.last_image_shape = f'{image_w}x{image_h} flask_json'
         self.last_image_encoding = 'external_json'
 
@@ -1100,9 +1274,14 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                 self.debug_show_opencv = False
 
     def on_debug_timer(self):
+        with self.detection_lock:
+            yolo_frame_count = self.yolo_frame_count
+            yolo_det_count = self.yolo_det_count
+            current_det_count = len(self.latest_detections)
+            yolo_drop_count = self.yolo_drop_count
         self.get_logger().info(
-            f'YOLO_DEBUG | image_rx={self.image_rx_count} | external_rx={self.external_detection_rx_count} | yolo_frames={self.yolo_frame_count} | '
-            f'total_dets={self.yolo_det_count} | current_dets={len(self.latest_detections)} | '
+            f'YOLO_DEBUG | image_rx={self.image_rx_count} | external_rx={self.external_detection_rx_count} | yolo_frames={yolo_frame_count} | '
+            f'total_dets={yolo_det_count} | current_dets={current_det_count} | yolo_dropped={yolo_drop_count} | '
             f'positive_max={float(np.max(self.positive_memory_map)) if self.positive_memory_map is not None else 0.0:.3f} | '
             f'risk_max={float(np.max(self.risk_map)) if self.risk_map is not None else 0.0:.3f} | '
             f'last_shape={self.last_image_shape} | enc={self.last_image_encoding} | '
@@ -1185,7 +1364,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         alpha = clamp(self.positive_memory_alpha, 0.0, 1.0)
         fused = 1.0 - (1.0 - self.positive_memory_map) * (1.0 - alpha * candidate)
         self.positive_memory_map = np.maximum(self.positive_memory_map, fused)
-        self.positive_memory_map[~self.valid_free_mask()] = 0.0
+        self.positive_memory_map[~self.risk_memory_mask()] = 0.0
         self.risk_dirty = True
         return True
 
@@ -1530,6 +1709,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         h, w = source.shape
         halo = np.zeros((h, w), dtype=np.float32)
         free = self.valid_free_mask()
+        memory_mask = self.risk_memory_mask()
         seeds = self.select_source_seeds(source)
         if not seeds:
             return halo
@@ -1538,6 +1718,9 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         sigma = max(self.source_halo_sigma_m, self.map_resolution)
 
         for sx, sy, sval in seeds:
+            if not memory_mask[sy, sx]:
+                continue
+            halo[sy, sx] = max(float(halo[sy, sx]), float(sval))
             if not free[sy, sx]:
                 continue
             x0 = max(0, sx - max_cells)
@@ -1572,7 +1755,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                         local_dist[ny, nx] = nd
                         q.append((nx, ny))
 
-        halo[~free] = 0.0
+        halo[~memory_mask] = 0.0
         return np.clip(halo, 0.0, 1.0)
 
     # ---------------- Main update ----------------
@@ -1591,21 +1774,25 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
 
         detections = []
         detections.extend(self.maybe_make_fake_detection())
+        with self.detection_lock:
+            last_yolo_ros_sec = self.last_yolo_ros_sec
+            latest_detection_pose = self.latest_detection_pose
+            latest_detections = list(self.latest_detections)
         can_reuse_detection = (
-            self.last_yolo_ros_sec is not None
-            and now_ros_sec - self.last_yolo_ros_sec <= self.detection_timeout_sec
+            last_yolo_ros_sec is not None
+            and now_ros_sec - last_yolo_ros_sec <= self.detection_timeout_sec
         )
-        if can_reuse_detection and self.latest_detection_pose is not None:
-            dx = float(robot_pose[0]) - float(self.latest_detection_pose[0])
-            dy = float(robot_pose[1]) - float(self.latest_detection_pose[1])
+        if can_reuse_detection and latest_detection_pose is not None:
+            dx = float(robot_pose[0]) - float(latest_detection_pose[0])
+            dy = float(robot_pose[1]) - float(latest_detection_pose[1])
             if math.hypot(dx, dy) > max(0.0, self.detection_reuse_max_distance_m):
                 can_reuse_detection = False
         if can_reuse_detection:
-            detections.extend(self.latest_detections)
+            detections.extend(latest_detections)
 
         projection_pose = (
-            self.latest_detection_pose
-            if detections and self.latest_detection_pose is not None
+            latest_detection_pose
+            if detections and latest_detection_pose is not None
             else robot_pose
         )
         self.detection_candidate_map = self.build_detection_candidate_map(projection_pose, detections)
@@ -1810,6 +1997,11 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             ma.markers.append(m)
 
         self.pub_markers.publish(ma)
+
+    def destroy_node(self):
+        self.stop_yolo_worker()
+        self.stop_opencv_capture_worker()
+        super().destroy_node()
 
 
 def main(args=None):

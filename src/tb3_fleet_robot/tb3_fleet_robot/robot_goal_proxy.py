@@ -157,8 +157,8 @@ class RobotGoalProxy(Node):
             ok = self.nav_client.wait_for_server(timeout_sec=self.wait_for_server_sec)
             if not ok:
                 self.get_logger().error(f'NAV2_ACTION_UNAVAILABLE | action={self.navigate_action}')
-            self._publish_status('ERROR_NAV2_ACTION_UNAVAILABLE')
-            return
+                self._publish_status('ERROR_NAV2_ACTION_UNAVAILABLE')
+                return
 
         if self.ignore_duplicate_goals and self._is_duplicate_goal(pose):
             self.get_logger().info('DUPLICATE_GOAL_IGNORED')

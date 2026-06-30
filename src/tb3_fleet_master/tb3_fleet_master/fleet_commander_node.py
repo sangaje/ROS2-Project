@@ -203,14 +203,15 @@ class FleetCommanderNode(Node):
         self._publish_pending_goals()
 
         if self.republish_timer is not None:
-            self.republish_timer.cancel()
+            self.destroy_timer(self.republish_timer)
+            self.republish_timer = None
         if self.republish_count > 1:
             self.republish_timer = self.create_timer(self.republish_period_sec, self._republish_timer_cb)
 
     def _republish_timer_cb(self):
         if self.pending_republish_left <= 0:
             if self.republish_timer is not None:
-                self.republish_timer.cancel()
+                self.destroy_timer(self.republish_timer)
                 self.republish_timer = None
             return
         self._publish_pending_goals()

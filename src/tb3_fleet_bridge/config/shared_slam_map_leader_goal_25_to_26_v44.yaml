@@ -1,6 +1,6 @@
 name: shared_slam_map_leader_goal_25_to_26_v44
 from_domain: 25
-to_domain: 26
+to_domain: 24
 
 topics:
   /map:

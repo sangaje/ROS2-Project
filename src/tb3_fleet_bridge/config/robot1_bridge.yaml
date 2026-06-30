@@ -1,6 +1,6 @@
-name: burger_domain_bridge
+name: burger_domain_bridge_robot1
 from_domain: 25
-to_domain: 26
+to_domain: 24
 
 topics:
   /fleet/burger/goal_pose:

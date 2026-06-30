@@ -220,6 +220,7 @@ def generate_launch_description():
         SetEnvironmentVariable('ROS_DOMAIN_ID', '25'),
         SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp'),
         SetEnvironmentVariable('FASTDDS_BUILTIN_TRANSPORTS', 'UDPv4'),
+        SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', 'LOCALHOST'),
         SetEnvironmentVariable('TURTLEBOT3_MODEL', 'waffle'),
         SetEnvironmentVariable('GZ_SIM_RESOURCE_PATH', gz_resource_path),
         SetEnvironmentVariable('IGN_GAZEBO_RESOURCE_PATH', gz_resource_path),

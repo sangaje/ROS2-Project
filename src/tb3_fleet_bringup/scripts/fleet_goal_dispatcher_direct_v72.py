@@ -143,13 +143,12 @@ class FleetGoalDispatcher(Node):
 
     def _make_goal(self, src: PoseStamped, x: float, y: float) -> PoseStamped:
         out = PoseStamped()
-        out.header = src.header
-        out.header.frame_id = out.header.frame_id or self.frame_id
+        out.header.frame_id = src.header.frame_id or self.frame_id
         out.header.stamp = self.get_clock().now().to_msg()
-        out.pose = src.pose
         out.pose.position.x = float(x)
         out.pose.position.y = float(y)
         out.pose.position.z = 0.0
+        out.pose.orientation = src.pose.orientation
         return out
 
     def _republish_pending(self) -> None:

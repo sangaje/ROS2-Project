@@ -9,7 +9,7 @@ Panels:
         - /Risk Overlay1
         - /RobotModel1
       Splitter Ratio: 0.5
-    Tree Height: 313
+    Tree Height: 375
   - Class: rviz_common/Views
     Expanded:
       - /Current View1
@@ -43,13 +43,43 @@ Visualization Manager:
       Frame Timeout: 15
       Frames:
         All Enabled: true
+        base_footprint:
+          Value: true
+        base_link:
+          Value: true
+        base_scan:
+          Value: true
+        caster_back_link:
+          Value: true
+        imu_link:
+          Value: true
+        map:
+          Value: true
+        odom:
+          Value: true
+        wheel_left_link:
+          Value: true
+        wheel_right_link:
+          Value: true
       Marker Scale: 0.25
       Name: TF
       Show Arrows: true
       Show Axes: true
       Show Names: false
       Tree:
-        {}
+        map:
+          base_footprint:
+            base_link:
+              base_scan:
+                {}
+              caster_back_link:
+                {}
+              imu_link:
+                {}
+              wheel_left_link:
+                {}
+              wheel_right_link:
+                {}
       Update Interval: 0
       Value: true
     - Alpha: 0.7799999713897705
@@ -148,7 +178,8 @@ Visualization Manager:
       Enabled: true
       Name: Evidence + Camera FOV
       Namespaces:
-        {}
+        positive_evidence: true
+        risk_fov: true
       Topic:
         Depth: 10
         Durability Policy: Transient Local
@@ -173,7 +204,40 @@ Visualization Manager:
         Expand Joint Details: false
         Expand Link Details: false
         Expand Tree: false
-        Link Tree Style: ""
+        Link Tree Style: Links in Alphabetic Order
+        base_footprint:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        base_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        base_scan:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        caster_back_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        imu_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        wheel_left_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
+        wheel_right_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
       Mass Properties:
         Inertia: false
         Mass: false
@@ -246,7 +310,7 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Scale: 16
+      Scale: 69.8158950805664
       Target Frame: map
       Value: TopDownOrtho (rviz)
       X: 0
@@ -254,13 +318,13 @@ Visualization Manager:
     Saved: ~
 Window Geometry:
   Displays:
-    collapsed: false
-  Height: 900
-  Hide Left Dock: false
+    collapsed: true
+  Height: 1003
+  Hide Left Dock: true
   Hide Right Dock: false
-  QMainWindow State: 000000ff00000000fd00000001000000000000020c0000031afc0200000002fb000000100044006900730070006c0061007900730100000048000001d7000000f300fffffffb0000000a0056006900650077007301000002260000013c000000c500ffffff000003650000031a00000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  QMainWindow State: 000000ff00000000fd00000001000000000000020c00000381fc0200000002fb000000100044006900730070006c006100790073000000004800000215000000f300fffffffb0000000a00560069006500770073000000026400000165000000c500ffffff0000039f0000038100000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   Views:
-    collapsed: false
-  Width: 1400
-  X: 80
-  Y: 60
+    collapsed: true
+  Width: 927
+  X: 993
+  Y: 40

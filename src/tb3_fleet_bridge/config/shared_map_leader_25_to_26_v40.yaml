@@ -1,6 +1,6 @@
 name: shared_map_leader_25_to_26_v40
 from_domain: 25
-to_domain: 26
+to_domain: 24
 
 topics:
   /map:

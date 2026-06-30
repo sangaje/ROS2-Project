@@ -23,6 +23,7 @@ setup(
     entry_points={
         'console_scripts': [
             'flask_yolo_server = tb3_flask_yolo_bridge.flask_yolo_server:main',
+            'opencv_camera_to_flask_yolo = tb3_flask_yolo_bridge.opencv_camera_to_flask_yolo:main',
             'opencv_camera_publisher = tb3_flask_yolo_bridge.opencv_camera_publisher:main',
             'ros_image_to_flask_yolo = tb3_flask_yolo_bridge.ros_image_to_flask_yolo:main',
             'random_world_detection_test = tb3_flask_yolo_bridge.random_world_detection_test:main',

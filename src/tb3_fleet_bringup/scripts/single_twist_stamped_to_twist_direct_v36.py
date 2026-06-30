@@ -111,7 +111,7 @@ class SingleTwistStampedToTwistBridge(Node):
         self._stopped_by_watchdog = False
         self._republish_count = 0
         self._publish_all(self._latest_twist)
-        self.get_logger().info(
+        self.get_logger().debug(
             f'V36_TWIST_BRIDGE_CMD_RX | robot={self.robot_name} | vx={msg.twist.linear.x:.3f} wz={msg.twist.angular.z:.3f}'
         )
 

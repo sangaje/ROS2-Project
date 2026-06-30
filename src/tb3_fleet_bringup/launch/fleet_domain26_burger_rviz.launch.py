@@ -38,10 +38,10 @@ def generate_launch_description():
 
     return LaunchDescription([
         DeclareLaunchArgument('rviz_config', default_value=os.path.join(bringup_share, 'rviz', 'fleet_domain25_debug_v41.rviz')),
-        SetEnvironmentVariable('ROS_DOMAIN_ID', '26'),
+        SetEnvironmentVariable('ROS_DOMAIN_ID', '24'),
         SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp'),
         SetEnvironmentVariable('FASTDDS_BUILTIN_TRANSPORTS', 'UDPv4'),
-        LogInfo(msg='V41_DOMAIN26_BURGER_RVIZ | RViz attached directly to Burger domain. Default /goal_pose controls Burger.'),
+        LogInfo(msg='V41_DOMAIN24_BURGER_RVIZ | RViz attached directly to Burger domain. Default /goal_pose controls Burger.'),
         marker_node,
         rviz,
     ])

@@ -174,7 +174,7 @@ topics:
     is_astar_control = IfCondition(PythonExpression(["'", control_mode, "' == 'astar_cmd'"]))
 
     return LaunchDescription([
-        DeclareLaunchArgument('domain_id', default_value='26', description='ROS_DOMAIN_ID used by Burger follower domain.'),
+        DeclareLaunchArgument('domain_id', default_value='24', description='ROS_DOMAIN_ID used by Burger follower domain.'),
         DeclareLaunchArgument('leader_domain_id', default_value='25', description='ROS_DOMAIN_ID of Waffle/SLAM owner domain.'),
         DeclareLaunchArgument('burger_x', default_value='-3.20'),
         DeclareLaunchArgument('burger_y', default_value='-1.75'),
@@ -188,8 +188,9 @@ topics:
         SetEnvironmentVariable('ROS_DOMAIN_ID', domain_id),
         SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp'),
         SetEnvironmentVariable('FASTDDS_BUILTIN_TRANSPORTS', 'UDPv4'),
+        SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', 'LOCALHOST'),
         SetEnvironmentVariable('TURTLEBOT3_MODEL', 'burger'),
-        LogInfo(msg='V55_DOMAIN26_BURGER | Burger Nav2 receives live SLAM /map and /leader_pose from Domain25. Burger map frame is relative to Waffle SLAM origin.'),
+        LogInfo(msg='V55_DOMAIN24_BURGER | Burger Nav2 receives live SLAM /map and /leader_pose from Domain25. Burger map frame is relative to Waffle SLAM origin.'),
         LogInfo(msg=['V55_BRIDGE_DOMAINS | leader_domain_id=', leader_domain_id, ' -> burger_domain_id=', domain_id, ' and debug back.']),
         LogInfo(msg='V55_SAFE_HOUSE_SPAWN | default Burger=(-3.20,-1.75,0.0), map_origin=(-2.25,-1.75,0.0). Keep map_origin equal to Waffle initial pose.'),
         LogInfo(msg=['V55_BURGER_CONTROL_MODE | ', control_mode, ' | nav2 or astar_cmd']),
@@ -201,5 +202,5 @@ topics:
         TimerAction(period=18.0, actions=[nav_lifecycle], condition=is_nav2_control),
         TimerAction(period=20.0, actions=[goal_proxy_default, goal_proxy_named], condition=is_nav2_control),
         TimerAction(period=30.0, actions=[follower], condition=IfCondition(PythonExpression(["'", control_mode, "' == 'nav2' and '", auto_follow, "' == 'true'"]))),
-        TimerAction(period=9.0, actions=[astar_cmd]),
+        TimerAction(period=9.0, actions=[astar_cmd], condition=is_astar_control),
     ])

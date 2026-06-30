@@ -217,13 +217,14 @@ topics:
 
     return LaunchDescription([
         DeclareLaunchArgument('waffle_domain_id', default_value='25'),
-        DeclareLaunchArgument('burger_domain_id', default_value='26'),
+        DeclareLaunchArgument('burger_domain_id', default_value='24'),
         DeclareLaunchArgument('show_rviz', default_value='true'),
         DeclareLaunchArgument('sim', default_value='true'),
         DeclareLaunchArgument('rviz_config', default_value=default_rviz),
         SetEnvironmentVariable('ROS_DOMAIN_ID', waffle_domain_id),
         SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp'),
         SetEnvironmentVariable('FASTDDS_BUILTIN_TRANSPORTS', 'UDPv4'),
+        SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', 'LOCALHOST'),
         LogInfo(msg='FLEET_MASTER_LAUNCH | domain bridge + dispatcher + RViz on Domain 25'),
         LogInfo(msg=['waffle_domain=', waffle_domain_id, ' burger_domain=', burger_domain_id]),
         TimerAction(period=0.5, actions=[domain_bridges]),

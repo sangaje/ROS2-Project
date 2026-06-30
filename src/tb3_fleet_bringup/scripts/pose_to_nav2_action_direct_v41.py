@@ -44,6 +44,7 @@ class PoseToNav2Action(Node):
         self.sub = self.create_subscription(PoseStamped, self.goal_pose_topic, self._on_goal_pose, 10)
         self.current_goal_handle = None
         self.goal_count = 0
+        self._action_ready = False
 
         self.get_logger().info(
             'V41_POSE_TO_NAV2_ACTION_READY | '
@@ -62,12 +63,14 @@ class PoseToNav2Action(Node):
         return action_name if action_name.startswith('/') else '/' + action_name
 
     def _on_goal_pose(self, msg: PoseStamped) -> None:
-        if not self.client.wait_for_server(timeout_sec=self.wait_for_server_sec):
-            self.get_logger().warn(
-                f'V41_NAV2_ACTION_SERVER_NOT_READY | action={self.navigate_action} '
-                f'goal_topic={self.goal_pose_topic}'
-            )
-            return
+        if not self._action_ready:
+            self._action_ready = self.client.server_is_ready()
+            if not self._action_ready:
+                self.get_logger().warn(
+                    f'V41_NAV2_ACTION_SERVER_NOT_READY | action={self.navigate_action} '
+                    f'goal_topic={self.goal_pose_topic}'
+                )
+                return
 
         if self.cancel_previous_goal and self.current_goal_handle is not None:
             try:

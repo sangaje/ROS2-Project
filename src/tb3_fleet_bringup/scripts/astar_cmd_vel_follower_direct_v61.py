@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import array
 import math
 import heapq
 from collections import deque
@@ -154,6 +155,7 @@ class AStarCmdVelFollower(Node):
         self.occ_cache = None
         self.cost_cache = None
         self.occ_cache_key = None
+        self._path_start_idx = 0
         self.robot_pose: Optional[PoseStamped] = None
         self.robot_pose_backup: Optional[PoseStamped] = None
         self.leader_pose: Optional[PoseStamped] = None
@@ -234,6 +236,7 @@ class AStarCmdVelFollower(Node):
             self.occ_cache = None
             self.cost_cache = None
             self.occ_cache_key = key
+            self._path_start_idx = 0
             self.path_world = []
 
     def on_robot_pose(self, msg: PoseStamped):
@@ -258,9 +261,8 @@ class AStarCmdVelFollower(Node):
     def on_dynamic_obstacle_pose(self, msg: PoseStamped):
         self.dynamic_obstacle_pose = msg
         self.dynamic_obstacle_stamp = self.now()
-        # Peer moved, so cached obstacle/cost grid must be rebuilt on next plan.
-        self.occ_cache = None
-        self.cost_cache = None
+        # build_occupied() key already includes dyn_grid (peer's grid cell).
+        # Only invalidate when the peer crosses to a different cell, not on every pose update.
 
     def dynamic_obstacle_xy(self) -> Optional[Tuple[float, float]]:
         if self.dynamic_obstacle_pose is None:
@@ -273,6 +275,7 @@ class AStarCmdVelFollower(Node):
         self.manual_goal = msg
         self.manual_goal_stamp = self.now()
         self.path_world = []
+        self._path_start_idx = 0
         self.last_replan_goal_xy = None
         if self.target_mode != 'manual':
             self.get_logger().info(f'MANUAL_GOAL_RECEIVED_BUT_TARGET_MODE_IS_{self.target_mode} | topic={self.manual_goal_topic}')
@@ -456,7 +459,7 @@ class AStarCmdVelFollower(Node):
 
         w, h = m.info.width, m.info.height
         occ = bytearray(w * h)
-        cost = [0.0] * (w * h)
+        cost = array.array('f', bytes(4 * w * h))
         obstacles = []
         unknowns = []
 
@@ -696,19 +699,24 @@ class AStarCmdVelFollower(Node):
                 self.publish_path([])
             return 'NO_PATH'
         self.path_world = [self.grid_to_world(x, y) for x, y in path_grid]
+        self._path_start_idx = 0
         self.publish_path(self.path_world)
         return f'PATH_OK n={len(self.path_world)}'
 
     def pick_lookahead(self, rx: float, ry: float, fallback_goal: Tuple[float, float]) -> Tuple[float, float, str]:
         if not self.path_world:
             return fallback_goal[0], fallback_goal[1], 'DIRECT_FALLBACK'
-        best_i = 0
+        # Search only from remembered position (± a few steps) to avoid O(n) scan per tick.
+        search_start = max(0, self._path_start_idx - 3)
+        best_i = search_start
         best_d = float('inf')
-        for i, (x, y) in enumerate(self.path_world):
+        for i in range(search_start, len(self.path_world)):
+            x, y = self.path_world[i]
             d = (x - rx) ** 2 + (y - ry) ** 2
             if d < best_d:
                 best_d = d
                 best_i = i
+        self._path_start_idx = best_i
         accum = 0.0
         prev = self.path_world[best_i]
         for j in range(best_i + 1, len(self.path_world)):

@@ -60,6 +60,7 @@ class DomainBridgeNav2Follower(Node):
         self.active_goal_handle = None
         self.goal_count = 0
         self.wait_count = 0
+        self._action_ready = False
 
         self.sub = self.create_subscription(PoseStamped, self.leader_pose_topic, self._on_leader_pose, 20)
         self.client = ActionClient(self, NavigateToPose, self.navigate_action)
@@ -104,11 +105,13 @@ class DomainBridgeNav2Follower(Node):
                 self.get_logger().warn('V40_FOLLOW_WAIT | no /leader_pose yet')
             return
 
-        if not self.client.wait_for_server(timeout_sec=self.wait_timeout):
-            self.wait_count += 1
-            if self.wait_count % self.log_wait_every_n == 1:
-                self.get_logger().warn(f'V40_FOLLOW_WAIT | action server not ready: {self.navigate_action}')
-            return
+        if not self._action_ready:
+            self._action_ready = self.client.server_is_ready()
+            if not self._action_ready:
+                self.wait_count += 1
+                if self.wait_count % self.log_wait_every_n == 1:
+                    self.get_logger().warn(f'V40_FOLLOW_WAIT | action server not ready: {self.navigate_action}')
+                return
 
         goal_pose = self._target_from_leader()
         gx = goal_pose.pose.position.x

@@ -54,7 +54,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        DeclareLaunchArgument('domain_id', default_value='26'),
+        DeclareLaunchArgument('domain_id', default_value='24'),
         DeclareLaunchArgument('astar_target_mode', default_value='leader'),
         LogInfo(msg=['V55_BURGER_ASTAR_ONLY | starts forced Burger A* follower mode=', target_mode]),
         SetEnvironmentVariable('ROS_DOMAIN_ID', domain_id),
