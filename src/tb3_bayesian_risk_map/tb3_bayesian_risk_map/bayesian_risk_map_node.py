@@ -381,7 +381,9 @@ class RoomAwareRiskMapNode(Node):
             except Exception as e:
                 self.get_logger().error(f'YOLO load failed: {e}')
                 self.enable_yolo = False
-        if self.enable_yolo and self.yolo is not None and self.use_opencv_camera:
+        # Start camera capture independently of YOLO.
+        # Frames are always captured; YOLO inference runs on top when available.
+        if self.use_opencv_camera:
             self.open_opencv_camera()
             self.opencv_camera_timer = self.create_timer(
                 1.0 / max(0.1, self.yolo_max_rate_hz),
@@ -792,7 +794,7 @@ class RoomAwareRiskMapNode(Node):
                 pass
 
     def on_opencv_camera_timer(self):
-        if not self.enable_yolo or self.yolo is None or not self.use_opencv_camera:
+        if not self.use_opencv_camera:
             return
         if self.opencv_cap is None or not self.opencv_cap.isOpened():
             if not self.opencv_camera_warned:
@@ -818,7 +820,16 @@ class RoomAwareRiskMapNode(Node):
 
         self.opencv_read_fail_count = 0
 
-        self.process_yolo_frame(frame, encoding='opencv_bgr8', header=None)
+        # Always run YOLO if available; otherwise publish raw frame as debug image.
+        if self.enable_yolo and self.yolo is not None:
+            self.process_yolo_frame(frame, encoding='opencv_bgr8', header=None)
+        else:
+            self.image_rx_count += 1
+            self.last_image_encoding = 'opencv_bgr8_raw'
+            h, w = frame.shape[:2]
+            self.last_image_shape = f'{w}x{h} opencv_bgr8_raw'
+            if self.publish_debug_image:
+                self.pub_debug_image.publish(self.bgr8_to_image_msg(frame, None))
 
     def on_image(self, msg: Image):
         if not self.enable_yolo or self.yolo is None:
