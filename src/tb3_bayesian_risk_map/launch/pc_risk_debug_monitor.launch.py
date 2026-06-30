@@ -9,13 +9,14 @@ import os
 
 def generate_launch_description():
     pkg_share = get_package_share_directory('tb3_bayesian_risk_map')
-    rviz_config = os.path.join(pkg_share, 'rviz', 'bayesian_risk_map.rviz')
+    rviz_config = os.path.join(pkg_share, 'rviz', 'slam_risk_live.rviz')
 
     return LaunchDescription([
-        DeclareLaunchArgument('start_rviz', default_value='false'),
+        DeclareLaunchArgument('start_rviz', default_value='true'),
         DeclareLaunchArgument('start_opencv_debug_view', default_value='true'),
         DeclareLaunchArgument('start_rqt_debug_view', default_value='false'),
-        DeclareLaunchArgument('domain_id', default_value='24'),
+        DeclareLaunchArgument('domain_id', default_value='25'),
+        DeclareLaunchArgument('rviz_config', default_value=rviz_config),
         DeclareLaunchArgument('debug_image_topic', default_value='/risk/debug_yolo_image/compressed'),
         DeclareLaunchArgument('image_type', default_value='auto'),
         DeclareLaunchArgument('resize_width', default_value='960'),
@@ -31,7 +32,8 @@ def generate_launch_description():
             executable='rviz2',
             name='rviz2_risk_map',
             output='screen',
-            arguments=['-d', rviz_config],
+            arguments=['-d', LaunchConfiguration('rviz_config')],
+            parameters=[{'use_sim_time': False}],
         ),
 
         Node(

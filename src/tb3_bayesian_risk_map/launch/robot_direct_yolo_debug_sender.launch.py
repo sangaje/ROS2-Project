@@ -13,7 +13,7 @@ def generate_launch_description():
     ])
 
     return LaunchDescription([
-        DeclareLaunchArgument('domain_id', default_value='24'),
+        DeclareLaunchArgument('domain_id', default_value='25'),
         DeclareLaunchArgument('use_sim_time', default_value='false'),
         DeclareLaunchArgument('start_robot_bringup', default_value='false'),
         DeclareLaunchArgument('start_cartographer', default_value='true'),

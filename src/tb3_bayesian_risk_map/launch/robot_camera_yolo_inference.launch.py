@@ -29,7 +29,7 @@ def generate_launch_description():
 
     return LaunchDescription([
         DeclareLaunchArgument('use_sim_time', default_value='false'),
-        DeclareLaunchArgument('domain_id', default_value='24'),
+        DeclareLaunchArgument('domain_id', default_value='25'),
         DeclareLaunchArgument('model_path', default_value='yolo11n.pt'),
         DeclareLaunchArgument('camera_device', default_value='/dev/video1'),
         DeclareLaunchArgument('camera_width', default_value='640'),
