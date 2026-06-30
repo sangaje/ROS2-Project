@@ -80,6 +80,7 @@ def generate_launch_description():
         DeclareLaunchArgument('camera_info_topic', default_value='/camera/camera_info'),
 
         DeclareLaunchArgument('cartographer_configuration_basename', default_value='turtlebot3_lds_2d.lua'),
+        DeclareLaunchArgument('cartographer_configuration_directory', default_value=cartographer_config_dir),
         DeclareLaunchArgument('cartographer_resolution', default_value='0.05'),
         DeclareLaunchArgument('cartographer_publish_period_sec', default_value='1.0'),
 
@@ -146,7 +147,7 @@ def generate_launch_description():
             output='screen',
             parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time')}],
             arguments=[
-                '-configuration_directory', cartographer_config_dir,
+                '-configuration_directory', LaunchConfiguration('cartographer_configuration_directory'),
                 '-configuration_basename', LaunchConfiguration('cartographer_configuration_basename'),
             ],
         ),

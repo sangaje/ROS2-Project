@@ -128,6 +128,9 @@ class RoomAwareRiskMapNode(Node):
         self.opencv_camera_width = int(self.declare_parameter('opencv_camera_width', 640).value)
         self.opencv_camera_height = int(self.declare_parameter('opencv_camera_height', 480).value)
         self.opencv_camera_fps = float(self.declare_parameter('opencv_camera_fps', 15.0).value)
+        self.opencv_reopen_after_failures = int(
+            self.declare_parameter('opencv_reopen_after_failures', 5).value
+        )
         # Direct OpenCV camera mode only. Empty string disables explicit FOURCC.
         # Useful on real TurtleBot3 USB cameras where MJPG avoids high USB/CPU load.
         self.opencv_camera_fourcc = str(
@@ -276,6 +279,7 @@ class RoomAwareRiskMapNode(Node):
         self.opencv_cap = None
         self.opencv_camera_timer = None
         self.opencv_camera_warned = False
+        self.opencv_read_fail_count = 0
 
         self.evidence_points: List[EvidencePoint] = []
         self.next_evidence_id = 1
@@ -770,11 +774,22 @@ class RoomAwareRiskMapNode(Node):
                 f'size={self.opencv_camera_width}x{self.opencv_camera_height} '
                 f'fps={self.opencv_camera_fps:.1f} fourcc={self.opencv_camera_fourcc or "default"}'
             )
+            self.opencv_read_fail_count = 0
+            self.opencv_camera_warned = False
             return True
         except Exception as e:
             self.get_logger().error(f'OpenCV camera setup failed: {e}')
             self.opencv_cap = None
             return False
+
+    def reset_opencv_camera(self):
+        cap = self.opencv_cap
+        self.opencv_cap = None
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
 
     def on_opencv_camera_timer(self):
         if not self.enable_yolo or self.yolo is None or not self.use_opencv_camera:
@@ -790,8 +805,18 @@ class RoomAwareRiskMapNode(Node):
 
         ok, frame = self.opencv_cap.read()
         if not ok or frame is None:
+            self.opencv_read_fail_count += 1
             self.get_logger().warn('OpenCV camera frame read failed', throttle_duration_sec=2.0)
+            if self.opencv_read_fail_count >= max(1, int(self.opencv_reopen_after_failures)):
+                self.get_logger().warn(
+                    f'OpenCV camera read failed {self.opencv_read_fail_count} times; reopening camera',
+                    throttle_duration_sec=2.0,
+                )
+                self.reset_opencv_camera()
+                self.open_opencv_camera()
             return
+
+        self.opencv_read_fail_count = 0
 
         self.process_yolo_frame(frame, encoding='opencv_bgr8', header=None)
 

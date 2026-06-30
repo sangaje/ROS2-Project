@@ -6,6 +6,11 @@ from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
+    package_config_dir = PathJoinSubstitution([
+        FindPackageShare('tb3_bayesian_risk_map'),
+        'config',
+    ])
+
     real_robot_launch = PathJoinSubstitution([
         FindPackageShare('tb3_bayesian_risk_map'),
         'launch',
@@ -28,13 +33,15 @@ def generate_launch_description():
             launch_arguments={
                 'use_sim_time': LaunchConfiguration('use_sim_time'),
                 'start_robot_bringup': 'false',
-                'start_camera': 'true',
+                'start_camera': 'false',
                 'start_cartographer': 'true',
                 'start_risk_map': 'true',
                 'start_rviz': 'false',
                 'start_teleop': 'false',
                 'start_opencv_yolo_view': 'false',
                 'start_rqt_yolo_view': 'false',
+                'cartographer_configuration_directory': package_config_dir,
+                'cartographer_configuration_basename': 'turtlebot3_lds_2d_risk_safe.lua',
                 'teleop_mode': 'true',
                 'risk_publish_rate_hz': '5.0',
                 'region_update_period_sec': '1.5',
@@ -42,7 +49,7 @@ def generate_launch_description():
                 'enable_room_probability': 'false',
                 'enable_region_segmentation': 'true',
                 'enable_visibility_tracking': 'true',
-                'detection_source': 'local_yolo',
+                'detection_source': 'opencv_camera',
                 'enable_yolo': 'true',
                 'model_path': LaunchConfiguration('model_path'),
                 'device': 'cpu',
