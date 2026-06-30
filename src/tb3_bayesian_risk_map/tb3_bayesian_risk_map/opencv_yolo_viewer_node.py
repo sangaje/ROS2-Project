@@ -31,6 +31,7 @@ class OpenCVYoloViewer(FlexibleParameterNodeMixin, Node):
         self.last_grid_log = 0.0
         self.last_shape = ''
         self.grid_stats = {}
+        self.window_ready = False
 
         qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -68,9 +69,11 @@ class OpenCVYoloViewer(FlexibleParameterNodeMixin, Node):
             try:
                 import cv2
                 cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+                self.window_ready = True
             except Exception as e:
                 self.get_logger().error(f'cv2.namedWindow failed: {e}')
                 self.get_logger().error('Check DISPLAY/X11. If SSH, use: ssh -X or run this on the PC desktop terminal.')
+                self.enable_image_view = False
 
     def image_msg_to_bgr8(self, msg: Image):
         enc = msg.encoding.lower()
@@ -145,7 +148,7 @@ class OpenCVYoloViewer(FlexibleParameterNodeMixin, Node):
             self.get_logger().warn(f'grid parse failed topic={topic}: {e}', throttle_duration_sec=2.0)
 
     def on_image(self, msg: Image):
-        if not self.enable_image_view:
+        if not self.enable_image_view or not self.window_ready:
             return
         self.count += 1
         try:
@@ -172,7 +175,7 @@ class OpenCVYoloViewer(FlexibleParameterNodeMixin, Node):
             self.get_logger().warn(f'OpenCV YOLO viewer failed: {e}', throttle_duration_sec=2.0)
 
     def on_compressed_image(self, msg: CompressedImage):
-        if not self.enable_image_view:
+        if not self.enable_image_view or not self.window_ready:
             return
         self.count += 1
         try:

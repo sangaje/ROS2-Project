@@ -1,8 +1,9 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, SetEnvironmentVariable
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, SetEnvironmentVariable
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
+from launch_ros.substitutions import FindPackageShare
 from ament_index_python.packages import get_package_share_directory
 import os
 
@@ -10,6 +11,11 @@ import os
 def generate_launch_description():
     pkg_share = get_package_share_directory('tb3_bayesian_risk_map')
     rviz_config = os.path.join(pkg_share, 'rviz', 'slam_risk_live.rviz')
+    rviz_clean = PathJoinSubstitution([
+        FindPackageShare('tb3_bayesian_risk_map'),
+        'scripts',
+        'rviz2_clean_env.bash',
+    ])
 
     return LaunchDescription([
         DeclareLaunchArgument('start_rviz', default_value='true'),
@@ -26,14 +32,18 @@ def generate_launch_description():
         SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp'),
         SetEnvironmentVariable('FASTDDS_BUILTIN_TRANSPORTS', 'UDPv4'),
 
-        Node(
+        ExecuteProcess(
             condition=IfCondition(LaunchConfiguration('start_rviz')),
-            package='rviz2',
-            executable='rviz2',
-            name='rviz2_risk_map',
+            cmd=[
+                rviz_clean,
+                '-d',
+                LaunchConfiguration('rviz_config'),
+                '--ros-args',
+                '-r',
+                '__node:=rviz2_risk_map',
+            ],
+            name='rviz2_risk_map_clean_env',
             output='screen',
-            arguments=['-d', LaunchConfiguration('rviz_config')],
-            parameters=[{'use_sim_time': False}],
         ),
 
         Node(

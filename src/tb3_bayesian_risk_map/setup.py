@@ -15,6 +15,7 @@ setup(
         (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
         (os.path.join('share', package_name, 'config'), glob('config/*.lua')),
         (os.path.join('share', package_name, 'rviz'), glob('rviz/*.rviz')),
+        (os.path.join('share', package_name, 'scripts'), glob('scripts/*.bash')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

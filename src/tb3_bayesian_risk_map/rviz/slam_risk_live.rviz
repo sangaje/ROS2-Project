@@ -1,6 +1,6 @@
 Panels:
   - Class: rviz_common/Displays
-    Help Height: 70
+    Help Height: 85
     Name: Displays
     Property Tree Widget:
       Expanded:
@@ -9,7 +9,7 @@ Panels:
         - /Risk Overlay1
         - /RobotModel1
       Splitter Ratio: 0.5
-    Tree Height: 620
+    Tree Height: 313
   - Class: rviz_common/Views
     Expanded:
       - /Current View1
@@ -18,8 +18,9 @@ Panels:
 Visualization Manager:
   Class: ""
   Displays:
-    - Class: rviz_default_plugins/Grid
+    - Alpha: 0.5
       Cell Size: 1
+      Class: rviz_default_plugins/Grid
       Color: 160; 160; 164
       Enabled: true
       Line Style:
@@ -37,6 +38,8 @@ Visualization Manager:
       Value: true
     - Class: rviz_default_plugins/TF
       Enabled: true
+      Filter (blacklist): ""
+      Filter (whitelist): ""
       Frame Timeout: 15
       Frames:
         All Enabled: true
@@ -45,9 +48,11 @@ Visualization Manager:
       Show Arrows: true
       Show Axes: true
       Show Names: false
+      Tree:
+        {}
       Update Interval: 0
       Value: true
-    - Alpha: 0.78
+    - Alpha: 0.7799999713897705
       Binary representation: false
       Binary threshold: 100
       Class: rviz_default_plugins/Map
@@ -70,7 +75,7 @@ Visualization Manager:
         Value: /map_updates
       Use Timestamp: false
       Value: true
-    - Alpha: 0.72
+    - Alpha: 0.7200000286102295
       Binary representation: false
       Binary threshold: 100
       Class: rviz_default_plugins/Map
@@ -93,7 +98,7 @@ Visualization Manager:
         Value: /risk/risk_map_updates
       Use Timestamp: false
       Value: true
-    - Alpha: 0.45
+    - Alpha: 0.44999998807907104
       Binary representation: false
       Binary threshold: 100
       Class: rviz_default_plugins/Map
@@ -116,7 +121,7 @@ Visualization Manager:
         Value: /risk/combined_priority_map_updates
       Use Timestamp: false
       Value: true
-    - Alpha: 0.45
+    - Alpha: 0.44999998807907104
       Binary representation: false
       Binary threshold: 100
       Class: rviz_default_plugins/Map
@@ -151,7 +156,9 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /risk/evidence_markers
       Value: true
-    - Class: rviz_default_plugins/RobotModel
+    - Alpha: 1
+      Class: rviz_default_plugins/RobotModel
+      Collision Enabled: false
       Description File: ""
       Description Source: Topic
       Description Topic:
@@ -161,6 +168,15 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /robot_description
       Enabled: true
+      Links:
+        All Links Enabled: true
+        Expand Joint Details: false
+        Expand Link Details: false
+        Expand Tree: false
+        Link Tree Style: ""
+      Mass Properties:
+        Inertia: false
+        Mass: false
       Name: RobotModel
       TF Prefix: ""
       Update Interval: 0
@@ -188,7 +204,7 @@ Visualization Manager:
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 3
-      Size (m): 0.03
+      Size (m): 0.029999999329447746
       Style: Points
       Topic:
         Depth: 100
@@ -220,16 +236,31 @@ Visualization Manager:
   Value: true
   Views:
     Current:
+      Angle: 0.004999999888241291
       Class: rviz_default_plugins/TopDownOrtho
+      Enable Stereo Rendering:
+        Stereo Eye Separation: 0.05999999865889549
+        Stereo Focal Distance: 1
+        Swap Stereo Eyes: false
+        Value: false
+      Invert Z Axis: false
       Name: Current View
-      Near Clip Distance: 0.01
+      Near Clip Distance: 0.009999999776482582
       Scale: 16
       Target Frame: map
       Value: TopDownOrtho (rviz)
       X: 0
       Y: 0
+    Saved: ~
 Window Geometry:
+  Displays:
+    collapsed: false
   Height: 900
+  Hide Left Dock: false
+  Hide Right Dock: false
+  QMainWindow State: 000000ff00000000fd00000001000000000000020c0000031afc0200000002fb000000100044006900730070006c0061007900730100000048000001d7000000f300fffffffb0000000a0056006900650077007301000002260000013c000000c500ffffff000003650000031a00000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  Views:
+    collapsed: false
   Width: 1400
   X: 80
   Y: 60
