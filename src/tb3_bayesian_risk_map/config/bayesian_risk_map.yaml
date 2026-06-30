@@ -8,15 +8,28 @@ bayesian_risk_map_node:
     use_sim_time: false
     update_rate_hz: 2.0
     tf_timeout_sec: 0.25
+    pose_history_duration_sec: 5.0
+    pose_history_max_error_sec: 0.75
 
     # YOLO
+    # opencv_camera: open camera directly with cv2.VideoCapture; no ROS image traffic.
+    # local_yolo: subscribe ROS Image and run YOLO in this node.
+    # flask_topic: do not subscribe ROS Image; consume compact JSON detections from Flask bridge.
+    detection_source: "local_yolo"
+    external_detection_topic: "/risk/yolo_detections"
+    external_person_only: true
     enable_yolo: true
     model_path: "yolo11n.pt"
     device: "cpu"
-    conf_threshold: 0.20
-    yolo_imgsz: 640
-    yolo_max_rate_hz: 3.0
-    detection_timeout_sec: 0.8
+    conf_threshold: 0.25
+    yolo_imgsz: 320
+    yolo_max_rate_hz: 1.0
+    detection_timeout_sec: 2.0
+    opencv_camera_device: "/dev/video0"
+    opencv_camera_width: 640
+    opencv_camera_height: 480
+    opencv_camera_fps: 15.0
+    opencv_camera_fourcc: "MJPG"
 
     # Fake detection debug
     enable_fake_detection: false
@@ -44,7 +57,8 @@ bayesian_risk_map_node:
     source_halo_radius_m: 0.75
     source_halo_sigma_m: 0.35
     source_halo_seed_threshold: 0.12
-    source_halo_top_k: 80
+    source_halo_top_k: 24
+    source_halo_seed_separation_m: 0.20
 
     # Room / region inference
     enable_room_probability: true
@@ -53,8 +67,10 @@ bayesian_risk_map_node:
 
     # Empty observation is stored separately, not subtracted from risk
     enable_empty_observation_map: true
+    enable_visibility_tracking: true
     visibility_num_rays: 96
     observed_empty_alpha: 0.20
+    diagnostic_publish_rate_hz: 1.0
 
     # Occupancy policy
     allow_unknown: false

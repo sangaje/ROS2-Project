@@ -1,0 +1,33 @@
+name: shared_slam_map_leader_goal_25_to_26_v44
+from_domain: 25
+to_domain: 26
+
+topics:
+  /map:
+    type: nav_msgs/msg/OccupancyGrid
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 5
+  /map_metadata:
+    type: nav_msgs/msg/MapMetaData
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 5
+  /leader_pose:
+    type: geometry_msgs/msg/PoseStamped
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 10
+  /burger_goal_pose:
+    type: geometry_msgs/msg/PoseStamped
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 10

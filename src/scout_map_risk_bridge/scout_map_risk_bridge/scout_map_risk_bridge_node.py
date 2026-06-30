@@ -8,6 +8,7 @@ from rclpy.context import Context
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 from nav_msgs.msg import OccupancyGrid
+from geometry_msgs.msg import PoseWithCovarianceStamped
 from std_msgs.msg import String
 
 
@@ -65,6 +66,22 @@ class Bridge:
         self.map_pubs = [self.n_to.create_publisher(OccupancyGrid, args.map_out, q) for q in tq]
         self.risk_pubs = [self.n_to.create_publisher(OccupancyGrid, args.risk_out, q) for q in tq]
         self.status_pubs = [self.n_to.create_publisher(String, args.status_out, q) for q in tq]
+        initialpose_qos = qos(ReliabilityPolicy.RELIABLE, DurabilityPolicy.VOLATILE, 10)
+        self.initialpose_pubs = [
+            self.n_from.create_publisher(
+                PoseWithCovarianceStamped,
+                args.initialpose_out,
+                initialpose_qos,
+            )
+        ]
+        self.initialpose_sub = self.n_to.create_subscription(
+            PoseWithCovarianceStamped,
+            args.initialpose_in,
+            self.on_initialpose,
+            initialpose_qos,
+        )
+        self.initialpose_count = 0
+        self.initialpose_last = 0.0
 
         self.subs = []
         for q in source_qos_profiles(args.source_qos_depth):
@@ -84,6 +101,11 @@ class Bridge:
         self.n_from.get_logger().info(f"MAP  : {args.map_in} -> {args.map_out}")
         self.n_from.get_logger().info(f"RISK : {args.risk_in} -> {args.risk_out}")
         self.n_from.get_logger().info(f"STATUS: {args.status_out}")
+        self.n_from.get_logger().info(
+            f"INITIALPOSE reverse: domain {args.to_domain}:{args.initialpose_in} "
+            f"-> domain {args.from_domain}:{args.initialpose_out} "
+            f"frame={args.source_initialpose_frame}"
+        )
         self.n_from.get_logger().info("QoS: source=4 profiles/topic, target=2 publishers/topic")
 
     def make_key(self, msg):
@@ -118,6 +140,22 @@ class Bridge:
         st.out_count += len(pubs)
         st.last_out = time.time()
 
+    def on_initialpose(self, msg):
+        out = PoseWithCovarianceStamped()
+        out.header = msg.header
+        out.pose = msg.pose
+        if self.args.rewrite_initialpose_frame:
+            out.header.frame_id = self.args.source_initialpose_frame
+        for pub in self.initialpose_pubs:
+            pub.publish(out)
+        self.initialpose_count += 1
+        self.initialpose_last = time.time()
+        self.n_from.get_logger().warn(
+            f"INITIALPOSE_BRIDGED | domain {self.args.to_domain}->{self.args.from_domain} "
+            f"count={self.initialpose_count} frame={out.header.frame_id} "
+            f"x={out.pose.pose.position.x:.2f} y={out.pose.pose.position.y:.2f}"
+        )
+
     def republish_cached(self):
         for pubs, st in [(self.map_pubs, self.map_state), (self.risk_pubs, self.risk_state)]:
             if st.msg is not None:
@@ -133,6 +171,11 @@ class Bridge:
             age_in = -1.0 if st.last_in <= 0 else now - st.last_in
             age_out = -1.0 if st.last_out <= 0 else now - st.last_out
             parts.append(f"{st.name}:in={st.in_count},out={st.out_count},dup={st.dup_count},age_in={age_in:.1f},age_out={age_out:.1f},frame={st.frame},size={st.size},in_topic={st.in_topic},out_topic={st.out_topic}")
+        initialpose_age = -1.0 if self.initialpose_last <= 0 else now - self.initialpose_last
+        parts.append(
+            f"initialpose:count={self.initialpose_count},age={initialpose_age:.1f},"
+            f"in_domain={self.args.to_domain},out_domain={self.args.from_domain}"
+        )
         return " | ".join(parts)
 
     def publish_status(self):
@@ -147,16 +190,20 @@ class Bridge:
 
     def spin(self):
         ex = SingleThreadedExecutor(context=self.ctx_from)
+        ex_to = SingleThreadedExecutor(context=self.ctx_to)
         ex.add_node(self.n_from)
+        ex_to.add_node(self.n_to)
         stop = {"v": False}
         def on_sig(*_): stop["v"] = True
         signal.signal(signal.SIGINT, on_sig)
         signal.signal(signal.SIGTERM, on_sig)
         try:
             while rclpy.ok(context=self.ctx_from) and not stop["v"]:
-                ex.spin_once(timeout_sec=0.1)
+                ex.spin_once(timeout_sec=0.05)
+                ex_to.spin_once(timeout_sec=0.05)
         finally:
             ex.remove_node(self.n_from)
+            ex_to.remove_node(self.n_to)
             self.n_from.destroy_node()
             self.n_to.destroy_node()
             rclpy.shutdown(context=self.ctx_from)
@@ -172,6 +219,15 @@ def parse_args(argv):
     p.add_argument("--map-out", default="/scout/map")
     p.add_argument("--risk-out", default="/scout/risk_map")
     p.add_argument("--status-out", default="/scout_bridge/status")
+    p.add_argument("--initialpose-in", default="/initialpose")
+    p.add_argument("--initialpose-out", default="/initialpose")
+    p.add_argument("--source-initialpose-frame", default="map")
+    p.add_argument("--rewrite-initialpose-frame", action="store_true", default=True)
+    p.add_argument(
+        "--no-rewrite-initialpose-frame",
+        dest="rewrite_initialpose_frame",
+        action="store_false",
+    )
     p.add_argument("--rewrite-frame", action="store_true", default=True)
     p.add_argument("--no-rewrite-frame", dest="rewrite_frame", action="store_false")
     p.add_argument("--target-frame", default="scout_map")

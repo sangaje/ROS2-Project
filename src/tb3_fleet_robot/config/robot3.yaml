@@ -1,0 +1,18 @@
+robot_goal_proxy:
+  ros__parameters:
+    robot_name: robot3
+    goal_topic: /fleet/robot3/goal_pose
+    hold_topic: /fleet/robot3/hold
+    cancel_topic: /fleet/robot3/cancel
+    status_topic: /fleet/robot3/status
+    navigate_action: /navigate_to_pose
+    cancel_previous_goal: true
+    wait_for_server_sec: 10.0
+
+robot_pose_reporter:
+  ros__parameters:
+    robot_name: robot3
+    map_frame: map
+    base_frame: base_footprint
+    pose_topic: /fleet/robot3/pose
+    publish_period_sec: 0.10

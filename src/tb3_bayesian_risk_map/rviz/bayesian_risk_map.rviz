@@ -48,20 +48,20 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /scout/map
+        Value: /map
       Update Topic:
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /scout/map_updates
+        Value: /map_updates
       Use Timestamp: false
       Value: true
     - Alpha: 0.800000011920929
       Binary representation: false
       Binary threshold: 100
       Class: rviz_default_plugins/Map
-      Color Scheme: map
+      Color Scheme: costmap
       Draw Behind: false
       Enabled: true
       Name: Risk Map Positive Halo
@@ -71,13 +71,13 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /scout/risk_map
+        Value: /risk/risk_map
       Update Topic:
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /scout/risk_map_updates
+        Value: /risk/risk_map_updates
       Use Timestamp: false
       Value: true
     - Alpha: 0.550000011920929

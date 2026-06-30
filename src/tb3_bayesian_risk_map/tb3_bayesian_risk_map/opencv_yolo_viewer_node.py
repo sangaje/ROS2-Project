@@ -6,6 +6,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import Image
+from nav_msgs.msg import OccupancyGrid
 
 
 class OpenCVYoloViewer(Node):
@@ -16,10 +17,17 @@ class OpenCVYoloViewer(Node):
         self.window_name = self.declare_parameter('window_name', 'YOLO Debug /risk/debug_yolo_image').value
         self.resize_width = int(self.declare_parameter('resize_width', 960).value)
         self.log_rate_sec = float(self.declare_parameter('log_rate_sec', 2.0).value)
+        self.enable_image_view = bool(self.declare_parameter('enable_image_view', True).value)
+        self.grid_topics_csv = self.declare_parameter(
+            'grid_topics',
+            '/risk/region_id_map,/risk/region_priority_map,/risk/region_checked_map,/risk/combined_priority_map,/risk/risk_map'
+        ).value
 
         self.count = 0
         self.last_log = 0.0
+        self.last_grid_log = 0.0
         self.last_shape = ''
+        self.grid_stats = {}
 
         qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
@@ -27,15 +35,28 @@ class OpenCVYoloViewer(Node):
             history=HistoryPolicy.KEEP_LAST,
             depth=5,
         )
-        self.sub = self.create_subscription(Image, self.image_topic, self.on_image, qos)
-        self.get_logger().info(f'OpenCV YOLO viewer started | topic={self.image_topic}')
+        self.sub = None
+        if self.enable_image_view:
+            self.sub = self.create_subscription(Image, self.image_topic, self.on_image, qos)
+        self.grid_subs = []
+        grid_topics = [t.strip() for t in str(self.grid_topics_csv).split(',') if t.strip()]
+        for topic in grid_topics:
+            self.grid_subs.append(self.create_subscription(
+                OccupancyGrid, topic, lambda msg, topic=topic: self.on_grid(topic, msg), qos
+            ))
 
-        try:
-            import cv2
-            cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
-        except Exception as e:
-            self.get_logger().error(f'cv2.namedWindow failed: {e}')
-            self.get_logger().error('Check DISPLAY/X11. If SSH, use: ssh -X or run this on the PC desktop terminal.')
+        self.get_logger().info(
+            f'OpenCV YOLO/region viewer started | image_topic={self.image_topic} | '
+            f'enable_image_view={self.enable_image_view} | grid_topics={grid_topics}'
+        )
+
+        if self.enable_image_view:
+            try:
+                import cv2
+                cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+            except Exception as e:
+                self.get_logger().error(f'cv2.namedWindow failed: {e}')
+                self.get_logger().error('Check DISPLAY/X11. If SSH, use: ssh -X or run this on the PC desktop terminal.')
 
     def image_msg_to_bgr8(self, msg: Image):
         enc = msg.encoding.lower()
@@ -63,7 +84,31 @@ class OpenCVYoloViewer(Node):
 
         raise ValueError(f'unsupported encoding: {msg.encoding}')
 
+    def on_grid(self, topic: str, msg: OccupancyGrid):
+        try:
+            data = np.array(msg.data, dtype=np.int16)
+            known = data[data >= 0]
+            nonzero = int(np.sum(data > 0))
+            maxv = int(np.max(known)) if known.size else 0
+            meanv = float(np.mean(known)) if known.size else 0.0
+            unique_pos = int(len(np.unique(data[data > 0]))) if np.any(data > 0) else 0
+            self.grid_stats[topic] = (
+                int(msg.info.width), int(msg.info.height), nonzero, maxv, meanv, unique_pos
+            )
+
+            now = time.time()
+            if now - self.last_grid_log >= self.log_rate_sec:
+                self.last_grid_log = now
+                parts = []
+                for name, (w, h, nz, mx, mean, upos) in sorted(self.grid_stats.items()):
+                    parts.append(f'{name}: {w}x{h} nz={nz} max={mx} mean={mean:.1f} uniq_pos={upos}')
+                self.get_logger().info('GRID_VIEW | ' + ' | '.join(parts))
+        except Exception as e:
+            self.get_logger().warn(f'grid parse failed topic={topic}: {e}', throttle_duration_sec=2.0)
+
     def on_image(self, msg: Image):
+        if not self.enable_image_view:
+            return
         self.count += 1
         try:
             import cv2

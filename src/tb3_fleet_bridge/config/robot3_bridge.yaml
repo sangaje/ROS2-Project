@@ -1,0 +1,63 @@
+name: robot3_domain_bridge
+from_domain: 25
+to_domain: 33
+
+topics:
+  /fleet/robot3/goal_pose:
+    type: geometry_msgs/msg/PoseStamped
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 10
+
+  /fleet/robot3/hold:
+    type: std_msgs/msg/Bool
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 10
+
+  /fleet/robot3/cancel:
+    type: std_msgs/msg/Bool
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 10
+
+  /fleet/robot3/pose:
+    type: geometry_msgs/msg/PoseStamped
+    reversed: true
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 10
+
+  /fleet/robot3/status:
+    type: std_msgs/msg/String
+    reversed: true
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 10
+
+
+  /map:
+    type: nav_msgs/msg/OccupancyGrid
+    qos:
+      reliability: reliable
+      durability: transient_local
+      history: keep_last
+      depth: 1
+
+  /map_metadata:
+    type: nav_msgs/msg/MapMetaData
+    qos:
+      reliability: reliable
+      durability: transient_local
+      history: keep_last
+      depth: 1

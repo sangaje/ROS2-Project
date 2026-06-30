@@ -1,0 +1,62 @@
+name: waffle_domain_bridge
+from_domain: 25
+to_domain: 27
+
+topics:
+  /fleet/waffle/goal_pose:
+    type: geometry_msgs/msg/PoseStamped
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 10
+
+  /fleet/waffle/hold:
+    type: std_msgs/msg/Bool
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 10
+
+  /fleet/waffle/cancel:
+    type: std_msgs/msg/Bool
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 10
+
+  /fleet/waffle/pose:
+    type: geometry_msgs/msg/PoseStamped
+    reversed: true
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 10
+
+  /fleet/waffle/status:
+    type: std_msgs/msg/String
+    reversed: true
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 10
+
+  /map:
+    type: nav_msgs/msg/OccupancyGrid
+    qos:
+      reliability: reliable
+      durability: transient_local
+      history: keep_last
+      depth: 1
+
+  /map_metadata:
+    type: nav_msgs/msg/MapMetaData
+    qos:
+      reliability: reliable
+      durability: transient_local
+      history: keep_last
+      depth: 1

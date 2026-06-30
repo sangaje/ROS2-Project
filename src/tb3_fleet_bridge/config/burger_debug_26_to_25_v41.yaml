@@ -1,0 +1,20 @@
+name: burger_debug_26_to_25_v41
+from_domain: 26
+to_domain: 25
+
+topics:
+  /burger_pose:
+    type: geometry_msgs/msg/PoseStamped
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 10
+
+  /astar_path:
+    type: nav_msgs/msg/Path
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 10

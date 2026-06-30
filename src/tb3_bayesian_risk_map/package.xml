@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>tb3_bayesian_risk_map</name>
-  <version>0.6.0</version>
+  <version>0.7.0</version>
   <description>Room-aware Bayesian risk map for TurtleBot3 using YOLO, Cartographer map, TF, and camera visibility. No cv_bridge dependency.</description>
   <maintainer email="qhals8380@gmail.com">bomin</maintainer>
   <license>MIT</license>
@@ -15,6 +15,11 @@
   <exec_depend>tf2_ros</exec_depend>
   <exec_depend>rviz2</exec_depend>
   <exec_depend>rqt_image_view</exec_depend>
+  <exec_depend>turtlebot3_teleop</exec_depend>
+  <exec_depend>v4l2_camera</exec_depend>
+  <exec_depend>cartographer_ros</exec_depend>
+  <exec_depend>turtlebot3_cartographer</exec_depend>
+  <exec_depend>turtlebot3_bringup</exec_depend>
 
   <export>
     <build_type>ament_python</build_type>

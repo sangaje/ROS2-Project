@@ -1,0 +1,199 @@
+# Conservative Nav2 params — Waffle (Domain 25, Leader)
+# use_sim_time overridden at launch time for real-robot support.
+
+controller_server:
+  ros__parameters:
+    use_sim_time: true
+    controller_frequency: 15.0
+    min_x_velocity_threshold: 0.001
+    min_y_velocity_threshold: 0.5
+    min_theta_velocity_threshold: 0.001
+    failure_tolerance: 0.8
+    odom_topic: "/odom_nav"
+    enable_stamped_cmd_vel: true
+    progress_checker_plugins: ["progress_checker"]
+    goal_checker_plugins: ["general_goal_checker"]
+    controller_plugins: ["FollowPath"]
+
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      required_movement_radius: 0.05
+      movement_time_allowance: 25.0
+
+    general_goal_checker:
+      stateful: true
+      plugin: "nav2_controller::SimpleGoalChecker"
+      xy_goal_tolerance: 0.30
+      yaw_goal_tolerance: 0.60
+
+    FollowPath:
+      plugin: "dwb_core::DWBLocalPlanner"
+      debug_trajectory_details: false
+      min_vel_x: 0.0
+      min_vel_y: 0.0
+      max_vel_x: 0.20          # conservative speed
+      max_vel_y: 0.0
+      max_vel_theta: 0.80
+      min_speed_xy: 0.0
+      max_speed_xy: 0.20
+      min_speed_theta: 0.0
+      acc_lim_x: 1.2
+      acc_lim_y: 0.0
+      acc_lim_theta: 2.5
+      decel_lim_x: -1.2
+      decel_lim_y: 0.0
+      decel_lim_theta: -2.5
+      vx_samples: 20
+      vy_samples: 1
+      vtheta_samples: 28
+      sim_time: 1.8             # look further ahead for obstacles
+      linear_granularity: 0.05
+      angular_granularity: 0.025
+      transform_tolerance: 1.0
+      xy_goal_tolerance: 0.30
+      trans_stopped_velocity: 0.08
+      short_circuit_trajectory_evaluation: true
+      stateful: true
+      critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
+      BaseObstacle.scale: 0.30        # conservative: was 0.025, much stronger obstacle avoidance
+      PathAlign.scale: 10.0
+      PathAlign.forward_point_distance: 0.1
+      GoalAlign.scale: 8.0
+      GoalAlign.forward_point_distance: 0.1
+      PathDist.scale: 14.0
+      GoalDist.scale: 12.0
+      RotateToGoal.scale: 8.0
+      RotateToGoal.slowing_factor: 2.5
+      RotateToGoal.lookahead_time: -1.0
+
+planner_server:
+  ros__parameters:
+    use_sim_time: true
+    expected_planner_frequency: 1.0
+    planner_plugins: ["GridBased"]
+    GridBased:
+      plugin: "nav2_navfn_planner::NavfnPlanner"
+      tolerance: 0.5
+      use_astar: true
+      allow_unknown: true
+
+behavior_server:
+  ros__parameters:
+    use_sim_time: true
+    local_costmap_topic: "/local_costmap/costmap_raw"
+    global_costmap_topic: "/global_costmap/costmap_raw"
+    local_footprint_topic: "/local_costmap/published_footprint"
+    global_footprint_topic: "/global_costmap/published_footprint"
+    cycle_frequency: 10.0
+    behavior_plugins: ["spin", "backup", "drive_on_heading", "wait"]
+    spin:
+      plugin: "nav2_behaviors::Spin"
+    backup:
+      plugin: "nav2_behaviors::BackUp"
+    drive_on_heading:
+      plugin: "nav2_behaviors::DriveOnHeading"
+    wait:
+      plugin: "nav2_behaviors::Wait"
+    global_frame: "map"
+    robot_base_frame: "base_footprint"
+    transform_tolerance: 1.0
+    simulate_ahead_time: 2.5
+    max_rotational_vel: 0.80
+    min_rotational_vel: 0.10
+    rotational_acc_lim: 2.0
+
+bt_navigator:
+  ros__parameters:
+    use_sim_time: true
+    global_frame: "map"
+    robot_base_frame: "base_footprint"
+    odom_topic: "/odom_nav"
+    bt_loop_duration: 10
+    default_server_timeout: 20
+    wait_for_service_timeout: 1000
+    navigators: ["navigate_to_pose", "navigate_through_poses"]
+    navigate_to_pose:
+      plugin: "nav2_bt_navigator::NavigateToPoseNavigator"
+    navigate_through_poses:
+      plugin: "nav2_bt_navigator::NavigateThroughPosesNavigator"
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      use_sim_time: true
+      update_frequency: 8.0       # faster updates for better dynamic obstacle tracking
+      publish_frequency: 4.0
+      global_frame: "odom"
+      robot_base_frame: "base_footprint"
+      rolling_window: true
+      width: 5                    # larger local costmap (was 4)
+      height: 5
+      resolution: 0.05
+      robot_radius: 0.25          # slightly conservative (waffle = 0.22)
+      plugins: ["voxel_layer", "inflation_layer"]
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 4.0
+        inflation_radius: 0.60    # conservative inflation (was 0.35)
+      voxel_layer:
+        plugin: "nav2_costmap_2d::VoxelLayer"
+        enabled: true
+        publish_voxel_map: false
+        origin_z: 0.0
+        z_resolution: 0.05
+        z_voxels: 16
+        max_obstacle_height: 2.0
+        mark_threshold: 0
+        observation_sources: scan
+        scan:
+          topic: "/scan_nav"
+          max_obstacle_height: 2.0
+          clearing: true
+          marking: true
+          data_type: "LaserScan"
+          raytrace_max_range: 3.5
+          raytrace_min_range: 0.0
+          obstacle_max_range: 3.0   # see peer robot further away
+          obstacle_min_range: 0.0
+      always_send_full_costmap: true
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      use_sim_time: true
+      update_frequency: 2.0
+      publish_frequency: 1.0
+      global_frame: "map"
+      robot_base_frame: "base_footprint"
+      robot_radius: 0.25
+      resolution: 0.05
+      track_unknown_space: true
+      plugins: ["static_layer", "inflation_layer"]
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_topic: "/map"
+        map_subscribe_transient_local: false
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 4.0
+        inflation_radius: 0.60    # conservative
+      always_send_full_costmap: true
+
+map_server:
+  ros__parameters:
+    use_sim_time: true
+    yaml_filename: ""
+
+lifecycle_manager_map:
+  ros__parameters:
+    use_sim_time: true
+    autostart: true
+    bond_timeout: 4.0
+    node_names: ["map_server"]
+
+lifecycle_manager_navigation:
+  ros__parameters:
+    use_sim_time: true
+    autostart: true
+    bond_timeout: 4.0
+    node_names: ["controller_server", "planner_server", "behavior_server", "bt_navigator"]
