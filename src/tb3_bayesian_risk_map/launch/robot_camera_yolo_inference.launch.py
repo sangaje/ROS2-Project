@@ -3,9 +3,19 @@ from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.substitutions import FindPackageShare
+from ament_index_python.packages import get_package_share_directory
+import os
 
 
 def generate_launch_description():
+    pkg_share = get_package_share_directory('tb3_bayesian_risk_map')
+    safe_lua = os.path.join(pkg_share, 'config', 'turtlebot3_lds_2d_risk_safe.lua')
+    carto_basename = (
+        'turtlebot3_lds_2d_risk_safe.lua'
+        if os.path.exists(safe_lua)
+        else 'turtlebot3_lds_2d.lua'
+    )
+
     package_config_dir = PathJoinSubstitution([
         FindPackageShare('tb3_bayesian_risk_map'),
         'config',
@@ -41,7 +51,7 @@ def generate_launch_description():
                 'start_opencv_yolo_view': 'false',
                 'start_rqt_yolo_view': 'false',
                 'cartographer_configuration_directory': package_config_dir,
-                'cartographer_configuration_basename': 'turtlebot3_lds_2d_risk_safe.lua',
+                'cartographer_configuration_basename': carto_basename,
                 'teleop_mode': 'true',
                 'risk_publish_rate_hz': '5.0',
                 'region_update_period_sec': '1.5',
