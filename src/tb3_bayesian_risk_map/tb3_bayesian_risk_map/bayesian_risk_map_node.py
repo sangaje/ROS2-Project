@@ -118,6 +118,12 @@ class RoomAwareRiskMapNode(Node):
         self.yolo_imgsz = int(self.declare_parameter('yolo_imgsz', 640).value)
         self.yolo_max_rate_hz = float(self.declare_parameter('yolo_max_rate_hz', 3.0).value)
         self.detection_timeout_sec = float(self.declare_parameter('detection_timeout_sec', 0.8).value)
+        self.detection_reuse_max_distance_m = float(
+            self.declare_parameter('detection_reuse_max_distance_m', 0.50).value
+        )
+        self.external_detection_max_count = int(
+            self.declare_parameter('external_detection_max_count', 64).value
+        )
         self.opencv_camera_device = self.declare_parameter('opencv_camera_device', '/dev/video0').value
         self.opencv_camera_width = int(self.declare_parameter('opencv_camera_width', 640).value)
         self.opencv_camera_height = int(self.declare_parameter('opencv_camera_height', 480).value)
@@ -176,6 +182,9 @@ class RoomAwareRiskMapNode(Node):
         self.region_frontier_gain_scale = float(self.declare_parameter('region_frontier_gain_scale', 18.0).value)
         self.region_obstacle_gain_scale = float(self.declare_parameter('region_obstacle_gain_scale', 6.0).value)
         self.region_debug_log_period_sec = float(self.declare_parameter('region_debug_log_period_sec', 2.0).value)
+        self.diagnostic_publish_rate_hz = float(
+            self.declare_parameter('diagnostic_publish_rate_hz', 1.0).value
+        )
 
         # Teleop / live mapping optimization.
         # This keeps the risk layer responsive while avoiding unnecessary CPU churn
@@ -194,9 +203,6 @@ class RoomAwareRiskMapNode(Node):
         if self.teleop_mode:
             self.visibility_num_rays = min(self.visibility_num_rays, 48)
         self.observed_empty_alpha = float(self.declare_parameter('observed_empty_alpha', 0.20).value)
-        self.diagnostic_publish_rate_hz = float(
-            self.declare_parameter('diagnostic_publish_rate_hz', 1.0).value
-        )
 
         # Occupancy policy
         self.allow_unknown = bool(self.declare_parameter('allow_unknown', False).value)
@@ -248,8 +254,8 @@ class RoomAwareRiskMapNode(Node):
         self.next_region_id = 1
         self.last_region_update_wall_sec = 0.0
         self.last_region_debug_wall_sec = 0.0
-        self.last_diagnostic_publish_wall_sec = 0.0
-        self.last_risk_publish_wall_sec = 0.0
+        self.last_diagnostic_publish_ros_ns = 0
+        self.last_risk_publish_ros_ns = 0
 
         self.latest_detections: List[Detection2D] = []
         self.last_yolo_wall_sec = 0.0
@@ -407,14 +413,24 @@ class RoomAwareRiskMapNode(Node):
         rows = raw[:h * step].reshape((h, step))
 
         if enc in ('bgr8', '8uc3'):
+            if step < w * 3:
+                raise ValueError(f'invalid step={step} for {enc} width={w}, need>={w * 3}')
             return rows[:, :w * 3].reshape((h, w, 3)).copy()
         if enc == 'rgb8':
+            if step < w * 3:
+                raise ValueError(f'invalid step={step} for {enc} width={w}, need>={w * 3}')
             return rows[:, :w * 3].reshape((h, w, 3))[:, :, ::-1].copy()
         if enc == 'bgra8':
+            if step < w * 4:
+                raise ValueError(f'invalid step={step} for {enc} width={w}, need>={w * 4}')
             return rows[:, :w * 4].reshape((h, w, 4))[:, :, :3].copy()
         if enc == 'rgba8':
+            if step < w * 4:
+                raise ValueError(f'invalid step={step} for {enc} width={w}, need>={w * 4}')
             return rows[:, :w * 4].reshape((h, w, 4))[:, :, [2, 1, 0]].copy()
         if enc in ('mono8', '8uc1'):
+            if step < w:
+                raise ValueError(f'invalid step={step} for {enc} width={w}, need>={w}')
             gray = rows[:, :w].reshape((h, w))
             return np.repeat(gray[:, :, None], 3, axis=2).copy()
 
@@ -888,6 +904,13 @@ class RoomAwareRiskMapNode(Node):
         if not isinstance(raw_dets, list):
             self.get_logger().warn('external detection ignored: detections is not a list', throttle_duration_sec=2.0)
             return
+        max_count = max(1, int(self.external_detection_max_count))
+        if len(raw_dets) > max_count:
+            self.get_logger().warn(
+                f'external detections truncated: {len(raw_dets)} -> {max_count}',
+                throttle_duration_sec=2.0,
+            )
+            raw_dets = raw_dets[:max_count]
 
         detections: List[Detection2D] = []
         for item in raw_dets:
@@ -1481,7 +1504,16 @@ class RoomAwareRiskMapNode(Node):
 
         detections = []
         detections.extend(self.maybe_make_fake_detection())
-        if self.last_yolo_ros_sec is not None and now_ros_sec - self.last_yolo_ros_sec <= self.detection_timeout_sec:
+        can_reuse_detection = (
+            self.last_yolo_ros_sec is not None
+            and now_ros_sec - self.last_yolo_ros_sec <= self.detection_timeout_sec
+        )
+        if can_reuse_detection and self.latest_detection_pose is not None:
+            dx = float(robot_pose[0]) - float(self.latest_detection_pose[0])
+            dy = float(robot_pose[1]) - float(self.latest_detection_pose[1])
+            if math.hypot(dx, dy) > max(0.0, self.detection_reuse_max_distance_m):
+                can_reuse_detection = False
+        if can_reuse_detection:
             detections.extend(self.latest_detections)
 
         projection_pose = (
@@ -1549,12 +1581,13 @@ class RoomAwareRiskMapNode(Node):
 
         gx0, gy0 = g
         r_cells = max(1, int(math.ceil(self.clear_radius_m / self.map_resolution)))
+        r_cells_sq = float(r_cells * r_cells)
         h, w = self.occ_grid.shape
 
         for gy in range(max(0, gy0 - r_cells), min(h - 1, gy0 + r_cells) + 1):
             for gx in range(max(0, gx0 - r_cells), min(w - 1, gx0 + r_cells) + 1):
-                wx, wy = self.grid_to_world(gx, gy)
-                if math.hypot(wx - x, wy - y) <= self.clear_radius_m:
+                d2 = float((gx - gx0) * (gx - gx0) + (gy - gy0) * (gy - gy0))
+                if d2 <= r_cells_sq:
                     self.detection_candidate_map[gy, gx] = 0.0
                     self.positive_memory_map[gy, gx] = 0.0
                     self.risk_map[gy, gx] = 0.0
@@ -1601,21 +1634,28 @@ class RoomAwareRiskMapNode(Node):
         return np.maximum(base, pri)
 
     def publish_all_maps(self):
-        stamp = self.get_clock().now().to_msg()
+        now_ros = self.get_clock().now()
+        stamp = now_ros.to_msg()
+        now_ros_ns = int(now_ros.nanoseconds)
         # The risk layer is latency-sensitive, but it still benefits from a small
         # publish throttle while teleop driving causes the map to resize frequently.
-        now = time.monotonic()
-        risk_period = 1.0 / self.risk_publish_rate_hz if self.risk_publish_rate_hz > 0.0 else 0.0
-        if risk_period <= 0.0 or now - self.last_risk_publish_wall_sec >= risk_period:
-            self.pub_risk.publish(self.array_to_occgrid(self.risk_map, stamp))
-            self.last_risk_publish_wall_sec = now
-        diagnostic_period = (
-            1.0 / self.diagnostic_publish_rate_hz
-            if self.diagnostic_publish_rate_hz > 0.0 else float('inf')
+        risk_period_ns = (
+            int(1e9 / self.risk_publish_rate_hz)
+            if self.risk_publish_rate_hz > 0.0 else 0
         )
-        if now - self.last_diagnostic_publish_wall_sec < diagnostic_period:
+        if risk_period_ns <= 0 or now_ros_ns - self.last_risk_publish_ros_ns >= risk_period_ns:
+            self.pub_risk.publish(self.array_to_occgrid(self.risk_map, stamp))
+            self.last_risk_publish_ros_ns = now_ros_ns
+        diagnostic_period_ns = (
+            int(1e9 / self.diagnostic_publish_rate_hz)
+            if self.diagnostic_publish_rate_hz > 0.0 else 0
+        )
+        if (
+            diagnostic_period_ns > 0
+            and now_ros_ns - self.last_diagnostic_publish_ros_ns < diagnostic_period_ns
+        ):
             return
-        self.last_diagnostic_publish_wall_sec = now
+        self.last_diagnostic_publish_ros_ns = now_ros_ns
 
         # Heavy full-map diagnostic layers are deliberately rate-limited.
         self.pub_detection_candidate.publish(self.array_to_occgrid(self.detection_candidate_map, stamp))

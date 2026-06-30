@@ -25,6 +25,8 @@ bayesian_risk_map_node:
     yolo_imgsz: 320
     yolo_max_rate_hz: 1.0
     detection_timeout_sec: 2.0
+    detection_reuse_max_distance_m: 0.50
+    external_detection_max_count: 64
     opencv_camera_device: "/dev/video0"
     opencv_camera_width: 640
     opencv_camera_height: 480

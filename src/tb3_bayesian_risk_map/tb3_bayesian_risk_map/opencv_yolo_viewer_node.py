@@ -64,6 +64,9 @@ class OpenCVYoloViewer(Node):
         w = int(msg.width)
         step = int(msg.step)
 
+        if h <= 0 or w <= 0 or step <= 0:
+            raise ValueError(f'invalid image h={h}, w={w}, step={step}, enc={msg.encoding}')
+
         raw = np.frombuffer(msg.data, dtype=np.uint8)
         if raw.size < h * step:
             raise ValueError(f'buffer too small: raw={raw.size}, expected={h * step}, enc={msg.encoding}')
@@ -71,15 +74,25 @@ class OpenCVYoloViewer(Node):
         rows = raw[:h * step].reshape((h, step))
 
         if enc in ('bgr8', '8uc3'):
+            if step < w * 3:
+                raise ValueError(f'invalid step={step} for {enc} width={w}, need>={w * 3}')
             return rows[:, :w * 3].reshape((h, w, 3)).copy()
         if enc == 'rgb8':
+            if step < w * 3:
+                raise ValueError(f'invalid step={step} for {enc} width={w}, need>={w * 3}')
             return rows[:, :w * 3].reshape((h, w, 3))[:, :, ::-1].copy()
         if enc in ('mono8', '8uc1'):
+            if step < w:
+                raise ValueError(f'invalid step={step} for {enc} width={w}, need>={w}')
             gray = rows[:, :w].reshape((h, w))
             return np.repeat(gray[:, :, None], 3, axis=2).copy()
         if enc == 'bgra8':
+            if step < w * 4:
+                raise ValueError(f'invalid step={step} for {enc} width={w}, need>={w * 4}')
             return rows[:, :w * 4].reshape((h, w, 4))[:, :, :3].copy()
         if enc == 'rgba8':
+            if step < w * 4:
+                raise ValueError(f'invalid step={step} for {enc} width={w}, need>={w * 4}')
             return rows[:, :w * 4].reshape((h, w, 4))[:, :, [2, 1, 0]].copy()
 
         raise ValueError(f'unsupported encoding: {msg.encoding}')
