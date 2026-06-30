@@ -11,8 +11,10 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import Image
 
+from tb3_flask_yolo_bridge.ros_param_helpers import FlexibleParameterNodeMixin
 
-class OpenCVCameraPublisher(Node):
+
+class OpenCVCameraPublisher(FlexibleParameterNodeMixin, Node):
     def __init__(self):
         super().__init__('opencv_camera_publisher')
         self.device = self.declare_parameter('device', '/dev/video0').value
@@ -21,7 +23,7 @@ class OpenCVCameraPublisher(Node):
         self.width = int(self.declare_parameter('width', 640).value)
         self.height = int(self.declare_parameter('height', 480).value)
         self.fps = float(self.declare_parameter('fps', 15.0).value)
-        self.show_preview = bool(self.declare_parameter('show_preview', False).value)
+        self.show_preview = self.declare_bool_parameter('show_preview', False)
         self.window_name = self.declare_parameter('window_name', 'OpenCV Camera Source').value
         self.log_period_sec = float(self.declare_parameter('log_period_sec', 2.0).value)
 

@@ -5,22 +5,25 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CompressedImage, Image
 from nav_msgs.msg import OccupancyGrid
 
+from tb3_bayesian_risk_map.ros_param_helpers import FlexibleParameterNodeMixin
 
-class OpenCVYoloViewer(Node):
+
+class OpenCVYoloViewer(FlexibleParameterNodeMixin, Node):
     def __init__(self):
         super().__init__('opencv_yolo_viewer_node')
 
         self.image_topic = self.declare_parameter('image_topic', '/risk/debug_yolo_image').value
+        self.image_type = str(self.declare_parameter('image_type', 'auto').value).strip().lower()
         self.window_name = self.declare_parameter('window_name', 'YOLO Debug /risk/debug_yolo_image').value
         self.resize_width = int(self.declare_parameter('resize_width', 960).value)
         self.log_rate_sec = float(self.declare_parameter('log_rate_sec', 2.0).value)
-        self.enable_image_view = bool(self.declare_parameter('enable_image_view', True).value)
+        self.enable_image_view = self.declare_bool_parameter('enable_image_view', True)
         self.grid_topics_csv = self.declare_parameter(
             'grid_topics',
-            '/risk/region_id_map,/risk/region_priority_map,/risk/region_checked_map,/risk/combined_priority_map,/risk/risk_map'
+            ''
         ).value
 
         self.count = 0
@@ -37,7 +40,18 @@ class OpenCVYoloViewer(Node):
         )
         self.sub = None
         if self.enable_image_view:
-            self.sub = self.create_subscription(Image, self.image_topic, self.on_image, qos)
+            image_type = self.image_type
+            if image_type == 'auto':
+                image_type = 'compressed' if str(self.image_topic).endswith('/compressed') else 'raw'
+            if image_type in ('compressed', 'jpeg', 'jpg'):
+                self.sub = self.create_subscription(
+                    CompressedImage,
+                    self.image_topic,
+                    self.on_compressed_image,
+                    qos,
+                )
+            else:
+                self.sub = self.create_subscription(Image, self.image_topic, self.on_image, qos)
         self.grid_subs = []
         grid_topics = [t.strip() for t in str(self.grid_topics_csv).split(',') if t.strip()]
         for topic in grid_topics:
@@ -47,7 +61,7 @@ class OpenCVYoloViewer(Node):
 
         self.get_logger().info(
             f'OpenCV YOLO/region viewer started | image_topic={self.image_topic} | '
-            f'enable_image_view={self.enable_image_view} | grid_topics={grid_topics}'
+            f'image_type={self.image_type} | enable_image_view={self.enable_image_view} | grid_topics={grid_topics}'
         )
 
         if self.enable_image_view:
@@ -97,6 +111,17 @@ class OpenCVYoloViewer(Node):
 
         raise ValueError(f'unsupported encoding: {msg.encoding}')
 
+    def compressed_msg_to_bgr8(self, msg: CompressedImage):
+        try:
+            import cv2
+            raw = np.frombuffer(msg.data, dtype=np.uint8)
+            img = cv2.imdecode(raw, cv2.IMREAD_COLOR)
+            if img is None:
+                raise ValueError(f'cv2.imdecode failed format={msg.format}')
+            return img
+        except Exception as e:
+            raise ValueError(f'compressed image decode failed: {e}') from e
+
     def on_grid(self, topic: str, msg: OccupancyGrid):
         try:
             data = np.array(msg.data, dtype=np.int16)
@@ -145,6 +170,33 @@ class OpenCVYoloViewer(Node):
                 )
         except Exception as e:
             self.get_logger().warn(f'OpenCV YOLO viewer failed: {e}', throttle_duration_sec=2.0)
+
+    def on_compressed_image(self, msg: CompressedImage):
+        if not self.enable_image_view:
+            return
+        self.count += 1
+        try:
+            import cv2
+            img = self.compressed_msg_to_bgr8(msg)
+
+            h, w = img.shape[:2]
+            self.last_shape = f'{w}x{h} {msg.format or "compressed"}'
+
+            if self.resize_width > 0 and w > 0 and w != self.resize_width:
+                scale = self.resize_width / float(w)
+                img = cv2.resize(img, (self.resize_width, int(h * scale)))
+
+            cv2.imshow(self.window_name, img)
+            cv2.waitKey(1)
+
+            now = time.time()
+            if now - self.last_log >= self.log_rate_sec:
+                self.last_log = now
+                self.get_logger().info(
+                    f'OPENCV_YOLO_VIEW | frames={self.count} | last_shape={self.last_shape} | topic={self.image_topic}'
+                )
+        except Exception as e:
+            self.get_logger().warn(f'OpenCV YOLO compressed viewer failed: {e}', throttle_duration_sec=2.0)
 
 
 def main(args=None):

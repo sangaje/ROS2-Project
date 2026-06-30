@@ -3,24 +3,9 @@ from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, SetE
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.substitutions import FindPackageShare
-from ament_index_python.packages import get_package_share_directory
-import os
 
 
 def generate_launch_description():
-    pkg_share = get_package_share_directory('tb3_bayesian_risk_map')
-    safe_lua = os.path.join(pkg_share, 'config', 'turtlebot3_lds_2d_risk_safe.lua')
-    carto_basename = (
-        'turtlebot3_lds_2d_risk_safe.lua'
-        if os.path.exists(safe_lua)
-        else 'turtlebot3_lds_2d.lua'
-    )
-
-    package_config_dir = PathJoinSubstitution([
-        FindPackageShare('tb3_bayesian_risk_map'),
-        'config',
-    ])
-
     real_robot_launch = PathJoinSubstitution([
         FindPackageShare('tb3_bayesian_risk_map'),
         'launch',
@@ -28,15 +13,21 @@ def generate_launch_description():
     ])
 
     return LaunchDescription([
-        DeclareLaunchArgument('use_sim_time', default_value='false'),
         DeclareLaunchArgument('domain_id', default_value='24'),
+        DeclareLaunchArgument('use_sim_time', default_value='false'),
+        DeclareLaunchArgument('start_robot_bringup', default_value='false'),
+        DeclareLaunchArgument('start_cartographer', default_value='true'),
+        DeclareLaunchArgument('start_risk_map', default_value='true'),
+        DeclareLaunchArgument('start_teleop', default_value='false'),
+        DeclareLaunchArgument('opencv_camera_device', default_value='/dev/video1'),
+        DeclareLaunchArgument('opencv_camera_width', default_value='640'),
+        DeclareLaunchArgument('opencv_camera_height', default_value='480'),
+        DeclareLaunchArgument('opencv_camera_fps', default_value='15.0'),
+        DeclareLaunchArgument('opencv_camera_fourcc', default_value='MJPG'),
         DeclareLaunchArgument('model_path', default_value='yolo11n.pt'),
-        DeclareLaunchArgument('camera_device', default_value='/dev/video1'),
-        DeclareLaunchArgument('camera_width', default_value='640'),
-        DeclareLaunchArgument('camera_height', default_value='480'),
-        DeclareLaunchArgument('camera_fps', default_value='15'),
+        DeclareLaunchArgument('device', default_value='cpu'),
         DeclareLaunchArgument('yolo_imgsz', default_value='320'),
-        DeclareLaunchArgument('yolo_max_rate_hz', default_value='1.0'),
+        DeclareLaunchArgument('yolo_max_rate_hz', default_value='2.0'),
         DeclareLaunchArgument('conf_threshold', default_value='0.25'),
         DeclareLaunchArgument('debug_compressed_image_topic', default_value='/risk/debug_yolo_image/compressed'),
         DeclareLaunchArgument('debug_compressed_jpeg_quality', default_value='70'),
@@ -49,49 +40,35 @@ def generate_launch_description():
             PythonLaunchDescriptionSource(real_robot_launch),
             launch_arguments={
                 'use_sim_time': LaunchConfiguration('use_sim_time'),
-                'start_robot_bringup': 'false',
+                'start_robot_bringup': LaunchConfiguration('start_robot_bringup'),
                 'start_camera': 'false',
-                'start_cartographer': 'true',
-                'start_risk_map': 'true',
+                'start_cartographer': LaunchConfiguration('start_cartographer'),
+                'start_risk_map': LaunchConfiguration('start_risk_map'),
                 'start_rviz': 'false',
-                'start_teleop': 'false',
+                'start_teleop': LaunchConfiguration('start_teleop'),
                 'start_opencv_yolo_view': 'false',
                 'start_rqt_yolo_view': 'false',
-                'cartographer_configuration_directory': package_config_dir,
-                'cartographer_configuration_basename': carto_basename,
-                'teleop_mode': 'true',
-                'risk_publish_rate_hz': '5.0',
-                'region_update_period_sec': '1.5',
-                'visibility_num_rays': '48',
-                'enable_room_probability': 'false',
-                'enable_region_segmentation': 'true',
-                'enable_visibility_tracking': 'true',
                 'detection_source': 'opencv_camera',
                 'enable_yolo': 'true',
                 'model_path': LaunchConfiguration('model_path'),
-                'device': 'cpu',
+                'device': LaunchConfiguration('device'),
                 'yolo_imgsz': LaunchConfiguration('yolo_imgsz'),
                 'yolo_max_rate_hz': LaunchConfiguration('yolo_max_rate_hz'),
                 'conf_threshold': LaunchConfiguration('conf_threshold'),
-                'detection_timeout_sec': '2.0',
-                'detection_reuse_max_distance_m': '0.50',
-                'external_detection_max_count': '64',
-                'camera_device': LaunchConfiguration('camera_device'),
-                'camera_width': LaunchConfiguration('camera_width'),
-                'camera_height': LaunchConfiguration('camera_height'),
-                'camera_fps': LaunchConfiguration('camera_fps'),
-                'opencv_camera_device': LaunchConfiguration('camera_device'),
-                'opencv_camera_width': LaunchConfiguration('camera_width'),
-                'opencv_camera_height': LaunchConfiguration('camera_height'),
-                'opencv_camera_fps': LaunchConfiguration('camera_fps'),
-                'camera_pixel_format': 'MJPG',
-                'camera_output_encoding': 'rgb8',
+                'opencv_camera_device': LaunchConfiguration('opencv_camera_device'),
+                'opencv_camera_width': LaunchConfiguration('opencv_camera_width'),
+                'opencv_camera_height': LaunchConfiguration('opencv_camera_height'),
+                'opencv_camera_fps': LaunchConfiguration('opencv_camera_fps'),
+                'opencv_camera_fourcc': LaunchConfiguration('opencv_camera_fourcc'),
                 'publish_overlay': 'false',
                 'publish_debug_image': 'false',
                 'publish_debug_compressed_image': 'true',
                 'debug_compressed_image_topic': LaunchConfiguration('debug_compressed_image_topic'),
                 'debug_compressed_jpeg_quality': LaunchConfiguration('debug_compressed_jpeg_quality'),
                 'debug_show_opencv': 'false',
+                'debug_save_images': 'false',
+                'debug_log_image_status': 'true',
+                'teleop_mode': 'true',
             }.items(),
         ),
     ])

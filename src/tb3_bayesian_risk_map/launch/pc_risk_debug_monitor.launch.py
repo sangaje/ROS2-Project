@@ -1,5 +1,5 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, SetEnvironmentVariable
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -12,11 +12,18 @@ def generate_launch_description():
     rviz_config = os.path.join(pkg_share, 'rviz', 'bayesian_risk_map.rviz')
 
     return LaunchDescription([
-        DeclareLaunchArgument('start_rviz', default_value='true'),
+        DeclareLaunchArgument('start_rviz', default_value='false'),
         DeclareLaunchArgument('start_opencv_debug_view', default_value='true'),
         DeclareLaunchArgument('start_rqt_debug_view', default_value='false'),
-        DeclareLaunchArgument('debug_image_topic', default_value='/risk/debug_yolo_image'),
+        DeclareLaunchArgument('domain_id', default_value='24'),
+        DeclareLaunchArgument('debug_image_topic', default_value='/risk/debug_yolo_image/compressed'),
+        DeclareLaunchArgument('image_type', default_value='auto'),
         DeclareLaunchArgument('resize_width', default_value='960'),
+        DeclareLaunchArgument('grid_topics', default_value=''),
+
+        SetEnvironmentVariable('ROS_DOMAIN_ID', LaunchConfiguration('domain_id')),
+        SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp'),
+        SetEnvironmentVariable('FASTDDS_BUILTIN_TRANSPORTS', 'UDPv4'),
 
         Node(
             condition=IfCondition(LaunchConfiguration('start_rviz')),
@@ -35,7 +42,9 @@ def generate_launch_description():
             output='screen',
             parameters=[{
                 'image_topic': LaunchConfiguration('debug_image_topic'),
+                'image_type': LaunchConfiguration('image_type'),
                 'resize_width': LaunchConfiguration('resize_width'),
+                'grid_topics': LaunchConfiguration('grid_topics'),
             }],
         ),
 

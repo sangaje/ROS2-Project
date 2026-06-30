@@ -15,12 +15,14 @@ from rclpy.duration import Duration
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy, HistoryPolicy
 
 from std_msgs.msg import Bool, String
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CompressedImage, Image
 from nav_msgs.msg import OccupancyGrid
 from geometry_msgs.msg import PointStamped, Point
 from visualization_msgs.msg import Marker, MarkerArray
 
 import tf2_ros
+
+from tb3_bayesian_risk_map.ros_param_helpers import FlexibleParameterNodeMixin
 
 
 @dataclass
@@ -78,7 +80,7 @@ def wrap_angle(a):
     return math.atan2(math.sin(a), math.cos(a))
 
 
-class RoomAwareRiskMapNode(Node):
+class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
     """
     v2 design:
     - Positive evidence creates candidate probability from YOLO bearing/range + map line-of-sight.
@@ -109,9 +111,9 @@ class RoomAwareRiskMapNode(Node):
         # YOLO
         self.detection_source = str(self.declare_parameter('detection_source', 'local_yolo').value).strip().lower()
         self.external_detection_topic = self.declare_parameter('external_detection_topic', '/risk/yolo_detections').value
-        self.external_person_only = bool(self.declare_parameter('external_person_only', True).value)
+        self.external_person_only = self.declare_bool_parameter('external_person_only', True)
         self.debug_image_topic = self.declare_parameter('debug_image_topic', '/risk/debug_yolo_image').value
-        self.enable_yolo = bool(self.declare_parameter('enable_yolo', True).value)
+        self.enable_yolo = self.declare_bool_parameter('enable_yolo', True)
         self.model_path = self.declare_parameter('model_path', 'yolo11n.pt').value
         self.device = self.declare_parameter('device', 'cpu').value
         self.conf_threshold = float(self.declare_parameter('conf_threshold', 0.20).value)
@@ -138,7 +140,7 @@ class RoomAwareRiskMapNode(Node):
         ).strip()
 
         # Fake
-        self.enable_fake_detection = bool(self.declare_parameter('enable_fake_detection', False).value)
+        self.enable_fake_detection = self.declare_bool_parameter('enable_fake_detection', False)
         self.fake_detection_interval_sec = float(self.declare_parameter('fake_detection_interval_sec', 2.0).value)
         self.fake_bearing_deg = float(self.declare_parameter('fake_bearing_deg', 0.0).value)
         self.fake_range_m = float(self.declare_parameter('fake_range_m', 2.0).value)
@@ -155,7 +157,7 @@ class RoomAwareRiskMapNode(Node):
         self.bearing_sigma_deg = float(self.declare_parameter('bearing_sigma_deg', 8.0).value)
         self.angular_sample_step_deg = float(self.declare_parameter('angular_sample_step_deg', 1.0).value)
         self.range_sigma_m = float(self.declare_parameter('range_sigma_m', 0.75).value)
-        self.use_bbox_range_prior = bool(self.declare_parameter('use_bbox_range_prior', True).value)
+        self.use_bbox_range_prior = self.declare_bool_parameter('use_bbox_range_prior', True)
         self.source_min_value = float(self.declare_parameter('source_min_value', 0.03).value)
         self.positive_memory_alpha = float(self.declare_parameter('positive_memory_alpha', 0.85).value)
 
@@ -169,13 +171,13 @@ class RoomAwareRiskMapNode(Node):
         )
 
         # Room / region
-        self.enable_room_probability = bool(self.declare_parameter('enable_room_probability', True).value)
+        self.enable_room_probability = self.declare_bool_parameter('enable_room_probability', True)
         self.room_top_k = int(self.declare_parameter('room_top_k', 3).value)
         self.room_min_score = float(self.declare_parameter('room_min_score', 0.02).value)
 
         # Region segmentation / priority for live teleop SLAM.
         # Internal name is region, not room, because a partial SLAM map can split/merge rooms while mapping.
-        self.enable_region_segmentation = bool(self.declare_parameter('enable_region_segmentation', True).value)
+        self.enable_region_segmentation = self.declare_bool_parameter('enable_region_segmentation', True)
         self.region_update_period_sec = float(self.declare_parameter('region_update_period_sec', 1.0).value)
         self.region_core_clearance_m = float(self.declare_parameter('region_core_clearance_m', 0.38).value)
         self.region_expand_clearance_m = float(self.declare_parameter('region_expand_clearance_m', 0.22).value)
@@ -192,7 +194,7 @@ class RoomAwareRiskMapNode(Node):
         # Teleop / live mapping optimization.
         # This keeps the risk layer responsive while avoiding unnecessary CPU churn
         # during manual exploration with Cartographer.
-        self.teleop_mode = bool(self.declare_parameter('teleop_mode', False).value)
+        self.teleop_mode = self.declare_bool_parameter('teleop_mode', False)
         self.risk_publish_rate_hz = float(self.declare_parameter('risk_publish_rate_hz', 5.0).value)
         if self.teleop_mode:
             self.region_update_period_sec = max(self.region_update_period_sec, 1.5)
@@ -200,15 +202,15 @@ class RoomAwareRiskMapNode(Node):
             self.risk_publish_rate_hz = min(self.risk_publish_rate_hz, 5.0)
 
         # Empty observation
-        self.enable_empty_observation_map = bool(self.declare_parameter('enable_empty_observation_map', True).value)
-        self.enable_visibility_tracking = bool(self.declare_parameter('enable_visibility_tracking', True).value)
+        self.enable_empty_observation_map = self.declare_bool_parameter('enable_empty_observation_map', True)
+        self.enable_visibility_tracking = self.declare_bool_parameter('enable_visibility_tracking', True)
         self.visibility_num_rays = int(self.declare_parameter('visibility_num_rays', 96).value)
         if self.teleop_mode:
             self.visibility_num_rays = min(self.visibility_num_rays, 48)
         self.observed_empty_alpha = float(self.declare_parameter('observed_empty_alpha', 0.20).value)
 
         # Occupancy policy
-        self.allow_unknown = bool(self.declare_parameter('allow_unknown', False).value)
+        self.allow_unknown = self.declare_bool_parameter('allow_unknown', False)
         self.free_threshold = int(self.declare_parameter('free_threshold', 30).value)
         self.occupied_threshold = int(self.declare_parameter('occupied_threshold', 65).value)
 
@@ -216,19 +218,30 @@ class RoomAwareRiskMapNode(Node):
         self.clear_radius_m = float(self.declare_parameter('clear_radius_m', 0.6).value)
 
         # Debug image
-        self.publish_overlay = bool(self.declare_parameter('publish_overlay', True).value)
-        self.publish_debug_image = bool(self.declare_parameter('publish_debug_image', True).value)
-        self.debug_show_opencv = bool(self.declare_parameter('debug_show_opencv', False).value)
-        self.debug_save_images = bool(self.declare_parameter('debug_save_images', False).value)
+        self.publish_overlay = self.declare_bool_parameter('publish_overlay', True)
+        self.publish_debug_image = self.declare_bool_parameter('publish_debug_image', True)
+        self.publish_debug_compressed_image = self.declare_bool_parameter(
+            'publish_debug_compressed_image',
+            False,
+        )
+        self.debug_compressed_image_topic = str(
+            self.declare_parameter('debug_compressed_image_topic', '/risk/debug_yolo_image/compressed').value
+        ).strip()
+        self.debug_compressed_jpeg_quality = int(
+            self.declare_parameter('debug_compressed_jpeg_quality', 70).value
+        )
+        self.debug_show_opencv = self.declare_bool_parameter('debug_show_opencv', False)
+        self.debug_save_images = self.declare_bool_parameter('debug_save_images', False)
         self.debug_image_dir = self.declare_parameter('debug_image_dir', '/tmp/tb3_bayesian_risk_map_debug').value
         self.debug_image_rate_hz = float(self.declare_parameter('debug_image_rate_hz', 1.0).value)
-        self.debug_log_image_status = bool(self.declare_parameter('debug_log_image_status', True).value)
+        self.debug_log_image_status = self.declare_bool_parameter('debug_log_image_status', True)
 
         # Persistence. Critical for Cartographer: map geometry can grow/change while exploring.
         # If true, positive/risk layers are reprojected in world coordinates instead of reset.
-        self.preserve_risk_on_map_resize = bool(self.declare_parameter('preserve_risk_on_map_resize', True).value)
-        self.publish_yolo_debug_even_without_detection = bool(
-            self.declare_parameter('publish_yolo_debug_even_without_detection', True).value
+        self.preserve_risk_on_map_resize = self.declare_bool_parameter('preserve_risk_on_map_resize', True)
+        self.publish_yolo_debug_even_without_detection = self.declare_bool_parameter(
+            'publish_yolo_debug_even_without_detection',
+            True,
         )
 
         # State
@@ -367,6 +380,11 @@ class RoomAwareRiskMapNode(Node):
         self.pub_markers = self.create_publisher(MarkerArray, '/risk/evidence_markers', self.qos_marker_pub)
         self.pub_overlay = self.create_publisher(Image, '/risk/overlay_image', self.qos_image_pub)
         self.pub_debug_image = self.create_publisher(Image, self.debug_image_topic, self.qos_image_pub)
+        self.pub_debug_compressed_image = self.create_publisher(
+            CompressedImage,
+            self.debug_compressed_image_topic,
+            self.qos_image_pub,
+        )
 
         if self.debug_save_images:
             os.makedirs(self.debug_image_dir, exist_ok=True)
@@ -399,7 +417,9 @@ class RoomAwareRiskMapNode(Node):
             'risk persists across Cartographer map resize; negative observations DO NOT reduce /risk/risk_map; '
             'they are published separately as /risk/observed_empty_map; region_id/priority maps are live SLAM diagnostics; '
             f'detection_source={self.detection_source} external_detection_topic={self.external_detection_topic} '
-            f'teleop_mode={self.teleop_mode} risk_publish_rate_hz={self.risk_publish_rate_hz:.2f}'
+            f'teleop_mode={self.teleop_mode} risk_publish_rate_hz={self.risk_publish_rate_hz:.2f} '
+            f'debug_raw={self.publish_debug_image}:{self.debug_image_topic} '
+            f'debug_compressed={self.publish_debug_compressed_image}:{self.debug_compressed_image_topic}'
         )
 
     # ---------------- Image conversion without cv_bridge ----------------
@@ -453,6 +473,35 @@ class RoomAwareRiskMapNode(Node):
         msg.step = int(img.shape[1] * 3)
         msg.data = img.astype(np.uint8, copy=False).tobytes()
         return msg
+
+    def bgr8_to_compressed_image_msg(self, img, header=None):
+        msg = CompressedImage()
+        if header is not None:
+            msg.header = header
+        msg.format = 'jpeg'
+        try:
+            import cv2
+            quality = clamp(int(self.debug_compressed_jpeg_quality), 1, 100)
+            ok, encoded = cv2.imencode(
+                '.jpg',
+                img,
+                [int(cv2.IMWRITE_JPEG_QUALITY), quality],
+            )
+            if not ok:
+                raise ValueError('cv2.imencode returned false')
+            msg.data = encoded.tobytes()
+            return msg
+        except Exception as e:
+            self.get_logger().warn(f'debug JPEG encode failed: {e}', throttle_duration_sec=2.0)
+            return None
+
+    def publish_debug_frame(self, img, header=None):
+        if self.publish_debug_image:
+            self.pub_debug_image.publish(self.bgr8_to_image_msg(img, header))
+        if self.publish_debug_compressed_image:
+            msg = self.bgr8_to_compressed_image_msg(img, header)
+            if msg is not None:
+                self.pub_debug_compressed_image.publish(msg)
 
     # ---------------- Map / frame helpers ----------------
 
@@ -828,8 +877,7 @@ class RoomAwareRiskMapNode(Node):
             self.last_image_encoding = 'opencv_bgr8_raw'
             h, w = frame.shape[:2]
             self.last_image_shape = f'{w}x{h} opencv_bgr8_raw'
-            if self.publish_debug_image:
-                self.pub_debug_image.publish(self.bgr8_to_image_msg(frame, None))
+            self.publish_debug_frame(frame, None)
 
     def on_image(self, msg: Image):
         if not self.enable_yolo or self.yolo is None:
@@ -913,13 +961,12 @@ class RoomAwareRiskMapNode(Node):
         overlay = self.make_overlay(frame, detections)
         if overlay is None:
             # Fallback: publish raw frame even when overlay failed or YOLO is off
-            if self.publish_debug_image and self.publish_yolo_debug_even_without_detection:
-                self.pub_debug_image.publish(self.bgr8_to_image_msg(frame, header))
+            if self.publish_yolo_debug_even_without_detection:
+                self.publish_debug_frame(frame, header)
         else:
             if self.publish_overlay:
                 self.pub_overlay.publish(self.bgr8_to_image_msg(overlay, header))
-            if self.publish_debug_image:
-                self.pub_debug_image.publish(self.bgr8_to_image_msg(overlay, header))
+            self.publish_debug_frame(overlay, header)
             self.debug_output_image(overlay)
 
     def on_external_detections(self, msg: String):

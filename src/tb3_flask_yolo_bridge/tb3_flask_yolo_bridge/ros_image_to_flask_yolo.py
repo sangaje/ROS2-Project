@@ -17,8 +17,10 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPo
 from sensor_msgs.msg import CompressedImage, Image
 from std_msgs.msg import String
 
+from tb3_flask_yolo_bridge.ros_param_helpers import FlexibleParameterNodeMixin
 
-class RosImageToFlaskYolo(Node):
+
+class RosImageToFlaskYolo(FlexibleParameterNodeMixin, Node):
     def __init__(self):
         super().__init__('ros_image_to_flask_yolo')
         self.image_topic = self.declare_parameter('image_topic', '/camera/image_raw').value
@@ -29,7 +31,7 @@ class RosImageToFlaskYolo(Node):
         self.jpeg_quality = int(self.declare_parameter('jpeg_quality', 75).value)
         self.timeout_sec = float(self.declare_parameter('timeout_sec', 1.0).value)
         self.frame_id = self.declare_parameter('frame_id', '').value
-        self.publish_debug_image = bool(self.declare_parameter('publish_debug_image', True).value)
+        self.publish_debug_image = self.declare_bool_parameter('publish_debug_image', True)
         self.debug_image_topic = self.declare_parameter('debug_image_topic', '/risk/debug_yolo_image').value
         self.log_period_sec = float(self.declare_parameter('log_period_sec', 2.0).value)
 

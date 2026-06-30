@@ -20,6 +20,8 @@ from geometry_msgs.msg import Point
 from visualization_msgs.msg import Marker, MarkerArray
 import tf2_ros
 
+from tb3_flask_yolo_bridge.ros_param_helpers import FlexibleParameterNodeMixin
+
 
 def yaw_from_quaternion(q) -> float:
     return math.atan2(
@@ -32,7 +34,7 @@ def wrap_angle(a: float) -> float:
     return math.atan2(math.sin(a), math.cos(a))
 
 
-class RandomWorldDetectionTest(Node):
+class RandomWorldDetectionTest(FlexibleParameterNodeMixin, Node):
     """Publish compact person detections only when a random world target is in camera FOV."""
 
     def __init__(self):
@@ -56,7 +58,7 @@ class RandomWorldDetectionTest(Node):
         self.x_max = float(self.declare_parameter('x_max', 2.0).value)
         self.y_min = float(self.declare_parameter('y_min', -2.0).value)
         self.y_max = float(self.declare_parameter('y_max', 2.0).value)
-        self.use_map_free_cells = bool(self.declare_parameter('use_map_free_cells', True).value)
+        self.use_map_free_cells = self.declare_bool_parameter('use_map_free_cells', True)
         self.free_threshold = int(self.declare_parameter('free_threshold', 30).value)
 
         map_qos = QoSProfile(
