@@ -6,6 +6,7 @@ Panels:
       Expanded:
         - /Global Options1
         - /Status1
+        - /SLAM Map Layer 1 (/map)1
         - /Fleet Debug Markers1
         - /Waffle Leader Pose1
         - /Burger Pose1
@@ -308,7 +309,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 12.339849472045898
+      Distance: 15.479106903076172
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1

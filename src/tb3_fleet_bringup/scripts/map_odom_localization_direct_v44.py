@@ -114,10 +114,9 @@ class MapOdomLocalization(Node):
         self.last_odom = msg
 
     def _stamp(self):
-        if self.last_odom is not None:
-            st = self.last_odom.header.stamp
-            if not (st.sec == 0 and st.nanosec == 0):
-                return st
+        # Always use the node clock (sim_time when use_sim_time=true).
+        # Using odom message stamps caused TF_OLD_DATA when odom messages arrived
+        # out of order or after a burst, making the TF buffer reject older stamps.
         return self.get_clock().now().to_msg()
 
     def _map_pose_from_odom(self) -> Tuple[float, float, float]:
