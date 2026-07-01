@@ -6,7 +6,7 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     return LaunchDescription([
-        DeclareLaunchArgument('device', default_value='/dev/video0'),
+        DeclareLaunchArgument('device', default_value='/dev/video1'),
         DeclareLaunchArgument('frame_id', default_value='camera_link'),
         DeclareLaunchArgument('width', default_value='320'),
         DeclareLaunchArgument('height', default_value='240'),
@@ -19,7 +19,7 @@ def generate_launch_description():
         DeclareLaunchArgument('output_topic', default_value='/risk/yolo_detections'),
         DeclareLaunchArgument('max_rate_hz', default_value='5.0'),
         DeclareLaunchArgument('jpeg_quality', default_value='60'),
-        DeclareLaunchArgument('timeout_sec', default_value='1.0'),
+        DeclareLaunchArgument('timeout_sec', default_value='2.0'),
         DeclareLaunchArgument('publish_empty_detections', default_value='true'),
         Node(
             package='tb3_flask_yolo_bridge',

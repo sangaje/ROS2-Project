@@ -49,8 +49,8 @@ to_domain: {central_domain}
 topics:
 """
         source_yaml += _topic_block('/clock', 'rosgraph_msgs/msg/Clock', reliability='best_effort', depth=10)
-        source_yaml += _topic_block('/map', 'nav_msgs/msg/OccupancyGrid', depth=5)
-        source_yaml += _topic_block('/map_metadata', 'nav_msgs/msg/MapMetaData', depth=5)
+        source_yaml += _topic_block('/map', 'nav_msgs/msg/OccupancyGrid', durability='transient_local', depth=1)
+        source_yaml += _topic_block('/map_metadata', 'nav_msgs/msg/MapMetaData', durability='transient_local', depth=1)
         source_yaml += _topic_block('/leader_pose', 'geometry_msgs/msg/PoseStamped', depth=10)
         source_yaml += _topic_block('/risk/yolo_detections', 'std_msgs/msg/String', depth=10)
         source_to_central.write_text(source_yaml, encoding='utf-8')
@@ -130,7 +130,7 @@ topics:
         DeclareLaunchArgument('central_domain_id', default_value='20'),
         DeclareLaunchArgument('source_domain_id', default_value='21'),
         DeclareLaunchArgument('risk_sink_domain_ids', default_value='21', description='Comma-separated domains that should receive central /risk maps.'),
-        DeclareLaunchArgument('use_sim_time', default_value='true'),
+        DeclareLaunchArgument('use_sim_time', default_value='false'),
         DeclareLaunchArgument('start_domain_bridges', default_value='true'),
         DeclareLaunchArgument('start_risk_map', default_value='true'),
         DeclareLaunchArgument('config_file', default_value=default_config),
