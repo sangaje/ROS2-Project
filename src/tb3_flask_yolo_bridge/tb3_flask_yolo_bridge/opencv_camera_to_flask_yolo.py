@@ -31,6 +31,8 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         self.frame_id = str(self.declare_parameter('frame_id', 'camera_link').value)
         self.width = int(self.declare_parameter('width', 320).value)
         self.height = int(self.declare_parameter('height', 240).value)
+        self.send_width = int(self.declare_parameter('send_width', self.width).value)
+        self.send_height = int(self.declare_parameter('send_height', self.height).value)
         self.camera_fps = float(self.declare_parameter('camera_fps', 15.0).value)
         self.buffer_size = int(self.declare_parameter('buffer_size', 1).value)
         self.fourcc = str(self.declare_parameter('fourcc', 'MJPG').value).strip()
@@ -95,7 +97,8 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
 
         self.get_logger().info(
             f'OPENCV_CAMERA_TO_FLASK_YOLO_READY | device={self.device} opened={self.cap.isOpened()} '
-            f'size={self.width}x{self.height} camera_fps={self.camera_fps:.1f} fourcc={self.fourcc or "default"} '
+            f'capture_request={self.width}x{self.height} send={self.send_width}x{self.send_height} '
+            f'camera_fps={self.camera_fps:.1f} fourcc={self.fourcc or "default"} '
             f'server={self.server_url} out={self.output_topic} rate={self.max_rate_hz:.2f}Hz '
             f'jpeg_quality={self.jpeg_quality} latest_frame_only=true ros_image_publish=false'
         )
@@ -141,11 +144,19 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
     def encode_jpeg(self, frame) -> bytes:
         import cv2
 
+        if self.send_width > 0 and self.send_height > 0:
+            h, w = frame.shape[:2]
+            if w != self.send_width or h != self.send_height:
+                frame = cv2.resize(
+                    frame,
+                    (int(self.send_width), int(self.send_height)),
+                    interpolation=cv2.INTER_AREA if self.send_width < w or self.send_height < h else cv2.INTER_LINEAR,
+                )
         quality = max(1, min(100, int(self.jpeg_quality)))
         ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
         if not ok:
             raise RuntimeError('cv2.imencode(.jpg) failed')
-        return bytes(buf)
+        return bytes(buf), frame.shape[1], frame.shape[0]
 
     def http_worker_loop(self):
         period = 1.0 / self.max_rate_hz if self.max_rate_hz > 0.0 else 0.0
@@ -166,8 +177,7 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
                 self.log_periodic()
 
     def post_frame(self, frame, capture_sec: float, seq: int):
-        jpeg = self.encode_jpeg(frame)
-        h, w = frame.shape[:2]
+        jpeg, w, h = self.encode_jpeg(frame)
         self.sent_count += 1
         files = {'image': ('frame.jpg', jpeg, 'image/jpeg')}
         data = {

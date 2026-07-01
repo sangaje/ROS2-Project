@@ -323,6 +323,7 @@ def build_app(args):
 
     app = Flask(__name__)
     model = YOLO(args.model_path)
+    use_half = bool(args.half) and str(args.device).lower() not in ('cpu', 'none', '')
     model_lock = threading.Lock()
     state = DebugState()
 
@@ -340,6 +341,7 @@ def build_app(args):
             'ok': True,
             'model_path': args.model_path,
             'device': args.device,
+            'half': use_half,
             'debug_url': f'http://127.0.0.1:{args.port}/',
         })
 
@@ -393,6 +395,7 @@ def build_app(args):
                     conf=args.conf,
                     classes=[0] if args.person_only else None,
                     device=args.device,
+                    half=use_half,
                     verbose=False,
                 )
         except Exception as exc:
@@ -448,11 +451,17 @@ def build_app(args):
 
 
 def parse_args():
+    def as_bool(value):
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--port', type=int, default=5005)
     parser.add_argument('--model-path', default='yolo11n.pt')
     parser.add_argument('--device', default='cpu')
+    parser.add_argument('--half', type=as_bool, default=False)
     parser.add_argument('--conf', type=float, default=0.20)
     parser.add_argument('--imgsz', type=int, default=640)
     parser.add_argument('--debug-jpeg-quality', type=int, default=80)
