@@ -50,6 +50,10 @@ topics:
 """
         source_yaml += _topic_block('/clock', 'rosgraph_msgs/msg/Clock', reliability='best_effort', depth=10)
         source_yaml += _topic_block('/map', 'nav_msgs/msg/OccupancyGrid', depth=5)
+        source_yaml += _topic_block('/tf', 'tf2_msgs/msg/TFMessage', reliability='best_effort', depth=100)
+        source_yaml += _topic_block('/tf_static', 'tf2_msgs/msg/TFMessage', durability='transient_local', depth=1)
+        source_yaml += _topic_block('/scan', 'sensor_msgs/msg/LaserScan', reliability='best_effort', depth=10)
+        source_yaml += _topic_block('/odom', 'nav_msgs/msg/Odometry', depth=10)
         source_yaml += _topic_block('/leader_pose', 'geometry_msgs/msg/PoseStamped', depth=10)
         source_yaml += _topic_block('/risk/yolo_detections', 'std_msgs/msg/String', depth=10)
         source_to_central.write_text(source_yaml, encoding='utf-8')
