@@ -176,9 +176,11 @@ def generate_launch_description():
     waffle_yaw = LaunchConfiguration('waffle_yaw')
 
     bridge_config = os.path.join(bringup_share, 'config', 'domain25_waffle_ros_gz_bridge.yaml')
+    burger_bridge_config = os.path.join(bringup_share, 'config', 'domain25_burger_ros_gz_bridge.yaml')
     nav2_params = os.path.join(bringup_share, 'config', 'domain25_waffle_nav2.yaml')
     single_twist_script = os.path.join(bringup_share, 'scripts', 'single_twist_stamped_to_twist_direct_v36.py')
     frame_tools_script = os.path.join(bringup_share, 'scripts', 'single_domain_nav2_frame_tools_direct_v40.py')
+    odom_pose_script = os.path.join(bringup_share, 'scripts', 'odom_pose_publisher.py')
     leader_pose_script = os.path.join(bringup_share, 'scripts', 'leader_pose_publisher_direct_v36.py')
     map_odom_localization_script = os.path.join(bringup_share, 'scripts', 'map_odom_localization_direct_v40.py')
     goal_proxy_script = os.path.join(bringup_share, 'scripts', 'pose_to_nav2_action_direct_v41.py')
@@ -191,7 +193,7 @@ def generate_launch_description():
     _clean_ld = ':'.join(p for p in _raw_ld.split(':') if p and '/snap/' not in p)
 
     gz_sim = ExecuteProcess(
-        cmd=['gz', 'sim', '-r', '-v', gz_verbosity, '--render-engine-gui', 'ogre', world],
+        cmd=['gz', 'sim', '-r', '-s', '-v', gz_verbosity, world],
         output='screen',
         name='gz_sim_v41',
         additional_env={'LD_LIBRARY_PATH': _clean_ld},
@@ -200,11 +202,19 @@ def generate_launch_description():
     spawn_burger = Node(package='ros_gz_sim', executable='create', name='spawn_burger', output='screen', arguments=['-file', burger_patched_sdf, '-name', 'burger', '-x', burger_x, '-y', burger_y, '-z', '0.05', '-Y', burger_yaw])
     spawn_waffle = Node(package='ros_gz_sim', executable='create', name='spawn_waffle', output='screen', arguments=['-file', waffle_patched_sdf, '-name', 'waffle', '-x', waffle_x, '-y', waffle_y, '-z', '0.05', '-Y', waffle_yaw])
 
+    burger_map_x = PythonExpression(['float("', burger_x, '") - float("', waffle_x, '")'])
+    burger_map_y = PythonExpression(['float("', burger_y, '") - float("', waffle_y, '")'])
+    burger_map_yaw = PythonExpression(['float("', burger_yaw, '") - float("', waffle_yaw, '")'])
+
     converter = ExecuteProcess(cmd=['python3', single_twist_script, '--ros-args', '-r', '__node:=single_twist_stamped_to_twist_bridge', '-p', 'use_sim_time:=true', '-p', 'robot_name:=waffle', '-p', 'cmd_vel_topic:=/cmd_vel', '-p', 'internal_cmd_vel_topics:=/gz_cmd_vel_unstamped,/gz_cmd_vel_model_unstamped', '-p', 'cmd_republish_rate_hz:=0.0', '-p', 'watchdog_timeout_sec:=0.5', '-p', 'log_every_n_republish:=100'], output='screen', name='waffle_twist_stamped_to_twist_v41')
+    burger_converter = ExecuteProcess(cmd=['python3', single_twist_script, '--ros-args', '-r', '__node:=burger_twist_stamped_to_twist_bridge', '-p', 'use_sim_time:=true', '-p', 'robot_name:=burger', '-p', 'cmd_vel_topic:=/burger/cmd_vel', '-p', 'internal_cmd_vel_topics:=/burger/gz_cmd_vel_unstamped,/burger/gz_cmd_vel_model_unstamped', '-p', 'cmd_republish_rate_hz:=0.0', '-p', 'watchdog_timeout_sec:=0.5', '-p', 'log_every_n_republish:=100'], output='screen', name='burger_twist_stamped_to_twist_v41')
 
     bridge = Node(package='ros_gz_bridge', executable='parameter_bridge', name='waffle_ros_gz_bridge_domain25', output='screen', parameters=[{'config_file': bridge_config}])
+    burger_bridge = Node(package='ros_gz_bridge', executable='parameter_bridge', name='burger_ros_gz_bridge_domain25', output='screen', parameters=[{'config_file': burger_bridge_config}])
 
     frame_tools = ExecuteProcess(cmd=['python3', frame_tools_script, '--ros-args', '-r', '__node:=single_domain_nav2_frame_tools', '-p', 'use_sim_time:=true', '-p', 'robot_name:=waffle', '-p', ['initial_x:=', waffle_x], '-p', ['initial_y:=', waffle_y], '-p', ['initial_yaw:=', waffle_yaw], '-p', 'reset_odom_origin_on_first_msg:=true', '-p', 'initial_pose_repeat_count:=40', '-p', 'initial_pose_period_sec:=0.25'], output='screen', name='waffle_frame_tools_v41')
+    burger_frame_tools = ExecuteProcess(cmd=['python3', frame_tools_script, '--ros-args', '-r', '__node:=burger_frame_tools', '-p', 'use_sim_time:=true', '-p', 'robot_name:=burger', '-p', 'odom_in:=/burger/odom', '-p', 'scan_in:=/burger/scan', '-p', 'odom_out:=/burger/odom_nav', '-p', 'scan_out:=/burger/scan_nav', '-p', 'initialpose_topic:=/burger_initialpose', '-p', 'odom_frame:=burger/odom', '-p', 'base_frame:=burger/base_footprint', '-p', 'base_link_frame:=burger/base_link', '-p', 'scan_frame:=burger/base_scan', '-p', ['initial_x:=', burger_map_x], '-p', ['initial_y:=', burger_map_y], '-p', ['initial_yaw:=', burger_map_yaw], '-p', 'reset_odom_origin_on_first_msg:=true', '-p', 'initial_pose_repeat_count:=10', '-p', 'initial_pose_period_sec:=0.5'], output='screen', name='burger_frame_tools_v41')
+    burger_pose = ExecuteProcess(cmd=['python3', odom_pose_script, '--ros-args', '-r', '__node:=burger_odom_pose_publisher', '-p', 'use_sim_time:=true', '-p', 'odom_topic:=/burger/odom_nav', '-p', 'output_topic:=/burger_pose', '-p', 'frame_id:=map', '-p', ['initial_x:=', burger_map_x], '-p', ['initial_y:=', burger_map_y], '-p', ['initial_yaw:=', burger_map_yaw], '-p', 'log_every_n:=100'], output='screen', name='burger_pose_from_odom_v59')
 
     # --- Static-map mode nodes (use_slam:=false) ---
     map_odom_localization = ExecuteProcess(cmd=['python3', map_odom_localization_script, '--ros-args', '-r', '__node:=map_odom_localization', '-p', 'use_sim_time:=true', '-p', 'robot_name:=waffle', '-p', 'odom_topic:=/odom_nav', '-p', 'map_frame:=map', '-p', 'odom_frame:=odom', '-p', 'base_frame:=base_footprint', '-p', ['initial_x:=', waffle_x], '-p', ['initial_y:=', waffle_y], '-p', ['initial_yaw:=', waffle_yaw], '-p', 'publish_rate_hz:=30.0', '-p', 'publish_amcl_pose:=true'], output='screen', name='waffle_map_odom_localization_v41')
@@ -249,34 +259,7 @@ def generate_launch_description():
     # OpaqueFunction: returns SLAM nodes or static-map nodes
     def _make_localization(context, *args, **kwargs):
         if use_slam.perform(context) == 'true':
-            # Cartographer's map frame starts at the robot's initial odom position (0,0).
-            # Publish a static map→odom TF (identity) immediately so the "map" frame
-            # exists in RViz before Cartographer finishes initializing.
-            # Cartographer's dynamic map→odom TF supersedes this once it starts publishing.
-            initial_map_odom_tf = Node(
-                package='tf2_ros',
-                executable='static_transform_publisher',
-                name='slam_initial_map_odom_tf',
-                parameters=[{'use_sim_time': True}],
-                arguments=['--x', '0', '--y', '0', '--z', '0',
-                           '--roll', '0', '--pitch', '0', '--yaw', '0',
-                           '--frame-id', 'map', '--child-frame-id', 'odom'],
-            )
-            # leader_pose uses odom directly (apply_initial_offset:=false).
-            # In Cartographer's map frame, map(0,0) == odom(0,0) at startup,
-            # so odom position = map position — no offset needed.
-            leader_slam_odom = ExecuteProcess(
-                cmd=['python3', leader_pose_script, '--ros-args',
-                     '-r', '__node:=leader_pose_publisher',
-                     '-p', 'use_sim_time:=true',
-                     '-p', 'odom_topic:=/odom_nav',
-                     '-p', 'leader_pose_topic:=/leader_pose',
-                     '-p', 'output_frame_id:=map',
-                     '-p', 'apply_initial_offset:=false',
-                     '-p', 'log_every_n:=100'],
-                output='screen', name='waffle_leader_pose_publisher_slam',
-            )
-            return [initial_map_odom_tf, cartographer_node, cartographer_occupancy_grid_node, leader_slam_odom]
+            return [cartographer_node, cartographer_occupancy_grid_node, leader_pose_slam]
         return [map_odom_localization, leader_pose]
 
     # OpaqueFunction: returns [map_server, map_lifecycle] or [] (SLAM mode skips static map)
@@ -320,10 +303,10 @@ def generate_launch_description():
         LogInfo(msg=['V43_WORLD_SELECTED | ', world]),
         LogInfo(msg=['V43_SLAM_MODE | use_slam=', use_slam]),
         gz_sim,
-        TimerAction(period=2.0, actions=[converter, bridge]),
+        TimerAction(period=2.0, actions=[converter, bridge, burger_converter, burger_bridge]),
         TimerAction(period=3.0, actions=[spawn_burger]),
         TimerAction(period=5.0, actions=[spawn_waffle]),
-        TimerAction(period=7.0, actions=[frame_tools]),
+        TimerAction(period=7.0, actions=[frame_tools, burger_frame_tools, burger_pose]),
         TimerAction(period=8.0, actions=[OpaqueFunction(function=_make_localization)]),
         TimerAction(period=10.0, actions=[OpaqueFunction(function=_make_static_map)]),
         TimerAction(period=16.0, actions=[controller_server, planner_server, behavior_server, bt_navigator]),

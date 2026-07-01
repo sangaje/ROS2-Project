@@ -74,6 +74,7 @@ class SingleDomainNav2FrameTools(Node):
         self.declare_parameter('log_every_n_scan', 200)
         self.declare_parameter('drop_non_monotonic_stamps', True)
         self.declare_parameter('max_stamp_jump_sec', 5.0)
+        self.declare_parameter('restamp_with_node_clock', True)
 
         self.robot_name = str(self.get_parameter('robot_name').value)
         self.odom_in = self._abs(str(self.get_parameter('odom_in').value))
@@ -97,6 +98,7 @@ class SingleDomainNav2FrameTools(Node):
         self.log_every_n_scan = max(0, int(self.get_parameter('log_every_n_scan').value))
         self.drop_non_monotonic_stamps = bool(self.get_parameter('drop_non_monotonic_stamps').value)
         self.max_stamp_jump_sec = max(0.0, float(self.get_parameter('max_stamp_jump_sec').value))
+        self.restamp_with_node_clock = bool(self.get_parameter('restamp_with_node_clock').value)
 
         self.tf_broadcaster = TransformBroadcaster(self)
         self.static_tf_broadcaster = StaticTransformBroadcaster(self)
@@ -112,6 +114,7 @@ class SingleDomainNav2FrameTools(Node):
         self.last_sim_stamp = None
         self.last_odom_stamp_sec: Optional[float] = None
         self.last_scan_stamp_sec: Optional[float] = None
+        self.last_output_stamp_ns = 0
         self.dropped_odom_stamps = 0
         self.dropped_scan_stamps = 0
         self.origin: Optional[Tuple[float, float, float]] = None
@@ -130,13 +133,7 @@ class SingleDomainNav2FrameTools(Node):
         t2.transform.translation.z = self.scan_z
         t2.transform.rotation.w = 1.0
 
-        # Static fallback for odom->base_footprint so Nav2 can initialize
-        # before Gazebo odometry arrives. Dynamic _on_odom overrides this.
-        t0 = TransformStamped()
-        t0.header.frame_id = self.odom_frame
-        t0.child_frame_id = self.base_frame
-        t0.transform.rotation.w = 1.0
-        self.static_tf_broadcaster.sendTransform([t0, t1, t2])
+        self.static_tf_broadcaster.sendTransform([t1, t2])
 
         self.create_timer(self.initial_pose_period_sec, self._initial_pose_tick)
         self.get_logger().info(
@@ -144,7 +141,7 @@ class SingleDomainNav2FrameTools(Node):
             f'robot={self.robot_name} odom_in={self.odom_in} odom_out={self.odom_out} '
             f'scan_in={self.scan_in} scan_out={self.scan_out} '
             f'reset_odom_origin={self.reset_origin} drop_bad_stamps={self.drop_non_monotonic_stamps} '
-            f'max_stamp_jump_sec={self.max_stamp_jump_sec:.1f} '
+            f'max_stamp_jump_sec={self.max_stamp_jump_sec:.1f} restamp={self.restamp_with_node_clock} '
             f'frames={self.map_frame}->{self.odom_frame}->{self.base_frame}->{self.scan_frame}'
         )
 
@@ -215,10 +212,20 @@ class SingleDomainNav2FrameTools(Node):
             self.last_scan_stamp_sec = current
         return True
 
-    def _on_odom(self, msg: Odometry) -> None:
-        stamp = msg.header.stamp
+    def _output_stamp(self, input_stamp):
+        stamp = self.get_clock().now().to_msg() if self.restamp_with_node_clock else input_stamp
         if stamp.sec == 0 and stamp.nanosec == 0:
             stamp = self.get_clock().now().to_msg()
+        ns = int(stamp.sec) * 1000000000 + int(stamp.nanosec)
+        if ns <= self.last_output_stamp_ns:
+            ns = self.last_output_stamp_ns + 1
+            stamp.sec = ns // 1000000000
+            stamp.nanosec = ns % 1000000000
+        self.last_output_stamp_ns = ns
+        return stamp
+
+    def _on_odom(self, msg: Odometry) -> None:
+        stamp = self._output_stamp(msg.header.stamp)
         if not self._stamp_is_usable('odom', stamp):
             return
 
@@ -261,9 +268,7 @@ class SingleDomainNav2FrameTools(Node):
             )
 
     def _on_scan(self, msg: LaserScan) -> None:
-        stamp = msg.header.stamp
-        if stamp.sec == 0 and stamp.nanosec == 0:
-            stamp = self.get_clock().now().to_msg()
+        stamp = self._output_stamp(msg.header.stamp)
         if not self._stamp_is_usable('scan', stamp):
             return
 

@@ -146,7 +146,8 @@ Visualization Manager:
       Enabled: true
       Name: Evidence Markers + Camera FOV
       Namespaces:
-        {}
+        positive_evidence: true
+        risk_fov: true
       Topic:
         Depth: 10
         Durability Policy: Transient Local
@@ -244,7 +245,7 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Scale: 22.0952205657959
+      Scale: 49.51680374145508
       Target Frame: map
       Value: TopDownOrtho (rviz)
       X: 0

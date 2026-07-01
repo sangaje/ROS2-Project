@@ -41,6 +41,7 @@ def generate_launch_description():
         SetEnvironmentVariable('ROS_DOMAIN_ID', '24'),
         SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp'),
         SetEnvironmentVariable('FASTDDS_BUILTIN_TRANSPORTS', 'UDPv4'),
+        SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', 'LOCALHOST'),
         LogInfo(msg='V41_DOMAIN24_BURGER_RVIZ | RViz attached directly to Burger domain. Default /goal_pose controls Burger.'),
         marker_node,
         rviz,

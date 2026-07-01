@@ -2,6 +2,7 @@
 
 import math
 import heapq
+import zlib
 from collections import deque
 from typing import List, Optional, Tuple
 
@@ -188,7 +189,7 @@ class AStarCmdVelFollower(Node):
     def on_map(self, msg: OccupancyGrid):
         self.map_msg = msg
         self.map_stamp = self.now()
-        key = (msg.info.width, msg.info.height, msg.info.resolution, msg.info.origin.position.x, msg.info.origin.position.y, len(msg.data))
+        key = self.occupancy_cache_key(msg)
         if key != self.occ_cache_key:
             self.occ_cache = None
             self.cost_cache = None
@@ -300,16 +301,26 @@ class AStarCmdVelFollower(Node):
             m.info.origin.position.y + (gy + 0.5) * m.info.resolution,
         )
 
+    def occupancy_cache_key(self, msg: OccupancyGrid):
+        try:
+            data_bytes = memoryview(msg.data).cast('B')
+        except TypeError:
+            data_bytes = bytes((int(v) & 0xff) for v in msg.data)
+        data_crc = zlib.crc32(data_bytes)
+        return (
+            msg.info.width, msg.info.height, msg.info.resolution,
+            msg.info.origin.position.x, msg.info.origin.position.y,
+            len(msg.data), data_crc, self.occupied_threshold,
+            self.treat_unknown_as_obstacle, self.inflation_radius_m,
+            self.soft_inflation_radius_m, self.clearance_cost_weight,
+            self.unknown_cost_weight, self.diagonal_motion,
+        )
+
     def build_occupied(self):
         m = self.map_msg
         if m is None:
             return None
-        key = (
-            m.info.width, m.info.height, m.info.resolution, m.info.origin.position.x, m.info.origin.position.y,
-            len(m.data), self.occupied_threshold, self.treat_unknown_as_obstacle,
-            self.inflation_radius_m, self.soft_inflation_radius_m,
-            self.clearance_cost_weight, self.unknown_cost_weight, self.diagonal_motion,
-        )
+        key = self.occupancy_cache_key(m)
         if self.occ_cache is not None and self.occ_cache_key == key:
             return self.occ_cache
 

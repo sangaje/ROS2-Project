@@ -54,6 +54,7 @@ def generate_launch_description():
         SetEnvironmentVariable('ROS_DOMAIN_ID', domain_id),
         SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp'),
         SetEnvironmentVariable('FASTDDS_BUILTIN_TRANSPORTS', 'UDPv4'),
+        SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', 'LOCALHOST'),
         LogInfo(msg='V55_FLEET_RVIZ | Aggregated RViz on Domain25. Shows /map, /leader_pose, bridged /burger_pose markers. Do not bridge raw /tf.'),
         marker_node,
         rviz,

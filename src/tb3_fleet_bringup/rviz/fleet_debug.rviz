@@ -93,15 +93,6 @@ Visualization Manager:
       Enabled: true
       Name: Fleet Debug Markers
       Namespaces:
-        burger: true
-        burger_heading: true
-        burger_label: true
-        fleet_clicked: true
-        fleet_debug: true
-        fleet_finals: true
-        fleet_grid_path: true
-        fleet_labels: true
-        fleet_sep: true
         waffle: true
         waffle_heading: true
         waffle_label: true
@@ -334,7 +325,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 9.721896171569824
+      Distance: 10.274762153625488
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1

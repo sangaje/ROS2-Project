@@ -10,7 +10,7 @@ from rclpy.node import Node
 from rclpy.exceptions import ParameterAlreadyDeclaredException
 from geometry_msgs.msg import PoseWithCovarianceStamped, TransformStamped, Quaternion
 from nav_msgs.msg import Odometry
-from tf2_ros import TransformBroadcaster, StaticTransformBroadcaster
+from tf2_ros import TransformBroadcaster
 
 
 def _safe_declare(node: Node, name: str, default):
@@ -65,21 +65,10 @@ class MapOdomLocalization(Node):
         self.log_every_n = max(0, int(_safe_declare(self, 'log_every_n', 300)))
 
         self.tf_broadcaster = TransformBroadcaster(self)
-        self._static_tf = StaticTransformBroadcaster(self)
         self.amcl_pose_pub = self.create_publisher(PoseWithCovarianceStamped, self.amcl_pose_topic, 10)
         self.odom_sub = self.create_subscription(Odometry, self.odom_topic, self._on_odom, 30)
         self.last_odom: Optional[Odometry] = None
         self.tick_count = 0
-
-        # Publish immediately so Nav2 can look up map->odom before first timer tick.
-        # Static TFs never expire; dynamic _tick() overrides them once sim time flows.
-        _init_tf = TransformStamped()
-        _init_tf.header.frame_id = self.map_frame
-        _init_tf.child_frame_id = self.odom_frame
-        _init_tf.transform.translation.x = self.initial_x
-        _init_tf.transform.translation.y = self.initial_y
-        _init_tf.transform.rotation = _yaw_to_quat(self.initial_yaw)
-        self._static_tf.sendTransform(_init_tf)
 
         self.create_timer(1.0 / self.publish_rate_hz, self._tick)
         self.get_logger().info(

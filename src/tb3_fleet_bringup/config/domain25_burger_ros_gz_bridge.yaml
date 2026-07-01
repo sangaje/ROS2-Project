@@ -1,0 +1,26 @@
+# Domain 25 Burger observation/control bridge for the shared Gazebo simulation.
+# ROS topic names are prefixed to avoid collisions with Waffle's /odom and /scan.
+
+- ros_topic_name: "/burger/gz_cmd_vel_unstamped"
+  gz_topic_name: "/burger/cmd_vel"
+  ros_type_name: "geometry_msgs/msg/Twist"
+  gz_type_name: "gz.msgs.Twist"
+  direction: ROS_TO_GZ
+
+- ros_topic_name: "/burger/gz_cmd_vel_model_unstamped"
+  gz_topic_name: "/model/burger/cmd_vel"
+  ros_type_name: "geometry_msgs/msg/Twist"
+  gz_type_name: "gz.msgs.Twist"
+  direction: ROS_TO_GZ
+
+- ros_topic_name: "/burger/odom"
+  gz_topic_name: "/burger/odometry"
+  ros_type_name: "nav_msgs/msg/Odometry"
+  gz_type_name: "gz.msgs.Odometry"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/burger/scan"
+  gz_topic_name: "/burger/scan"
+  ros_type_name: "sensor_msgs/msg/LaserScan"
+  gz_type_name: "gz.msgs.LaserScan"
+  direction: GZ_TO_ROS
