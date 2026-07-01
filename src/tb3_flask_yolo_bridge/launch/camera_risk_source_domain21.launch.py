@@ -1,5 +1,8 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, SetEnvironmentVariable
+import os
+
+from ament_index_python.packages import get_package_share_directory
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription, SetEnvironmentVariable, TimerAction
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
@@ -7,6 +10,9 @@ from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
+    bringup_share = get_package_share_directory('tb3_fleet_bringup')
+    tf_pose_script = os.path.join(bringup_share, 'scripts', 'tf_pose_publisher_direct_v44.py')
+
     flask_server_launch = PathJoinSubstitution([
         FindPackageShare('tb3_flask_yolo_bridge'),
         'launch',
@@ -29,7 +35,8 @@ def generate_launch_description():
         DeclareLaunchArgument('start_flask_server', default_value='true'),
         DeclareLaunchArgument('start_image_sender', default_value='true'),
         DeclareLaunchArgument('start_cartographer', default_value='true'),
-        DeclareLaunchArgument('start_risk_map', default_value='true'),
+        DeclareLaunchArgument('start_risk_map', default_value='false'),
+        DeclareLaunchArgument('start_pose_publisher', default_value='true'),
         DeclareLaunchArgument('start_domain21_rviz', default_value='false'),
         DeclareLaunchArgument('start_opencv_yolo_view', default_value='false'),
         DeclareLaunchArgument('image_topic', default_value='/camera/image_raw'),
@@ -49,6 +56,7 @@ def generate_launch_description():
         DeclareLaunchArgument('map_topic', default_value='/map'),
         DeclareLaunchArgument('map_frame', default_value='map'),
         DeclareLaunchArgument('base_frame', default_value='base_footprint'),
+        DeclareLaunchArgument('pose_topic', default_value='/leader_pose'),
 
         SetEnvironmentVariable('ROS_DOMAIN_ID', LaunchConfiguration('domain_id')),
         SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp'),
@@ -101,5 +109,25 @@ def generate_launch_description():
                 'model_path': LaunchConfiguration('model_path'),
                 'device': LaunchConfiguration('device'),
             }.items(),
+        ),
+        TimerAction(
+            period=3.0,
+            actions=[
+                ExecuteProcess(
+                    cmd=[
+                        'python3', tf_pose_script, '--ros-args',
+                        '-r', '__node:=domain21_tf_pose_publisher',
+                        '-p', ['use_sim_time:=', LaunchConfiguration('use_sim_time')],
+                        '-p', ['target_frame:=', LaunchConfiguration('map_frame')],
+                        '-p', ['source_frame:=', LaunchConfiguration('base_frame')],
+                        '-p', ['output_topic:=', LaunchConfiguration('pose_topic')],
+                        '-p', 'publish_rate_hz:=10.0',
+                        '-p', 'log_every_n:=100',
+                    ],
+                    output='screen',
+                    name='domain21_tf_pose_publisher',
+                    condition=IfCondition(LaunchConfiguration('start_pose_publisher')),
+                )
+            ],
         ),
     ])

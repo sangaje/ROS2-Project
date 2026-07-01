@@ -18,7 +18,7 @@ from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy, HistoryPo
 from std_msgs.msg import Bool, String
 from sensor_msgs.msg import CompressedImage, Image
 from nav_msgs.msg import OccupancyGrid
-from geometry_msgs.msg import PointStamped, Point
+from geometry_msgs.msg import PointStamped, Point, PoseStamped
 from visualization_msgs.msg import Marker, MarkerArray
 
 import tf2_ros
@@ -100,6 +100,9 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.image_topic = self.declare_parameter('image_topic', '/camera/image_raw').value
         self.map_frame = self.declare_parameter('map_frame', 'map').value
         self.base_frame = self.declare_parameter('base_frame', 'base_link').value
+        self.pose_source = str(self.declare_parameter('pose_source', 'tf').value).strip().lower()
+        self.pose_topic = self.declare_parameter('pose_topic', '/leader_pose').value
+        self.pose_topic_stale_sec = float(self.declare_parameter('pose_topic_stale_sec', 2.5).value)
         self.update_rate_hz = float(self.declare_parameter('update_rate_hz', 2.0).value)
         self.tf_timeout_sec = float(self.declare_parameter('tf_timeout_sec', 0.25).value)
         self.pose_history_duration_sec = float(
@@ -324,6 +327,8 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
 
         self.evidence_points: List[EvidencePoint] = []
         self.next_evidence_id = 1
+        self.topic_pose: Optional[PoseStamped] = None
+        self.topic_pose_stamp = None
 
         # TF
         self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=120.0))
@@ -363,6 +368,9 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
 
         # IO
         self.map_sub = self.create_subscription(OccupancyGrid, self.map_topic, self.on_map, self.qos_map_sub)
+        self.pose_sub = None
+        if self.pose_source in ('topic', 'pose_topic', 'pose'):
+            self.pose_sub = self.create_subscription(PoseStamped, self.pose_topic, self.on_pose_topic, 10)
         self.image_sub = None
         self.external_detection_sub = None
         self.use_opencv_camera = False
@@ -447,6 +455,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             'risk persists across Cartographer map resize; negative observations DO NOT reduce /risk/risk_map; '
             'they are published separately as /risk/observed_empty_map; region_id/priority maps are live SLAM diagnostics; '
             f'detection_source={self.detection_source} external_detection_topic={self.external_detection_topic} '
+            f'pose_source={self.pose_source} pose_topic={self.pose_topic} '
             f'teleop_mode={self.teleop_mode} risk_publish_rate_hz={self.risk_publish_rate_hz:.2f} '
             f'debug_raw={self.publish_debug_image}:{self.debug_image_topic} '
             f'debug_compressed={self.publish_debug_compressed_image}:{self.debug_compressed_image_topic} '
@@ -750,6 +759,28 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         return v <= self.free_threshold
 
     def get_robot_pose(self) -> Optional[Tuple[float, float, float]]:
+        if self.pose_source in ('topic', 'pose_topic', 'pose'):
+            if self.topic_pose is None or self.topic_pose_stamp is None:
+                self.get_logger().warn(
+                    f'pose topic wait: no pose received on {self.pose_topic}',
+                    throttle_duration_sec=2.0,
+                )
+                return None
+            if self.pose_topic_stale_sec > 0.0:
+                try:
+                    age = (self.get_clock().now() - self.topic_pose_stamp).nanoseconds * 1e-9
+                except Exception:
+                    age = float('inf')
+                if age > self.pose_topic_stale_sec:
+                    self.get_logger().warn(
+                        f'pose topic stale: topic={self.pose_topic} age={age:.2f}s limit={self.pose_topic_stale_sec:.2f}s',
+                        throttle_duration_sec=2.0,
+                    )
+                    return None
+            p = self.topic_pose.pose.position
+            q = self.topic_pose.pose.orientation
+            return float(p.x), float(p.y), yaw_from_quaternion(q)
+
         # Always request latest available TF. Cartographer can lag slightly, and querying
         # a stamped time often causes "extrapolation into the past" during live mapping.
         candidate_frames = [self.base_frame]
@@ -783,6 +814,10 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             throttle_duration_sec=2.0
         )
         return None
+
+    def on_pose_topic(self, msg: PoseStamped):
+        self.topic_pose = msg
+        self.topic_pose_stamp = self.get_clock().now()
 
     def record_pose_sample(self, stamp_sec: float, pose):
         sample = PoseSample(

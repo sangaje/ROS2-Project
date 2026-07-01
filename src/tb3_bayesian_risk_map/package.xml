@@ -12,8 +12,10 @@
   <exec_depend>nav_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>std_msgs</exec_depend>
+  <exec_depend>rosgraph_msgs</exec_depend>
   <exec_depend>visualization_msgs</exec_depend>
   <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>domain_bridge</exec_depend>
   <exec_depend>rviz2</exec_depend>
   <exec_depend>rqt_image_view</exec_depend>
   <exec_depend>turtlebot3_teleop</exec_depend>

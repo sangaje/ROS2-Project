@@ -73,6 +73,9 @@ class FleetGoalDispatcher(Node):
         self.assignment_prefers_shorter_total_distance = bool(_safe_declare(self, 'assignment_prefers_shorter_total_distance', True))
         self.republish_count = int(_safe_declare(self, 'republish_count', 3))
         self.republish_period_sec = float(_safe_declare(self, 'republish_period_sec', 1.00))
+        # converge_mode: both robots receive the EXACT same goal. LIDAR-based local
+        # costmaps handle collision avoidance between the two robots in real time.
+        self.converge_mode = bool(_safe_declare(self, 'converge_mode', False))
 
         self.map: Optional[OccupancyGrid] = None
         self.waffle_pose: Optional[PoseStamped] = None
@@ -124,12 +127,20 @@ class FleetGoalDispatcher(Node):
         if not math.isfinite(yaw):
             yaw = 0.0
 
-        waffle_xy, burger_xy, detail = self._compute_pair(x, y, yaw)
-        if self.assignment_prefers_shorter_total_distance:
-            waffle_xy, burger_xy, detail = self._assign_by_distance(waffle_xy, burger_xy, detail)
+        if self.converge_mode:
+            # Both robots get the identical goal. Each robot's Nav2 local costmap
+            # uses its own LIDAR scan (which detects the other robot in Gazebo)
+            # to perform real-time collision avoidance while converging.
+            wmsg = self._make_goal(msg, x, y)
+            bmsg = self._make_goal(msg, x, y)
+            detail = 'mode=converge'
+        else:
+            waffle_xy, burger_xy, detail = self._compute_pair(x, y, yaw)
+            if self.assignment_prefers_shorter_total_distance:
+                waffle_xy, burger_xy, detail = self._assign_by_distance(waffle_xy, burger_xy, detail)
+            wmsg = self._make_goal(msg, waffle_xy[0], waffle_xy[1])
+            bmsg = self._make_goal(msg, burger_xy[0], burger_xy[1])
 
-        wmsg = self._make_goal(msg, waffle_xy[0], waffle_xy[1])
-        bmsg = self._make_goal(msg, burger_xy[0], burger_xy[1])
         self.pending_pair = (wmsg, bmsg)
         self.pending_left = max(1, self.republish_count)
         self._publish_pair(wmsg, bmsg)

@@ -1,6 +1,6 @@
 Panels:
   - Class: rviz_common/Displays
-    Help Height: 85
+    Help Height: 0
     Name: Displays
     Property Tree Widget:
       Expanded:
@@ -10,7 +10,7 @@ Panels:
         - /Waffle Leader Pose1
         - /Burger Pose1
       Splitter Ratio: 0.5
-    Tree Height: 173
+    Tree Height: 259
   - Class: rviz_common/Selection
     Name: Selection
   - Class: rviz_common/Tool Properties
@@ -50,20 +50,20 @@ Visualization Manager:
       Color Scheme: map
       Draw Behind: false
       Enabled: true
-      Name: Raw Cartographer Map (/map_raw)
+      Name: SLAM Map Layer 1 (/map)
       Topic:
         Depth: 1
-        Durability Policy: Transient Local
+        Durability Policy: Volatile
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /map_raw
+        Value: /map
       Update Topic:
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /map_raw_updates
+        Value: /map_updates
       Use Timestamp: false
       Value: true
     - Alpha: 0.44999998807907104
@@ -73,10 +73,10 @@ Visualization Manager:
       Color Scheme: map
       Draw Behind: false
       Enabled: true
-      Name: Cleaned Map (/map)
+      Name: SLAM Map Layer 2 (/map)
       Topic:
         Depth: 1
-        Durability Policy: Transient Local
+        Durability Policy: Volatile
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Reliable
@@ -93,7 +93,12 @@ Visualization Manager:
       Enabled: true
       Name: Fleet Debug Markers
       Namespaces:
-        {}
+        burger: true
+        burger_heading: true
+        burger_label: true
+        waffle: true
+        waffle_heading: true
+        waffle_label: true
       Topic:
         Depth: 10
         Durability Policy: Volatile
@@ -303,7 +308,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 17.63760757446289
+      Distance: 12.339849472045898
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -318,24 +323,24 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 1.5697963237762451
+      Pitch: 1.5547963380813599
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz)
-      Yaw: 0
+      Yaw: 0.005000114440917969
     Saved: ~
 Window Geometry:
   Displays:
     collapsed: false
-  Height: 1000
+  Height: 1003
   Hide Left Dock: false
   Hide Right Dock: false
-  QMainWindow State: 000000ff00000000fd00000001000000000000020c0000037efc0200000004fb000000100044006900730070006c00610079007301000000480000014b000000f300fffffffb0000001200530065006c0065006300740069006f006e010000019a000000a00000006f00fffffffb0000001e0054006f006f006c002000500072006f007000650072007400690065007301000002410000009f0000006f00fffffffb0000000a0056006900650077007301000002e7000000df000000c500ffffff000003650000037e00000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  QMainWindow State: 000000ff00000000fd00000001000000000000020c00000381fc0200000004fb000000100044006900730070006c00610079007301000000480000014c000000f300fffffffb0000001200530065006c0065006300740069006f006e010000019b000000a10000006f00fffffffb0000001e0054006f006f006c002000500072006f007000650072007400690065007301000002430000009f0000006f00fffffffb0000000a0056006900650077007301000002e9000000e0000000c500ffffff0000052b0000038100000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   Selection:
     collapsed: false
   Tool Properties:
     collapsed: false
   Views:
     collapsed: false
-  Width: 1400
-  X: 80
-  Y: 43
+  Width: 1854
+  X: 66
+  Y: 40

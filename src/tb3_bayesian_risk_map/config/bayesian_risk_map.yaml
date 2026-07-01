@@ -5,6 +5,10 @@ bayesian_risk_map_node:
     image_topic: "/camera/image_raw"
     map_frame: "map"
     base_frame: "base_link"
+    # tf: read map->base_frame from TF. topic: read PoseStamped from pose_topic.
+    pose_source: "tf"
+    pose_topic: "/leader_pose"
+    pose_topic_stale_sec: 2.5
     use_sim_time: false
     update_rate_hz: 2.0
     tf_timeout_sec: 0.25

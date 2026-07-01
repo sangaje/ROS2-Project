@@ -144,6 +144,7 @@ topics:
             '-p', 'occupied_threshold:=45',
             '-p', 'republish_count:=3',
             '-p', 'republish_period_sec:=1.0',
+            '-p', 'converge_mode:=true',
         ],
         output='screen', name='fleet_goal_dispatcher',
     )

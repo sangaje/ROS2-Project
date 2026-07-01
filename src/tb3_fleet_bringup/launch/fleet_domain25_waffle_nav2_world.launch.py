@@ -8,7 +8,7 @@ from typing import Iterable, Tuple
 
 from ament_index_python.packages import get_package_share_directory, PackageNotFoundError
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, TimerAction, SetEnvironmentVariable, LogInfo
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, TimerAction, SetEnvironmentVariable, LogInfo, OpaqueFunction
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 
@@ -46,6 +46,14 @@ def _default_map() -> str:
 
 def _default_house_map() -> str:
     candidates = []
+    # First: check tb3_fleet_bringup's own blank house map (all-free, same origin as world map).
+    # Local costmap + LIDAR handles actual wall avoidance at runtime.
+    try:
+        bringup_share = get_package_share_directory('tb3_fleet_bringup')
+        candidates.append(os.path.join(bringup_share, 'map', 'house_blank.yaml'))
+    except PackageNotFoundError:
+        pass
+    # Then: official pre-built house maps if available.
     try:
         tb3_nav_share = get_package_share_directory('turtlebot3_navigation2')
         candidates.extend([
@@ -61,20 +69,9 @@ def _default_house_map() -> str:
         candidates.extend([
             os.path.join(tb3_gazebo_share, 'map', 'turtlebot3_house.yaml'),
             os.path.join(tb3_gazebo_share, 'maps', 'turtlebot3_house.yaml'),
-            os.path.join(tb3_gazebo_share, 'map', 'house.yaml'),
-            os.path.join(tb3_gazebo_share, 'maps', 'house.yaml'),
         ])
     except PackageNotFoundError:
         pass
-    # Fall back to world map.yaml if no house map is found.
-    # The geometry won't match turtlebot3_house.world but Nav2 will at least load a map.
-    if not _first_existing(candidates):
-        try:
-            nav2_share = get_package_share_directory('turtlebot3_navigation2')
-            candidates.append(os.path.join(nav2_share, 'map', 'map.yaml'))
-            candidates.append(os.path.join(nav2_share, 'maps', 'map.yaml'))
-        except PackageNotFoundError:
-            pass
     return _first_existing(candidates)
 
 
@@ -169,6 +166,7 @@ def generate_launch_description():
         "'", default_house_map, "' if '", world_preset, "' == 'house' else '", default_map, "')))"
     ])
 
+    use_slam = LaunchConfiguration('use_slam')
     gz_verbosity = LaunchConfiguration('gz_verbosity')
     burger_x = LaunchConfiguration('burger_x')
     burger_y = LaunchConfiguration('burger_y')
@@ -184,22 +182,18 @@ def generate_launch_description():
     leader_pose_script = os.path.join(bringup_share, 'scripts', 'leader_pose_publisher_direct_v36.py')
     map_odom_localization_script = os.path.join(bringup_share, 'scripts', 'map_odom_localization_direct_v40.py')
     goal_proxy_script = os.path.join(bringup_share, 'scripts', 'pose_to_nav2_action_direct_v41.py')
+    tf_pose_script = os.path.join(bringup_share, 'scripts', 'tf_pose_publisher_direct_v44.py')
+    cartographer_config_dir = os.path.join(bringup_share, 'config')
 
-    # Run Gazebo server only (-s flag).
-    # When gz sim runs both server+GUI together, a GUI crash (snap/libpthread conflict
-    # or EGL failure) causes the Ruby wrapper to SIGKILL the server too.
-    # Running -s (server only) keeps the server alive regardless of GUI state.
-    # Connect the GUI separately with:  gz gui   (in a separate terminal)
-    #
-    # Filter /snap/ paths from LD_LIBRARY_PATH so the server process does not
-    # accidentally pull in snap's libpthread (incompatible with system glibc).
+    # Filter /snap/ paths from LD_LIBRARY_PATH to prevent snap's libpthread from
+    # being loaded by gz sim (incompatible with system glibc, causes symbol lookup crash).
     _raw_ld = os.environ.get('LD_LIBRARY_PATH', '')
     _clean_ld = ':'.join(p for p in _raw_ld.split(':') if p and '/snap/' not in p)
 
     gz_sim = ExecuteProcess(
-        cmd=['gz', 'sim', '-s', '-r', '-v', gz_verbosity, world],
+        cmd=['gz', 'sim', '-r', '-v', gz_verbosity, '--render-engine-gui', 'ogre', world],
         output='screen',
-        name='gz_sim_server_v41',
+        name='gz_sim_v41',
         additional_env={'LD_LIBRARY_PATH': _clean_ld},
     )
 
@@ -212,12 +206,84 @@ def generate_launch_description():
 
     frame_tools = ExecuteProcess(cmd=['python3', frame_tools_script, '--ros-args', '-r', '__node:=single_domain_nav2_frame_tools', '-p', 'use_sim_time:=true', '-p', 'robot_name:=waffle', '-p', ['initial_x:=', waffle_x], '-p', ['initial_y:=', waffle_y], '-p', ['initial_yaw:=', waffle_yaw], '-p', 'reset_odom_origin_on_first_msg:=true', '-p', 'initial_pose_repeat_count:=40', '-p', 'initial_pose_period_sec:=0.25'], output='screen', name='waffle_frame_tools_v41')
 
+    # --- Static-map mode nodes (use_slam:=false) ---
     map_odom_localization = ExecuteProcess(cmd=['python3', map_odom_localization_script, '--ros-args', '-r', '__node:=map_odom_localization', '-p', 'use_sim_time:=true', '-p', 'robot_name:=waffle', '-p', 'odom_topic:=/odom_nav', '-p', 'map_frame:=map', '-p', 'odom_frame:=odom', '-p', 'base_frame:=base_footprint', '-p', ['initial_x:=', waffle_x], '-p', ['initial_y:=', waffle_y], '-p', ['initial_yaw:=', waffle_yaw], '-p', 'publish_rate_hz:=30.0', '-p', 'publish_amcl_pose:=true'], output='screen', name='waffle_map_odom_localization_v41')
-
     leader_pose = ExecuteProcess(cmd=['python3', leader_pose_script, '--ros-args', '-r', '__node:=leader_pose_publisher', '-p', 'use_sim_time:=true', '-p', 'odom_topic:=/odom_nav', '-p', 'leader_pose_topic:=/leader_pose', '-p', 'output_frame_id:=map', '-p', ['initial_x:=', waffle_x], '-p', ['initial_y:=', waffle_y], '-p', ['initial_yaw:=', waffle_yaw], '-p', 'apply_initial_offset:=true', '-p', 'log_every_n:=100'], output='screen', name='waffle_leader_pose_publisher_v41')
-
     map_server = Node(package='nav2_map_server', executable='map_server', name='map_server', output='screen', parameters=[nav2_params, {'use_sim_time': True, 'yaml_filename': map_yaml}])
     map_lifecycle = Node(package='nav2_lifecycle_manager', executable='lifecycle_manager', name='lifecycle_manager_map', output='screen', parameters=[nav2_params])
+
+    # --- SLAM mode nodes (use_slam:=true) ---
+    # Cartographer provides map→odom TF and publishes /map in real-time.
+    # map_odom_localization and map_server are NOT launched in SLAM mode to avoid TF conflicts.
+    cartographer_node = Node(
+        package='cartographer_ros',
+        executable='cartographer_node',
+        name='cartographer_node',
+        output='screen',
+        parameters=[{'use_sim_time': True}],
+        arguments=['-configuration_directory', cartographer_config_dir,
+                   '-configuration_basename', 'cartographer_2d_lidar_odom_v44.lua'],
+        remappings=[('/scan', '/scan_nav'), ('/odom', '/odom_nav')],
+    )
+    cartographer_occupancy_grid_node = Node(
+        package='cartographer_ros',
+        executable='cartographer_occupancy_grid_node',
+        name='cartographer_occupancy_grid_node',
+        output='screen',
+        parameters=[{'use_sim_time': True}],
+        arguments=['-resolution', '0.05', '-publish_period_sec', '1.0'],
+    )
+    # SLAM mode leader_pose: look up map→base_footprint from Cartographer TF
+    leader_pose_slam = ExecuteProcess(
+        cmd=['python3', tf_pose_script, '--ros-args',
+             '-r', '__node:=waffle_leader_pose_tf',
+             '-p', 'use_sim_time:=true',
+             '-p', 'target_frame:=map',
+             '-p', 'source_frame:=base_footprint',
+             '-p', 'output_topic:=/leader_pose',
+             '-p', 'publish_rate_hz:=10.0',
+             '-p', 'log_every_n:=100'],
+        output='screen', name='waffle_leader_pose_tf_slam',
+    )
+
+    # OpaqueFunction: returns SLAM nodes or static-map nodes
+    def _make_localization(context, *args, **kwargs):
+        if use_slam.perform(context) == 'true':
+            # Cartographer's map frame starts at the robot's initial odom position (0,0).
+            # Publish a static map→odom TF (identity) immediately so the "map" frame
+            # exists in RViz before Cartographer finishes initializing.
+            # Cartographer's dynamic map→odom TF supersedes this once it starts publishing.
+            initial_map_odom_tf = Node(
+                package='tf2_ros',
+                executable='static_transform_publisher',
+                name='slam_initial_map_odom_tf',
+                parameters=[{'use_sim_time': True}],
+                arguments=['--x', '0', '--y', '0', '--z', '0',
+                           '--roll', '0', '--pitch', '0', '--yaw', '0',
+                           '--frame-id', 'map', '--child-frame-id', 'odom'],
+            )
+            # leader_pose uses odom directly (apply_initial_offset:=false).
+            # In Cartographer's map frame, map(0,0) == odom(0,0) at startup,
+            # so odom position = map position — no offset needed.
+            leader_slam_odom = ExecuteProcess(
+                cmd=['python3', leader_pose_script, '--ros-args',
+                     '-r', '__node:=leader_pose_publisher',
+                     '-p', 'use_sim_time:=true',
+                     '-p', 'odom_topic:=/odom_nav',
+                     '-p', 'leader_pose_topic:=/leader_pose',
+                     '-p', 'output_frame_id:=map',
+                     '-p', 'apply_initial_offset:=false',
+                     '-p', 'log_every_n:=100'],
+                output='screen', name='waffle_leader_pose_publisher_slam',
+            )
+            return [initial_map_odom_tf, cartographer_node, cartographer_occupancy_grid_node, leader_slam_odom]
+        return [map_odom_localization, leader_pose]
+
+    # OpaqueFunction: returns [map_server, map_lifecycle] or [] (SLAM mode skips static map)
+    def _make_static_map(context, *args, **kwargs):
+        if use_slam.perform(context) == 'true':
+            return []
+        return [map_server, map_lifecycle]
 
     controller_server = Node(package='nav2_controller', executable='controller_server', name='controller_server', output='screen', parameters=[nav2_params])
     planner_server = Node(package='nav2_planner', executable='planner_server', name='planner_server', output='screen', parameters=[nav2_params])
@@ -229,10 +295,13 @@ def generate_launch_description():
     goal_proxy_named = ExecuteProcess(cmd=['python3', goal_proxy_script, '--ros-args', '-r', '__node:=waffle_named_goal_pose_to_nav2', '-p', 'use_sim_time:=true', '-p', 'goal_pose_topic:=/waffle_goal_pose', '-p', 'navigate_action:=/navigate_to_pose', '-p', 'default_frame_id:=map', '-p', 'cancel_previous_goal:=true'], output='screen', name='waffle_named_goal_pose_to_nav2_v41')
 
     return LaunchDescription([
+        DeclareLaunchArgument('use_slam', default_value='true',
+                              description='true: Cartographer SLAM builds map in real-time (map→odom TF from Cartographer). '
+                                          'false: static map_server + map_odom_localization (pre-built map required).'),
         DeclareLaunchArgument('world_preset', default_value='house', description='world | house | absolute world file path. Use world:=... to force override.'),
         DeclareLaunchArgument('world', default_value='', description='Absolute Gazebo world path override. Empty means use world_preset.'),
-        DeclareLaunchArgument('map', default_value='', description='Absolute Nav2 map yaml override. Required for house if no turtlebot3_house map is installed.'),
-        DeclareLaunchArgument('map_preset', default_value='auto', description='auto | world | house. auto follows world_preset. Use map:=... for an exact YAML.'),
+        DeclareLaunchArgument('map', default_value='', description='Absolute Nav2 map yaml override. Only used when use_slam:=false.'),
+        DeclareLaunchArgument('map_preset', default_value='auto', description='auto | world | house. auto follows world_preset. Used only when use_slam:=false.'),
         DeclareLaunchArgument('gz_verbosity', default_value='2'),
         DeclareLaunchArgument('burger_x', default_value='-3.20'),
         DeclareLaunchArgument('burger_y', default_value='-1.75'),
@@ -249,15 +318,14 @@ def generate_launch_description():
         SetEnvironmentVariable('IGN_GAZEBO_RESOURCE_PATH', gz_resource_path),
         LogInfo(msg='V43_DOMAIN25_WAFFLE_OWNER | Gazebo + Waffle Nav2 + shared map owner + RViz goal topic proxies.'),
         LogInfo(msg=['V43_WORLD_SELECTED | ', world]),
-        LogInfo(msg=['V43_MAP_PRESET | ', map_preset, ' | house_default=', default_house_map, ' | world_default=', default_map]),
-        LogInfo(msg=['V43_MAP_SELECTED | ', map_yaml]),
+        LogInfo(msg=['V43_SLAM_MODE | use_slam=', use_slam]),
         gz_sim,
         TimerAction(period=2.0, actions=[converter, bridge]),
         TimerAction(period=3.0, actions=[spawn_burger]),
         TimerAction(period=5.0, actions=[spawn_waffle]),
         TimerAction(period=7.0, actions=[frame_tools]),
-        TimerAction(period=8.0, actions=[map_odom_localization, leader_pose]),
-        TimerAction(period=10.0, actions=[map_server, map_lifecycle]),
+        TimerAction(period=8.0, actions=[OpaqueFunction(function=_make_localization)]),
+        TimerAction(period=10.0, actions=[OpaqueFunction(function=_make_static_map)]),
         TimerAction(period=16.0, actions=[controller_server, planner_server, behavior_server, bt_navigator]),
         TimerAction(period=22.0, actions=[nav_lifecycle]),
         TimerAction(period=24.0, actions=[goal_proxy_default, goal_proxy_named]),
