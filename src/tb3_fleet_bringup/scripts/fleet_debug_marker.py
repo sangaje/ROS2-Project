@@ -80,8 +80,10 @@ class FleetDebugMarker(Node):
         m.id = mid
         m.type = Marker.CYLINDER
         m.action = Marker.ADD
-        m.pose = pose.pose
+        m.pose.position.x = pose.pose.position.x
+        m.pose.position.y = pose.pose.position.y
         m.pose.position.z = 0.12
+        m.pose.orientation = pose.pose.orientation
         m.scale.x, m.scale.y, m.scale.z = scale
         # Do not rely on color semantics for correctness; use different alpha/intensity only for visual separation.
         if ns == 'waffle':
@@ -154,7 +156,7 @@ class FleetDebugMarker(Node):
             p = self.poses['burger']
             arr.markers.append(self._make_body('burger', 11, p, (0.30, 0.30, 0.16)))
             arr.markers.append(self._make_arrow('burger', 12, p, 0.45))
-            arr.markers.append(self._make_text('burger', 13, p, 'burger / domain26'))
+            arr.markers.append(self._make_text('burger', 13, p, 'burger / domain24'))
         if arr.markers:
             self.pub.publish(arr)
 

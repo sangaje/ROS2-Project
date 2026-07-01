@@ -26,6 +26,7 @@ def generate_launch_description():
     astar_target_mode = LaunchConfiguration('astar_target_mode')
     domain_id = LaunchConfiguration('domain_id')
     leader_domain_id = LaunchConfiguration('leader_domain_id')
+    use_slam = LaunchConfiguration('use_slam')
 
     bridge_config = os.path.join(bringup_share, 'config', 'domain26_burger_ros_gz_bridge.yaml')
     nav2_params = os.path.join(bringup_share, 'config', 'domain26_burger_nav2_slam.yaml')
@@ -33,20 +34,48 @@ def generate_launch_description():
     frame_tools_script = os.path.join(bringup_share, 'scripts', 'single_domain_nav2_frame_tools_direct_v40.py')
     follower_script = os.path.join(bringup_share, 'scripts', 'domain_bridge_nav2_follower_direct_v40.py')
     map_odom_localization_script = os.path.join(bringup_share, 'scripts', 'map_odom_localization_direct_v44.py')
+    leader_pose_script = os.path.join(bringup_share, 'scripts', 'leader_pose_publisher_direct_v36.py')
     tf_pose_script = os.path.join(bringup_share, 'scripts', 'tf_pose_publisher_direct_v44.py')
     goal_proxy_script = os.path.join(bringup_share, 'scripts', 'pose_to_nav2_action_direct_v41.py')
     astar_cmd_script = os.path.join(bringup_share, 'scripts', 'astar_cmd_vel_follower_direct_v55.py')
+    cartographer_config_dir = os.path.join(bringup_share, 'config')
 
     def _write_domain_bridge_configs(context, *args, **kwargs):
+        is_slam = use_slam.perform(context) == 'true'
         leader_domain = leader_domain_id.perform(context)
         burger_domain = domain_id.perform(context)
         out_dir = Path(tempfile.gettempdir()) / 'tb3_fleet_v55_domain_bridge'
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        shared_path = out_dir / f'shared_slam_map_leader_goal_{leader_domain}_to_{burger_domain}.yaml'
+        shared_path = out_dir / f'shared_leader_goal_{leader_domain}_to_{burger_domain}.yaml'
         debug_path = out_dir / f'burger_debug_{burger_domain}_to_{leader_domain}.yaml'
 
-        shared_yaml = f"""name: shared_slam_map_leader_goal_{leader_domain}_to_{burger_domain}_v55
+        if is_slam:
+            # SLAM mode: /map is produced by Cartographer in burger domain — do NOT bridge
+            # map from leader (25) to burger (24). Only bridge control topics.
+            shared_yaml = f"""name: shared_leader_goal_{leader_domain}_to_{burger_domain}_v55_slam
+from_domain: {leader_domain}
+to_domain: {burger_domain}
+
+topics:
+  /leader_pose:
+    type: geometry_msgs/msg/PoseStamped
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 10
+  /burger_goal_pose:
+    type: geometry_msgs/msg/PoseStamped
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 10
+"""
+        else:
+            # Static map mode: /map comes from waffle (leader) domain to burger domain.
+            shared_yaml = f"""name: shared_slam_map_leader_goal_{leader_domain}_to_{burger_domain}_v55
 from_domain: {leader_domain}
 to_domain: {burger_domain}
 
@@ -106,7 +135,7 @@ topics:
         debug_path.write_text(debug_yaml)
 
         return [
-            ExecuteProcess(cmd=['ros2', 'run', 'domain_bridge', 'domain_bridge', str(shared_path)], output='screen', name='shared_slam_map_leader_goal_domain_bridge_v55'),
+            ExecuteProcess(cmd=['ros2', 'run', 'domain_bridge', 'domain_bridge', str(shared_path)], output='screen', name='shared_leader_goal_domain_bridge_v55'),
             ExecuteProcess(cmd=['ros2', 'run', 'domain_bridge', 'domain_bridge', str(debug_path)], output='screen', name='burger_debug_domain_bridge_v55'),
         ]
 
@@ -118,9 +147,49 @@ topics:
 
     frame_tools = ExecuteProcess(cmd=['python3', frame_tools_script, '--ros-args', '-r', '__node:=single_domain_nav2_frame_tools', '-p', 'use_sim_time:=true', '-p', 'robot_name:=burger', '-p', ['initial_x:=', burger_x], '-p', ['initial_y:=', burger_y], '-p', ['initial_yaw:=', burger_yaw], '-p', 'reset_odom_origin_on_first_msg:=true', '-p', 'initial_pose_repeat_count:=40', '-p', 'initial_pose_period_sec:=0.25'], output='screen', name='burger_frame_tools_v55')
 
+    # Static-map mode localization (use_slam:=false)
     map_odom_localization = ExecuteProcess(cmd=['python3', map_odom_localization_script, '--ros-args', '-r', '__node:=map_odom_localization', '-p', 'use_sim_time:=true', '-p', 'robot_name:=burger', '-p', 'odom_topic:=/odom_nav', '-p', 'map_frame:=map', '-p', 'odom_frame:=odom', '-p', 'base_frame:=base_footprint', '-p', ['initial_x:=', burger_x], '-p', ['initial_y:=', burger_y], '-p', ['initial_yaw:=', burger_yaw], '-p', 'relative_to_world_origin:=true', '-p', ['world_origin_x:=', map_origin_x], '-p', ['world_origin_y:=', map_origin_y], '-p', ['world_origin_yaw:=', map_origin_yaw], '-p', 'publish_rate_hz:=30.0', '-p', 'publish_amcl_pose:=true'], output='screen', name='burger_map_odom_localization_v55')
 
     burger_pose = ExecuteProcess(cmd=['python3', tf_pose_script, '--ros-args', '-r', '__node:=burger_pose_tf_publisher', '-p', 'use_sim_time:=true', '-p', 'target_frame:=map', '-p', 'source_frame:=base_footprint', '-p', 'output_topic:=/burger_pose', '-p', 'publish_rate_hz:=10.0', '-p', 'log_every_n:=100'], output='screen', name='burger_pose_tf_publisher_v55')
+
+    def _make_localization_nodes(context, *args, **kwargs):
+        if use_slam.perform(context) == 'true':
+            # SLAM mode: Cartographer owns map->odom TF. No map_odom_localization.
+            # burger_pose uses odom-based publisher: burger is at map origin (0,0).
+            slam_cartographer = Node(
+                package='cartographer_ros',
+                executable='cartographer_node',
+                name='cartographer_node',
+                output='screen',
+                parameters=[{'use_sim_time': True}],
+                arguments=['-configuration_directory', cartographer_config_dir,
+                           '-configuration_basename', 'cartographer_2d_lidar_odom_v44.lua'],
+                remappings=[('/scan', '/scan_nav'), ('/odom', '/odom_nav')],
+            )
+            slam_occ_grid = Node(
+                package='cartographer_ros',
+                executable='cartographer_occupancy_grid_node',
+                name='cartographer_occupancy_grid_node',
+                output='screen',
+                parameters=[{'use_sim_time': True}],
+                arguments=['-resolution', '0.05', '-publish_period_sec', '1.0'],
+            )
+            slam_burger_pose = ExecuteProcess(
+                cmd=['python3', leader_pose_script, '--ros-args',
+                     '-r', '__node:=burger_pose_publisher',
+                     '-p', 'use_sim_time:=true',
+                     '-p', 'odom_topic:=/odom_nav',
+                     '-p', 'leader_pose_topic:=/burger_pose',
+                     '-p', 'output_frame_id:=map',
+                     '-p', 'initial_x:=0.0',
+                     '-p', 'initial_y:=0.0',
+                     '-p', 'initial_yaw:=0.0',
+                     '-p', 'apply_initial_offset:=false',
+                     '-p', 'log_every_n:=100'],
+                output='screen', name='burger_slam_pose_publisher',
+            )
+            return [slam_cartographer, slam_occ_grid, slam_burger_pose]
+        return [map_odom_localization, burger_pose]
 
     controller_server = Node(package='nav2_controller', executable='controller_server', name='controller_server', output='screen', parameters=[nav2_params])
     planner_server = Node(package='nav2_planner', executable='planner_server', name='planner_server', output='screen', parameters=[nav2_params])
@@ -176,12 +245,15 @@ topics:
     return LaunchDescription([
         DeclareLaunchArgument('domain_id', default_value='24', description='ROS_DOMAIN_ID used by Burger follower domain.'),
         DeclareLaunchArgument('leader_domain_id', default_value='25', description='ROS_DOMAIN_ID of Waffle/SLAM owner domain.'),
+        DeclareLaunchArgument('use_slam', default_value='true',
+                              description='true: Cartographer SLAM on Burger builds the map. '
+                                          'false: static map_odom_localization, /map received from leader domain.'),
         DeclareLaunchArgument('burger_x', default_value='-3.20'),
         DeclareLaunchArgument('burger_y', default_value='-1.75'),
         DeclareLaunchArgument('burger_yaw', default_value='0.0'),
-        DeclareLaunchArgument('map_origin_x', default_value='-2.25', description='Map frame origin x. For Cartographer SLAM: set to waffle initial x so burger coords are relative to the SLAM map origin. For static pre-built map: use 0.0 (Gazebo absolute coords).'),
-        DeclareLaunchArgument('map_origin_y', default_value='-1.75', description='Map frame origin y. For Cartographer SLAM: set to waffle initial y. For static pre-built map: use 0.0.'),
-        DeclareLaunchArgument('map_origin_yaw', default_value='0.0', description='Map frame origin yaw.'),
+        DeclareLaunchArgument('map_origin_x', default_value='-2.25', description='Static map mode only: map frame origin x.'),
+        DeclareLaunchArgument('map_origin_y', default_value='-1.75', description='Static map mode only: map frame origin y.'),
+        DeclareLaunchArgument('map_origin_yaw', default_value='0.0', description='Static map mode only: map frame origin yaw.'),
         DeclareLaunchArgument('auto_follow', default_value='true', description='Nav2 mode only: true means Burger follows /leader_pose with NavigateToPose goals.'),
         DeclareLaunchArgument('control_mode', default_value='astar_cmd', description='nav2: use Nav2 NavigateToPose. astar_cmd: bypass Nav2 and publish /cmd_vel TwistStamped from A* path tracking.'),
         DeclareLaunchArgument('astar_target_mode', default_value='leader', description='astar_cmd mode: leader follows /leader_pose; manual follows /burger_goal_pose.'),
@@ -190,14 +262,14 @@ topics:
         SetEnvironmentVariable('FASTDDS_BUILTIN_TRANSPORTS', 'UDPv4'),
         SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', 'LOCALHOST'),
         SetEnvironmentVariable('TURTLEBOT3_MODEL', 'burger'),
-        LogInfo(msg='V55_DOMAIN24_BURGER | Burger Nav2 receives live SLAM /map and /leader_pose from Domain25. Burger map frame is relative to Waffle SLAM origin.'),
+        LogInfo(msg='V55_DOMAIN24_BURGER | SLAM mode: Cartographer on Burger builds map. Waffle gets /map via bridge.'),
         LogInfo(msg=['V55_BRIDGE_DOMAINS | leader_domain_id=', leader_domain_id, ' -> burger_domain_id=', domain_id, ' and debug back.']),
-        LogInfo(msg='V55_SAFE_HOUSE_SPAWN | default Burger=(-3.20,-1.75,0.0), map_origin=(-2.25,-1.75,0.0). Keep map_origin equal to Waffle initial pose.'),
+        LogInfo(msg=['V55_BURGER_SLAM_MODE | use_slam=', use_slam]),
         LogInfo(msg=['V55_BURGER_CONTROL_MODE | ', control_mode, ' | nav2 or astar_cmd']),
         TimerAction(period=0.5, actions=[domain_bridges]),
         TimerAction(period=1.5, actions=[converter, bridge]),
         TimerAction(period=4.0, actions=[frame_tools]),
-        TimerAction(period=5.0, actions=[map_odom_localization, burger_pose]),
+        TimerAction(period=5.0, actions=[OpaqueFunction(function=_make_localization_nodes)]),
         TimerAction(period=10.0, actions=[controller_server, planner_server, behavior_server, bt_navigator], condition=is_nav2_control),
         TimerAction(period=18.0, actions=[nav_lifecycle], condition=is_nav2_control),
         TimerAction(period=20.0, actions=[goal_proxy_default, goal_proxy_named], condition=is_nav2_control),

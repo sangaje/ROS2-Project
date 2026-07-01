@@ -222,44 +222,53 @@ def generate_launch_description():
     map_server = Node(package='nav2_map_server', executable='map_server', name='map_server', output='screen', parameters=[nav2_params, {'use_sim_time': True, 'yaml_filename': map_yaml}])
     map_lifecycle = Node(package='nav2_lifecycle_manager', executable='lifecycle_manager', name='lifecycle_manager_map', output='screen', parameters=[nav2_params])
 
-    # --- SLAM mode nodes (use_slam:=true) ---
-    # Cartographer provides map→odom TF and publishes /map in real-time.
-    # map_odom_localization and map_server are NOT launched in SLAM mode to avoid TF conflicts.
-    cartographer_node = Node(
-        package='cartographer_ros',
-        executable='cartographer_node',
-        name='cartographer_node',
-        output='screen',
-        parameters=[{'use_sim_time': True}],
-        arguments=['-configuration_directory', cartographer_config_dir,
-                   '-configuration_basename', 'cartographer_2d_lidar_odom_v44.lua'],
-        remappings=[('/scan', '/scan_nav'), ('/odom', '/odom_nav')],
-    )
-    cartographer_occupancy_grid_node = Node(
-        package='cartographer_ros',
-        executable='cartographer_occupancy_grid_node',
-        name='cartographer_occupancy_grid_node',
-        output='screen',
-        parameters=[{'use_sim_time': True}],
-        arguments=['-resolution', '0.05', '-publish_period_sec', '1.0'],
-    )
-    # SLAM mode leader_pose: look up map→base_footprint from Cartographer TF
-    leader_pose_slam = ExecuteProcess(
-        cmd=['python3', tf_pose_script, '--ros-args',
-             '-r', '__node:=waffle_leader_pose_tf',
-             '-p', 'use_sim_time:=true',
-             '-p', 'target_frame:=map',
-             '-p', 'source_frame:=base_footprint',
-             '-p', 'output_topic:=/leader_pose',
-             '-p', 'publish_rate_hz:=10.0',
-             '-p', 'log_every_n:=100'],
-        output='screen', name='waffle_leader_pose_tf_slam',
-    )
-
-    # OpaqueFunction: returns SLAM nodes or static-map nodes
+    # OpaqueFunction: returns localization nodes.
+    # SLAM mode: Cartographer runs on Burger (Domain 24). Waffle consumes /map from bridge.
+    #   Waffle uses static map_odom_localization at spawn offset from Burger.
+    # Static-map mode: map_odom_localization + leader_pose with Waffle's absolute spawn.
     def _make_localization(context, *args, **kwargs):
         if use_slam.perform(context) == 'true':
-            return [cartographer_node, cartographer_occupancy_grid_node, leader_pose_slam]
+            # Map origin = Burger spawn. Waffle map-frame offset = waffle_spawn - burger_spawn.
+            wx = float(waffle_x.perform(context))
+            wy = float(waffle_y.perform(context))
+            wyaw_v = float(waffle_yaw.perform(context))
+            bx = float(burger_x.perform(context))
+            by = float(burger_y.perform(context))
+            byaw_v = float(burger_yaw.perform(context))
+            offset_x = wx - bx
+            offset_y = wy - by
+            offset_yaw = wyaw_v - byaw_v
+            slam_map_odom = ExecuteProcess(
+                cmd=['python3', map_odom_localization_script, '--ros-args',
+                     '-r', '__node:=map_odom_localization',
+                     '-p', 'use_sim_time:=true',
+                     '-p', 'robot_name:=waffle',
+                     '-p', 'odom_topic:=/odom_nav',
+                     '-p', 'map_frame:=map',
+                     '-p', 'odom_frame:=odom',
+                     '-p', 'base_frame:=base_footprint',
+                     '-p', f'initial_x:={offset_x}',
+                     '-p', f'initial_y:={offset_y}',
+                     '-p', f'initial_yaw:={offset_yaw}',
+                     '-p', 'publish_rate_hz:=30.0',
+                     '-p', 'publish_amcl_pose:=true'],
+                output='screen', name='waffle_slam_map_odom_localization',
+            )
+            slam_leader_pose = ExecuteProcess(
+                cmd=['python3', leader_pose_script, '--ros-args',
+                     '-r', '__node:=leader_pose_publisher',
+                     '-p', 'use_sim_time:=true',
+                     '-p', 'odom_topic:=/odom_nav',
+                     '-p', 'leader_pose_topic:=/leader_pose',
+                     '-p', 'output_frame_id:=map',
+                     '-p', f'initial_x:={offset_x}',
+                     '-p', f'initial_y:={offset_y}',
+                     '-p', f'initial_yaw:={offset_yaw}',
+                     '-p', 'apply_initial_offset:=true',
+                     '-p', 'log_every_n:=100'],
+                output='screen', name='waffle_slam_leader_pose_publisher',
+            )
+            return [slam_map_odom, slam_leader_pose]
         return [map_odom_localization, leader_pose]
 
     # OpaqueFunction: returns [map_server, map_lifecycle] or [] (SLAM mode skips static map)

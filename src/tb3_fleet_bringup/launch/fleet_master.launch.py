@@ -45,6 +45,7 @@ def generate_launch_description():
 
     waffle_domain_id = LaunchConfiguration('waffle_domain_id')
     burger_domain_id = LaunchConfiguration('burger_domain_id')
+    use_slam = LaunchConfiguration('use_slam')
     show_rviz = LaunchConfiguration('show_rviz')
     sim = LaunchConfiguration('sim')
     rviz_config = LaunchConfiguration('rviz_config')
@@ -54,6 +55,7 @@ def generate_launch_description():
 
     # ---- Domain bridges (OpaqueFunction) ----------------------------------
     def _write_bridge_configs(context, *args, **kwargs):
+        is_slam = use_slam.perform(context) == 'true'
         waffle_domain = waffle_domain_id.perform(context)
         burger_domain = burger_domain_id.perform(context)
         out_dir = Path(tempfile.gettempdir()) / 'tb3_fleet_master_bridge'
@@ -62,7 +64,53 @@ def generate_launch_description():
         path_25_to_26 = out_dir / f'master_{waffle_domain}_to_{burger_domain}.yaml'
         path_26_to_25 = out_dir / f'master_{burger_domain}_to_{waffle_domain}.yaml'
 
-        yaml_25_to_26 = f"""name: fleet_master_{waffle_domain}_to_{burger_domain}
+        if is_slam:
+            # SLAM mode: Cartographer is in burger (Domain 24). /map flows 24->25.
+            # Only bridge /leader_pose from waffle to burger (no /map from waffle).
+            yaml_25_to_26 = f"""name: fleet_master_{waffle_domain}_to_{burger_domain}_slam
+from_domain: {waffle_domain}
+to_domain: {burger_domain}
+
+topics:
+  /leader_pose:
+    type: geometry_msgs/msg/PoseStamped
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 10
+"""
+            # Bridge /map from burger (Cartographer) to waffle (for Nav2 + RViz).
+            yaml_26_to_25 = f"""name: fleet_master_{burger_domain}_to_{waffle_domain}_slam
+from_domain: {burger_domain}
+to_domain: {waffle_domain}
+
+topics:
+  /burger_pose:
+    type: geometry_msgs/msg/PoseStamped
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 10
+  /map:
+    type: nav_msgs/msg/OccupancyGrid
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 5
+  /map_metadata:
+    type: nav_msgs/msg/MapMetaData
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 5
+"""
+        else:
+            # Static map mode: /map comes from waffle (Domain 25) to burger (Domain 24).
+            yaml_25_to_26 = f"""name: fleet_master_{waffle_domain}_to_{burger_domain}
 from_domain: {waffle_domain}
 to_domain: {burger_domain}
 
@@ -89,8 +137,7 @@ topics:
       history: keep_last
       depth: 10
 """
-
-        yaml_26_to_25 = f"""name: fleet_master_{burger_domain}_to_{waffle_domain}
+            yaml_26_to_25 = f"""name: fleet_master_{burger_domain}_to_{waffle_domain}
 from_domain: {burger_domain}
 to_domain: {waffle_domain}
 
@@ -192,6 +239,9 @@ topics:
     return LaunchDescription([
         DeclareLaunchArgument('waffle_domain_id', default_value='25'),
         DeclareLaunchArgument('burger_domain_id', default_value='24'),
+        DeclareLaunchArgument('use_slam', default_value='true',
+                              description='true: Cartographer SLAM on Burger (map flows 24->25). '
+                                          'false: static map from Waffle (map flows 25->24).'),
         DeclareLaunchArgument('show_rviz', default_value='true'),
         DeclareLaunchArgument('sim', default_value='true'),
         DeclareLaunchArgument('rviz_config', default_value=default_rviz),
@@ -200,7 +250,8 @@ topics:
         SetEnvironmentVariable('FASTDDS_BUILTIN_TRANSPORTS', 'UDPv4'),
         SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', 'LOCALHOST'),
         LogInfo(msg='FLEET_MASTER_LAUNCH | domain bridge + dispatcher + RViz on Domain 25'),
-        LogInfo(msg=['waffle_domain=', waffle_domain_id, ' burger_domain=', burger_domain_id]),
+        LogInfo(msg=['waffle_domain=', waffle_domain_id, ' burger_domain=', burger_domain_id, ' use_slam=', use_slam]),
+        LogInfo(msg='FLEET_MASTER_SLAM_MODE | /map bridges 24->25 (Cartographer on Burger). No /map from 25->24.'),
         TimerAction(period=0.5, actions=[domain_bridges]),
         TimerAction(period=2.0, actions=[dispatcher]),
         TimerAction(period=2.0, actions=[OpaqueFunction(function=_make_marker_node)]),

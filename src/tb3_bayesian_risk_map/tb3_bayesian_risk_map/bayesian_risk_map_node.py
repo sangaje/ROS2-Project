@@ -181,6 +181,16 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.source_halo_seed_separation_m = float(
             self.declare_parameter('source_halo_seed_separation_m', 0.20).value
         )
+        self.risk_source_mode = str(
+            self.declare_parameter('risk_source_mode', 'evidence_points').value
+        ).strip().lower()
+        self.evidence_source_gain = float(self.declare_parameter('evidence_source_gain', 0.65).value)
+        self.evidence_distribution_radius_m = float(
+            self.declare_parameter('evidence_distribution_radius_m', 0.45).value
+        )
+        self.evidence_distribution_sigma_m = float(
+            self.declare_parameter('evidence_distribution_sigma_m', 0.22).value
+        )
 
         # Room / region
         self.enable_room_probability = self.declare_bool_parameter('enable_room_probability', True)
@@ -477,6 +487,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             f'detection_source={self.detection_source} external_detection_topic={self.external_detection_topic} '
             f'pose_source={self.pose_source} pose_topic={self.pose_topic} map_qos_durability={self.map_qos_durability} '
             f'teleop_mode={self.teleop_mode} risk_publish_rate_hz={self.risk_publish_rate_hz:.2f} '
+            f'risk_source_mode={self.risk_source_mode} evidence_radius={self.evidence_distribution_radius_m:.2f} '
             f'publish_diagnostic_maps={self.publish_diagnostic_maps} '
             f'debug_raw={self.publish_debug_image}:{self.debug_image_topic} '
             f'debug_compressed={self.publish_debug_compressed_image}:{self.debug_compressed_image_topic} '
@@ -1822,6 +1833,73 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         halo[~memory_mask] = 0.0
         return np.clip(halo, 0.0, 1.0)
 
+    def build_evidence_source_map(self):
+        out = np.zeros_like(self.positive_memory_map, dtype=np.float32)
+        if not self.evidence_points:
+            return out
+
+        h, w = out.shape
+        free = self.valid_free_mask()
+        memory_mask = self.risk_memory_mask()
+        gain = max(0.0, float(self.evidence_source_gain))
+        radius_m = max(self.map_resolution, float(self.evidence_distribution_radius_m))
+        sigma_m = max(self.map_resolution, float(self.evidence_distribution_sigma_m))
+        for ev in self.evidence_points:
+            g = self.world_to_grid(float(ev.x), float(ev.y))
+            if g is None:
+                continue
+            sx, sy = g
+            if not memory_mask[sy, sx]:
+                continue
+
+            max_cells = max(1, int(math.ceil(radius_m / self.map_resolution)))
+            x0 = max(0, sx - max_cells)
+            x1 = min(w, sx + max_cells + 1)
+            y0 = max(0, sy - max_cells)
+            y1 = min(h, sy + max_cells + 1)
+
+            local_dist = np.full((y1 - y0, x1 - x0), np.inf, dtype=np.float32)
+            local_dist[sy - y0, sx - x0] = 0.0
+            q = deque([(sx - x0, sy - y0)])
+            while q:
+                x, y = q.popleft()
+                d = float(local_dist[y, x])
+                if d > radius_m:
+                    continue
+
+                gy = y + y0
+                gx = x + x0
+                if memory_mask[gy, gx]:
+                    kernel = math.exp(-0.5 * (d / sigma_m) ** 2)
+                    val = clamp(float(ev.confidence) * gain * kernel, 0.0, 1.0)
+                    if val >= self.source_min_value:
+                        # Probabilistic union makes overlapping marker kernels stronger,
+                        # so clustered evidence darkens and nearby pairs reinforce the middle.
+                        out[gy, gx] = 1.0 - (1.0 - out[gy, gx]) * (1.0 - val)
+
+                for nx, ny in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+                    if nx < 0 or nx >= local_dist.shape[1] or ny < 0 or ny >= local_dist.shape[0]:
+                        continue
+                    ngx = nx + x0
+                    ngy = ny + y0
+                    if not free[ngy, ngx] and not (ngx == sx and ngy == sy):
+                        continue
+                    nd = d + self.map_resolution
+                    if nd <= radius_m and nd < local_dist[ny, nx]:
+                        local_dist[ny, nx] = nd
+                        q.append((nx, ny))
+
+        out[~memory_mask] = 0.0
+        return np.clip(out, 0.0, 1.0)
+
+    def build_risk_source_map(self):
+        if self.risk_source_mode in ('evidence', 'evidence_points', 'markers', 'marker_distribution'):
+            evidence_source = self.build_evidence_source_map()
+            if float(np.max(evidence_source)) > 1e-6:
+                return evidence_source
+            return self.positive_memory_map
+        return self.positive_memory_map
+
     # ---------------- Main update ----------------
 
     def on_timer(self):
@@ -1878,7 +1956,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
 
         # Risk is positive-only bounded halo. No negative observation subtraction.
         if self.risk_dirty:
-            self.risk_map = self.build_bounded_geodesic_halo(self.positive_memory_map)
+            self.risk_map = self.build_bounded_geodesic_halo(self.build_risk_source_map())
             self.risk_dirty = False
 
         self.publish_all_maps()
