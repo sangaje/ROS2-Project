@@ -66,8 +66,15 @@ def _default_house_map() -> str:
         ])
     except PackageNotFoundError:
         pass
-    # Do NOT fall back to map.yaml here. map.yaml is usually the TurtleBot3 world map,
-    # and silently using it with turtlebot3_house.world makes RViz show the wrong map.
+    # Fall back to world map.yaml if no house map is found.
+    # The geometry won't match turtlebot3_house.world but Nav2 will at least load a map.
+    if not _first_existing(candidates):
+        try:
+            nav2_share = get_package_share_directory('turtlebot3_navigation2')
+            candidates.append(os.path.join(nav2_share, 'map', 'map.yaml'))
+            candidates.append(os.path.join(nav2_share, 'maps', 'map.yaml'))
+        except PackageNotFoundError:
+            pass
     return _first_existing(candidates)
 
 
@@ -178,7 +185,23 @@ def generate_launch_description():
     map_odom_localization_script = os.path.join(bringup_share, 'scripts', 'map_odom_localization_direct_v40.py')
     goal_proxy_script = os.path.join(bringup_share, 'scripts', 'pose_to_nav2_action_direct_v41.py')
 
-    gz_sim = ExecuteProcess(cmd=['gz', 'sim', '-r', '-v', gz_verbosity, world], output='screen', name='gz_sim_burger_waffle_v41')
+    # Run Gazebo server only (-s flag).
+    # When gz sim runs both server+GUI together, a GUI crash (snap/libpthread conflict
+    # or EGL failure) causes the Ruby wrapper to SIGKILL the server too.
+    # Running -s (server only) keeps the server alive regardless of GUI state.
+    # Connect the GUI separately with:  gz gui   (in a separate terminal)
+    #
+    # Filter /snap/ paths from LD_LIBRARY_PATH so the server process does not
+    # accidentally pull in snap's libpthread (incompatible with system glibc).
+    _raw_ld = os.environ.get('LD_LIBRARY_PATH', '')
+    _clean_ld = ':'.join(p for p in _raw_ld.split(':') if p and '/snap/' not in p)
+
+    gz_sim = ExecuteProcess(
+        cmd=['gz', 'sim', '-s', '-r', '-v', gz_verbosity, world],
+        output='screen',
+        name='gz_sim_server_v41',
+        additional_env={'LD_LIBRARY_PATH': _clean_ld},
+    )
 
     spawn_burger = Node(package='ros_gz_sim', executable='create', name='spawn_burger', output='screen', arguments=['-file', burger_patched_sdf, '-name', 'burger', '-x', burger_x, '-y', burger_y, '-z', '0.05', '-Y', burger_yaw])
     spawn_waffle = Node(package='ros_gz_sim', executable='create', name='spawn_waffle', output='screen', arguments=['-file', waffle_patched_sdf, '-name', 'waffle', '-x', waffle_x, '-y', waffle_y, '-z', '0.05', '-Y', waffle_yaw])

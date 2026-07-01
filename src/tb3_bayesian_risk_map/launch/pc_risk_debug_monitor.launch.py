@@ -19,7 +19,7 @@ def generate_launch_description():
 
     return LaunchDescription([
         DeclareLaunchArgument('start_rviz', default_value='true'),
-        DeclareLaunchArgument('start_opencv_debug_view', default_value='true'),
+        DeclareLaunchArgument('start_opencv_debug_view', default_value='false'),
         DeclareLaunchArgument('start_rqt_debug_view', default_value='false'),
         DeclareLaunchArgument('domain_id', default_value='25'),
         DeclareLaunchArgument('rviz_config', default_value=rviz_config),

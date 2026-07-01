@@ -2,11 +2,11 @@
 """Fleet Master launch — Domain 25.
 
 Runs on the same PC as Waffle (Domain 25).
-- domain_bridge 25->26: /map, /map_metadata, /leader_pose, /waffle_waypoints, /burger_waypoints
-- domain_bridge 26->25: /burger_pose
-- fleet_goal_dispatcher.py
+- domain_bridge 25->24: /map, /map_metadata, /leader_pose
+- domain_bridge 24->25: /burger_pose
+- fleet_goal_dispatcher_direct_v72.py  (publishes /waffle_goal_pose, /burger_goal_pose)
 - fleet_debug_marker.py
-- RViz (optional, fleet_debug.rviz)
+- RViz (optional, fleet_fleet_debug_v71.rviz)
 """
 
 import os
@@ -36,10 +36,10 @@ def _require_files(paths):
 def generate_launch_description():
     bringup_share = get_package_share_directory('tb3_fleet_bringup')
 
-    dispatcher_script = os.path.join(bringup_share, 'scripts', 'fleet_goal_dispatcher.py')
+    dispatcher_script = os.path.join(bringup_share, 'scripts', 'fleet_goal_dispatcher_direct_v72.py')
     marker_script = os.path.join(bringup_share, 'scripts', 'fleet_debug_marker.py')
     rviz_clean = os.path.join(bringup_share, 'scripts', 'run_rviz2_clean.bash')
-    default_rviz = os.path.join(bringup_share, 'rviz', 'fleet_debug.rviz')
+    default_rviz = os.path.join(bringup_share, 'rviz', 'fleet_fleet_debug_v71.rviz')
 
     _require_files([dispatcher_script])
 
@@ -88,20 +88,6 @@ topics:
       durability: volatile
       history: keep_last
       depth: 10
-  /waffle_waypoints:
-    type: nav_msgs/msg/Path
-    qos:
-      reliability: reliable
-      durability: volatile
-      history: keep_last
-      depth: 10
-  /burger_waypoints:
-    type: nav_msgs/msg/Path
-    qos:
-      reliability: reliable
-      durability: volatile
-      history: keep_last
-      depth: 10
 """
 
         yaml_26_to_25 = f"""name: fleet_master_{burger_domain}_to_{waffle_domain}
@@ -143,34 +129,21 @@ topics:
             '-r', '__node:=fleet_goal_dispatcher',
             '-p', ['use_sim_time:=', use_sim_time_str],
             '-p', 'input_goal_topic:=/fleet_goal_pose',
-            '-p', 'alias_topics:=/goal_pose,/move_base_simple/goal',
+            '-p', 'input_alias_topics:=/goal_pose,/move_base_simple/goal',
+            '-p', 'waffle_goal_topic:=/waffle_goal_pose',
+            '-p', 'burger_goal_topic:=/burger_goal_pose',
             '-p', 'waffle_pose_topic:=/leader_pose',
             '-p', 'burger_pose_topic:=/burger_pose',
             '-p', 'map_topic:=/map',
             '-p', 'frame_id:=map',
-            '-p', 'waffle_waypoints_topic:=/waffle_waypoints',
-            '-p', 'burger_waypoints_topic:=/burger_waypoints',
             '-p', 'formation_separation_m:=1.20',
             '-p', 'min_pair_distance_m:=0.85',
             '-p', 'search_rings:=4',
             '-p', 'search_angles:=20',
             '-p', 'clearance_check_radius_m:=0.55',
             '-p', 'occupied_threshold:=45',
-            '-p', 'path_inflation_radius_m:=0.25',   # conservative wall clearance
-            '-p', 'peer_hard_radius_m:=0.55',          # hard block around peer in A*
-            '-p', 'peer_soft_radius_m:=1.10',          # soft cost zone around peer
-            '-p', 'peer_soft_cost:=15.0',              # strong peer avoidance in A*
-            '-p', 'peer_stop_dist:=1.10',              # stop Burger if closer than 1.1m
-            '-p', 'peer_back_dist:=0.75',              # back up if closer than 0.75m
-            '-p', 'peer_clear_dist:=1.40',             # resume when 1.4m apart
-            '-p', 'backup_dist_m:=0.45',               # back up 0.45m
-            '-p', 'waypoint_step_m:=0.70',             # finer waypoints
-            '-p', 'waypoint_final_snap_m:=0.80',
-            '-p', 'republish_period_sec:=0.60',        # faster replan
-            '-p', 'change_threshold_m:=0.15',          # detect smaller moves
-            '-p', 'max_idle_sec:=3.0',
-            '-p', 'debug_markers:=true',
-            '-p', 'debug_markers_topic:=/fleet_debug_markers',
+            '-p', 'republish_count:=3',
+            '-p', 'republish_period_sec:=1.0',
         ],
         output='screen', name='fleet_goal_dispatcher',
     )

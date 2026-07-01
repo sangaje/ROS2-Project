@@ -6,6 +6,7 @@ import argparse
 import logging
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -16,68 +17,171 @@ DEBUG_PAGE = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>TB3 Flask YOLO Debug</title>
+  <title>TB3 YOLO Debug</title>
   <style>
-    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
-    body { margin: 0; background: #101318; color: #eef2f6; }
-    header { padding: 14px 18px; background: #171c23; position: sticky; top: 0; z-index: 2; }
-    h1 { margin: 0 0 6px; font-size: 20px; }
-    #status { color: #8fd3ff; font-family: monospace; font-size: 13px; }
-    main { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; padding: 12px; }
-    section { background: #171c23; border: 1px solid #29313c; border-radius: 8px; overflow: hidden; }
-    h2 { margin: 0; padding: 9px 12px; font-size: 15px; background: #202731; }
-    img { width: 100%; display: block; min-height: 240px; object-fit: contain; background: #050607; }
-    @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+    :root {
+      color-scheme: dark;
+      --bg: #0c1016;
+      --panel: #151b24;
+      --panel-2: #1d2530;
+      --line: #2a3544;
+      --text: #edf3fb;
+      --muted: #93a4b8;
+      --good: #42d392;
+      --warn: #ffd166;
+      --bad: #ff6b6b;
+      --accent: #72c7ff;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: radial-gradient(circle at top, #152033 0, var(--bg) 42%); color: var(--text); }
+    header {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 14px;
+      align-items: center;
+      padding: 14px 18px;
+      background: rgba(12, 16, 22, 0.92);
+      border-bottom: 1px solid var(--line);
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      backdrop-filter: blur(10px);
+    }
+    h1 { margin: 0; font-size: 20px; letter-spacing: 0.2px; }
+    .subtitle { margin-top: 4px; color: var(--muted); font-size: 12px; }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 7px 10px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--panel);
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .dot { width: 8px; height: 8px; border-radius: 999px; background: var(--warn); box-shadow: 0 0 14px currentColor; }
+    .ok .dot { background: var(--good); }
+    .stale .dot { background: var(--warn); }
+    .dead .dot { background: var(--bad); }
+    main { display: grid; grid-template-columns: minmax(0, 2fr) minmax(320px, 0.9fr); gap: 12px; padding: 12px; }
+    .video-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    section, aside {
+      background: rgba(21, 27, 36, 0.94);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 10px 32px rgba(0,0,0,0.22);
+    }
+    h2 { margin: 0; padding: 10px 12px; font-size: 14px; background: var(--panel-2); color: #dbe8f7; }
+    img { width: 100%; display: block; min-height: 260px; object-fit: contain; background: #030509; }
+    .cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; padding: 10px; }
+    .card { padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: #101722; }
+    .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; }
+    .value { margin-top: 5px; font: 700 22px/1.1 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .value.good { color: var(--good); }
+    .value.warn { color: var(--warn); }
+    .value.bad { color: var(--bad); }
+    .wide { grid-column: 1 / -1; }
+    #detections { padding: 0 10px 10px; }
+    .det { display: grid; grid-template-columns: 1fr auto; gap: 6px; padding: 8px 0; border-top: 1px solid var(--line); font-size: 13px; }
+    .det:first-child { border-top: 0; }
+    .muted { color: var(--muted); }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    @media (max-width: 1100px) {
+      main { grid-template-columns: 1fr; }
+      .video-grid { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 640px) {
+      header { grid-template-columns: 1fr; }
+      .cards { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
   <header>
-    <h1>TB3 Camera / YOLO Debug</h1>
-    <div id="status">Waiting for OpenCV camera frames...</div>
+    <div>
+      <h1>TB3 YOLO Debug</h1>
+      <div class="subtitle">Robot camera JPEG → PC Flask YOLO → ROS detection JSON</div>
+    </div>
+    <div id="connection" class="pill stale"><span class="dot"></span><span id="connectionText">waiting for frames</span></div>
   </header>
   <main>
-    <section><h2>OpenCV input — latest frame</h2><img id="raw" alt="raw camera frame"></section>
-    <section><h2>YOLO person result — latest frame</h2><img id="yolo" alt="YOLO frame"></section>
+    <div class="video-grid">
+      <section><h2>Camera input</h2><img src="/stream/raw.mjpg" alt="raw camera stream"></section>
+      <section><h2>YOLO overlay</h2><img src="/stream/yolo.mjpg" alt="YOLO stream"></section>
+    </div>
+    <aside>
+      <h2>Live status</h2>
+      <div class="cards">
+        <div class="card"><div class="label">People</div><div id="people" class="value">—</div></div>
+        <div class="card"><div class="label">FPS</div><div id="fps" class="value">—</div></div>
+        <div class="card"><div class="label">YOLO</div><div id="latency" class="value">—</div></div>
+        <div class="card"><div class="label">Capture age</div><div id="captureAge" class="value">—</div></div>
+        <div class="card"><div class="label">Frame age</div><div id="frameAge" class="value">—</div></div>
+        <div class="card"><div class="label">Size</div><div id="size" class="value">—</div></div>
+        <div class="card wide"><div class="label">Frames</div><div id="frames" class="value">—</div></div>
+      </div>
+      <h2>Detections</h2>
+      <div id="detections"><div class="muted">No detections yet.</div></div>
+    </aside>
   </main>
   <script>
+    const fmt = (v, digits = 1, suffix = '') => Number.isFinite(v) && v >= 0 ? `${v.toFixed(digits)}${suffix}` : '—';
+    function level(value, good, warn) {
+      if (!Number.isFinite(value) || value < 0) return '';
+      if (value <= good) return 'good';
+      if (value <= warn) return 'warn';
+      return 'bad';
+    }
+    function setValue(id, text, cls = '') {
+      const el = document.getElementById(id);
+      el.textContent = text;
+      el.className = `value ${cls}`.trim();
+    }
+    function setConnection(status, text) {
+      const el = document.getElementById('connection');
+      el.className = `pill ${status}`;
+      document.getElementById('connectionText').textContent = text;
+    }
     async function refreshStatus() {
       try {
         const s = await (await fetch('/api/status', {cache: 'no-store'})).json();
-        document.getElementById('status').textContent =
-          `frames=${s.frames} | people=${s.people} | inference=${s.latency_ms.toFixed(1)} ms | ` +
-          `capture-to-web=${s.capture_age_ms.toFixed(1)} ms | ` +
-          `size=${s.image_width}x${s.image_height} | server-age=${s.frame_age_sec.toFixed(2)} s`;
+        const age = Number(s.frame_age_sec);
+        if (!s.ok) setConnection('stale', 'waiting for first frame');
+        else if (age > 2.0) setConnection('dead', `stale ${age.toFixed(1)}s`);
+        else if (age > 0.7) setConnection('stale', `slow ${age.toFixed(1)}s`);
+        else setConnection('ok', 'live');
+
+        setValue('people', String(s.people ?? 0), s.people > 0 ? 'good' : '');
+        const fps = Number(s.fps);
+        setValue('fps', fmt(fps, 1), Number.isFinite(fps) ? (fps >= 4 ? 'good' : fps >= 2 ? 'warn' : 'bad') : '');
+        setValue('latency', fmt(Number(s.latency_ms), 1, 'ms'), level(Number(s.latency_ms), 80, 180));
+        setValue('captureAge', fmt(Number(s.capture_age_ms), 1, 'ms'), level(Number(s.capture_age_ms), 200, 600));
+        setValue('frameAge', fmt(age * 1000.0, 0, 'ms'), level(age * 1000.0, 250, 800));
+        setValue('size', s.image_width && s.image_height ? `${s.image_width}×${s.image_height}` : '—');
+        setValue('frames', String(s.frames ?? 0));
+
+        const root = document.getElementById('detections');
+        const detections = Array.isArray(s.detections) ? s.detections : [];
+        if (!detections.length) {
+          root.innerHTML = '<div class="muted">No person in latest frame.</div>';
+        } else {
+          root.innerHTML = detections.map((d, i) => {
+            const conf = Number(d.conf ?? d.confidence ?? 0);
+            const box = Array.isArray(d.bbox) ? d.bbox.map(v => Number(v).toFixed(0)).join(', ') : 'bbox unavailable';
+            return `<div class="det"><div><b>${i + 1}. ${d.label ?? 'person'}</b><div class="muted mono">${box}</div></div><div class="mono">${(conf * 100).toFixed(0)}%</div></div>`;
+          }).join('');
+        }
       } catch (_) {
-        document.getElementById('status').textContent = 'Debug server disconnected';
-      }
-    }
-    async function fetchLatest(kind) {
-      const response = await fetch(`/frame/${kind}.jpg?t=${Date.now()}`, {cache: 'no-store'});
-      if (!response.ok) return;
-      const blob = await response.blob();
-      const image = document.getElementById(kind);
-      const nextUrl = URL.createObjectURL(blob);
-      const oldUrl = image.dataset.objectUrl;
-      image.src = nextUrl;
-      image.dataset.objectUrl = nextUrl;
-      if (oldUrl) URL.revokeObjectURL(oldUrl);
-    }
-    let polling = false;
-    async function pollLatest() {
-      if (polling) return;
-      polling = true;
-      try {
-        await Promise.all([fetchLatest('raw'), fetchLatest('yolo')]);
-      } catch (_) {
-        // The next poll retries. Never queue old browser requests.
-      } finally {
-        polling = false;
-        setTimeout(pollLatest, 60);
+        setConnection('dead', 'server disconnected');
       }
     }
     setInterval(refreshStatus, 500);
     refreshStatus();
-    pollLatest();
   </script>
 </body>
 </html>
@@ -97,8 +201,10 @@ class DebugState:
     image_height: int = 0
     capture_age_ms: float = -1.0
     last_frame_wall_sec: float = 0.0
+    detections: list = field(default_factory=list)
+    frame_wall_times: deque = field(default_factory=lambda: deque(maxlen=90))
 
-    def update(self, raw_jpeg, yolo_jpeg, people, latency_ms, width, height, capture_age_ms):
+    def update(self, raw_jpeg, yolo_jpeg, people, latency_ms, width, height, capture_age_ms, detections=None):
         with self.condition:
             self.raw_jpeg = raw_jpeg
             self.yolo_jpeg = yolo_jpeg
@@ -110,20 +216,29 @@ class DebugState:
             self.image_height = height
             self.capture_age_ms = capture_age_ms
             self.last_frame_wall_sec = time.time()
+            self.detections = list(detections or [])
+            self.frame_wall_times.append(self.last_frame_wall_sec)
             self.condition.notify_all()
 
     def status(self):
         with self.condition:
             age = time.time() - self.last_frame_wall_sec if self.last_frame_wall_sec else -1.0
+            fps = 0.0
+            if len(self.frame_wall_times) >= 2:
+                dt = self.frame_wall_times[-1] - self.frame_wall_times[0]
+                if dt > 1e-6:
+                    fps = (len(self.frame_wall_times) - 1) / dt
             return {
                 'ok': self.frames > 0,
                 'frames': self.frames,
                 'people': self.people,
+                'fps': fps,
                 'latency_ms': self.latency_ms,
                 'image_width': self.image_width,
                 'image_height': self.image_height,
                 'capture_age_ms': self.capture_age_ms,
                 'frame_age_sec': age,
+                'detections': self.detections,
             }
 
     def latest_frame(self, kind):
@@ -314,7 +429,7 @@ def build_app(args):
         annotated_jpeg = _encode_jpeg(overlay, args.debug_jpeg_quality)
         state.update(
             original_jpeg, annotated_jpeg, len(detections),
-            inference_ms, w, h, capture_age_ms,
+            inference_ms, w, h, capture_age_ms, detections,
         )
 
         return jsonify({

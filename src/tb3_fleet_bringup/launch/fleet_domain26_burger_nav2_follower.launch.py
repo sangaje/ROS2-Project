@@ -27,8 +27,8 @@ def generate_launch_description():
     domain_id = LaunchConfiguration('domain_id')
     leader_domain_id = LaunchConfiguration('leader_domain_id')
 
-    bridge_config = os.path.join(bringup_share, 'config', 'domain_burger_burger_ros_gz_bridge.yaml')
-    nav2_params = os.path.join(bringup_share, 'config', 'domain_burger_burger_nav2_slam.yaml')
+    bridge_config = os.path.join(bringup_share, 'config', 'domain26_burger_ros_gz_bridge.yaml')
+    nav2_params = os.path.join(bringup_share, 'config', 'domain26_burger_nav2_slam.yaml')
     single_twist_script = os.path.join(bringup_share, 'scripts', 'single_twist_stamped_to_twist_direct_v36.py')
     frame_tools_script = os.path.join(bringup_share, 'scripts', 'single_domain_nav2_frame_tools_direct_v40.py')
     follower_script = os.path.join(bringup_share, 'scripts', 'domain_bridge_nav2_follower_direct_v40.py')
