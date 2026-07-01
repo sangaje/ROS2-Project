@@ -49,8 +49,7 @@ to_domain: {central_domain}
 topics:
 """
         source_yaml += _topic_block('/clock', 'rosgraph_msgs/msg/Clock', reliability='best_effort', depth=10)
-        source_yaml += _topic_block('/map', 'nav_msgs/msg/OccupancyGrid', durability='transient_local', depth=1)
-        source_yaml += _topic_block('/map_metadata', 'nav_msgs/msg/MapMetaData', durability='transient_local', depth=1)
+        source_yaml += _topic_block('/map', 'nav_msgs/msg/OccupancyGrid', depth=5)
         source_yaml += _topic_block('/leader_pose', 'geometry_msgs/msg/PoseStamped', depth=10)
         source_yaml += _topic_block('/risk/yolo_detections', 'std_msgs/msg/String', depth=10)
         source_to_central.write_text(source_yaml, encoding='utf-8')
@@ -65,8 +64,6 @@ topics:
 
         risk_topics = [
             ('/risk/risk_map', 'nav_msgs/msg/OccupancyGrid'),
-            ('/risk/combined_priority_map', 'nav_msgs/msg/OccupancyGrid'),
-            ('/risk/positive_memory_map', 'nav_msgs/msg/OccupancyGrid'),
             ('/risk/evidence_markers', 'visualization_msgs/msg/MarkerArray'),
         ]
         for sink_domain in sink_domains:
@@ -103,6 +100,7 @@ topics:
             {
                 'use_sim_time': LaunchConfiguration('use_sim_time'),
                 'map_topic': LaunchConfiguration('map_topic'),
+                'map_qos_durability': 'volatile',
                 'map_frame': LaunchConfiguration('map_frame'),
                 'base_frame': LaunchConfiguration('base_frame'),
                 'pose_source': 'topic',
@@ -114,6 +112,7 @@ topics:
                 'publish_overlay': False,
                 'publish_debug_image': False,
                 'publish_debug_compressed_image': False,
+                'publish_diagnostic_maps': False,
                 'debug_show_opencv': False,
                 'teleop_mode': True,
                 'risk_publish_rate_hz': LaunchConfiguration('risk_publish_rate_hz'),
@@ -144,8 +143,8 @@ topics:
         DeclareLaunchArgument('diagnostic_publish_rate_hz', default_value='1.0'),
         DeclareLaunchArgument('region_update_period_sec', default_value='1.5'),
         DeclareLaunchArgument('enable_room_probability', default_value='false'),
-        DeclareLaunchArgument('enable_region_segmentation', default_value='true'),
-        DeclareLaunchArgument('enable_visibility_tracking', default_value='true'),
+        DeclareLaunchArgument('enable_region_segmentation', default_value='false'),
+        DeclareLaunchArgument('enable_visibility_tracking', default_value='false'),
         SetEnvironmentVariable('ROS_DOMAIN_ID', central_domain_id),
         SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp'),
         SetEnvironmentVariable('FASTDDS_BUILTIN_TRANSPORTS', 'UDPv4'),

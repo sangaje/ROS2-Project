@@ -97,6 +97,9 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
 
         # Core parameters
         self.map_topic = self.declare_parameter('map_topic', '/map').value
+        self.map_qos_durability = str(
+            self.declare_parameter('map_qos_durability', 'volatile').value
+        ).strip().lower()
         self.image_topic = self.declare_parameter('image_topic', '/camera/image_raw').value
         self.map_frame = self.declare_parameter('map_frame', 'map').value
         self.base_frame = self.declare_parameter('base_frame', 'base_link').value
@@ -251,6 +254,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.debug_image_dir = self.declare_parameter('debug_image_dir', '/tmp/tb3_bayesian_risk_map_debug').value
         self.debug_image_rate_hz = float(self.declare_parameter('debug_image_rate_hz', 1.0).value)
         self.debug_log_image_status = self.declare_bool_parameter('debug_log_image_status', True)
+        self.publish_diagnostic_maps = self.declare_bool_parameter('publish_diagnostic_maps', False)
 
         # Persistence. Critical for Cartographer: map geometry can grow/change while exploring.
         # If true, positive/risk layers are reprojected in world coordinates instead of reset.
@@ -335,9 +339,14 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         # QoS
+        map_durability = (
+            DurabilityPolicy.TRANSIENT_LOCAL
+            if self.map_qos_durability in ('transient_local', 'transient-local', 'transientlocal')
+            else DurabilityPolicy.VOLATILE
+        )
         self.qos_map_sub = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            durability=map_durability,
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
         )
@@ -402,17 +411,28 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.clear_point_sub = self.create_subscription(PointStamped, '/risk/clear_point', self.on_clear_point, 10)
         self.clear_all_sub = self.create_subscription(Bool, '/risk/clear_all', self.on_clear_all, 10)
 
-        self.pub_detection_candidate = self.create_publisher(OccupancyGrid, '/risk/detection_candidate_map', self.qos_grid_pub)
-        self.pub_positive_memory = self.create_publisher(OccupancyGrid, '/risk/positive_memory_map', self.qos_grid_pub)
         self.pub_risk = self.create_publisher(OccupancyGrid, '/risk/risk_map', self.qos_grid_pub)
-        self.pub_visibility = self.create_publisher(OccupancyGrid, '/risk/visibility_map', self.qos_grid_pub)
-        self.pub_observed_empty = self.create_publisher(OccupancyGrid, '/risk/observed_empty_map', self.qos_grid_pub)
-        self.pub_room_probability = self.create_publisher(OccupancyGrid, '/risk/room_probability_map', self.qos_grid_pub)
-        self.pub_visual_seen = self.create_publisher(OccupancyGrid, '/risk/visual_seen_map', self.qos_grid_pub)
-        self.pub_region_id = self.create_publisher(OccupancyGrid, '/risk/region_id_map', self.qos_grid_pub)
-        self.pub_region_priority = self.create_publisher(OccupancyGrid, '/risk/region_priority_map', self.qos_grid_pub)
-        self.pub_region_checked = self.create_publisher(OccupancyGrid, '/risk/region_checked_map', self.qos_grid_pub)
-        self.pub_combined_priority = self.create_publisher(OccupancyGrid, '/risk/combined_priority_map', self.qos_grid_pub)
+        self.pub_detection_candidate = None
+        self.pub_positive_memory = None
+        self.pub_visibility = None
+        self.pub_observed_empty = None
+        self.pub_room_probability = None
+        self.pub_visual_seen = None
+        self.pub_region_id = None
+        self.pub_region_priority = None
+        self.pub_region_checked = None
+        self.pub_combined_priority = None
+        if self.publish_diagnostic_maps:
+            self.pub_detection_candidate = self.create_publisher(OccupancyGrid, '/risk/detection_candidate_map', self.qos_grid_pub)
+            self.pub_positive_memory = self.create_publisher(OccupancyGrid, '/risk/positive_memory_map', self.qos_grid_pub)
+            self.pub_visibility = self.create_publisher(OccupancyGrid, '/risk/visibility_map', self.qos_grid_pub)
+            self.pub_observed_empty = self.create_publisher(OccupancyGrid, '/risk/observed_empty_map', self.qos_grid_pub)
+            self.pub_room_probability = self.create_publisher(OccupancyGrid, '/risk/room_probability_map', self.qos_grid_pub)
+            self.pub_visual_seen = self.create_publisher(OccupancyGrid, '/risk/visual_seen_map', self.qos_grid_pub)
+            self.pub_region_id = self.create_publisher(OccupancyGrid, '/risk/region_id_map', self.qos_grid_pub)
+            self.pub_region_priority = self.create_publisher(OccupancyGrid, '/risk/region_priority_map', self.qos_grid_pub)
+            self.pub_region_checked = self.create_publisher(OccupancyGrid, '/risk/region_checked_map', self.qos_grid_pub)
+            self.pub_combined_priority = self.create_publisher(OccupancyGrid, '/risk/combined_priority_map', self.qos_grid_pub)
         self.pub_markers = self.create_publisher(MarkerArray, '/risk/evidence_markers', self.qos_marker_pub)
         self.pub_overlay = self.create_publisher(Image, '/risk/overlay_image', self.qos_image_pub)
         self.pub_debug_image = self.create_publisher(Image, self.debug_image_topic, self.qos_image_pub)
@@ -455,8 +475,9 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             'risk persists across Cartographer map resize; negative observations DO NOT reduce /risk/risk_map; '
             'they are published separately as /risk/observed_empty_map; region_id/priority maps are live SLAM diagnostics; '
             f'detection_source={self.detection_source} external_detection_topic={self.external_detection_topic} '
-            f'pose_source={self.pose_source} pose_topic={self.pose_topic} '
+            f'pose_source={self.pose_source} pose_topic={self.pose_topic} map_qos_durability={self.map_qos_durability} '
             f'teleop_mode={self.teleop_mode} risk_publish_rate_hz={self.risk_publish_rate_hz:.2f} '
+            f'publish_diagnostic_maps={self.publish_diagnostic_maps} '
             f'debug_raw={self.publish_debug_image}:{self.debug_image_topic} '
             f'debug_compressed={self.publish_debug_compressed_image}:{self.debug_compressed_image_topic} '
             f'yolo_async={self.yolo_async}'
@@ -818,6 +839,12 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
     def on_pose_topic(self, msg: PoseStamped):
         self.topic_pose = msg
         self.topic_pose_stamp = self.get_clock().now()
+        pose_sec = self.header_to_sec(msg.header)
+        if pose_sec is None:
+            pose_sec = self.topic_pose_stamp.nanoseconds * 1e-9
+        p = msg.pose.position
+        q = msg.pose.orientation
+        self.record_pose_sample(pose_sec, (float(p.x), float(p.y), yaw_from_quaternion(q)))
 
     def record_pose_sample(self, stamp_sec: float, pose):
         sample = PoseSample(
@@ -1247,6 +1274,8 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             self.last_yolo_ros_sec = self.get_clock().now().nanoseconds * 1e-9
             self.latest_detection_capture_sec = capture_sec if capture_sec > 0.0 else None
             self.latest_detection_pose = self.lookup_pose_at(capture_sec)
+            if self.latest_detection_pose is None:
+                self.latest_detection_pose = self.get_robot_pose()
             if capture_sec > 0.0:
                 self.latest_detection_delay_ms = max(
                     0.0, (self.last_yolo_ros_sec - capture_sec) * 1000.0
@@ -1805,7 +1834,8 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             return
 
         now_ros_sec = self.get_clock().now().nanoseconds * 1e-9
-        self.record_pose_sample(now_ros_sec, robot_pose)
+        if self.pose_source not in ('topic', 'pose_topic', 'pose'):
+            self.record_pose_sample(now_ros_sec, robot_pose)
 
         detections = []
         detections.extend(self.maybe_make_fake_detection())
@@ -1967,6 +1997,9 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.last_diagnostic_publish_ros_ns = now_ros_ns
 
         # Heavy full-map diagnostic layers are deliberately rate-limited.
+        if not self.publish_diagnostic_maps:
+            return
+
         self.pub_detection_candidate.publish(self.array_to_occgrid(self.detection_candidate_map, stamp))
         self.pub_positive_memory.publish(self.array_to_occgrid(self.positive_memory_map, stamp))
         self.pub_visibility.publish(self.array_to_occgrid(self.visibility_map, stamp))

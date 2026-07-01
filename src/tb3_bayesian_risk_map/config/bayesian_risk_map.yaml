@@ -2,6 +2,7 @@ bayesian_risk_map_node:
   ros__parameters:
     # Topics / frames
     map_topic: "/map"
+    map_qos_durability: "volatile"
     image_topic: "/camera/image_raw"
     map_frame: "map"
     base_frame: "base_link"
@@ -94,6 +95,7 @@ bayesian_risk_map_node:
     debug_image_dir: "/tmp/tb3_bayesian_risk_map_debug"
     debug_image_rate_hz: 1.0
     debug_log_image_status: true
+    publish_diagnostic_maps: false
 
     # Persistence
     preserve_risk_on_map_resize: true
