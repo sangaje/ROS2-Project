@@ -31,8 +31,10 @@ def generate_launch_description():
                               description='[AMCL only] Leader x in follower SLAM map.'),
         DeclareLaunchArgument('initial_y',   default_value='0.0'),
         DeclareLaunchArgument('initial_yaw', default_value='0.0'),
-        DeclareLaunchArgument('robot1_ip',   default_value='10.10.14.10'),
-        DeclareLaunchArgument('robot2_ip',   default_value='10.10.14.14'),
+        DeclareLaunchArgument('robot1_ip',   default_value='',
+                              description='Optional leader robot IP for static DDS peers. Empty uses subnet multicast.'),
+        DeclareLaunchArgument('robot2_ip',   default_value='',
+                              description='Optional follower robot IP for static DDS peers. Empty uses subnet multicast.'),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(leader_launch),
             launch_arguments={
