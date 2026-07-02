@@ -266,9 +266,7 @@ Visualization Manager:
       Enabled: true
       Name: Fleet Debug Markers
       Namespaces:
-        burger: true
-        burger_heading: true
-        burger_label: true
+        {}
       Topic:
         Depth: 10
         Durability Policy: Volatile
@@ -314,16 +312,16 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 21.254436492919922
+      Distance: 34.837196350097656
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: -2.239454746246338
-        Y: 3.8119924068450928
-        Z: 0.0006394631927832961
+        X: 1.8702183961868286
+        Y: 1.9921129941940308
+        Z: -0.04476664587855339
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false

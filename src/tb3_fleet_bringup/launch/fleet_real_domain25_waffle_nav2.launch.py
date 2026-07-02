@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 
 import os
+import tempfile
+from pathlib import Path
 
+import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     ExecuteProcess,
     LogInfo,
+    OpaqueFunction,
     SetEnvironmentVariable,
     TimerAction,
     UnsetEnvironmentVariable,
@@ -20,57 +24,103 @@ from nav2_common.launch import RewrittenYaml
 def generate_launch_description():
     bringup_share = get_package_share_directory('tb3_fleet_bringup')
 
-    domain_id = LaunchConfiguration('domain_id')
+    domain_id   = LaunchConfiguration('domain_id')
     robot_model = LaunchConfiguration('robot_model')
+    use_slam    = LaunchConfiguration('use_slam')
+    initial_x   = LaunchConfiguration('initial_x')
+    initial_y   = LaunchConfiguration('initial_y')
+    initial_yaw = LaunchConfiguration('initial_yaw')
 
-    waffle_nav2_source = os.path.join(
-        bringup_share, 'config', 'domain25_waffle_nav2.yaml'
-    )
-    burger_nav2_source = os.path.join(
-        bringup_share, 'config', 'domain26_burger_nav2_slam.yaml'
-    )
+    # ── yaml paths ────────────────────────────────────────────────────────────
+    burger_slam_yaml = os.path.join(bringup_share, 'config', 'domain26_burger_nav2_slam.yaml')
+    burger_amcl_yaml = os.path.join(bringup_share, 'config', 'domain24_burger_nav2_amcl.yaml')
+    waffle_yaml      = os.path.join(bringup_share, 'config', 'domain25_waffle_nav2.yaml')
+
+    # Select nav2 yaml based on model + slam mode.
+    # Burger AMCL mode → amcl yaml; burger SLAM → slam yaml; waffle → waffle yaml.
     nav2_source = PythonExpression([
-        "'", burger_nav2_source, "' if '", robot_model,
-        "' == 'burger' else '", waffle_nav2_source, "'",
+        "'", burger_amcl_yaml, "' if '", robot_model, "' == 'burger' and '",
+        use_slam, "' == 'false' else ('",
+        burger_slam_yaml, "' if '", robot_model, "' == 'burger' else '",
+        waffle_yaml, "')",
     ])
     nav2_params = RewrittenYaml(
         source_file=nav2_source,
         param_rewrites={
             'use_sim_time': 'false',
-            'odom_topic': '/odom',
-            'topic': '/scan',
+            'odom_topic':   '/odom',
+            'topic':        '/scan',
         },
         convert_types=True,
     )
 
+    # ── fixed scripts ─────────────────────────────────────────────────────────
     cartographer_config_dir = os.path.join(bringup_share, 'config')
-    tf_pose_script = os.path.join(
-        bringup_share, 'scripts', 'tf_pose_publisher_direct_v44.py'
-    )
-    goal_proxy_script = os.path.join(
-        bringup_share, 'scripts', 'pose_to_nav2_action_direct_v41.py'
-    )
+    tf_pose_script   = os.path.join(bringup_share, 'scripts', 'tf_pose_publisher_direct_v44.py')
+    goal_proxy_script = os.path.join(bringup_share, 'scripts', 'pose_to_nav2_action_direct_v41.py')
 
-    cartographer = Node(
-        package='cartographer_ros',
-        executable='cartographer_node',
-        name='cartographer_node',
-        output='screen',
-        parameters=[{'use_sim_time': False}],
-        arguments=[
-            '-configuration_directory', cartographer_config_dir,
-            '-configuration_basename', 'cartographer_2d_lidar_odom_v44.lua',
-        ],
-    )
-    occupancy_grid = Node(
-        package='cartographer_ros',
-        executable='cartographer_occupancy_grid_node',
-        name='cartographer_occupancy_grid_node',
-        output='screen',
-        parameters=[{'use_sim_time': False}],
-        arguments=['-resolution', '0.05', '-publish_period_sec', '1.0'],
-    )
+    # ── localization: Cartographer (SLAM) or AMCL ─────────────────────────────
+    def make_localization(context, *args, **kwargs):
+        slam_mode = use_slam.perform(context).lower() in ('true', '1', 'yes')
 
+        if slam_mode:
+            cartographer = Node(
+                package='cartographer_ros',
+                executable='cartographer_node',
+                name='cartographer_node',
+                output='screen',
+                parameters=[{'use_sim_time': False}],
+                arguments=[
+                    '-configuration_directory', cartographer_config_dir,
+                    '-configuration_basename', 'cartographer_2d_lidar_odom_v44.lua',
+                ],
+            )
+            occupancy_grid = Node(
+                package='cartographer_ros',
+                executable='cartographer_occupancy_grid_node',
+                name='cartographer_occupancy_grid_node',
+                output='screen',
+                parameters=[{'use_sim_time': False}],
+                arguments=['-resolution', '0.05', '-publish_period_sec', '1.0'],
+            )
+            return [TimerAction(period=0.5, actions=[cartographer, occupancy_grid])]
+
+        # ── AMCL mode (this robot receives the SLAM map from the other robot) ──
+        ix   = float(initial_x.perform(context))
+        iy   = float(initial_y.perform(context))
+        iyaw = float(initial_yaw.perform(context))
+
+        amcl_pose_overrides = {
+            'amcl': {
+                'ros__parameters': {
+                    'set_initial_pose': True,
+                    'initial_pose': {'x': ix, 'y': iy, 'z': 0.0, 'yaw': iyaw},
+                }
+            }
+        }
+        pose_yaml = Path(tempfile.gettempdir()) / 'leader_amcl_initial_pose.yaml'
+        pose_yaml.write_text(yaml.dump(amcl_pose_overrides), encoding='utf-8')
+
+        amcl = Node(
+            package='nav2_amcl',
+            executable='amcl',
+            name='amcl',
+            output='screen',
+            parameters=[nav2_params, str(pose_yaml)],
+        )
+        lifecycle_loc = Node(
+            package='nav2_lifecycle_manager',
+            executable='lifecycle_manager',
+            name='lifecycle_manager_localization',
+            output='screen',
+            parameters=[nav2_params],
+        )
+        return [
+            TimerAction(period=0.5, actions=[amcl]),
+            TimerAction(period=1.0, actions=[lifecycle_loc]),
+        ]
+
+    # ── leader pose publisher (works with both Cartographer and AMCL TF) ──────
     leader_pose = ExecuteProcess(
         cmd=[
             'python3', tf_pose_script, '--ros-args',
@@ -86,6 +136,7 @@ def generate_launch_description():
         name='waffle_real_leader_pose_publisher',
     )
 
+    # ── Nav2 planning stack ───────────────────────────────────────────────────
     controller_server = Node(
         package='nav2_controller',
         executable='controller_server',
@@ -114,14 +165,13 @@ def generate_launch_description():
         output='screen',
         parameters=[nav2_params],
     )
-    lifecycle = Node(
+    lifecycle_nav = Node(
         package='nav2_lifecycle_manager',
         executable='lifecycle_manager',
         name='lifecycle_manager_navigation',
         output='screen',
         parameters=[nav2_params],
     )
-
     default_goal = ExecuteProcess(
         cmd=[
             'python3', goal_proxy_script, '--ros-args',
@@ -150,33 +200,48 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        DeclareLaunchArgument('domain_id', default_value='25'),
+        DeclareLaunchArgument('domain_id',    default_value='25'),
         DeclareLaunchArgument(
             'robot_model',
             default_value='waffle_pi',
-            description='Physical TurtleBot3 model: waffle, waffle_pi, or burger.',
+            description='Physical model: waffle, waffle_pi, or burger.',
         ),
+        DeclareLaunchArgument(
+            'use_slam',
+            default_value='true',
+            description='true=Cartographer SLAM; false=AMCL with received map.',
+        ),
+        DeclareLaunchArgument(
+            'initial_x',
+            default_value='1.05',
+            description='[AMCL only] Start x in the other robot Cartographer map frame.',
+        ),
+        DeclareLaunchArgument('initial_y',   default_value='0.0'),
+        DeclareLaunchArgument('initial_yaw', default_value='0.0'),
         UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
         UnsetEnvironmentVariable('ROS_LOCALHOST_ONLY'),
         UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),
         UnsetEnvironmentVariable('FASTDDS_DEFAULT_PROFILES_FILE'),
-        SetEnvironmentVariable('ROS_DOMAIN_ID', domain_id),
-        SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp'),
-        SetEnvironmentVariable('FASTDDS_BUILTIN_TRANSPORTS', 'UDPv4'),
-        SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', 'SUBNET'),
-        SetEnvironmentVariable('TURTLEBOT3_MODEL', robot_model),
+        SetEnvironmentVariable('ROS_DOMAIN_ID',                  domain_id),
+        SetEnvironmentVariable('RMW_IMPLEMENTATION',             'rmw_fastrtps_cpp'),
+        SetEnvironmentVariable('FASTDDS_BUILTIN_TRANSPORTS',     'UDPv4'),
+        SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE',  'SUBNET'),
+        SetEnvironmentVariable('TURTLEBOT3_MODEL',               robot_model),
         LogInfo(
             msg=[
                 'REAL_LEADER_DOMAIN25 | model=', robot_model,
-                ' | Cartographer SLAM → map→odom TF | /leader_pose → bridge → Domain24',
+                ' | use_slam=', use_slam,
+                ' | initial=(', initial_x, ',', initial_y, ',', initial_yaw, ')',
             ]
         ),
-        TimerAction(period=0.5, actions=[cartographer, occupancy_grid]),
-        TimerAction(period=1.0, actions=[leader_pose]),
+        # Localization (Cartographer or AMCL depending on use_slam)
+        OpaqueFunction(function=make_localization),
+        # leader_pose TF publisher (works with both Cartographer and AMCL TF)
+        TimerAction(period=1.5, actions=[leader_pose]),
         TimerAction(
             period=2.0,
             actions=[controller_server, planner_server, behavior_server, bt_navigator],
         ),
-        TimerAction(period=5.0, actions=[lifecycle]),
+        TimerAction(period=5.0, actions=[lifecycle_nav]),
         TimerAction(period=7.0, actions=[default_goal, named_goal]),
     ])
