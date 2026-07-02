@@ -5,7 +5,15 @@ import tempfile
 from pathlib import Path
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, TimerAction, LogInfo, SetEnvironmentVariable, OpaqueFunction
+from launch.actions import (
+    DeclareLaunchArgument,
+    ExecuteProcess,
+    TimerAction,
+    LogInfo,
+    SetEnvironmentVariable,
+    UnsetEnvironmentVariable,
+    OpaqueFunction,
+)
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression
 from launch_ros.actions import Node
@@ -27,6 +35,10 @@ def generate_launch_description():
     domain_id = LaunchConfiguration('domain_id')
     leader_domain_id = LaunchConfiguration('leader_domain_id')
     use_slam = LaunchConfiguration('use_slam')
+    follow_distance = LaunchConfiguration('follow_distance')
+    enable_path_yield = LaunchConfiguration('enable_path_yield')
+    path_block_distance = LaunchConfiguration('path_block_distance')
+    yield_lateral_distance = LaunchConfiguration('yield_lateral_distance')
 
     bridge_config = os.path.join(bringup_share, 'config', 'domain26_burger_ros_gz_bridge.yaml')
     nav2_params = os.path.join(bringup_share, 'config', 'domain26_burger_nav2_slam.yaml')
@@ -65,8 +77,23 @@ topics:
       durability: volatile
       history: keep_last
       depth: 10
+  /plan:
+    type: nav_msgs/msg/Path
+    remap: /waffle_plan
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 10
   /burger_goal_pose:
     type: geometry_msgs/msg/PoseStamped
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 10
+  /fleet/follow_command:
+    type: std_msgs/msg/String
     qos:
       reliability: reliable
       durability: volatile
@@ -103,6 +130,14 @@ topics:
       durability: volatile
       history: keep_last
       depth: 10
+  /plan:
+    type: nav_msgs/msg/Path
+    remap: /waffle_plan
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 10
   /burger_goal_pose:
     type: geometry_msgs/msg/PoseStamped
     qos:
@@ -110,15 +145,48 @@ topics:
       durability: volatile
       history: keep_last
       depth: 10
+  /fleet/follow_command:
+    type: std_msgs/msg/String
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 10
 """
 
-        debug_yaml = f"""name: burger_debug_{burger_domain}_to_{leader_domain}_v55
+        slam_map_topics = """
+  /map:
+    type: nav_msgs/msg/OccupancyGrid
+    qos:
+      reliability: reliable
+      durability: transient_local
+      history: keep_last
+      depth: 1
+  /map_metadata:
+    type: nav_msgs/msg/MapMetaData
+    qos:
+      reliability: reliable
+      durability: transient_local
+      history: keep_last
+      depth: 1
+""" if is_slam else ""
+
+        debug_yaml = f"""name: burger_debug_{burger_domain}_to_{leader_domain}_v56
 from_domain: {burger_domain}
 to_domain: {leader_domain}
 
 topics:
+{slam_map_topics}
   /burger_pose:
     type: geometry_msgs/msg/PoseStamped
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 10
+  /plan:
+    type: nav_msgs/msg/Path
+    remap: /burger_plan
     qos:
       reliability: reliable
       durability: volatile
@@ -131,6 +199,13 @@ topics:
       durability: volatile
       history: keep_last
       depth: 10
+  /fleet/follow_enabled:
+    type: std_msgs/msg/Bool
+    qos:
+      reliability: reliable
+      durability: transient_local
+      history: keep_last
+      depth: 1
 """
 
         shared_path.write_text(shared_yaml)
@@ -201,7 +276,35 @@ topics:
     goal_proxy_default = ExecuteProcess(cmd=['python3', goal_proxy_script, '--ros-args', '-r', '__node:=burger_default_goal_pose_to_nav2', '-p', 'use_sim_time:=true', '-p', 'goal_pose_topic:=/goal_pose', '-p', 'navigate_action:=/navigate_to_pose', '-p', 'default_frame_id:=map', '-p', 'cancel_previous_goal:=true'], output='screen', name='burger_default_goal_pose_to_nav2_v55')
     goal_proxy_named = ExecuteProcess(cmd=['python3', goal_proxy_script, '--ros-args', '-r', '__node:=burger_named_goal_pose_to_nav2', '-p', 'use_sim_time:=true', '-p', 'goal_pose_topic:=/burger_goal_pose', '-p', 'navigate_action:=/navigate_to_pose', '-p', 'default_frame_id:=map', '-p', 'cancel_previous_goal:=true'], output='screen', name='burger_named_goal_pose_to_nav2_v55')
 
-    follower = ExecuteProcess(cmd=['python3', follower_script, '--ros-args', '-r', '__node:=domain_bridge_nav2_follower', '-p', 'use_sim_time:=true', '-p', 'leader_pose_topic:=/leader_pose', '-p', 'navigate_action:=/navigate_to_pose', '-p', 'follow_distance:=1.05', '-p', 'goal_period_sec:=1.5', '-p', 'goal_update_distance:=0.25', '-p', 'cancel_previous_goal:=false'], output='screen', name='domain_bridge_nav2_follower_v55')
+    follower = ExecuteProcess(
+        cmd=[
+            'python3', follower_script, '--ros-args',
+            '-r', '__node:=domain_bridge_nav2_follower',
+            '-p', 'use_sim_time:=true',
+            '-p', 'leader_pose_topic:=/leader_pose',
+            '-p', 'leader_path_topic:=/waffle_plan',
+            '-p', 'follower_pose_topic:=/burger_pose',
+            '-p', 'map_topic:=/map',
+            '-p', 'navigate_action:=/navigate_to_pose',
+            '-p', ['follow_distance:=', follow_distance],
+            '-p', 'goal_period_sec:=1.0',
+            '-p', 'goal_update_distance:=0.20',
+            '-p', 'cancel_previous_goal:=false',
+            '-p', 'follow_command_topic:=/fleet/follow_command',
+            '-p', 'follow_status_topic:=/fleet/follow_enabled',
+            '-p', 'start_following:=true',
+            '-p', ['enable_path_yield:=', enable_path_yield],
+            '-p', ['path_block_distance:=', path_block_distance],
+            '-p', 'path_lookahead_min:=0.30',
+            '-p', 'path_lookahead_max:=2.50',
+            '-p', ['yield_lateral_distance:=', yield_lateral_distance],
+            '-p', 'yield_release_distance:=0.80',
+            '-p', 'yield_min_hold_sec:=4.0',
+            '-p', 'yield_max_hold_sec:=12.0',
+        ],
+        output='screen',
+        name='domain_bridge_nav2_follower_v56',
+    )
 
     astar_cmd = ExecuteProcess(cmd=[
         'python3', astar_cmd_script,
@@ -245,7 +348,7 @@ topics:
 
     return LaunchDescription([
         DeclareLaunchArgument('domain_id', default_value='24', description='ROS_DOMAIN_ID used by Burger follower domain.'),
-        DeclareLaunchArgument('leader_domain_id', default_value='25', description='ROS_DOMAIN_ID of Waffle/SLAM owner domain.'),
+        DeclareLaunchArgument('leader_domain_id', default_value='25', description='ROS_DOMAIN_ID of the Waffle Nav2 leader.'),
         DeclareLaunchArgument('use_slam', default_value='true',
                               description='true: Cartographer SLAM on Burger builds the map. '
                                           'false: static map_odom_localization, /map received from leader domain.'),
@@ -256,14 +359,21 @@ topics:
         DeclareLaunchArgument('map_origin_y', default_value='-1.75', description='Static map mode only: map frame origin y.'),
         DeclareLaunchArgument('map_origin_yaw', default_value='0.0', description='Static map mode only: map frame origin yaw.'),
         DeclareLaunchArgument('auto_follow', default_value='true', description='Nav2 mode only: true means Burger follows /leader_pose with NavigateToPose goals.'),
-        DeclareLaunchArgument('control_mode', default_value='astar_cmd', description='nav2: use Nav2 NavigateToPose. astar_cmd: bypass Nav2 and publish /cmd_vel TwistStamped from A* path tracking.'),
+        DeclareLaunchArgument('control_mode', default_value='nav2', description='nav2: Burger follows Waffle through NavigateToPose. astar_cmd: bypass Nav2 and publish /cmd_vel TwistStamped from A* path tracking.'),
         DeclareLaunchArgument('astar_target_mode', default_value='leader', description='astar_cmd mode: leader follows /leader_pose; manual follows /burger_goal_pose.'),
+        DeclareLaunchArgument('follow_distance', default_value='1.05', description='Burger target distance behind Waffle in meters.'),
+        DeclareLaunchArgument('enable_path_yield', default_value='true', description='Move Burger aside when it blocks the upcoming Waffle Nav2 path.'),
+        DeclareLaunchArgument('path_block_distance', default_value='0.55', description='Burger-to-Waffle-path distance that triggers yielding.'),
+        DeclareLaunchArgument('yield_lateral_distance', default_value='0.75', description='Initial lateral Nav2 offset used to clear Waffle path.'),
+        UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
+        UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),
+        UnsetEnvironmentVariable('FASTDDS_DEFAULT_PROFILES_FILE'),
         SetEnvironmentVariable('ROS_DOMAIN_ID', domain_id),
         SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp'),
         SetEnvironmentVariable('FASTDDS_BUILTIN_TRANSPORTS', 'UDPv4'),
         SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', 'LOCALHOST'),
         SetEnvironmentVariable('TURTLEBOT3_MODEL', 'burger'),
-        LogInfo(msg='V55_DOMAIN24_BURGER | SLAM mode: Cartographer on Burger builds map. Waffle gets /map via bridge.'),
+        LogInfo(msg='V56_DOMAIN24_BURGER | Cartographer builds /map in Domain24; SLAM map and Burger pose bridge to Waffle Domain25.'),
         LogInfo(msg=['V55_BRIDGE_DOMAINS | leader_domain_id=', leader_domain_id, ' -> burger_domain_id=', domain_id, ' and debug back.']),
         LogInfo(msg=['V55_BURGER_SLAM_MODE | use_slam=', use_slam]),
         LogInfo(msg=['V55_BURGER_CONTROL_MODE | ', control_mode, ' | nav2 or astar_cmd']),

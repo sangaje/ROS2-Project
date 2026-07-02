@@ -20,6 +20,7 @@ from launch.actions import (
     ExecuteProcess,
     TimerAction,
     SetEnvironmentVariable,
+    UnsetEnvironmentVariable,
     LogInfo,
     OpaqueFunction,
 )
@@ -263,6 +264,9 @@ topics:
         DeclareLaunchArgument('show_rviz', default_value='true'),
         DeclareLaunchArgument('sim', default_value='true'),
         DeclareLaunchArgument('rviz_config', default_value=default_rviz),
+        UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
+        UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),
+        UnsetEnvironmentVariable('FASTDDS_DEFAULT_PROFILES_FILE'),
         SetEnvironmentVariable('ROS_DOMAIN_ID', waffle_domain_id),
         SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp'),
         SetEnvironmentVariable('FASTDDS_BUILTIN_TRANSPORTS', 'UDPv4'),

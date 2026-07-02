@@ -1,5 +1,5 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, ExecuteProcess
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
@@ -12,6 +12,11 @@ def generate_launch_description():
     pkg_share = get_package_share_directory('tb3_bayesian_risk_map')
     default_config = os.path.join(pkg_share, 'config', 'bayesian_risk_map.yaml')
     default_rviz = os.path.join(pkg_share, 'rviz', 'bayesian_risk_map.rviz')
+    rviz_clean = PathJoinSubstitution([
+        FindPackageShare('tb3_bayesian_risk_map'),
+        'scripts',
+        'rviz2_clean_env.bash',
+    ])
 
     cartographer_config_dir = PathJoinSubstitution([
         FindPackageShare('turtlebot3_cartographer'),
@@ -110,14 +115,17 @@ def generate_launch_description():
             ],
         ),
 
-        Node(
+        ExecuteProcess(
             condition=IfCondition(LaunchConfiguration('start_rviz')),
-            package='rviz2',
-            executable='rviz2',
+            cmd=[
+                rviz_clean,
+                '-d', LaunchConfiguration('rviz_config'),
+                '--ros-args',
+                '-r', '__node:=rviz2_risk_cartographer',
+                '-p', ['use_sim_time:=', LaunchConfiguration('use_sim_time')],
+            ],
             name='rviz2_risk_cartographer',
             output='screen',
-            arguments=['-d', LaunchConfiguration('rviz_config')],
-            parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time')}],
         ),
 
         Node(

@@ -13,9 +13,11 @@
   <exec_depend>tb3_fleet_robot</exec_depend>
   <exec_depend>tb3_fleet_bridge</exec_depend>
   <exec_depend>nav2_bringup</exec_depend>
+  <exec_depend>nav2_common</exec_depend>
   <exec_depend>nav2_amcl</exec_depend>
   <exec_depend>nav2_lifecycle_manager</exec_depend>
   <exec_depend>turtlebot3_gazebo</exec_depend>
+  <exec_depend>turtlebot3_bringup</exec_depend>
   <export>
     <build_type>ament_python</build_type>
   </export>
@@ -25,6 +27,7 @@
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>nav_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>tf2_ros</exec_depend>
   <exec_depend>nav2_msgs</exec_depend>

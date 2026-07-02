@@ -44,6 +44,7 @@ setup(
             'waffle_burger_follower = tb3_fleet_bringup.waffle_burger_follower:main',
             'waffle_burger_nav2_follower = tb3_fleet_bringup.waffle_burger_nav2_follower:main',
             'nav2_frame_tools = tb3_fleet_bringup.nav2_frame_tools:main',
+            'fleet_follow_signal = tb3_fleet_bringup.fleet_follow_signal:main',
         ],
     },
 )

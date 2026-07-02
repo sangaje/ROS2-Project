@@ -8,6 +8,7 @@ from typing import Optional, Tuple
 import rclpy
 from rclpy.node import Node
 from rclpy.exceptions import ParameterAlreadyDeclaredException
+from rclpy.qos import qos_profile_sensor_data
 from geometry_msgs.msg import PoseWithCovarianceStamped, TransformStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
@@ -106,7 +107,12 @@ class SingleDomainNav2FrameTools(Node):
         self.scan_pub = self.create_publisher(LaserScan, self.scan_out, 10)
         self.initial_pub = self.create_publisher(PoseWithCovarianceStamped, self.initialpose_topic, 10)
         self.odom_sub = self.create_subscription(Odometry, self.odom_in, self._on_odom, 20)
-        self.scan_sub = self.create_subscription(LaserScan, self.scan_in, self._on_scan, 20)
+        self.scan_sub = self.create_subscription(
+            LaserScan,
+            self.scan_in,
+            self._on_scan,
+            qos_profile_sensor_data,
+        )
 
         self.odom_count = 0
         self.scan_count = 0

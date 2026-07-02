@@ -6,17 +6,17 @@ Panels:
       Expanded:
         - /Global Options1
         - /Status1
-        - /Fleet Debug Markers1
-        - /Waffle Leader Pose1
+        - /Map1
+        - /TF1
+        - /Waffle Scan1
+        - /Burger Scan1
+        - /Waffle Pose1
         - /Burger Pose1
+        - /Waffle Nav2 Plan1
+        - /Burger Nav2 Plan1
+        - /Fleet Debug Markers1
       Splitter Ratio: 0.5
-    Tree Height: 85
-  - Class: rviz_common/Selection
-    Name: Selection
-  - Class: rviz_common/Tool Properties
-    Expanded: ~
-    Name: Tool Properties
-    Splitter Ratio: 0.5886790156364441
+    Tree Height: 313
   - Class: rviz_common/Views
     Expanded:
       - /Current View1
@@ -25,7 +25,7 @@ Panels:
 Visualization Manager:
   Class: ""
   Displays:
-    - Alpha: 0.5
+    - Alpha: 0.44999998807907104
       Cell Size: 1
       Class: rviz_default_plugins/Grid
       Color: 160; 160; 164
@@ -34,18 +34,6 @@ Visualization Manager:
         Line Width: 0.029999999329447746
         Value: Lines
       Name: Grid
-Visualization Manager:
-  Class: ""
-  Displays:
-    - Class: rviz_default_plugins/Grid
-      Name: Grid
-      Enabled: true
-      Alpha: 0.5
-      Cell Size: 1
-      Color: 160; 160; 164
-      Line Style:
-        Line Width: 0.03
-        Value: Lines
       Normal Cell Count: 0
       Offset:
         X: 0
@@ -55,14 +43,14 @@ Visualization Manager:
       Plane Cell Count: 20
       Reference Frame: <Fixed Frame>
       Value: true
-    - Class: rviz_default_plugins/Map
-      Name: Map
-      Enabled: true
-      Alpha: 0.75
+    - Alpha: 0.75
       Binary representation: false
       Binary threshold: 100
+      Class: rviz_default_plugins/Map
       Color Scheme: map
       Draw Behind: true
+      Enabled: true
+      Name: Map
       Topic:
         Depth: 1
         Durability Policy: Transient Local
@@ -78,199 +66,105 @@ Visualization Manager:
         Value: /map_updates
       Use Timestamp: false
       Value: true
-    - Class: rviz_default_plugins/MarkerArray
-      Name: Fleet Debug Markers
+    - Class: rviz_default_plugins/TF
       Enabled: true
-      Namespaces:
-        burger: true
-        burger_heading: true
-        burger_label: true
-        waffle: true
-        waffle_heading: true
-        waffle_label: true
-      Topic:
-        Depth: 10
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /fleet_debug_markers
+      Filter (blacklist): ""
+      Filter (whitelist): ""
+      Frame Timeout: 15
+      Frames:
+        All Enabled: true
+        base_footprint:
+          Value: true
+        base_link:
+          Value: true
+        base_scan:
+          Value: true
+        map:
+          Value: true
+        odom:
+          Value: true
+      Marker Scale: 0.3499999940395355
+      Name: TF
+      Show Arrows: true
+      Show Axes: true
+      Show Names: true
+      Tree:
+        map:
+          odom:
+            base_footprint:
+              base_link:
+                {}
+              base_scan:
+                {}
+      Update Interval: 0
       Value: true
-    - Class: rviz_default_plugins/Pose
-      Name: Waffle Pose
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz_default_plugins/LaserScan
+      Color: 25; 120; 255
+      Color Transformer: FlatColor
+      Decay Time: 0
       Enabled: true
-      Alpha: 1
-      Axes Length: 0.35
-      Axes Radius: 0.03
-      Color: 25; 80; 255
-      Head Length: 0.25
-      Head Radius: 0.08
-      Shaft Length: 0.45
-      Shaft Radius: 0.03
-      Shape: Arrow
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Max Intensity: 4096
+      Min Color: 0; 0; 0
+      Min Intensity: 0
+      Name: Waffle Scan
+      Position Transformer: XYZ
+      Selectable: true
+      Size (Pixels): 3
+      Size (m): 0.03999999910593033
+      Style: Points
       Topic:
         Depth: 10
         Durability Policy: Volatile
         Filter size: 10
         History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /leader_pose
+        Reliability Policy: Best Effort
+        Value: /scan_nav
+      Use Fixed Frame: true
+      Use rainbow: true
       Value: true
-    - Class: rviz_default_plugins/Pose
-      Name: Burger Pose
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz_default_plugins/LaserScan
+      Color: 255; 120; 30
+      Color Transformer: FlatColor
+      Decay Time: 0
       Enabled: true
-      Alpha: 1
-      Axes Length: 0.3
-      Axes Radius: 0.03
-      Color: 255; 90; 20
-      Head Length: 0.22
-      Head Radius: 0.07
-      Shaft Length: 0.4
-      Shaft Radius: 0.03
-      Shape: Arrow
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Max Intensity: 4096
+      Min Color: 0; 0; 0
+      Min Intensity: 0
+      Name: Burger Scan
+      Position Transformer: XYZ
+      Selectable: true
+      Size (Pixels): 3
+      Size (m): 0.03999999910593033
+      Style: Points
       Topic:
         Depth: 10
         Durability Policy: Volatile
         Filter size: 10
         History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /burger_pose
-      Value: true
-  Enabled: true
-  Global Options:
-    Background Color: 48; 48; 48
-    Fixed Frame: map
-    Frame Rate: 30
-  Name: root
-  Tools:
-    - Class: rviz_default_plugins/Interact
-      Hide Inactive Objects: true
-    - Class: rviz_default_plugins/MoveCamera
-    - Class: rviz_default_plugins/Select
-    - Class: rviz_default_plugins/FocusCamera
-    - Class: rviz_default_plugins/Measure
-      Line color: 128; 128; 0
-    - Class: rviz_default_plugins/SetInitialPose
-      Covariance x: 0.25
-      Covariance y: 0.25
-      Covariance yaw: 0.06853891909122467
-      Topic:
-        Depth: 10
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /initialpose
-    - Class: rviz_default_plugins/SetGoal
-      Topic:
-        Depth: 10
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /fleet_goal_pose
-  Transformation:
-    Current:
-      Class: rviz_default_plugins/TF
-  Value: true
-  Views:
-    Current:
-      Class: rviz_default_plugins/Orbit
-      Distance: 6
-      Enable Stereo Rendering:
-        Stereo Eye Separation: 0.06
-        Stereo Focal Distance: 1
-        Swap Stereo Eyes: false
-        Value: false
-      Focal Point:
-        X: -1.6
-        Y: -0.9
-        Z: 0
-      Focal Shape Fixed Size: true
-      Focal Shape Size: 0.05
-      Invert Z Axis: false
-      Name: Current View
-      Near Clip Distance: 0.01
-      Pitch: 1.5708
-      Target Frame: <Fixed Frame>
-      Value: Orbit (rviz)
-      Yaw: 0
-    Saved: ~
-Window Geometry:
-  Displays:
-    collapsed: false
-  Height: 900
-  Hide Left Dock: false
-  Hide Right Dock: true
-  Views:
-    collapsed: false
-  Width: 1400
-  X: 80
-  Y: 80
-      Offset:
-        X: 0
-        Y: 0
-        Z: 0
-      Plane: XY
-      Plane Cell Count: 20
-      Reference Frame: <Fixed Frame>
-      Value: true
-    - Alpha: 0.699999988079071
-      Binary representation: false
-      Binary threshold: 100
-      Class: rviz_default_plugins/Map
-      Color Scheme: map
-      Draw Behind: false
-      Enabled: true
-      Name: Raw Cartographer Map (/map_raw)
-      Topic:
-        Depth: 1
-        Durability Policy: Transient Local
-        Filter size: 10
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /map_raw
-      Update Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /map_raw_updates
-      Use Timestamp: false
-      Value: true
-    - Alpha: 0.44999998807907104
-      Binary representation: false
-      Binary threshold: 100
-      Class: rviz_default_plugins/Map
-      Color Scheme: map
-      Draw Behind: false
-      Enabled: true
-      Name: Cleaned Map (/map)
-      Topic:
-        Depth: 1
-        Durability Policy: Transient Local
-        Filter size: 10
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /map
-      Update Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /map_updates
-      Use Timestamp: false
-      Value: true
-    - Class: rviz_default_plugins/MarkerArray
-      Enabled: true
-      Name: Fleet Debug Markers
-      Namespaces:
-        waffle: true
-        waffle_heading: true
-        waffle_label: true
-      Topic:
-        Depth: 10
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /fleet_debug_markers
+        Reliability Policy: Best Effort
+        Value: /burger/scan_nav
+      Use Fixed Frame: true
+      Use rainbow: true
       Value: true
     - Alpha: 1
       Axes Length: 0.3499999940395355
@@ -280,7 +174,7 @@ Window Geometry:
       Enabled: true
       Head Length: 0.25
       Head Radius: 0.07999999821186066
-      Name: Waffle Leader Pose
+      Name: Waffle Pose
       Shaft Length: 0.44999998807907104
       Shaft Radius: 0.029999999329447746
       Shape: Arrow
@@ -313,66 +207,6 @@ Window Geometry:
         Value: /burger_pose
       Value: true
     - Alpha: 1
-      Axes Length: 0.25
-      Axes Radius: 0.019999999552965164
-      Class: rviz_default_plugins/Pose
-      Color: 255; 255; 255
-      Enabled: true
-      Head Length: 0.2199999988079071
-      Head Radius: 0.07500000298023224
-      Name: Fleet Final Goal
-      Shaft Length: 0.3799999952316284
-      Shaft Radius: 0.02500000037252903
-      Shape: Arrow
-      Topic:
-        Depth: 10
-        Durability Policy: Volatile
-        Filter size: 10
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /fleet_final_goal
-      Value: true
-    - Alpha: 1
-      Axes Length: 0.25
-      Axes Radius: 0.019999999552965164
-      Class: rviz_default_plugins/Pose
-      Color: 80; 160; 255
-      Enabled: true
-      Head Length: 0.18000000715255737
-      Head Radius: 0.05999999865889549
-      Name: Waffle Current Waypoint
-      Shaft Length: 0.3199999928474426
-      Shaft Radius: 0.019999999552965164
-      Shape: Arrow
-      Topic:
-        Depth: 10
-        Durability Policy: Volatile
-        Filter size: 10
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /waffle_goal_pose
-      Value: true
-    - Alpha: 1
-      Axes Length: 0.25
-      Axes Radius: 0.019999999552965164
-      Class: rviz_default_plugins/Pose
-      Color: 255; 140; 30
-      Enabled: true
-      Head Length: 0.18000000715255737
-      Head Radius: 0.05999999865889549
-      Name: Burger Current Waypoint
-      Shaft Length: 0.3199999928474426
-      Shaft Radius: 0.019999999552965164
-      Shape: Arrow
-      Topic:
-        Depth: 10
-        Durability Policy: Volatile
-        Filter size: 10
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /burger_goal_pose
-      Value: true
-    - Alpha: 1
       Buffer Length: 1
       Class: rviz_default_plugins/Path
       Color: 25; 80; 255
@@ -381,69 +215,13 @@ Window Geometry:
       Head Length: 0.20000000298023224
       Length: 0.30000001192092896
       Line Style: Lines
-      Line Width: 0.029999999329447746
-      Name: Waffle AStar Path
-      Offset:
-        X: 0
-        Y: 0
-        Z: 0
-      Pose Color: 255; 85; 255
-      Pose Style: None
-      Radius: 0.029999999329447746
-      Shaft Diameter: 0.10000000149011612
-      Shaft Length: 0.10000000149011612
-      Topic:
-        Depth: 10
-        Durability Policy: Volatile
-        Filter size: 10
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /waffle_astar_path
-      Value: true
-    - Alpha: 1
-      Buffer Length: 1
-      Class: rviz_default_plugins/Path
-      Color: 255; 90; 20
-      Enabled: true
-      Head Diameter: 0.30000001192092896
-      Head Length: 0.20000000298023224
-      Length: 0.30000001192092896
-      Line Style: Lines
-      Line Width: 0.029999999329447746
-      Name: Burger AStar Path
-      Offset:
-        X: 0
-        Y: 0
-        Z: 0
-      Pose Color: 255; 85; 255
-      Pose Style: None
-      Radius: 0.029999999329447746
-      Shaft Diameter: 0.10000000149011612
-      Shaft Length: 0.10000000149011612
-      Topic:
-        Depth: 10
-        Durability Policy: Volatile
-        Filter size: 10
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /astar_path
-      Value: true
-    - Alpha: 1
-      Buffer Length: 1
-      Class: rviz_default_plugins/Path
-      Color: 80; 220; 120
-      Enabled: true
-      Head Diameter: 0.30000001192092896
-      Head Length: 0.20000000298023224
-      Length: 0.30000001192092896
-      Line Style: Lines
       Line Width: 0.03999999910593033
-      Name: Nav2 Plan
+      Name: Waffle Nav2 Plan
       Offset:
         X: 0
         Y: 0
         Z: 0
-      Pose Color: 255; 85; 255
+      Pose Color: 25; 80; 255
       Pose Style: None
       Radius: 0.029999999329447746
       Shaft Diameter: 0.10000000149011612
@@ -455,6 +233,51 @@ Window Geometry:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /plan
+      Value: true
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz_default_plugins/Path
+      Color: 255; 90; 20
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.03999999910593033
+      Name: Burger Nav2 Plan
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 90; 20
+      Pose Style: None
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /burger_plan
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Fleet Debug Markers
+      Namespaces:
+        burger: true
+        burger_heading: true
+        burger_label: true
+        waffle: true
+        waffle_heading: true
+        waffle_label: true
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /fleet_debug_markers
       Value: true
   Enabled: true
   Global Options:
@@ -486,7 +309,7 @@ Window Geometry:
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /fleet_goal_pose
+        Value: /goal_pose
   Transformation:
     Current:
       Class: rviz_default_plugins/TF
@@ -494,39 +317,35 @@ Window Geometry:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 10.274762153625488
+      Distance: 14.108323097229004
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 1.4017412662506104
-        Y: -0.34845125675201416
-        Z: -0.0011443006806075573
+        X: -2.239454746246338
+        Y: 3.8119924068450928
+        Z: 0.0006394631927832961
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 1.5697963237762451
+      Pitch: 1.5597963333129883
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz)
-      Yaw: 5.383184909820557
+      Yaw: 6.2731852531433105
     Saved: ~
 Window Geometry:
   Displays:
     collapsed: false
-  Height: 789
+  Height: 900
   Hide Left Dock: false
-  Hide Right Dock: false
-  QMainWindow State: 000000ff00000000fd00000001000000000000020c000002abfc0200000004fb000000100044006900730070006c0061007900730100000048000000f3000000f300fffffffb0000001200530065006c0065006300740069006f006e01000001420000006f0000006f00fffffffb0000001e0054006f006f006c002000500072006f007000650072007400690065007301000001b80000006f0000006f00fffffffb0000000a00560069006500770073010000022e000000c5000000c500ffffff0000035b000002ab00000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
-  Selection:
-    collapsed: false
-  Tool Properties:
-    collapsed: false
+  Hide Right Dock: true
+  QMainWindow State: 000000ff00000000fd00000001000000000000020c0000031afc0200000002fb000000100044006900730070006c0061007900730100000048000001d7000000f300fffffffb0000000a0056006900650077007301000002260000013c000000c500ffffff000003650000031a00000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   Views:
     collapsed: false
-  Width: 1390
-  X: 66
-  Y: 119
+  Width: 1400
+  X: 80
+  Y: 80

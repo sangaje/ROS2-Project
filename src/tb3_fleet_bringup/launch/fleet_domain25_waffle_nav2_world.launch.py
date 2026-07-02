@@ -8,7 +8,15 @@ from typing import Iterable, Tuple
 
 from ament_index_python.packages import get_package_share_directory, PackageNotFoundError
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, TimerAction, SetEnvironmentVariable, LogInfo, OpaqueFunction
+from launch.actions import (
+    DeclareLaunchArgument,
+    ExecuteProcess,
+    TimerAction,
+    SetEnvironmentVariable,
+    UnsetEnvironmentVariable,
+    LogInfo,
+    OpaqueFunction,
+)
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 
@@ -193,7 +201,7 @@ def generate_launch_description():
     _clean_ld = ':'.join(p for p in _raw_ld.split(':') if p and '/snap/' not in p)
 
     gz_sim = ExecuteProcess(
-        cmd=['gz', 'sim', '-r', '-v', gz_verbosity, world],
+        cmd=['gz', 'sim', '-r', '-s', '-v', gz_verbosity, world],
         output='screen',
         name='gz_sim_v41',
         additional_env={'LD_LIBRARY_PATH': _clean_ld},
@@ -218,6 +226,7 @@ def generate_launch_description():
 
     # --- Static-map mode nodes (use_slam:=false) ---
     map_odom_localization = ExecuteProcess(cmd=['python3', map_odom_localization_script, '--ros-args', '-r', '__node:=map_odom_localization', '-p', 'use_sim_time:=true', '-p', 'robot_name:=waffle', '-p', 'odom_topic:=/odom_nav', '-p', 'map_frame:=map', '-p', 'odom_frame:=odom', '-p', 'base_frame:=base_footprint', '-p', ['initial_x:=', waffle_x], '-p', ['initial_y:=', waffle_y], '-p', ['initial_yaw:=', waffle_yaw], '-p', 'publish_rate_hz:=30.0', '-p', 'publish_amcl_pose:=true'], output='screen', name='waffle_map_odom_localization_v41')
+    burger_map_odom_localization = ExecuteProcess(cmd=['python3', map_odom_localization_script, '--ros-args', '-r', '__node:=burger_map_odom_localization', '-p', 'use_sim_time:=true', '-p', 'robot_name:=burger', '-p', 'odom_topic:=/burger/odom_nav', '-p', 'map_frame:=map', '-p', 'odom_frame:=burger/odom', '-p', 'base_frame:=burger/base_footprint', '-p', ['initial_x:=', burger_map_x], '-p', ['initial_y:=', burger_map_y], '-p', ['initial_yaw:=', burger_map_yaw], '-p', 'publish_rate_hz:=30.0', '-p', 'publish_amcl_pose:=false'], output='screen', name='burger_map_odom_localization_v41')
     leader_pose = ExecuteProcess(cmd=['python3', leader_pose_script, '--ros-args', '-r', '__node:=leader_pose_publisher', '-p', 'use_sim_time:=true', '-p', 'odom_topic:=/odom_nav', '-p', 'leader_pose_topic:=/leader_pose', '-p', 'output_frame_id:=map', '-p', ['initial_x:=', waffle_x], '-p', ['initial_y:=', waffle_y], '-p', ['initial_yaw:=', waffle_yaw], '-p', 'apply_initial_offset:=true', '-p', 'log_every_n:=100'], output='screen', name='waffle_leader_pose_publisher_v41')
     map_server = Node(package='nav2_map_server', executable='map_server', name='map_server', output='screen', parameters=[nav2_params, {'use_sim_time': True, 'yaml_filename': map_yaml}])
     map_lifecycle = Node(package='nav2_lifecycle_manager', executable='lifecycle_manager', name='lifecycle_manager_map', output='screen', parameters=[nav2_params])
@@ -278,14 +287,14 @@ def generate_launch_description():
         return [map_server, map_lifecycle]
 
     # OpaqueFunction: Domain 25 burger observer nodes.
-    # SLAM mode: burger pose + TF come from Domain 24 (Cartographer) via fleet_master bridge.
+    # SLAM mode: burger pose + map come from Domain 24 via the Burger follower launch bridge.
     #   Running these here would publish /burger_pose at wrong offset (burger_x - waffle_x = -0.95)
     #   conflicting with Domain 24's correct bridge → causes marker teleporting.
     # Static-map mode: Domain 25 handles burger pose locally from Gazebo odom.
     def _make_burger_domain25_nodes(context, *args, **kwargs):
         if use_slam.perform(context) == 'true':
             return []
-        return [burger_frame_tools, burger_pose]
+        return [burger_frame_tools, burger_map_odom_localization, burger_pose]
 
     controller_server = Node(package='nav2_controller', executable='controller_server', name='controller_server', output='screen', parameters=[nav2_params])
     planner_server = Node(package='nav2_planner', executable='planner_server', name='planner_server', output='screen', parameters=[nav2_params])
@@ -311,6 +320,9 @@ def generate_launch_description():
         DeclareLaunchArgument('waffle_x', default_value='-2.25'),
         DeclareLaunchArgument('waffle_y', default_value='-1.75'),
         DeclareLaunchArgument('waffle_yaw', default_value='0.0'),
+        UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
+        UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),
+        UnsetEnvironmentVariable('FASTDDS_DEFAULT_PROFILES_FILE'),
         SetEnvironmentVariable('ROS_DOMAIN_ID', '25'),
         SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp'),
         SetEnvironmentVariable('FASTDDS_BUILTIN_TRANSPORTS', 'UDPv4'),
@@ -318,7 +330,7 @@ def generate_launch_description():
         SetEnvironmentVariable('TURTLEBOT3_MODEL', 'waffle'),
         SetEnvironmentVariable('GZ_SIM_RESOURCE_PATH', gz_resource_path),
         SetEnvironmentVariable('IGN_GAZEBO_RESOURCE_PATH', gz_resource_path),
-        LogInfo(msg='V43_DOMAIN25_WAFFLE_OWNER | Gazebo + Waffle Nav2 + shared map owner + RViz goal topic proxies.'),
+        LogInfo(msg='V44_DOMAIN25_WAFFLE | Gazebo + Waffle Nav2; consumes Burger Cartographer /map in SLAM mode.'),
         LogInfo(msg=['V43_WORLD_SELECTED | ', world]),
         LogInfo(msg=['V43_SLAM_MODE | use_slam=', use_slam]),
         gz_sim,
