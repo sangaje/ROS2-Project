@@ -20,6 +20,8 @@ def make_node():
     node.occupied_threshold = 65
     node.min_range_m = 0.2
     node.max_range_m = 5.0
+    node.camera_hfov_deg = 62.0
+    node.visibility_num_rays = 97
     node.source_min_value = 0.03
     node.evidence_distribution_radius_m = 0.45
     node.positive_projection_mode = 'bearing_consensus'
@@ -27,6 +29,19 @@ def make_node():
     node.positive_memory_map = np.zeros_like(node.occ_grid, dtype=np.float32)
     node.risk_persist_in_unknown = True
     node.risk_dirty = False
+    node.enable_person_probability_map = True
+    node.person_bayes_prior_probability = 0.01
+    node.person_bayes_hit_log_odds_gain = 8.0
+    node.person_bayes_candidate_power = 0.5
+    node.person_bayes_miss_log_odds_per_sec = 0.20
+    node.person_bayes_decay_grace_sec = 1.0
+    node.person_bayes_max_probability = 0.995
+    node.person_bayes_max_update_dt_sec = 1.0
+    node.person_log_odds_map = np.zeros_like(node.occ_grid, dtype=np.float32)
+    node.person_probability_map = np.zeros_like(node.occ_grid, dtype=np.float32)
+    node.person_location_estimate = None
+    node.last_person_bayes_update_ros_sec = None
+    node.last_person_detection_ros_sec = None
 
     node.bearing_consensus_sigma_deg = 2.0
     node.bearing_consensus_angle_step_deg = 0.5
@@ -161,3 +176,77 @@ def test_low_confidence_single_view_still_creates_halo_seed():
     assert max(seed[2] for seed in seeds) >= node.bearing_halo_seed_threshold
     risk = node.build_bounded_geodesic_halo(node.positive_memory_map)
     assert float(np.max(risk)) >= node.bearing_halo_seed_threshold
+
+
+def test_bayesian_detection_builds_spatial_probability_memory():
+    node = make_node()
+    candidate = np.zeros_like(node.person_log_odds_map)
+    candidate[60, 60] = 0.25
+    candidate[60, 61] = 0.0625
+
+    assert node.update_person_bayesian_memory(candidate, None, True, 1.0)
+
+    assert float(node.person_probability_map[60, 60]) > 0.30
+    assert 0.05 < float(node.person_probability_map[60, 61]) < float(
+        node.person_probability_map[60, 60]
+    )
+    assert float(node.person_probability_map[10, 10]) == 0.0
+
+
+def test_bayesian_absence_decays_only_visible_cells_after_grace():
+    node = make_node()
+    candidate = np.zeros_like(node.person_log_odds_map)
+    candidate[60, 60] = 0.25  # visible later
+    candidate[60, 70] = 0.25  # outside the later FOV
+    visibility = np.zeros_like(candidate)
+    visibility[60, 60] = 1.0
+
+    node.update_person_bayesian_memory(candidate, visibility, True, 1.0)
+    initial_visible = float(node.person_probability_map[60, 60])
+    initial_hidden = float(node.person_probability_map[60, 70])
+
+    # A detector flicker inside the grace period must not erase memory.
+    assert not node.update_person_bayesian_memory(None, visibility, False, 1.2)
+    assert math.isclose(
+        float(node.person_probability_map[60, 60]), initial_visible, rel_tol=1e-6
+    )
+
+    # After the grace period, only the visible cell fades and it remains non-zero.
+    assert node.update_person_bayesian_memory(None, visibility, False, 2.2)
+    decayed_visible = float(node.person_probability_map[60, 60])
+    assert 0.0 < decayed_visible < initial_visible
+    assert math.isclose(
+        float(node.person_probability_map[60, 70]), initial_hidden, rel_tol=1e-6
+    )
+
+
+def test_wall_and_unknown_cells_occlude_visibility_and_protect_memory():
+    for occluder_value in (100, -1):
+        node = make_node()
+        # Make the distinction explicit: unknown space must still occlude camera
+        # visibility even if another subsystem allows planning through unknown.
+        node.allow_unknown = True
+        node.occ_grid[:, 50] = occluder_value
+        robot_pose = node.grid_to_world(20, 60) + (0.0,)
+        visibility = node.compute_visibility_map(robot_pose)
+
+        front_cell = (60, 40)
+        occluded_cell = (60, 70)
+        assert float(visibility[front_cell]) == 1.0
+        assert float(visibility[60, 50]) == 0.0
+        assert float(visibility[occluded_cell]) == 0.0
+
+        candidate = np.zeros_like(node.person_log_odds_map)
+        candidate[front_cell] = 0.25
+        candidate[occluded_cell] = 0.25
+        node.update_person_bayesian_memory(candidate, visibility, True, 1.0)
+        initial_front = float(node.person_probability_map[front_cell])
+        initial_occluded = float(node.person_probability_map[occluded_cell])
+
+        node.update_person_bayesian_memory(None, visibility, False, 2.2)
+        assert float(node.person_probability_map[front_cell]) < initial_front
+        assert math.isclose(
+            float(node.person_probability_map[occluded_cell]),
+            initial_occluded,
+            rel_tol=1e-6,
+        )

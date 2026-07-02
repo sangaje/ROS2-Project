@@ -82,6 +82,7 @@ topics:
 
         risk_topics = [
             ('/risk/risk_map', 'nav_msgs/msg/OccupancyGrid'),
+            ('/risk/person_probability_map', 'nav_msgs/msg/OccupancyGrid'),
             ('/risk/evidence_markers', 'visualization_msgs/msg/MarkerArray'),
         ]
         for sink_domain in sink_domains:
@@ -174,7 +175,7 @@ topics:
         DeclareLaunchArgument('region_update_period_sec', default_value='1.5'),
         DeclareLaunchArgument('enable_room_probability', default_value='false'),
         DeclareLaunchArgument('enable_region_segmentation', default_value='false'),
-        DeclareLaunchArgument('enable_visibility_tracking', default_value='false'),
+        DeclareLaunchArgument('enable_visibility_tracking', default_value='true'),
         UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),
         UnsetEnvironmentVariable('RMW_FASTRTPS_DEFAULT_PROFILES_FILE'),
         UnsetEnvironmentVariable('FASTDDS_DEFAULT_PROFILES_FILE'),

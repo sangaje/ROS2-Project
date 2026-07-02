@@ -97,6 +97,29 @@ Visualization Manager:
         Value: /risk/risk_map_updates
       Use Timestamp: false
       Value: true
+    - Alpha: 0.75
+      Binary representation: false
+      Binary threshold: 100
+      Class: rviz_default_plugins/Map
+      Color Scheme: costmap
+      Draw Behind: false
+      Enabled: true
+      Name: 03 Bayesian Person Probability
+      Topic:
+        Depth: 5
+        Durability Policy: Transient Local
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /risk/person_probability_map
+      Update Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /risk/person_probability_map_updates
+      Use Timestamp: false
+      Value: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
       Name: Evidence Markers + Camera FOV

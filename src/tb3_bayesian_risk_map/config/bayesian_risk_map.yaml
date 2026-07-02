@@ -86,6 +86,22 @@ bayesian_risk_map_node:
     bearing_max_observations_per_viewpoint: 8
     bearing_same_view_angle_merge_deg: 2.0
 
+    # Real-time Bayesian person memory.
+    # Detection adds cell-wise log-odds. A missing detection reduces evidence only
+    # inside the current camera FOV, after the grace time; out-of-view cells persist.
+    enable_person_probability_map: true
+    bearing_consensus_accumulate: true
+    person_bayes_prior_probability: 0.01
+    person_bayes_hit_log_odds_gain: 8.0
+    person_bayes_candidate_power: 0.5
+    person_bayes_miss_log_odds_per_sec: 0.15
+    person_bayes_decay_grace_sec: 1.5
+    person_bayes_max_probability: 0.995
+    person_bayes_max_update_dt_sec: 1.0
+    person_prob_viz_threshold: 0.01
+    person_prob_marker_max_count: 1000
+    person_prob_estimate_min_views: 2
+
     # Risk halo: bounded, wall-aware, not global diffusion
     source_halo_radius_m: 0.75
     source_halo_sigma_m: 0.35

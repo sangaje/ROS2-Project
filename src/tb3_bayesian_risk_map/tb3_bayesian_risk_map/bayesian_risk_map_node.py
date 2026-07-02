@@ -259,6 +259,32 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.person_prob_estimate_min_views = int(
             self.declare_parameter('person_prob_estimate_min_views', 2).value
         )
+        # Per-cell Bayesian memory. The internal state is log-odds evidence above
+        # the configurable prior. Positive detections add evidence immediately.
+        # Negative evidence is applied only to cells inside the current camera
+        # visibility map, after a grace period, and therefore never erases
+        # out-of-view history.
+        self.person_bayes_prior_probability = float(
+            self.declare_parameter('person_bayes_prior_probability', 0.01).value
+        )
+        self.person_bayes_hit_log_odds_gain = float(
+            self.declare_parameter('person_bayes_hit_log_odds_gain', 8.0).value
+        )
+        self.person_bayes_candidate_power = float(
+            self.declare_parameter('person_bayes_candidate_power', 0.5).value
+        )
+        self.person_bayes_miss_log_odds_per_sec = float(
+            self.declare_parameter('person_bayes_miss_log_odds_per_sec', 0.15).value
+        )
+        self.person_bayes_decay_grace_sec = float(
+            self.declare_parameter('person_bayes_decay_grace_sec', 1.5).value
+        )
+        self.person_bayes_max_probability = float(
+            self.declare_parameter('person_bayes_max_probability', 0.995).value
+        )
+        self.person_bayes_max_update_dt_sec = float(
+            self.declare_parameter('person_bayes_max_update_dt_sec', 1.0).value
+        )
 
         # Halo
         self.source_halo_radius_m = float(self.declare_parameter('source_halo_radius_m', 0.75).value)
@@ -436,8 +462,11 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.next_bearing_viewpoint_id = 1
         self.bearing_viewpoint_origins: Dict[int, Tuple[float, float, float]] = {}
         self.bearing_consensus_peaks: List[Tuple[float, float, float]] = []
+        self.person_log_odds_map = None
         self.person_probability_map = None
         self.person_location_estimate: Optional[Tuple[float, float, float]] = None
+        self.last_person_bayes_update_ros_sec = None
+        self.last_person_detection_ros_sec = None
         self.topic_pose: Optional[PoseStamped] = None
         self.topic_pose_stamp = None
 
@@ -603,9 +632,10 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             self.debug_timer = self.create_timer(2.0, self.on_debug_timer)
 
         self.get_logger().info(
-            'PERSISTENT_ROOM_RISK_V4_REGION_PRIORITY_TELEOP started | '
-            'risk persists across Cartographer map resize; negative observations DO NOT reduce /risk/risk_map; '
-            'they are published separately as /risk/observed_empty_map; region_id/priority maps are live SLAM diagnostics; '
+            'BAYESIAN_FOV_MEMORY_V5 started | '
+            'risk persists across Cartographer map resize and outside camera FOV; '
+            'visible no-detection cells decay gradually after a grace period; '
+            'region_id/priority maps are live SLAM diagnostics; '
             f'detection_source={self.detection_source} external_detection_topic={self.external_detection_topic} '
             f'pose_source={self.pose_source} pose_topic={self.pose_topic} map_qos_durability={self.map_qos_durability} '
             f'teleop_mode={self.teleop_mode} risk_publish_rate_hz={self.risk_publish_rate_hz:.2f} '
@@ -614,6 +644,9 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             f'bearing_min_baseline={self.bearing_viewpoint_min_baseline_m:.2f}m '
             f'bearing_single_gain={self.bearing_single_view_gain:.2f} '
             f'bearing_halo_seed={self.bearing_halo_seed_threshold:.3f} '
+            f'bayes_hit_gain={self.person_bayes_hit_log_odds_gain:.2f} '
+            f'bayes_miss_rate={self.person_bayes_miss_log_odds_per_sec:.3f}/s '
+            f'bayes_grace={self.person_bayes_decay_grace_sec:.2f}s '
             f'risk_source_mode={self.risk_source_mode} evidence_radius={self.evidence_distribution_radius_m:.2f} '
             f'publish_diagnostic_maps={self.publish_diagnostic_maps} '
             f'debug_raw={self.publish_debug_image}:{self.debug_image_topic} '
@@ -759,6 +792,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                 old_detection = self.detection_candidate_map
                 old_seen = self.visual_seen_map
                 old_region = self.region_id_map
+                old_person_log_odds = self.person_log_odds_map
 
                 self.detection_candidate_map = self.reproject_layer_to_new_map(
                     old_detection, old_geometry, new_geometry
@@ -781,7 +815,10 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                 self.region_priority_map = np.zeros((h, w), dtype=np.float32)
                 self.region_checked_map = np.zeros((h, w), dtype=np.float32)
                 self.risk_map = np.zeros((h, w), dtype=np.float32)
-                self.person_probability_map = None  # rebuilt from reprojected positive_memory at next tick
+                self.person_log_odds_map = self.reproject_layer_to_new_map(
+                    old_person_log_odds, old_geometry, new_geometry
+                )
+                self.person_probability_map = np.zeros((h, w), dtype=np.float32)
 
                 free = self.valid_free_mask()
                 memory_mask = self.risk_memory_mask()
@@ -789,6 +826,8 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                 self.positive_memory_map[~memory_mask] = 0.0
                 self.observed_empty_map[~free] = 0.0
                 self.visual_seen_map[~free] = 0.0
+                self.person_log_odds_map[~memory_mask] = 0.0
+                self.refresh_person_probability_map()
 
                 self.get_logger().warn(
                     f'map geometry changed: {sig}; persistent risk layers reprojected, not reset'
@@ -810,8 +849,11 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                 self.bearing_observations.clear()
                 self.bearing_viewpoint_origins.clear()
                 self.bearing_consensus_peaks.clear()
+                self.person_log_odds_map = np.zeros((h, w), dtype=np.float32)
                 self.person_probability_map = np.zeros((h, w), dtype=np.float32)
                 self.person_location_estimate = None
+                self.last_person_bayes_update_ros_sec = None
+                self.last_person_detection_ros_sec = None
                 self.get_logger().warn(f'map geometry initialized/changed: {sig}; internal maps initialized')
 
             self.map_signature = sig
@@ -929,6 +971,14 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         if v >= self.occupied_threshold:
             return False
         return v <= self.free_threshold
+
+    def camera_line_of_sight_free(self, gy: int, gx: int) -> bool:
+        """Return true only for mapped free space that the camera ray may cross."""
+        value = int(self.occ_grid[gy, gx])
+        # Visibility is stricter than navigation/risk persistence. Even when unknown
+        # traversal is enabled elsewhere, an unobserved cell cannot prove that the
+        # camera sees through it. Occupied, uncertain and unknown cells all occlude.
+        return 0 <= value <= self.free_threshold
 
     def get_robot_pose(self) -> Optional[Tuple[float, float, float]]:
         if self.pose_source in ('topic', 'pose_topic', 'pose'):
@@ -1784,44 +1834,136 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.extract_bearing_consensus_peaks(consensus)
         return candidate
 
-    def build_person_probability_map(self):
-        """
-        Normalize positive_memory_map into a proper probability distribution P(enemy at cell).
-        Uses all accumulated bearing evidence. Never decreases (max-fusion already in positive_memory).
-        """
-        if not self.enable_person_probability_map or self.occ_grid is None:
+    def person_bayes_prior(self) -> float:
+        return clamp(
+            float(getattr(self, 'person_bayes_prior_probability', 0.01)),
+            1e-4,
+            0.49,
+        )
+
+    def refresh_person_probability_map(self):
+        """Convert accumulated log-odds evidence to a zero-baseline posterior map."""
+        if not getattr(self, 'enable_person_probability_map', True) or self.occ_grid is None:
             return
         h, w = self.occ_grid.shape
-        if self.person_probability_map is None or self.person_probability_map.shape != (h, w):
-            self.person_probability_map = np.zeros((h, w), dtype=np.float32)
+        if self.person_log_odds_map is None or self.person_log_odds_map.shape != (h, w):
+            self.person_log_odds_map = np.zeros((h, w), dtype=np.float32)
 
-        src = self.positive_memory_map
-        if src is None or float(np.max(src)) < 1e-8:
-            return
+        prior = self.person_bayes_prior()
+        prior_log_odds = math.log(prior / (1.0 - prior))
+        posterior = 1.0 / (
+            1.0 + np.exp(-(prior_log_odds + self.person_log_odds_map.astype(np.float64)))
+        )
+        # RViz should show accumulated information, not a non-zero color over every
+        # untouched cell. Remove the prior floor while retaining the Bayesian shape.
+        probability_above_prior = (posterior - prior) / (1.0 - prior)
+        self.person_probability_map = np.clip(
+            probability_above_prior, 0.0, 1.0
+        ).astype(np.float32)
+        self.person_probability_map[self.person_probability_map < 1e-8] = 0.0
+        self.person_probability_map[~self.risk_memory_mask()] = 0.0
 
-        free = self.valid_free_mask()
-        evidence = src.copy()
-        evidence[~free] = 0.0
-
-        total = float(np.sum(evidence))
-        if total < 1e-8:
-            return
-
-        # Normalize to probability distribution; then max-fuse so it never decreases
-        # when the person goes out of view.
-        normalized = (evidence / total).astype(np.float32)
-        self.person_probability_map = np.maximum(self.person_probability_map, normalized)
-        self.person_probability_map[~free] = 0.0
-
-        # Update MAP (maximum a posteriori) location estimate
         flat_idx = int(np.argmax(self.person_probability_map))
         peak_val = float(self.person_probability_map.flat[flat_idx])
-        if peak_val > 1e-10:
+        if peak_val > 1e-6:
             gy, gx = np.unravel_index(flat_idx, self.person_probability_map.shape)
             wx, wy = self.grid_to_world(int(gx), int(gy))
             self.person_location_estimate = (wx, wy, peak_val)
         else:
             self.person_location_estimate = None
+
+    def update_person_bayesian_memory(
+        self,
+        positive_candidate,
+        visibility,
+        currently_detecting_person: bool,
+        now_ros_sec: float,
+    ) -> bool:
+        """
+        Update per-cell Bayesian log-odds memory.
+
+        Positive evidence is accumulated from each new detector batch. Negative
+        evidence is deliberately conservative: it starts only after a grace period,
+        affects only the current camera-visible cells, and moves belief toward the
+        prior gradually. Cells outside the FOV remain bit-for-bit unchanged.
+        """
+        if not getattr(self, 'enable_person_probability_map', True) or self.occ_grid is None:
+            return False
+
+        h, w = self.occ_grid.shape
+        if self.person_log_odds_map is None or self.person_log_odds_map.shape != (h, w):
+            self.person_log_odds_map = np.zeros((h, w), dtype=np.float32)
+
+        previous = self.person_log_odds_map.copy()
+        last_update = getattr(self, 'last_person_bayes_update_ros_sec', None)
+        if last_update is None:
+            dt = 0.0
+        else:
+            dt = clamp(
+                now_ros_sec - float(last_update),
+                0.0,
+                max(0.0, float(getattr(self, 'person_bayes_max_update_dt_sec', 1.0))),
+            )
+        self.last_person_bayes_update_ros_sec = now_ros_sec
+
+        if currently_detecting_person:
+            self.last_person_detection_ros_sec = now_ros_sec
+
+        if positive_candidate is not None and positive_candidate.shape == (h, w):
+            candidate = np.clip(positive_candidate, 0.0, 1.0).astype(np.float32)
+            candidate[~self.risk_memory_mask()] = 0.0
+            power = max(0.05, float(getattr(self, 'person_bayes_candidate_power', 0.5)))
+            gain = max(0.0, float(getattr(self, 'person_bayes_hit_log_odds_gain', 8.0)))
+            self.person_log_odds_map += gain * np.power(candidate, power)
+
+        last_detection = getattr(self, 'last_person_detection_ros_sec', None)
+        grace_elapsed = (
+            last_detection is None
+            or now_ros_sec - float(last_detection)
+            >= max(0.0, float(getattr(self, 'person_bayes_decay_grace_sec', 1.5)))
+        )
+        if (
+            not currently_detecting_person
+            and grace_elapsed
+            and dt > 0.0
+            and visibility is not None
+            and visibility.shape == (h, w)
+        ):
+            miss_rate = max(
+                0.0, float(getattr(self, 'person_bayes_miss_log_odds_per_sec', 0.15))
+            )
+            visible_weight = np.clip(visibility, 0.0, 1.0).astype(np.float32)
+            # Evidence cannot fall below the prior. This treats "no detection" as
+            # forgetting positive evidence, not as proof that a person can never be there.
+            self.person_log_odds_map = np.maximum(
+                0.0,
+                self.person_log_odds_map - miss_rate * dt * visible_weight,
+            )
+
+        prior = self.person_bayes_prior()
+        max_probability = clamp(
+            float(getattr(self, 'person_bayes_max_probability', 0.995)),
+            prior + 1e-4,
+            1.0 - 1e-5,
+        )
+        max_evidence_log_odds = (
+            math.log(max_probability / (1.0 - max_probability))
+            - math.log(prior / (1.0 - prior))
+        )
+        self.person_log_odds_map = np.clip(
+            self.person_log_odds_map, 0.0, max_evidence_log_odds
+        ).astype(np.float32)
+        self.person_log_odds_map[~self.risk_memory_mask()] = 0.0
+
+        changed = bool(np.any(np.abs(self.person_log_odds_map - previous) > 1e-6))
+        self.refresh_person_probability_map()
+        if changed:
+            self.risk_dirty = True
+        return changed
+
+    def build_person_probability_map(self):
+        """Compatibility wrapper: rebuild the posterior view without adding evidence."""
+        self.refresh_person_probability_map()
 
     def compute_triangulation_estimate(self) -> Optional[Tuple[float, float, float]]:
         """
@@ -1989,7 +2131,9 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
 
         rx, ry, ryaw = robot_pose
         hfov = math.radians(self.camera_hfov_deg)
-        r_step = max(self.map_resolution, 0.03)
+        # Half-cell sampling prevents a thin/diagonal wall from being skipped by a
+        # ray. This is intentionally independent from navigation's allow_unknown.
+        r_step = max(0.01, min(0.03, 0.5 * self.map_resolution))
         n = max(3, self.visibility_num_rays)
 
         for i in range(n):
@@ -2003,7 +2147,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                 if g is None:
                     break
                 gx, gy = g
-                if not self.traversable(gy, gx):
+                if not self.camera_line_of_sight_free(gy, gx):
                     break
                 vis[gy, gx] = 1.0
                 r += r_step
@@ -2440,6 +2584,11 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
 
     def build_risk_source_map(self):
         if self.bearing_consensus_enabled():
+            if (
+                getattr(self, 'enable_person_probability_map', False)
+                and self.person_probability_map is not None
+            ):
+                return self.person_probability_map
             return self.positive_memory_map
         if self.risk_source_mode in ('evidence', 'evidence_points', 'markers', 'marker_distribution'):
             evidence_source = self.build_evidence_source_map()
@@ -2488,8 +2637,10 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         currently_detecting_person = bool(fake_detections) or (
             can_reuse_detection and bool(latest_detections)
         )
+        bayes_positive_candidate = None
 
         if new_detections:
+            new_candidate = None
             projection_pose = (
                 latest_detection_pose
                 if has_new_detection_batch and latest_detection_pose is not None
@@ -2512,35 +2663,44 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                         self.bearing_consensus_map = new_consensus
                     # Use only the current (non-accumulated) consensus to feed positive_memory,
                     # preventing stale evidence from artificially inflating the risk kernel.
-                    self.detection_candidate_map = new_consensus.copy()
+                    new_candidate = new_consensus
             else:
-                self.detection_candidate_map = self.build_detection_candidate_map(
+                new_candidate = self.build_detection_candidate_map(
                     projection_pose,
                     new_detections,
                 )
 
-            if float(np.max(self.detection_candidate_map)) > 1e-6:
-                self.update_positive_memory(self.detection_candidate_map)
+            if new_candidate is not None:
+                self.detection_candidate_map = new_candidate.copy()
+            if new_candidate is not None and float(np.max(new_candidate)) > 1e-6:
+                self.update_positive_memory(new_candidate)
+                # Only a genuinely new detector batch contributes positive Bayesian
+                # evidence. Reusing the same frame for UI freshness must not repeatedly
+                # inflate confidence.
+                bayes_positive_candidate = new_candidate
 
         if self.enable_visibility_tracking:
             self.visibility_map = self.compute_visibility_map(robot_pose)
             self.update_visual_seen_map(self.visibility_map)
             self.update_observed_empty(self.visibility_map, currently_detecting_person)
 
+        self.update_person_bayesian_memory(
+            bayes_positive_candidate,
+            self.visibility_map if self.enable_visibility_tracking else None,
+            currently_detecting_person,
+            now_ros_sec,
+        )
+
         if self.enable_region_segmentation:
             self.update_region_segmentation()
         if self.enable_room_probability:
             self.room_probability_map = self.build_room_probability_map()
 
-        # Risk is positive-only bounded halo. No negative observation subtraction.
+        # The wall-aware risk halo follows Bayesian memory. Out-of-view cells are
+        # unchanged; only visible no-detection cells fade gradually toward the prior.
         if self.risk_dirty:
             self.risk_map = self.build_bounded_geodesic_halo(self.build_risk_source_map())
             self.risk_dirty = False
-
-        # Rebuild probability distribution from accumulated positive evidence every tick.
-        # This is cheap (just a normalization) and ensures the display always reflects
-        # the full history of bearing observations without decaying when person is out of view.
-        self.build_person_probability_map()
 
         self.publish_all_maps()
         self.publish_markers(robot_pose)
@@ -2561,6 +2721,8 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             self.visual_seen_map,
             self.region_priority_map,
             self.region_checked_map,
+            self.person_log_odds_map,
+            self.person_probability_map,
         ):
             if arr is not None:
                 arr.fill(0.0)
@@ -2572,8 +2734,8 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.bearing_viewpoint_origins.clear()
         self.bearing_consensus_peaks.clear()
         self.person_location_estimate = None
-        if self.person_probability_map is not None:
-            self.person_probability_map.fill(0.0)
+        self.last_person_detection_ros_sec = None
+        self.last_person_bayes_update_ros_sec = None
         self.risk_dirty = True
         self.get_logger().warn('cleared all room-aware risk/region maps')
 
@@ -2599,6 +2761,10 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                     self.positive_memory_map[gy, gx] = 0.0
                     self.risk_map[gy, gx] = 0.0
                     self.room_probability_map[gy, gx] = 0.0
+                    if self.person_log_odds_map is not None:
+                        self.person_log_odds_map[gy, gx] = 0.0
+                    if self.person_probability_map is not None:
+                        self.person_probability_map[gy, gx] = 0.0
 
         self.evidence_points = [
             ev for ev in self.evidence_points
@@ -2660,14 +2826,11 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                 self.array_to_occgrid(self.bearing_consensus_map, stamp)
             )
             if self.enable_person_probability_map and self.person_probability_map is not None:
-                # Scale probability map for OccupancyGrid: multiply by 1/max so the peak
-                # cell is always 100, making the color gradient meaningful in RViz.
-                prob = self.person_probability_map
-                p_max = float(np.max(prob))
-                if p_max > 1e-10:
-                    self.pub_person_probability.publish(
-                        self.array_to_occgrid((prob / p_max).astype(np.float32), stamp)
-                    )
+                # Publish the absolute Bayesian confidence, not a per-frame normalized
+                # image. Otherwise a decaying peak would misleadingly remain at 100.
+                self.pub_person_probability.publish(
+                    self.array_to_occgrid(self.person_probability_map, stamp)
+                )
             self.last_risk_publish_ros_ns = now_ros_ns
         diagnostic_period_ns = (
             int(1e9 / self.diagnostic_publish_rate_hz)
