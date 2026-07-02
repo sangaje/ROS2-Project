@@ -71,6 +71,10 @@ bayesian_risk_map_node:
     bearing_min_viewpoints: 2
     bearing_support_threshold: 0.12
     bearing_consensus_gain: 1.0
+    # A single view paints a low-confidence directional corridor immediately.
+    # Multi-view overlap still dominates and localizes the final high-risk area.
+    bearing_single_view_gain: 0.28
+    bearing_pair_min_vote: 0.02
     bearing_additional_view_bonus: 0.15
     bearing_use_bbox_range_prior: false
     bearing_range_sigma_m: 2.0

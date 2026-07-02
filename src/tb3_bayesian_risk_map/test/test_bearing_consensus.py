@@ -34,6 +34,8 @@ def make_node():
     node.bearing_min_viewpoints = 2
     node.bearing_support_threshold = 0.12
     node.bearing_consensus_gain = 1.0
+    node.bearing_single_view_gain = 0.28
+    node.bearing_pair_min_vote = 0.02
     node.bearing_additional_view_bonus = 0.15
     node.bearing_use_bbox_range_prior = False
     node.bearing_range_sigma_m = 2.0
@@ -60,7 +62,7 @@ def detection_for(origin, target, confidence=0.9):
     )
 
 
-def test_one_viewpoint_does_not_create_range_guess():
+def test_one_viewpoint_creates_low_gain_directional_corridor():
     node = make_node()
     origin = (1.0, 2.0)
     target = (3.0, 3.0)
@@ -73,7 +75,10 @@ def test_one_viewpoint_does_not_create_range_guess():
 
     candidate = node.build_bearing_consensus_map()
     assert len(node.bearing_viewpoint_origins) == 1
-    assert float(np.max(candidate)) == 0.0
+    assert 0.15 < float(np.max(candidate)) < 0.35
+    assert node.bearing_consensus_peaks == []
+    assert node.update_positive_memory(candidate)
+    assert float(np.max(node.positive_memory_map)) > 0.12
 
 
 def test_distinct_viewpoints_localize_bearing_intersection():
@@ -113,7 +118,8 @@ def test_repeated_detection_at_same_position_is_not_independent_support():
 
     candidate = node.build_bearing_consensus_map()
     assert len(node.bearing_viewpoint_origins) == 1
-    assert float(np.max(candidate)) == 0.0
+    assert 0.15 < float(np.max(candidate)) < 0.35
+    assert node.bearing_consensus_peaks == []
 
 
 def test_repeated_consensus_map_does_not_saturate_memory():

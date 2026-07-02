@@ -212,6 +212,12 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.bearing_consensus_gain = float(
             self.declare_parameter('bearing_consensus_gain', 1.0).value
         )
+        self.bearing_single_view_gain = float(
+            self.declare_parameter('bearing_single_view_gain', 0.28).value
+        )
+        self.bearing_pair_min_vote = float(
+            self.declare_parameter('bearing_pair_min_vote', 0.02).value
+        )
         self.bearing_additional_view_bonus = float(
             self.declare_parameter('bearing_additional_view_bonus', 0.15).value
         )
@@ -1691,10 +1697,6 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             grouped.setdefault(obs.viewpoint_id, []).append(obs)
 
         required_views = max(2, min(3, int(self.bearing_min_viewpoints)))
-        if len(grouped) < required_views:
-            self.extract_bearing_consensus_peaks(empty)
-            return empty
-
         viewpoint_maps = []
         for observations in grouped.values():
             group_map = np.zeros((h, w), dtype=np.float32)
@@ -1704,22 +1706,47 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
 
         votes = np.stack(viewpoint_maps, axis=0)
         ordered = np.sort(votes, axis=0)
-        strongest_required = ordered[-required_views:, :, :]
-        geometric_mean = np.exp(
-            np.mean(np.log(np.maximum(strongest_required, 1e-6)), axis=0)
+        strongest = ordered[-1, :, :]
+
+        # A single bearing contains real information even though it cannot determine
+        # range. Represent that uncertainty as a low-gain visible corridor instead of
+        # returning an all-zero map. Additional viewpoints can then promote only their
+        # overlapping area to high risk.
+        directional_fallback = (
+            max(0.0, float(self.bearing_single_view_gain)) * strongest
         )
-        support_count = np.sum(
-            votes >= max(0.0, float(self.bearing_support_threshold)),
-            axis=0,
-        )
-        extra_views = np.maximum(0, support_count - required_views).astype(np.float32)
-        bonus = 1.0 + max(0.0, float(self.bearing_additional_view_bonus)) * extra_views
-        candidate = geometric_mean * max(0.0, float(self.bearing_consensus_gain)) * bonus
-        candidate[support_count < required_views] = 0.0
+        consensus = np.zeros((h, w), dtype=np.float32)
+        if len(grouped) >= required_views:
+            strongest_required = ordered[-required_views:, :, :]
+            weakest_required = strongest_required[0, :, :]
+            geometric_mean = np.exp(
+                np.mean(np.log(np.maximum(strongest_required, 1e-6)), axis=0)
+            )
+            support_count = np.sum(
+                votes >= max(0.0, float(self.bearing_support_threshold)),
+                axis=0,
+            )
+            extra_views = np.maximum(0, support_count - required_views).astype(np.float32)
+            bonus = 1.0 + max(
+                0.0,
+                float(self.bearing_additional_view_bonus),
+            ) * extra_views
+            consensus = (
+                geometric_mean
+                * max(0.0, float(self.bearing_consensus_gain))
+                * bonus
+            )
+            consensus[
+                weakest_required < max(1e-6, float(self.bearing_pair_min_vote))
+            ] = 0.0
+
+        candidate = np.maximum(directional_fallback, consensus)
         candidate[candidate < self.source_min_value] = 0.0
         candidate[~self.valid_free_mask()] = 0.0
         candidate = np.clip(candidate, 0.0, 1.0).astype(np.float32)
-        self.extract_bearing_consensus_peaks(candidate)
+        # Yellow markers are reserved for true multi-view agreement; the fallback
+        # corridor remains visible as cyan bearing rays and in the debug grid.
+        self.extract_bearing_consensus_peaks(consensus)
         return candidate
 
     def build_detection_candidate_map(self, robot_pose, detections):
