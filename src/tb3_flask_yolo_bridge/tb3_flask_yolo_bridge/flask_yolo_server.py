@@ -13,6 +13,10 @@ from dataclasses import dataclass, field
 import numpy as np
 
 
+class InferenceBusyError(RuntimeError):
+    pass
+
+
 DEBUG_PAGE = """<!doctype html>
 <html lang="en">
 <head>
@@ -353,6 +357,20 @@ def _cuda_synchronize_if_needed(device):
         pass
 
 
+def _request_capture_age_sec(req):
+    capture_wall_sec = float(req.form.get('capture_wall_sec') or 0.0)
+    if capture_wall_sec > 0.0:
+        wall_delta_sec = time.time() - capture_wall_sec
+        if 0.0 <= wall_delta_sec <= 60.0:
+            return wall_delta_sec
+
+    robot_frame_age_ms_at_send = float(req.form.get('robot_frame_age_ms_at_send') or -1.0)
+    if robot_frame_age_ms_at_send >= 0.0:
+        return robot_frame_age_ms_at_send / 1000.0
+
+    return -1.0
+
+
 def build_app(args):
     from flask import Flask, Response, jsonify, request
     from ultralytics import YOLO
@@ -439,6 +457,7 @@ def build_app(args):
     class InferenceWorker:
         def __init__(self):
             self.jobs = queue.Queue(maxsize=1)
+            self.inflight_lock = threading.Lock()
             self.ready = threading.Event()
             self.thread = threading.Thread(
                 target=self.loop,
@@ -475,12 +494,25 @@ def build_app(args):
                     result_queue.put((False, exc))
 
         def infer(self, frame):
+            if args.max_queue_wait_sec > 0.0:
+                acquired = self.inflight_lock.acquire(timeout=args.max_queue_wait_sec)
+            else:
+                acquired = self.inflight_lock.acquire(blocking=False)
+            if not acquired:
+                raise InferenceBusyError('inference worker busy; dropped stale request instead of queueing')
+
             result_queue = queue.Queue(maxsize=1)
-            self.jobs.put((frame, result_queue))
-            ok, payload = result_queue.get()
-            if not ok:
-                raise payload
-            return payload
+            try:
+                try:
+                    self.jobs.put_nowait((frame, result_queue))
+                except queue.Full as exc:
+                    raise InferenceBusyError('inference job queue full; dropped request') from exc
+                ok, payload = result_queue.get()
+                if not ok:
+                    raise payload
+                return payload
+            finally:
+                self.inflight_lock.release()
 
         def run_predict(self, frame):
             t_predict0 = time.perf_counter()
@@ -577,19 +609,30 @@ def build_app(args):
         t0 = time.perf_counter()
         if 'image' not in request.files:
             return jsonify({'ok': False, 'error': 'missing multipart file field: image'}), 400
-        capture_wall_sec_early = float(request.form.get('capture_wall_sec') or 0.0)
-        if args.max_capture_age_sec > 0.0 and capture_wall_sec_early > 0.0:
-            early_age_sec = time.time() - capture_wall_sec_early
-            if early_age_sec > args.max_capture_age_sec:
+
+        early_age_sec = _request_capture_age_sec(request)
+        if args.max_capture_age_sec > 0.0 and early_age_sec > args.max_capture_age_sec:
+            return jsonify({
+                'ok': False,
+                'stale': True,
+                'error': 'stale frame rejected before inference',
+                'capture_age_ms': max(0.0, early_age_sec * 1000.0),
+                'max_capture_age_ms': args.max_capture_age_sec * 1000.0,
+                'detections': [],
+            })
+
+        try:
+            busy_age_sec = _request_capture_age_sec(request)
+            if args.max_capture_age_sec > 0.0 and busy_age_sec > args.max_capture_age_sec:
                 return jsonify({
                     'ok': False,
                     'stale': True,
-                    'error': 'stale frame rejected before inference',
-                    'capture_age_ms': max(0.0, early_age_sec * 1000.0),
+                    'error': 'stale frame rejected before decode',
+                    'capture_age_ms': max(0.0, busy_age_sec * 1000.0),
                     'max_capture_age_ms': args.max_capture_age_sec * 1000.0,
                     'detections': [],
                 })
-        try:
+
             t_decode0 = time.perf_counter()
             original_jpeg, frame = _decode_image(request.files['image'])
             decode_ms = (time.perf_counter() - t_decode0) * 1000.0
@@ -599,6 +642,16 @@ def build_app(args):
         h, w = frame.shape[:2]
         try:
             results, input_shape, predict_ms = inference_worker.infer(frame)
+        except InferenceBusyError as exc:
+            busy_age_sec = _request_capture_age_sec(request)
+            return jsonify({
+                'ok': False,
+                'stale': True,
+                'busy': True,
+                'error': str(exc),
+                'capture_age_ms': max(0.0, busy_age_sec * 1000.0) if busy_age_sec >= 0.0 else -1.0,
+                'detections': [],
+            })
         except Exception as exc:
             return jsonify({'ok': False, 'error': f'YOLO inference failed: {exc}'}), 500
 
@@ -644,6 +697,20 @@ def build_app(args):
         )
         if capture_age_ms < 0.0 and robot_frame_age_ms_at_send >= 0.0:
             capture_age_ms = robot_frame_age_ms_at_send
+        if (
+            args.max_capture_age_sec > 0.0
+            and capture_age_ms >= 0.0
+            and capture_age_ms > args.max_capture_age_sec * 1000.0
+        ):
+            return jsonify({
+                'ok': False,
+                'stale': True,
+                'error': 'stale frame rejected after inference',
+                'capture_age_ms': capture_age_ms,
+                'max_capture_age_ms': args.max_capture_age_sec * 1000.0,
+                'detections': [],
+            })
+
         overlay = _draw_yolo_overlay(frame, detections, predict_ms)
         annotated_jpeg = _encode_jpeg(overlay, args.debug_jpeg_quality)
         post_ms = (time.perf_counter() - t_post0) * 1000.0
@@ -684,15 +751,16 @@ def parse_args():
     parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--port', type=int, default=5005)
     parser.add_argument('--model-path', default='yolo11n.pt')
-    parser.add_argument('--device', default='cpu')
-    parser.add_argument('--half', type=as_bool, default=False)
+    parser.add_argument('--device', default='0')
+    parser.add_argument('--half', type=as_bool, default=True)
     parser.add_argument('--fast-forward', type=as_bool, default=True)
     parser.add_argument('--conf', type=float, default=0.20)
     parser.add_argument('--iou', type=float, default=0.45)
     parser.add_argument('--max-det', type=int, default=64)
     parser.add_argument('--imgsz', type=int, default=640)
     parser.add_argument('--debug-jpeg-quality', type=int, default=80)
-    parser.add_argument('--max-capture-age-sec', type=float, default=1.5)
+    parser.add_argument('--max-capture-age-sec', type=float, default=0.8)
+    parser.add_argument('--max-queue-wait-sec', type=float, default=0.0)
     parser.add_argument('--person-only', action='store_true', default=True)
     parser.add_argument('--all-classes', action='store_false', dest='person_only')
     return parser.parse_args()

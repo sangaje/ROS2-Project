@@ -52,6 +52,12 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         self.max_rate_hz = float(self.declare_parameter('max_rate_hz', 5.0).value)
         self.jpeg_quality = int(self.declare_parameter('jpeg_quality', 60).value)
         self.timeout_sec = float(self.declare_parameter('timeout_sec', 1.0).value)
+        self.connect_timeout_sec = float(
+            self.declare_parameter('connect_timeout_sec', min(0.3, self.timeout_sec)).value
+        )
+        self.read_timeout_sec = float(
+            self.declare_parameter('read_timeout_sec', self.timeout_sec).value
+        )
         self.max_http_roundtrip_sec = float(
             self.declare_parameter('max_http_roundtrip_sec', 1.0).value
         )
@@ -121,6 +127,7 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             f'camera_fps={self.camera_fps:.1f} fourcc={self.fourcc or "default"} '
             f'server={self.server_url} out={self.output_topic} rate={self.max_rate_hz:.2f}Hz '
             f'jpeg_quality={self.jpeg_quality} timeout={self.timeout_sec:.2f}s '
+            f'connect_timeout={self.connect_timeout_sec:.2f}s read_timeout={self.read_timeout_sec:.2f}s '
             f'max_http_roundtrip={self.max_http_roundtrip_sec:.2f}s '
             f'max_frame_age={self.max_frame_age_sec:.2f}s '
             f'latest_frame_only=true ros_image_publish=false'
@@ -336,7 +343,12 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             'robot_frame_age_ms_at_send': f'{frame_age_before_send * 1000.0:.3f}',
         }
         request_start = time.monotonic()
-        resp = self.http.post(self.server_url, files=files, data=data, timeout=self.timeout_sec)
+        resp = self.http.post(
+            self.server_url,
+            files=files,
+            data=data,
+            timeout=(self.connect_timeout_sec, self.read_timeout_sec),
+        )
         roundtrip_sec = time.monotonic() - request_start
         resp.raise_for_status()
         payload = resp.json()
