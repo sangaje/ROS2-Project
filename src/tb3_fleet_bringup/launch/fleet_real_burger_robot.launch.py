@@ -15,19 +15,21 @@ from launch.actions import (
 )
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PythonExpression
+from launch_ros.actions import Node
 
 
 def generate_launch_description():
     role      = LaunchConfiguration('role')
     lds_model = LaunchConfiguration('lds_model')
     usb_port  = LaunchConfiguration('usb_port')
+    lidar_port = LaunchConfiguration('lidar_port')
     pc_ip     = LaunchConfiguration('pc_ip')
 
     domain_id = PythonExpression(["'25' if '", role, "' == 'leader' else '24'"])
 
-    robot_launch = str(
-        Path(get_package_share_directory('turtlebot3_bringup')) / 'launch' / 'robot.launch.py'
-    )
+    tb3_bringup_share = Path(get_package_share_directory('turtlebot3_bringup'))
+    state_publisher_launch = str(tb3_bringup_share / 'launch' / 'turtlebot3_state_publisher.launch.py')
+    tb3_param_file = str(tb3_bringup_share / 'param' / 'burger.yaml')
 
     def make_fastdds_env(context, *args, **kwargs):
         p = pc_ip.perform(context)
@@ -53,6 +55,41 @@ def generate_launch_description():
             SetEnvironmentVariable('ROS_STATIC_PEERS', p),
         ]
 
+    def make_lidar(context, *args, **kwargs):
+        model = lds_model.perform(context)
+        port = lidar_port.perform(context)
+
+        if model == 'LDS-02':
+            lidar_launch = Path(get_package_share_directory('ld08_driver')) / 'launch' / 'ld08.launch.py'
+        elif model == 'LDS-03':
+            lidar_launch = Path(get_package_share_directory('coin_d4_driver')) / 'launch' / 'single_lidar_node.launch.py'
+        else:
+            lidar_launch = Path(get_package_share_directory('hls_lfcd_lds_driver')) / 'launch' / 'hlds_laser.launch.py'
+
+        return [
+            LogInfo(msg=['REAL_BURGER_LIDAR | model=', model, ' port=', port, ' frame=base_scan']),
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(str(lidar_launch)),
+                launch_arguments={
+                    'port': lidar_port,
+                    'frame_id': 'base_scan',
+                    'namespace': '',
+                }.items(),
+            ),
+        ]
+
+    state_publisher = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(state_publisher_launch),
+        launch_arguments={'use_sim_time': 'false', 'namespace': ''}.items(),
+    )
+    turtlebot3_node = Node(
+        package='turtlebot3_node',
+        executable='turtlebot3_ros',
+        parameters=[tb3_param_file, {'namespace': ''}],
+        arguments=['-i', usb_port],
+        output='screen',
+    )
+
     return LaunchDescription([
         DeclareLaunchArgument(
             'role', default_value='leader',
@@ -61,6 +98,8 @@ def generate_launch_description():
         DeclareLaunchArgument('lds_model', default_value='LDS-01',
                               description='LDS-01, LDS-02, or LDS-03.'),
         DeclareLaunchArgument('usb_port', default_value='/dev/ttyACM0'),
+        DeclareLaunchArgument('lidar_port', default_value='/dev/ttyUSB0',
+                              description='LiDAR serial port. Check with: ls -l /dev/serial/by-id/'),
         DeclareLaunchArgument('pc_ip',    default_value='10.10.14.58',
                               description='PC IP for unicast DDS discovery.'),
         UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
@@ -75,9 +114,9 @@ def generate_launch_description():
         SetEnvironmentVariable('LDS_MODEL', lds_model),
         OpaqueFunction(function=make_fastdds_env),
         LogInfo(msg=['REAL_BURGER_BASE | role=', role,
-                     ' domain=', domain_id, ' lds=', lds_model, ' pc=', pc_ip]),
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(robot_launch),
-            launch_arguments={'use_sim_time': 'false', 'usb_port': usb_port}.items(),
-        ),
+                     ' domain=', domain_id, ' lds=', lds_model,
+                     ' opencr=', usb_port, ' pc=', pc_ip]),
+        state_publisher,
+        OpaqueFunction(function=make_lidar),
+        turtlebot3_node,
     ])
