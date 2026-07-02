@@ -53,17 +53,24 @@ def generate_launch_description():
 
     # ── FastDDS XML with robot IPs (written at launch-time) ───────────────────
     def make_fastdds_env(context, *args, **kwargs):
-        r1 = robot1_ip.perform(context)
-        r2 = robot2_ip.perform(context)
+        peers = [p.strip() for p in (robot1_ip.perform(context), robot2_ip.perform(context)) if p.strip()]
         d  = domain_id.perform(context)
+        if not peers:
+            return [
+                UnsetEnvironmentVariable('ROS_STATIC_PEERS'),
+                LogInfo(msg=['FOLLOWER_D', d, ' | DDS discovery=subnet multicast']),
+            ]
+        locators = '\n'.join(
+            f'          <locator><udpv4><address>{peer}</address></udpv4></locator>'
+            for peer in peers
+        )
         xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
   <participant profile_name="default_profile" is_default_profile="true">
     <rtps>
       <builtin>
         <initialPeersList>
-          <locator><udpv4><address>{r1}</address></udpv4></locator>
-          <locator><udpv4><address>{r2}</address></udpv4></locator>
+{locators}
         </initialPeersList>
       </builtin>
     </rtps>
@@ -75,7 +82,7 @@ def generate_launch_description():
         return [
             SetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE', str(xml_path)),
             SetEnvironmentVariable('FASTDDS_DEFAULT_PROFILES_FILE', str(xml_path)),
-            SetEnvironmentVariable('ROS_STATIC_PEERS', f'{r1};{r2}'),
+            SetEnvironmentVariable('ROS_STATIC_PEERS', ';'.join(peers)),
         ]
 
     # ── Domain bridge (/map direction depends on slam_domain) ─────────────────
@@ -307,8 +314,8 @@ topics:
         DeclareLaunchArgument('follower_initial_yaw', default_value='0.0'),
         DeclareLaunchArgument('use_slam',    default_value='false'),
         DeclareLaunchArgument('slam_domain', default_value='25'),
-        DeclareLaunchArgument('robot1_ip',   default_value='10.10.14.10'),
-        DeclareLaunchArgument('robot2_ip',   default_value='10.10.14.14'),
+        DeclareLaunchArgument('robot1_ip',   default_value=''),
+        DeclareLaunchArgument('robot2_ip',   default_value=''),
         UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
         UnsetEnvironmentVariable('ROS_LOCALHOST_ONLY'),
         UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),

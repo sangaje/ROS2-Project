@@ -32,8 +32,14 @@ def generate_launch_description():
     tb3_param_file = str(tb3_bringup_share / 'param' / 'burger.yaml')
 
     def make_fastdds_env(context, *args, **kwargs):
-        p = pc_ip.perform(context)
+        p = pc_ip.perform(context).strip()
         d = context.perform_substitution(domain_id)
+        if not p:
+            return [
+                UnsetEnvironmentVariable('ROS_STATIC_PEERS'),
+                LogInfo(msg=['REAL_BURGER_DDS | domain=', d, ' discovery=subnet multicast']),
+            ]
+
         xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
   <participant profile_name="default_profile" is_default_profile="true">
@@ -100,8 +106,8 @@ def generate_launch_description():
         DeclareLaunchArgument('usb_port', default_value='/dev/ttyACM0'),
         DeclareLaunchArgument('lidar_port', default_value='/dev/ttyUSB0',
                               description='LiDAR serial port. Check with: ls -l /dev/serial/by-id/'),
-        DeclareLaunchArgument('pc_ip',    default_value='10.10.14.58',
-                              description='PC IP for unicast DDS discovery.'),
+        DeclareLaunchArgument('pc_ip',    default_value='',
+                              description='Optional PC IP for unicast DDS discovery. Empty uses subnet multicast.'),
         UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
         UnsetEnvironmentVariable('ROS_LOCALHOST_ONLY'),
         UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),

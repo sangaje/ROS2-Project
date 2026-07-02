@@ -1,5 +1,5 @@
 # Narrow-space Nav2 tuning — Waffle leader (Domain 25).
-# The footprint follows the Gazebo collision geometry instead of an oversized circle.
+# The footprint follows the TurtleBot3 footprint instead of an oversized circle.
 
 controller_server:
   ros__parameters:
