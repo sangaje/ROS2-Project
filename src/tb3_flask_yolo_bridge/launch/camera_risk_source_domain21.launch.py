@@ -70,7 +70,7 @@ def generate_launch_description():
             FindPackageShare('tb3_bayesian_risk_map'),
             'config',
         ])),
-        DeclareLaunchArgument('cartographer_configuration_basename', default_value='turtlebot3_lds_2d_risk_safe.lua'),
+        DeclareLaunchArgument('cartographer_configuration_basename', default_value='turtlebot3_lds_2d_risk_safe_no_odom.lua'),
 
         SetEnvironmentVariable('ROS_DOMAIN_ID', LaunchConfiguration('domain_id')),
         SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp'),

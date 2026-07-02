@@ -9,9 +9,9 @@ import os
 
 def generate_launch_description():
     pkg_share = get_package_share_directory('tb3_bayesian_risk_map')
-    safe_lua = os.path.join(pkg_share, 'config', 'turtlebot3_lds_2d_risk_safe.lua')
+    safe_lua = os.path.join(pkg_share, 'config', 'turtlebot3_lds_2d_risk_safe_no_odom.lua')
     carto_basename = (
-        'turtlebot3_lds_2d_risk_safe.lua'
+        'turtlebot3_lds_2d_risk_safe_no_odom.lua'
         if os.path.exists(safe_lua)
         else 'turtlebot3_lds_2d.lua'
     )

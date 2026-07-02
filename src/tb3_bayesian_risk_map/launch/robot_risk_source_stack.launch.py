@@ -3,6 +3,7 @@ from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchD
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 from ament_index_python.packages import get_package_share_directory
 import os
@@ -22,6 +23,10 @@ def generate_launch_description():
         'launch',
         'opencv_camera_to_flask_yolo.launch.py',
     ])
+    cartographer_config_dir = PathJoinSubstitution([
+        FindPackageShare('tb3_bayesian_risk_map'),
+        'config',
+    ])
 
     return LaunchDescription([
         DeclareLaunchArgument('domain_id', default_value='21'),
@@ -32,8 +37,11 @@ def generate_launch_description():
         DeclareLaunchArgument('start_cartographer', default_value='true'),
         DeclareLaunchArgument('start_pose_publisher', default_value='true'),
         DeclareLaunchArgument('start_camera_sender', default_value='true'),
-        DeclareLaunchArgument('start_teleop', default_value='true'),
+        DeclareLaunchArgument('start_teleop', default_value='false'),
         DeclareLaunchArgument('start_robot_rviz', default_value='false'),
+        DeclareLaunchArgument('camera_sender_start_delay_sec', default_value='4.0'),
+        DeclareLaunchArgument('cartographer_start_delay_sec', default_value='12.0'),
+        DeclareLaunchArgument('pose_publisher_start_delay_sec', default_value='18.0'),
 
         DeclareLaunchArgument('server_url', default_value='http://100.96.193.2:5005/detect'),
 
@@ -55,7 +63,9 @@ def generate_launch_description():
         DeclareLaunchArgument('base_frame', default_value='base_footprint'),
         DeclareLaunchArgument('pose_topic', default_value='/leader_pose'),
         DeclareLaunchArgument('detection_topic', default_value='/risk/yolo_detections'),
-        DeclareLaunchArgument('cartographer_configuration_basename', default_value='turtlebot3_lds_2d_risk_safe.lua'),
+        DeclareLaunchArgument('cartographer_configuration_directory', default_value=cartographer_config_dir),
+        DeclareLaunchArgument('cartographer_configuration_basename', default_value='turtlebot3_lds_2d_risk_safe_no_odom.lua'),
+        DeclareLaunchArgument('cartographer_resolution', default_value='0.05'),
         DeclareLaunchArgument('cartographer_publish_period_sec', default_value='1.0'),
 
         SetEnvironmentVariable('ROS_DOMAIN_ID', LaunchConfiguration('domain_id')),
@@ -71,12 +81,13 @@ def generate_launch_description():
                 'use_sim_time': LaunchConfiguration('use_sim_time'),
                 'start_robot_bringup': LaunchConfiguration('start_robot_bringup'),
                 'start_camera': 'false',
-                'start_cartographer': LaunchConfiguration('start_cartographer'),
+                'start_cartographer': 'false',
                 'start_risk_map': 'false',
                 'start_rviz': LaunchConfiguration('start_robot_rviz'),
                 'start_teleop': LaunchConfiguration('start_teleop'),
                 'start_opencv_yolo_view': 'false',
                 'start_rqt_yolo_view': 'false',
+                'cartographer_configuration_directory': LaunchConfiguration('cartographer_configuration_directory'),
                 'cartographer_configuration_basename': LaunchConfiguration('cartographer_configuration_basename'),
                 'cartographer_publish_period_sec': LaunchConfiguration('cartographer_publish_period_sec'),
                 'map_topic': LaunchConfiguration('map_topic'),
@@ -88,7 +99,36 @@ def generate_launch_description():
             }.items(),
         ),
         TimerAction(
-            period=4.0,
+            period=LaunchConfiguration('cartographer_start_delay_sec'),
+            actions=[
+                Node(
+                    condition=IfCondition(LaunchConfiguration('start_cartographer')),
+                    package='cartographer_ros',
+                    executable='cartographer_node',
+                    name='cartographer_node',
+                    output='screen',
+                    parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time')}],
+                    arguments=[
+                        '-configuration_directory', LaunchConfiguration('cartographer_configuration_directory'),
+                        '-configuration_basename', LaunchConfiguration('cartographer_configuration_basename'),
+                    ],
+                ),
+                Node(
+                    condition=IfCondition(LaunchConfiguration('start_cartographer')),
+                    package='cartographer_ros',
+                    executable='cartographer_occupancy_grid_node',
+                    name='cartographer_occupancy_grid_node',
+                    output='screen',
+                    parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time')}],
+                    arguments=[
+                        '-resolution', LaunchConfiguration('cartographer_resolution'),
+                        '-publish_period_sec', LaunchConfiguration('cartographer_publish_period_sec'),
+                    ],
+                ),
+            ],
+        ),
+        TimerAction(
+            period=LaunchConfiguration('camera_sender_start_delay_sec'),
             actions=[
                 IncludeLaunchDescription(
                     PythonLaunchDescriptionSource(opencv_sender_launch),
@@ -114,7 +154,7 @@ def generate_launch_description():
             ],
         ),
         TimerAction(
-            period=6.0,
+            period=LaunchConfiguration('pose_publisher_start_delay_sec'),
             actions=[
                 ExecuteProcess(
                     cmd=[
