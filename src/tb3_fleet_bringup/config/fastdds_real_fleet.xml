@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- FastDDS unicast initial-peers profile for real-robot fleet.
+     Ensures PC and both burgers discover each other without relying on multicast.
+     PC: 10.10.14.58   Leader: 10.10.14.10   Follower: 10.10.14.14            -->
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <participant profile_name="default_profile" is_default_profile="true">
+    <rtps>
+      <builtin>
+        <initialPeersList>
+          <locator>
+            <udpv4>
+              <address>10.10.14.10</address>
+            </udpv4>
+          </locator>
+          <locator>
+            <udpv4>
+              <address>10.10.14.14</address>
+            </udpv4>
+          </locator>
+          <locator>
+            <udpv4>
+              <address>10.10.14.58</address>
+            </udpv4>
+          </locator>
+        </initialPeersList>
+      </builtin>
+    </rtps>
+  </participant>
+</profiles>

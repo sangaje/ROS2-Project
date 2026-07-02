@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
-import os
+import tempfile
+from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -8,6 +9,7 @@ from launch.actions import (
     DeclareLaunchArgument,
     ExecuteProcess,
     LogInfo,
+    OpaqueFunction,
     SetEnvironmentVariable,
     UnsetEnvironmentVariable,
 )
@@ -16,17 +18,40 @@ from launch.substitutions import LaunchConfiguration
 
 def generate_launch_description():
     bringup_share = get_package_share_directory('tb3_fleet_bringup')
-    domain_id = LaunchConfiguration('domain_id')
+
+    domain_id   = LaunchConfiguration('domain_id')
     rviz_config = LaunchConfiguration('rviz_config')
-    default_rviz_config = os.path.join(
-        bringup_share, 'rviz', 'fleet_debug.rviz'
-    )
-    marker_script = os.path.join(
-        bringup_share, 'scripts', 'fleet_debug_marker.py'
-    )
-    rviz_clean_script = os.path.join(
-        bringup_share, 'scripts', 'run_rviz2_clean.bash'
-    )
+    robot1_ip   = LaunchConfiguration('robot1_ip')
+    robot2_ip   = LaunchConfiguration('robot2_ip')
+
+    default_rviz_config = str(Path(bringup_share) / 'rviz' / 'fleet_debug.rviz')
+    marker_script       = str(Path(bringup_share) / 'scripts' / 'fleet_debug_marker.py')
+    rviz_clean_script   = str(Path(bringup_share) / 'scripts' / 'run_rviz2_clean.bash')
+
+    def make_fastdds_env(context, *args, **kwargs):
+        r1 = robot1_ip.perform(context)
+        r2 = robot2_ip.perform(context)
+        d  = domain_id.perform(context)
+        xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <participant profile_name="default_profile" is_default_profile="true">
+    <rtps>
+      <builtin>
+        <initialPeersList>
+          <locator><udpv4><address>{r1}</address></udpv4></locator>
+          <locator><udpv4><address>{r2}</address></udpv4></locator>
+        </initialPeersList>
+      </builtin>
+    </rtps>
+  </participant>
+</profiles>
+"""
+        xml_path = Path(tempfile.gettempdir()) / f'fastdds_fleet_rviz_d{d}.xml'
+        xml_path.write_text(xml, encoding='utf-8')
+        return [
+            SetEnvironmentVariable('FASTDDS_DEFAULT_PROFILES_FILE', str(xml_path)),
+            SetEnvironmentVariable('ROS_STATIC_PEERS', f'{r1};{r2}'),
+        ]
 
     marker = ExecuteProcess(
         cmd=[
@@ -54,24 +79,19 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        DeclareLaunchArgument('domain_id', default_value='25'),
-        DeclareLaunchArgument(
-            'rviz_config',
-            default_value=default_rviz_config,
-        ),
+        DeclareLaunchArgument('domain_id',    default_value='25'),
+        DeclareLaunchArgument('rviz_config',  default_value=default_rviz_config),
+        DeclareLaunchArgument('robot1_ip',    default_value='10.10.14.10'),
+        DeclareLaunchArgument('robot2_ip',    default_value='10.10.14.14'),
         UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
         UnsetEnvironmentVariable('ROS_LOCALHOST_ONLY'),
         UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),
-        UnsetEnvironmentVariable('FASTDDS_DEFAULT_PROFILES_FILE'),
-        SetEnvironmentVariable('ROS_DOMAIN_ID', domain_id),
-        SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp'),
-        SetEnvironmentVariable('FASTDDS_BUILTIN_TRANSPORTS', 'UDPv4'),
+        SetEnvironmentVariable('ROS_DOMAIN_ID',               domain_id),
+        SetEnvironmentVariable('RMW_IMPLEMENTATION',          'rmw_fastrtps_cpp'),
+        SetEnvironmentVariable('FASTDDS_BUILTIN_TRANSPORTS',  'UDPv4'),
         SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', 'SUBNET'),
-        SetEnvironmentVariable('ROS_STATIC_PEERS', '10.10.14.10;10.10.14.14'),
-        LogInfo(
-            msg='REAL_FLEET_RVIZ_DOMAIN25 | /goal_pose controls Waffle; '
-                '/fleet/follow_command controls Burger following.'
-        ),
+        OpaqueFunction(function=make_fastdds_env),
+        LogInfo(msg='REAL_FLEET_RVIZ_D25 | /goal_pose → Waffle | /fleet/follow_command → Burger'),
         marker,
         rviz,
     ])

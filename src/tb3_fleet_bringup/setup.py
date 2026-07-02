@@ -21,7 +21,7 @@ setup(
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'launch'), launch_files),
         (os.path.join('share', package_name, 'scripts'), only_files('scripts/*.py') + only_files('scripts/*.bash') + only_files('scripts/*.zsh')),
-        (os.path.join('share', package_name, 'config'), only_files('config/*.yaml') + only_files('config/*.lua')),
+        (os.path.join('share', package_name, 'config'), only_files('config/*.yaml') + only_files('config/*.lua') + only_files('config/*.xml')),
         (os.path.join('share', package_name, 'rviz'), only_files('rviz/*.rviz')),
         (os.path.join('share', package_name, 'map'), only_files('map/*.yaml') + only_files('map/*.pgm')),
     ],

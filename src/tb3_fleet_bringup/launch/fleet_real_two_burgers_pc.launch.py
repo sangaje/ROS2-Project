@@ -22,8 +22,9 @@ def generate_launch_description():
     follow_distance      = LaunchConfiguration('follow_distance')
     start_following      = LaunchConfiguration('start_following')
     start_rviz           = LaunchConfiguration('start_rviz')
+    robot1_ip            = LaunchConfiguration('robot1_ip')
+    robot2_ip            = LaunchConfiguration('robot2_ip')
 
-    # use_slam for each robot: only the slam_domain robot does SLAM.
     leader_use_slam   = PythonExpression(["'true' if '", slam_domain, "' == '25' else 'false'"])
     follower_use_slam = PythonExpression(["'true' if '", slam_domain, "' == '24' else 'false'"])
 
@@ -43,6 +44,8 @@ def generate_launch_description():
             ['follower_initial_x:=',   follower_initial_x],
             ['follower_initial_y:=',   follower_initial_y],
             ['follower_initial_yaw:=', follower_initial_yaw],
+            ['robot1_ip:=', robot1_ip],
+            ['robot2_ip:=', robot2_ip],
         ],
         output='screen',
         name='two_burgers_follower_stack',
@@ -56,6 +59,8 @@ def generate_launch_description():
             ['initial_x:=',   leader_initial_x],
             ['initial_y:=',   leader_initial_y],
             ['initial_yaw:=', leader_initial_yaw],
+            ['robot1_ip:=', robot1_ip],
+            ['robot2_ip:=', robot2_ip],
         ],
         output='screen',
         name='two_burgers_leader_stack',
@@ -65,6 +70,8 @@ def generate_launch_description():
             'ros2', 'launch', 'tb3_fleet_bringup',
             'fleet_real_domain25_rviz.launch.py',
             'domain_id:=25',
+            ['robot1_ip:=', robot1_ip],
+            ['robot2_ip:=', robot2_ip],
         ],
         output='screen',
         name='two_burgers_rviz',
@@ -72,36 +79,27 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        DeclareLaunchArgument(
-            'slam_domain', default_value='25',
-            description='Which burger does SLAM: 25=leader, 24=follower.',
-        ),
-        DeclareLaunchArgument(
-            'follower_initial_x', default_value='-1.05',
-            description='[slam_domain=25] Follower start x in leader SLAM map. '
-                        'Leader is SLAM origin (0,0). Follower is behind.',
-        ),
+        DeclareLaunchArgument('slam_domain', default_value='25',
+                              description='Which burger does SLAM: 25=leader, 24=follower.'),
+        DeclareLaunchArgument('follower_initial_x', default_value='-1.05',
+                              description='[slam_domain=25] Follower x in leader SLAM map.'),
         DeclareLaunchArgument('follower_initial_y',   default_value='0.0'),
         DeclareLaunchArgument('follower_initial_yaw', default_value='0.0'),
-        DeclareLaunchArgument(
-            'leader_initial_x', default_value='1.05',
-            description='[slam_domain=24] Leader start x in follower SLAM map. '
-                        'Follower is SLAM origin (0,0). Leader is ahead.',
-        ),
+        DeclareLaunchArgument('leader_initial_x', default_value='1.05',
+                              description='[slam_domain=24] Leader x in follower SLAM map.'),
         DeclareLaunchArgument('leader_initial_y',   default_value='0.0'),
         DeclareLaunchArgument('leader_initial_yaw', default_value='0.0'),
-        DeclareLaunchArgument('follow_distance', default_value='1.05'),
-        DeclareLaunchArgument(
-            'start_following', default_value='false',
-            description='Safe default: wait for follow command via fleet_follow_signal.',
-        ),
-        DeclareLaunchArgument('start_rviz', default_value='true'),
-        LogInfo(
-            msg=[
-                'REAL_TWO_BURGERS_PC | slam_domain=', slam_domain,
-                ' | start_following=', start_following,
-            ]
-        ),
+        DeclareLaunchArgument('follow_distance',  default_value='1.05'),
+        DeclareLaunchArgument('start_following',  default_value='false',
+                              description='Safe default: wait for fleet_follow_signal.'),
+        DeclareLaunchArgument('start_rviz',  default_value='true'),
+        DeclareLaunchArgument('robot1_ip',   default_value='10.10.14.10',
+                              description='Leader robot IP (Domain 25).'),
+        DeclareLaunchArgument('robot2_ip',   default_value='10.10.14.14',
+                              description='Follower robot IP (Domain 24).'),
+        LogInfo(msg=['REAL_TWO_BURGERS_PC | slam_domain=', slam_domain,
+                     ' | start_following=', start_following,
+                     ' | robot1=', robot1_ip, ' robot2=', robot2_ip]),
         follower,
         TimerAction(period=2.0, actions=[leader]),
         TimerAction(period=5.0, actions=[rviz]),

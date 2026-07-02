@@ -20,19 +20,19 @@ def generate_launch_description():
     initial_x   = LaunchConfiguration('initial_x')
     initial_y   = LaunchConfiguration('initial_y')
     initial_yaw = LaunchConfiguration('initial_yaw')
+    robot1_ip   = LaunchConfiguration('robot1_ip')
+    robot2_ip   = LaunchConfiguration('robot2_ip')
 
     return LaunchDescription([
-        DeclareLaunchArgument('domain_id',   default_value='25'),
-        DeclareLaunchArgument(
-            'use_slam', default_value='true',
-            description='true=Cartographer SLAM; false=AMCL with map from other robot.',
-        ),
-        DeclareLaunchArgument(
-            'initial_x', default_value='1.05',
-            description='[AMCL only] Leader x in follower SLAM map frame.',
-        ),
+        DeclareLaunchArgument('domain_id',  default_value='25'),
+        DeclareLaunchArgument('use_slam',   default_value='true',
+                              description='true=Cartographer SLAM; false=AMCL.'),
+        DeclareLaunchArgument('initial_x',  default_value='1.05',
+                              description='[AMCL only] Leader x in follower SLAM map.'),
         DeclareLaunchArgument('initial_y',   default_value='0.0'),
         DeclareLaunchArgument('initial_yaw', default_value='0.0'),
+        DeclareLaunchArgument('robot1_ip',   default_value='10.10.14.10'),
+        DeclareLaunchArgument('robot2_ip',   default_value='10.10.14.14'),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(leader_launch),
             launch_arguments={
@@ -42,6 +42,8 @@ def generate_launch_description():
                 'initial_x':   initial_x,
                 'initial_y':   initial_y,
                 'initial_yaw': initial_yaw,
+                'robot1_ip':   robot1_ip,
+                'robot2_ip':   robot2_ip,
             }.items(),
         ),
     ])
