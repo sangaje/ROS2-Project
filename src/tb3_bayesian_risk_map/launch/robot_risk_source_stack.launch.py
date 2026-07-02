@@ -13,10 +13,10 @@ def generate_launch_description():
     bringup_share = get_package_share_directory('tb3_fleet_bringup')
     tf_pose_script = os.path.join(bringup_share, 'scripts', 'tf_pose_publisher_direct_v44.py')
 
-    real_robot_risk_slam_launch = PathJoinSubstitution([
-        FindPackageShare('tb3_bayesian_risk_map'),
+    robot_launch = PathJoinSubstitution([
+        FindPackageShare('turtlebot3_bringup'),
         'launch',
-        'real_robot_risk_slam.launch.py',
+        'robot.launch.py',
     ])
     opencv_sender_launch = PathJoinSubstitution([
         FindPackageShare('tb3_flask_yolo_bridge'),
@@ -26,6 +26,11 @@ def generate_launch_description():
     cartographer_config_dir = PathJoinSubstitution([
         FindPackageShare('tb3_bayesian_risk_map'),
         'config',
+    ])
+    rviz_config = PathJoinSubstitution([
+        FindPackageShare('tb3_bayesian_risk_map'),
+        'rviz',
+        'slam_risk_live.rviz',
     ])
 
     return LaunchDescription([
@@ -42,10 +47,12 @@ def generate_launch_description():
         DeclareLaunchArgument('camera_sender_start_delay_sec', default_value='4.0'),
         DeclareLaunchArgument('cartographer_start_delay_sec', default_value='12.0'),
         DeclareLaunchArgument('pose_publisher_start_delay_sec', default_value='18.0'),
+        DeclareLaunchArgument('rviz_config', default_value=rviz_config),
 
         DeclareLaunchArgument('server_url', default_value='http://100.96.193.2:5005/detect'),
 
         DeclareLaunchArgument('camera_device', default_value='/dev/video1'),
+        DeclareLaunchArgument('camera_fallback_devices', default_value='/dev/video1,/dev/video0,/dev/video2,/dev/video3'),
         DeclareLaunchArgument('camera_width', default_value='320'),
         DeclareLaunchArgument('camera_height', default_value='240'),
         DeclareLaunchArgument('send_width', default_value='320'),
@@ -57,6 +64,7 @@ def generate_launch_description():
         DeclareLaunchArgument('http_timeout_sec', default_value='0.8'),
         DeclareLaunchArgument('max_http_roundtrip_sec', default_value='1.0'),
         DeclareLaunchArgument('max_frame_age_sec', default_value='1.2'),
+        DeclareLaunchArgument('camera_retry_open_period_sec', default_value='1.0'),
 
         DeclareLaunchArgument('map_topic', default_value='/map'),
         DeclareLaunchArgument('map_frame', default_value='map'),
@@ -76,27 +84,9 @@ def generate_launch_description():
         SetEnvironmentVariable('TURTLEBOT3_MODEL', LaunchConfiguration('turtlebot3_model')),
 
         IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(real_robot_risk_slam_launch),
-            launch_arguments={
-                'use_sim_time': LaunchConfiguration('use_sim_time'),
-                'start_robot_bringup': LaunchConfiguration('start_robot_bringup'),
-                'start_camera': 'false',
-                'start_cartographer': 'false',
-                'start_risk_map': 'false',
-                'start_rviz': LaunchConfiguration('start_robot_rviz'),
-                'start_teleop': LaunchConfiguration('start_teleop'),
-                'start_opencv_yolo_view': 'false',
-                'start_rqt_yolo_view': 'false',
-                'cartographer_configuration_directory': LaunchConfiguration('cartographer_configuration_directory'),
-                'cartographer_configuration_basename': LaunchConfiguration('cartographer_configuration_basename'),
-                'cartographer_publish_period_sec': LaunchConfiguration('cartographer_publish_period_sec'),
-                'map_topic': LaunchConfiguration('map_topic'),
-                'map_frame': LaunchConfiguration('map_frame'),
-                'base_frame': LaunchConfiguration('base_frame'),
-                'detection_source': 'flask_topic',
-                'enable_yolo': 'false',
-                'external_detection_topic': LaunchConfiguration('detection_topic'),
-            }.items(),
+            PythonLaunchDescriptionSource(robot_launch),
+            condition=IfCondition(LaunchConfiguration('start_robot_bringup')),
+            launch_arguments={'use_sim_time': LaunchConfiguration('use_sim_time')}.items(),
         ),
         TimerAction(
             period=LaunchConfiguration('cartographer_start_delay_sec'),
@@ -136,6 +126,7 @@ def generate_launch_description():
                     launch_arguments={
                         'device': LaunchConfiguration('camera_device'),
                         'frame_id': 'camera_link',
+                        'fallback_devices': LaunchConfiguration('camera_fallback_devices'),
                         'width': LaunchConfiguration('camera_width'),
                         'height': LaunchConfiguration('camera_height'),
                         'send_width': LaunchConfiguration('send_width'),
@@ -149,6 +140,7 @@ def generate_launch_description():
                         'timeout_sec': LaunchConfiguration('http_timeout_sec'),
                         'max_http_roundtrip_sec': LaunchConfiguration('max_http_roundtrip_sec'),
                         'max_frame_age_sec': LaunchConfiguration('max_frame_age_sec'),
+                        'retry_open_period_sec': LaunchConfiguration('camera_retry_open_period_sec'),
                     }.items(),
                 ),
             ],
@@ -173,5 +165,14 @@ def generate_launch_description():
                     condition=IfCondition(LaunchConfiguration('start_pose_publisher')),
                 ),
             ],
+        ),
+        Node(
+            condition=IfCondition(LaunchConfiguration('start_robot_rviz')),
+            package='rviz2',
+            executable='rviz2',
+            name='rviz2_robot_risk_source_stack',
+            output='screen',
+            arguments=['-d', LaunchConfiguration('rviz_config')],
+            parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time')}],
         ),
     ])

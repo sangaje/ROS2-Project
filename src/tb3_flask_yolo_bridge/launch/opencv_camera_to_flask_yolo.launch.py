@@ -7,6 +7,7 @@ from launch_ros.actions import Node
 def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('device', default_value='/dev/video1'),
+        DeclareLaunchArgument('fallback_devices', default_value='/dev/video1,/dev/video0,/dev/video2,/dev/video3'),
         DeclareLaunchArgument('frame_id', default_value='camera_link'),
         DeclareLaunchArgument('width', default_value='320'),
         DeclareLaunchArgument('height', default_value='240'),
@@ -22,6 +23,7 @@ def generate_launch_description():
         DeclareLaunchArgument('timeout_sec', default_value='0.8'),
         DeclareLaunchArgument('max_http_roundtrip_sec', default_value='1.0'),
         DeclareLaunchArgument('max_frame_age_sec', default_value='1.2'),
+        DeclareLaunchArgument('retry_open_period_sec', default_value='1.0'),
         DeclareLaunchArgument('publish_empty_detections', default_value='true'),
         Node(
             package='tb3_flask_yolo_bridge',
@@ -30,6 +32,7 @@ def generate_launch_description():
             output='screen',
             parameters=[{
                 'device': LaunchConfiguration('device'),
+                'fallback_devices': LaunchConfiguration('fallback_devices'),
                 'frame_id': LaunchConfiguration('frame_id'),
                 'width': LaunchConfiguration('width'),
                 'height': LaunchConfiguration('height'),
@@ -45,6 +48,7 @@ def generate_launch_description():
                 'timeout_sec': LaunchConfiguration('timeout_sec'),
                 'max_http_roundtrip_sec': LaunchConfiguration('max_http_roundtrip_sec'),
                 'max_frame_age_sec': LaunchConfiguration('max_frame_age_sec'),
+                'retry_open_period_sec': LaunchConfiguration('retry_open_period_sec'),
                 'publish_empty_detections': LaunchConfiguration('publish_empty_detections'),
             }],
         ),

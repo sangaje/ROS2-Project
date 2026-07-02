@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from collections import deque
@@ -29,6 +30,12 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         super().__init__('opencv_camera_to_flask_yolo')
 
         self.device = self.declare_parameter('device', '/dev/video0').value
+        self.fallback_devices = str(
+            self.declare_parameter(
+                'fallback_devices',
+                '/dev/video1,/dev/video0,/dev/video2,/dev/video3',
+            ).value
+        )
         self.frame_id = str(self.declare_parameter('frame_id', 'camera_link').value)
         self.width = int(self.declare_parameter('width', 320).value)
         self.height = int(self.declare_parameter('height', 240).value)
@@ -50,6 +57,9 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         )
         self.max_frame_age_sec = float(
             self.declare_parameter('max_frame_age_sec', 1.2).value
+        )
+        self.retry_open_period_sec = float(
+            self.declare_parameter('retry_open_period_sec', 1.0).value
         )
         self.log_period_sec = float(self.declare_parameter('log_period_sec', 2.0).value)
         self.publish_empty_detections = self.declare_bool_parameter('publish_empty_detections', True)
@@ -81,23 +91,15 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         self.drop_count = 0
         self.last_log_wall_sec = 0.0
         self.ok_timestamps = deque(maxlen=120)
+        self.active_device = ''
+        self.next_open_attempt_mono_sec = 0.0
+        self.read_fail_streak = 0
 
         import cv2
 
-        device_arg = int(self.device) if str(self.device).isdigit() else self.device
-        self.cap = cv2.VideoCapture(device_arg)
-        if self.buffer_size > 0:
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, int(self.buffer_size))
-        if self.fourcc:
-            code = self.fourcc.upper()[:4]
-            if len(code) == 4:
-                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*code))
-        if self.width > 0:
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(self.width))
-        if self.height > 0:
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self.height))
-        if self.camera_fps > 0.0:
-            self.cap.set(cv2.CAP_PROP_FPS, float(self.camera_fps))
+        self.cv2 = cv2
+        self.cap = None
+        self.open_camera(log_success=False)
 
         self.capture_thread = threading.Thread(
             target=self.capture_loop,
@@ -113,7 +115,8 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         self.worker_thread.start()
 
         self.get_logger().info(
-            f'OPENCV_CAMERA_TO_FLASK_YOLO_READY | device={self.device} opened={self.cap.isOpened()} '
+            f'OPENCV_CAMERA_TO_FLASK_YOLO_READY | device={self.device} '
+            f'active_device={self.active_device or "none"} opened={self.is_camera_open()} '
             f'capture_request={self.width}x{self.height} send={self.send_width}x{self.send_height} '
             f'camera_fps={self.camera_fps:.1f} fourcc={self.fourcc or "default"} '
             f'server={self.server_url} out={self.output_topic} rate={self.max_rate_hz:.2f}Hz '
@@ -123,17 +126,125 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             f'latest_frame_only=true ros_image_publish=false'
         )
 
+    def camera_candidates(self):
+        candidates = []
+
+        def add(value):
+            value = str(value).strip()
+            if not value:
+                return
+            if value.lower() == 'auto':
+                for index in range(8):
+                    add(f'/dev/video{index}')
+                return
+            if value not in candidates:
+                candidates.append(value)
+
+        add(self.device)
+        for item in self.fallback_devices.split(','):
+            add(item)
+        return candidates
+
+    def configure_capture(self, cap):
+        cv2 = self.cv2
+        if self.buffer_size > 0:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, int(self.buffer_size))
+        if self.fourcc:
+            code = self.fourcc.upper()[:4]
+            if len(code) == 4:
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*code))
+        if self.width > 0:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(self.width))
+        if self.height > 0:
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self.height))
+        if self.camera_fps > 0.0:
+            cap.set(cv2.CAP_PROP_FPS, float(self.camera_fps))
+
+    def close_camera(self):
+        cap = self.cap
+        self.cap = None
+        self.active_device = ''
+        self.read_fail_streak = 0
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
+
+    def is_camera_open(self):
+        return self.cap is not None and self.cap.isOpened()
+
+    def open_camera(self, log_success=True):
+        self.close_camera()
+        cv2 = self.cv2
+        for candidate in self.camera_candidates():
+            if (
+                not str(candidate).isdigit()
+                and str(candidate).startswith('/dev/')
+                and not os.path.exists(str(candidate))
+            ):
+                continue
+            device_arg = int(candidate) if str(candidate).isdigit() else candidate
+            cap = cv2.VideoCapture(device_arg, cv2.CAP_V4L2)
+            self.configure_capture(cap)
+            if not cap.isOpened():
+                cap.release()
+                continue
+
+            frame_ok = False
+            for _ in range(3):
+                ok, frame = cap.read()
+                if ok and frame is not None:
+                    frame_ok = True
+                    break
+                time.sleep(0.03)
+            if not frame_ok:
+                cap.release()
+                continue
+
+            self.cap = cap
+            self.active_device = str(candidate)
+            self.read_fail_streak = 0
+            if log_success:
+                self.get_logger().info(
+                    f'OPENCV_CAMERA_OPENED | active_device={self.active_device} '
+                    f'requested_device={self.device}'
+                )
+            return True
+
+        self.next_open_attempt_mono_sec = time.monotonic() + max(0.1, self.retry_open_period_sec)
+        self.get_logger().warn(
+            f'OPENCV_CAMERA_OPEN_FAILED | requested_device={self.device} '
+            f'fallback_devices={self.fallback_devices}',
+            throttle_duration_sec=2.0,
+        )
+        return False
+
     def capture_loop(self):
         while not self.stop_threads:
-            if not self.cap.isOpened():
+            if not self.is_camera_open():
                 self.fail_count += 1
+                now = time.monotonic()
+                if now >= self.next_open_attempt_mono_sec:
+                    self.open_camera()
                 time.sleep(0.05)
                 continue
             ok, frame = self.cap.read()
             if not ok or frame is None:
                 self.fail_count += 1
+                self.read_fail_streak += 1
+                max_streak = max(5, int(self.camera_fps))
+                if self.read_fail_streak >= max_streak:
+                    self.get_logger().warn(
+                        f'OPENCV_CAMERA_READ_FAILED | active_device={self.active_device} '
+                        f'fail_streak={self.read_fail_streak}; reopening',
+                        throttle_duration_sec=2.0,
+                    )
+                    self.close_camera()
+                    self.next_open_attempt_mono_sec = 0.0
                 time.sleep(0.02)
                 continue
+            self.read_fail_streak = 0
             capture_sec = self.get_clock().now().nanoseconds * 1e-9
             capture_mono_sec = time.monotonic()
             with self.frame_condition:
@@ -305,7 +416,7 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         except Exception:
             pass
         try:
-            self.cap.release()
+            self.close_camera()
         except Exception:
             pass
         super().destroy_node()

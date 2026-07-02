@@ -1,6 +1,8 @@
 -- Cartographer config for combined robot risk runs.
 -- It avoids subscribing to /odom so startup-time odom timestamp jitter cannot
 -- abort Cartographer with "Non-sorted data added to queue".
+-- TurtleBot3 still publishes odom->base_footprint TF; Cartographer publishes
+-- map->odom from scan matching, keeping the normal map->odom->base_footprint tree.
 
 include "map_builder.lua"
 include "trajectory_builder.lua"
@@ -10,9 +12,9 @@ options = {
   trajectory_builder = TRAJECTORY_BUILDER,
   map_frame = "map",
   tracking_frame = "base_footprint",
-  published_frame = "base_footprint",
+  published_frame = "odom",
   odom_frame = "odom",
-  provide_odom_frame = true,
+  provide_odom_frame = false,
   publish_frame_projected_to_2d = true,
   use_odometry = false,
   use_nav_sat = false,
