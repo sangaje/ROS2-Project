@@ -16,7 +16,7 @@ Panels:
         - /Burger Nav2 Plan1
         - /Fleet Debug Markers1
       Splitter Ratio: 0.5
-    Tree Height: 313
+    Tree Height: 375
   - Class: rviz_common/Views
     Expanded:
       - /Current View1
@@ -79,9 +79,17 @@ Visualization Manager:
           Value: true
         base_scan:
           Value: true
+        caster_back_link:
+          Value: true
+        imu_link:
+          Value: true
         map:
           Value: true
         odom:
+          Value: true
+        wheel_left_link:
+          Value: true
+        wheel_right_link:
           Value: true
       Marker Scale: 0.3499999940395355
       Name: TF
@@ -93,9 +101,16 @@ Visualization Manager:
           odom:
             base_footprint:
               base_link:
-                {}
-              base_scan:
-                {}
+                base_scan:
+                  {}
+                caster_back_link:
+                  {}
+                imu_link:
+                  {}
+                wheel_left_link:
+                  {}
+                wheel_right_link:
+                  {}
       Update Interval: 0
       Value: true
     - Alpha: 1
@@ -340,12 +355,12 @@ Visualization Manager:
 Window Geometry:
   Displays:
     collapsed: false
-  Height: 900
+  Height: 1003
   Hide Left Dock: false
   Hide Right Dock: true
-  QMainWindow State: 000000ff00000000fd00000001000000000000020c0000031afc0200000002fb000000100044006900730070006c0061007900730100000048000001d7000000f300fffffffb0000000a0056006900650077007301000002260000013c000000c500ffffff000003650000031a00000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  QMainWindow State: 000000ff00000000fd00000001000000000000020c00000381fc0200000002fb000000100044006900730070006c006100790073010000004800000215000000f300fffffffb0000000a00560069006500770073010000026400000165000000c500ffffff0000052b0000038100000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   Views:
     collapsed: false
-  Width: 1400
-  X: 80
-  Y: 80
+  Width: 1854
+  X: 66
+  Y: 40

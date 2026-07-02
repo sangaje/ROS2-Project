@@ -21,9 +21,6 @@ def generate_launch_description():
     bringup_share = get_package_share_directory('tb3_fleet_bringup')
 
     domain_id = LaunchConfiguration('domain_id')
-    initial_x = LaunchConfiguration('initial_x')
-    initial_y = LaunchConfiguration('initial_y')
-    initial_yaw = LaunchConfiguration('initial_yaw')
     robot_model = LaunchConfiguration('robot_model')
 
     waffle_nav2_source = os.path.join(
@@ -46,9 +43,7 @@ def generate_launch_description():
         convert_types=True,
     )
 
-    map_odom_script = os.path.join(
-        bringup_share, 'scripts', 'map_odom_localization_direct_v40.py'
-    )
+    cartographer_config_dir = os.path.join(bringup_share, 'config')
     tf_pose_script = os.path.join(
         bringup_share, 'scripts', 'tf_pose_publisher_direct_v44.py'
     )
@@ -56,24 +51,24 @@ def generate_launch_description():
         bringup_share, 'scripts', 'pose_to_nav2_action_direct_v41.py'
     )
 
-    map_odom = ExecuteProcess(
-        cmd=[
-            'python3', map_odom_script, '--ros-args',
-            '-r', '__node:=waffle_real_map_odom_localization',
-            '-p', 'use_sim_time:=false',
-            '-p', ['robot_name:=', robot_model],
-            '-p', 'odom_topic:=/odom',
-            '-p', 'map_frame:=map',
-            '-p', 'odom_frame:=odom',
-            '-p', 'base_frame:=base_footprint',
-            '-p', ['initial_x:=', initial_x],
-            '-p', ['initial_y:=', initial_y],
-            '-p', ['initial_yaw:=', initial_yaw],
-            '-p', 'publish_rate_hz:=30.0',
-            '-p', 'publish_amcl_pose:=true',
-        ],
+    cartographer = Node(
+        package='cartographer_ros',
+        executable='cartographer_node',
+        name='cartographer_node',
         output='screen',
-        name='waffle_real_map_odom_localization',
+        parameters=[{'use_sim_time': False}],
+        arguments=[
+            '-configuration_directory', cartographer_config_dir,
+            '-configuration_basename', 'cartographer_2d_lidar_odom_v44.lua',
+        ],
+    )
+    occupancy_grid = Node(
+        package='cartographer_ros',
+        executable='cartographer_occupancy_grid_node',
+        name='cartographer_occupancy_grid_node',
+        output='screen',
+        parameters=[{'use_sim_time': False}],
+        arguments=['-resolution', '0.05', '-publish_period_sec', '1.0'],
     )
 
     leader_pose = ExecuteProcess(
@@ -159,15 +154,8 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'robot_model',
             default_value='waffle_pi',
-            description='Physical TurtleBot3 model: waffle or waffle_pi.',
+            description='Physical TurtleBot3 model: waffle, waffle_pi, or burger.',
         ),
-        DeclareLaunchArgument(
-            'initial_x',
-            default_value='0.95',
-            description='Waffle start x in the Burger Cartographer map frame.',
-        ),
-        DeclareLaunchArgument('initial_y', default_value='0.0'),
-        DeclareLaunchArgument('initial_yaw', default_value='0.0'),
         UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
         UnsetEnvironmentVariable('ROS_LOCALHOST_ONLY'),
         UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),
@@ -180,12 +168,10 @@ def generate_launch_description():
         LogInfo(
             msg=[
                 'REAL_LEADER_DOMAIN25 | model=', robot_model,
-                ' | hardware /odom,/scan,/cmd_vel | '
-                'shared-map initial pose=(',
-                initial_x, ',', initial_y, ',', initial_yaw, ')',
+                ' | Cartographer SLAM → map→odom TF | /leader_pose → bridge → Domain24',
             ]
         ),
-        TimerAction(period=0.5, actions=[map_odom]),
+        TimerAction(period=0.5, actions=[cartographer, occupancy_grid]),
         TimerAction(period=1.0, actions=[leader_pose]),
         TimerAction(
             period=2.0,

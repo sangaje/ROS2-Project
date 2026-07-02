@@ -12,9 +12,9 @@ from launch.substitutions import LaunchConfiguration
 
 
 def generate_launch_description():
-    leader_initial_x = LaunchConfiguration('leader_initial_x')
-    leader_initial_y = LaunchConfiguration('leader_initial_y')
-    leader_initial_yaw = LaunchConfiguration('leader_initial_yaw')
+    follower_initial_x = LaunchConfiguration('follower_initial_x')
+    follower_initial_y = LaunchConfiguration('follower_initial_y')
+    follower_initial_yaw = LaunchConfiguration('follower_initial_yaw')
     follow_distance = LaunchConfiguration('follow_distance')
     start_following = LaunchConfiguration('start_following')
     start_rviz = LaunchConfiguration('start_rviz')
@@ -30,6 +30,9 @@ def generate_launch_description():
             'enable_path_yield:=true',
             'path_block_distance:=0.55',
             'yield_lateral_distance:=0.75',
+            ['follower_initial_x:=', follower_initial_x],
+            ['follower_initial_y:=', follower_initial_y],
+            ['follower_initial_yaw:=', follower_initial_yaw],
         ],
         output='screen',
         name='two_burgers_follower_stack',
@@ -39,9 +42,6 @@ def generate_launch_description():
             'ros2', 'launch', 'tb3_fleet_bringup',
             'fleet_real_domain25_burger_nav2.launch.py',
             'domain_id:=25',
-            ['initial_x:=', leader_initial_x],
-            ['initial_y:=', leader_initial_y],
-            ['initial_yaw:=', leader_initial_yaw],
         ],
         output='screen',
         name='two_burgers_leader_stack',
@@ -59,12 +59,13 @@ def generate_launch_description():
 
     return LaunchDescription([
         DeclareLaunchArgument(
-            'leader_initial_x',
-            default_value='0.95',
-            description='Leader Burger x relative to follower Burger at startup.',
+            'follower_initial_x',
+            default_value='-1.05',
+            description='Follower Burger x in the leader Cartographer map frame. '
+                        'Leader is SLAM origin (0,0). Follower starts behind leader.',
         ),
-        DeclareLaunchArgument('leader_initial_y', default_value='0.0'),
-        DeclareLaunchArgument('leader_initial_yaw', default_value='0.0'),
+        DeclareLaunchArgument('follower_initial_y', default_value='0.0'),
+        DeclareLaunchArgument('follower_initial_yaw', default_value='0.0'),
         DeclareLaunchArgument('follow_distance', default_value='1.05'),
         DeclareLaunchArgument(
             'start_following',
@@ -74,9 +75,10 @@ def generate_launch_description():
         DeclareLaunchArgument('start_rviz', default_value='true'),
         LogInfo(
             msg=[
-                'REAL_TWO_BURGERS_PC | leader Domain25 at x=',
-                leader_initial_x,
-                ' | follower Domain24 | start_following=',
+                'REAL_TWO_BURGERS_PC | Leader Domain25 = SLAM origin (0,0) | '
+                'Follower Domain24 initial x=',
+                follower_initial_x,
+                ' | start_following=',
                 start_following,
             ]
         ),

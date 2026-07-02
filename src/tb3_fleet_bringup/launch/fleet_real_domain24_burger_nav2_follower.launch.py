@@ -31,6 +31,9 @@ def generate_launch_description():
     enable_path_yield = LaunchConfiguration('enable_path_yield')
     path_block_distance = LaunchConfiguration('path_block_distance')
     yield_lateral_distance = LaunchConfiguration('yield_lateral_distance')
+    follower_initial_x = LaunchConfiguration('follower_initial_x')
+    follower_initial_y = LaunchConfiguration('follower_initial_y')
+    follower_initial_yaw = LaunchConfiguration('follower_initial_yaw')
 
     nav2_source = os.path.join(
         bringup_share, 'config', 'domain26_burger_nav2_slam.yaml'
@@ -51,10 +54,12 @@ def generate_launch_description():
     tf_pose_script = os.path.join(
         bringup_share, 'scripts', 'tf_pose_publisher_direct_v44.py'
     )
+    map_odom_script = os.path.join(
+        bringup_share, 'scripts', 'map_odom_localization_direct_v40.py'
+    )
     goal_proxy_script = os.path.join(
         bringup_share, 'scripts', 'pose_to_nav2_action_direct_v41.py'
     )
-    cartographer_config_dir = os.path.join(bringup_share, 'config')
 
     def make_domain_bridges(context, *args, **kwargs):
         leader_domain = leader_domain_id.perform(context)
@@ -69,12 +74,27 @@ def generate_launch_description():
             f'real_burger_{burger_domain}_to_leader_{leader_domain}.yaml'
         )
 
+        # Map is now built on domain 25 (leader SLAM) and sent to domain 24 (follower)
         leader_to_burger.write_text(
             f"""name: real_leader_{leader_domain}_to_burger_{burger_domain}
 from_domain: {leader_domain}
 to_domain: {burger_domain}
 
 topics:
+  /map:
+    type: nav_msgs/msg/OccupancyGrid
+    qos:
+      reliability: reliable
+      durability: transient_local
+      history: keep_last
+      depth: 1
+  /map_metadata:
+    type: nav_msgs/msg/MapMetaData
+    qos:
+      reliability: reliable
+      durability: transient_local
+      history: keep_last
+      depth: 1
   /leader_pose:
     type: geometry_msgs/msg/PoseStamped
     qos:
@@ -114,20 +134,6 @@ from_domain: {burger_domain}
 to_domain: {leader_domain}
 
 topics:
-  /map:
-    type: nav_msgs/msg/OccupancyGrid
-    qos:
-      reliability: reliable
-      durability: transient_local
-      history: keep_last
-      depth: 1
-  /map_metadata:
-    type: nav_msgs/msg/MapMetaData
-    qos:
-      reliability: reliable
-      durability: transient_local
-      history: keep_last
-      depth: 1
   /burger_pose:
     type: geometry_msgs/msg/PoseStamped
     qos:
@@ -173,25 +179,26 @@ topics:
             ),
         ]
 
-    cartographer = Node(
-        package='cartographer_ros',
-        executable='cartographer_node',
-        name='cartographer_node',
-        output='screen',
-        parameters=[{'use_sim_time': False}],
-        arguments=[
-            '-configuration_directory', cartographer_config_dir,
-            '-configuration_basename', 'cartographer_2d_lidar_odom_v44.lua',
+    map_odom = ExecuteProcess(
+        cmd=[
+            'python3', map_odom_script, '--ros-args',
+            '-r', '__node:=burger_real_map_odom_localization',
+            '-p', 'use_sim_time:=false',
+            '-p', ['robot_name:=', robot_model],
+            '-p', 'odom_topic:=/odom',
+            '-p', 'map_frame:=map',
+            '-p', 'odom_frame:=odom',
+            '-p', 'base_frame:=base_footprint',
+            '-p', ['initial_x:=', follower_initial_x],
+            '-p', ['initial_y:=', follower_initial_y],
+            '-p', ['initial_yaw:=', follower_initial_yaw],
+            '-p', 'publish_rate_hz:=30.0',
+            '-p', 'publish_amcl_pose:=true',
         ],
-    )
-    occupancy_grid = Node(
-        package='cartographer_ros',
-        executable='cartographer_occupancy_grid_node',
-        name='cartographer_occupancy_grid_node',
         output='screen',
-        parameters=[{'use_sim_time': False}],
-        arguments=['-resolution', '0.05', '-publish_period_sec', '1.0'],
+        name='burger_real_map_odom_localization',
     )
+
     burger_pose = ExecuteProcess(
         cmd=[
             'python3', tf_pose_script, '--ros-args',
@@ -301,6 +308,13 @@ topics:
         DeclareLaunchArgument('enable_path_yield', default_value='true'),
         DeclareLaunchArgument('path_block_distance', default_value='0.55'),
         DeclareLaunchArgument('yield_lateral_distance', default_value='0.75'),
+        DeclareLaunchArgument(
+            'follower_initial_x',
+            default_value='-1.05',
+            description='Follower start x in the leader Cartographer map frame (leader is origin).',
+        ),
+        DeclareLaunchArgument('follower_initial_y', default_value='0.0'),
+        DeclareLaunchArgument('follower_initial_yaw', default_value='0.0'),
         UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
         UnsetEnvironmentVariable('ROS_LOCALHOST_ONLY'),
         UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),
@@ -312,15 +326,16 @@ topics:
         SetEnvironmentVariable('TURTLEBOT3_MODEL', robot_model),
         LogInfo(
             msg=[
-                'REAL_BURGER_DOMAIN24 | hardware /odom,/scan,/cmd_vel | '
-                'Cartographer map owner | start_following=', start_following,
+                'REAL_BURGER_DOMAIN24 | follower | map_odom_localization initial=(',
+                follower_initial_x, ',', follower_initial_y, ',', follower_initial_yaw,
+                ') | map received from Domain25 via bridge | start_following=', start_following,
             ]
         ),
         TimerAction(
             period=0.5,
             actions=[OpaqueFunction(function=make_domain_bridges)],
         ),
-        TimerAction(period=2.0, actions=[cartographer, occupancy_grid]),
+        TimerAction(period=2.0, actions=[map_odom]),
         TimerAction(period=3.0, actions=[burger_pose]),
         TimerAction(
             period=4.0,
