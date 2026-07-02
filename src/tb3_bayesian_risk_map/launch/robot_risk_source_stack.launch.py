@@ -37,6 +37,11 @@ def generate_launch_description():
         'rviz',
         'slam_risk_live.rviz',
     ])
+    rviz_clean = PathJoinSubstitution([
+        FindPackageShare('tb3_bayesian_risk_map'),
+        'scripts',
+        'rviz2_clean_env.bash',
+    ])
 
     return LaunchDescription([
         DeclareLaunchArgument('domain_id', default_value='21'),
@@ -181,13 +186,16 @@ def generate_launch_description():
                 ),
             ],
         ),
-        Node(
+        ExecuteProcess(
             condition=IfCondition(LaunchConfiguration('start_robot_rviz')),
-            package='rviz2',
-            executable='rviz2',
+            cmd=[
+                rviz_clean,
+                '-d', LaunchConfiguration('rviz_config'),
+                '--ros-args',
+                '-r', '__node:=rviz2_robot_risk_source_stack',
+                '-p', ['use_sim_time:=', LaunchConfiguration('use_sim_time')],
+            ],
             name='rviz2_robot_risk_source_stack',
             output='screen',
-            arguments=['-d', LaunchConfiguration('rviz_config')],
-            parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time')}],
         ),
     ])
