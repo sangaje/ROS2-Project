@@ -40,7 +40,6 @@ class RandomWorldDetectionTest(FlexibleParameterNodeMixin, Node):
     def __init__(self):
         super().__init__('random_world_detection_test')
         self.output_topic = self.declare_parameter('output_topic', '/risk/yolo_detections').value
-        self.declare_parameter('use_sim_time', False)
         self.map_topic = self.declare_parameter('map_topic', '/map').value
         self.map_frame = self.declare_parameter('map_frame', 'map').value
         self.base_frame = self.declare_parameter('base_frame', 'base_link').value
@@ -253,9 +252,15 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
+        try:
+            node.destroy_node()
+        except KeyboardInterrupt:
+            pass
         if rclpy.ok():
-            rclpy.shutdown()
+            try:
+                rclpy.shutdown()
+            except KeyboardInterrupt:
+                pass
 
 
 if __name__ == '__main__':

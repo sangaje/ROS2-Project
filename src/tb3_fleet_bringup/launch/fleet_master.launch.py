@@ -66,7 +66,7 @@ def generate_launch_description():
 
         if is_slam:
             # SLAM mode: Cartographer is in burger (Domain 24). /map flows 24->25.
-            # Only bridge /leader_pose from waffle to burger (no /map from waffle).
+            # Bridge /leader_pose and /burger_goal_pose from waffle to burger.
             yaml_25_to_26 = f"""name: fleet_master_{waffle_domain}_to_{burger_domain}_slam
 from_domain: {waffle_domain}
 to_domain: {burger_domain}
@@ -79,8 +79,17 @@ topics:
       durability: volatile
       history: keep_last
       depth: 10
+  /burger_goal_pose:
+    type: geometry_msgs/msg/PoseStamped
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 10
 """
             # Bridge /map from burger (Cartographer) to waffle (for Nav2 + RViz).
+            # Use transient_local so the bridge receives Cartographer's latched map
+            # immediately on connect and re-publishes it latched to Domain 25.
             yaml_26_to_25 = f"""name: fleet_master_{burger_domain}_to_{waffle_domain}_slam
 from_domain: {burger_domain}
 to_domain: {waffle_domain}
@@ -97,19 +106,21 @@ topics:
     type: nav_msgs/msg/OccupancyGrid
     qos:
       reliability: reliable
-      durability: volatile
+      durability: transient_local
       history: keep_last
-      depth: 5
+      depth: 1
   /map_metadata:
     type: nav_msgs/msg/MapMetaData
     qos:
       reliability: reliable
-      durability: volatile
+      durability: transient_local
       history: keep_last
-      depth: 5
+      depth: 1
 """
         else:
             # Static map mode: /map comes from waffle (Domain 25) to burger (Domain 24).
+            # Use transient_local so the bridge receives the latched map immediately
+            # (map_server publishes TRANSIENT_LOCAL; volatile subscriber misses the latch).
             yaml_25_to_26 = f"""name: fleet_master_{waffle_domain}_to_{burger_domain}
 from_domain: {waffle_domain}
 to_domain: {burger_domain}
@@ -119,17 +130,24 @@ topics:
     type: nav_msgs/msg/OccupancyGrid
     qos:
       reliability: reliable
-      durability: volatile
+      durability: transient_local
       history: keep_last
-      depth: 5
+      depth: 1
   /map_metadata:
     type: nav_msgs/msg/MapMetaData
     qos:
       reliability: reliable
+      durability: transient_local
+      history: keep_last
+      depth: 1
+  /leader_pose:
+    type: geometry_msgs/msg/PoseStamped
+    qos:
+      reliability: reliable
       durability: volatile
       history: keep_last
-      depth: 5
-  /leader_pose:
+      depth: 10
+  /burger_goal_pose:
     type: geometry_msgs/msg/PoseStamped
     qos:
       reliability: reliable

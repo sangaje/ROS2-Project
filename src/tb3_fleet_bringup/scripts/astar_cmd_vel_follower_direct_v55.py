@@ -10,6 +10,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
 from rclpy.exceptions import ParameterAlreadyDeclaredException
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy, QoSHistoryPolicy
 
 from geometry_msgs.msg import PoseStamped, TwistStamped
 from nav_msgs.msg import OccupancyGrid, Path
@@ -142,7 +143,13 @@ class AStarCmdVelFollower(Node):
         self.last_status = ''
 
         qos = 10
-        self.create_subscription(OccupancyGrid, self.map_topic, self.on_map, qos)
+        map_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        self.create_subscription(OccupancyGrid, self.map_topic, self.on_map, map_qos)
         self.create_subscription(PoseStamped, self.robot_pose_topic, self.on_robot_pose, qos)
         self.create_subscription(PoseStamped, self.leader_pose_topic, self.on_leader_pose, qos)
         self.create_subscription(PoseStamped, self.manual_goal_topic, self.on_manual_goal, qos)

@@ -145,6 +145,15 @@ class FleetDebugMarker(Node):
             arr.markers.append(m)
         return arr
 
+    def _make_delete(self, ns: str, mid: int) -> Marker:
+        m = Marker()
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.header.frame_id = self.frame_id
+        m.ns = ns
+        m.id = mid
+        m.action = Marker.DELETE
+        return m
+
     def _tick(self) -> None:
         arr = MarkerArray()
         if self._fresh('waffle') and self.poses['waffle'] is not None:
@@ -152,11 +161,19 @@ class FleetDebugMarker(Node):
             arr.markers.append(self._make_body('waffle', 1, p, (0.38, 0.38, 0.18)))
             arr.markers.append(self._make_arrow('waffle', 2, p, 0.55))
             arr.markers.append(self._make_text('waffle', 3, p, 'waffle / domain25'))
+        elif self.last_seen['waffle'] is not None:
+            arr.markers.append(self._make_delete('waffle', 1))
+            arr.markers.append(self._make_delete('waffle_heading', 2))
+            arr.markers.append(self._make_delete('waffle_label', 3))
         if self._fresh('burger') and self.poses['burger'] is not None:
             p = self.poses['burger']
             arr.markers.append(self._make_body('burger', 11, p, (0.30, 0.30, 0.16)))
             arr.markers.append(self._make_arrow('burger', 12, p, 0.45))
             arr.markers.append(self._make_text('burger', 13, p, 'burger / domain24'))
+        elif self.last_seen['burger'] is not None:
+            arr.markers.append(self._make_delete('burger', 11))
+            arr.markers.append(self._make_delete('burger_heading', 12))
+            arr.markers.append(self._make_delete('burger_label', 13))
         if arr.markers:
             self.pub.publish(arr)
 

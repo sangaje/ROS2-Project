@@ -19,6 +19,7 @@ def generate_launch_description():
         DeclareLaunchArgument('max_det', default_value='64'),
         DeclareLaunchArgument('imgsz', default_value='640'),
         DeclareLaunchArgument('debug_jpeg_quality', default_value='80'),
+        DeclareLaunchArgument('max_capture_age_sec', default_value='1.5'),
         ExecuteProcess(
             cmd=[
                 exe,
@@ -33,6 +34,7 @@ def generate_launch_description():
                 '--max-det', LaunchConfiguration('max_det'),
                 '--imgsz', LaunchConfiguration('imgsz'),
                 '--debug-jpeg-quality', LaunchConfiguration('debug_jpeg_quality'),
+                '--max-capture-age-sec', LaunchConfiguration('max_capture_age_sec'),
                 '--person-only',
             ],
             output='screen',

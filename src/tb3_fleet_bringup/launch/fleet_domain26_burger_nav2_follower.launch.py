@@ -75,6 +75,8 @@ topics:
 """
         else:
             # Static map mode: /map comes from waffle (leader) domain to burger domain.
+            # Use transient_local so the bridge receives the latched map from map_server
+            # immediately on connect (map_server publishes TRANSIENT_LOCAL).
             shared_yaml = f"""name: shared_slam_map_leader_goal_{leader_domain}_to_{burger_domain}_v55
 from_domain: {leader_domain}
 to_domain: {burger_domain}
@@ -84,16 +86,16 @@ topics:
     type: nav_msgs/msg/OccupancyGrid
     qos:
       reliability: reliable
-      durability: volatile
+      durability: transient_local
       history: keep_last
-      depth: 5
+      depth: 1
   /map_metadata:
     type: nav_msgs/msg/MapMetaData
     qos:
       reliability: reliable
-      durability: volatile
+      durability: transient_local
       history: keep_last
-      depth: 5
+      depth: 1
   /leader_pose:
     type: geometry_msgs/msg/PoseStamped
     qos:
@@ -174,19 +176,18 @@ topics:
                 parameters=[{'use_sim_time': True}],
                 arguments=['-resolution', '0.05', '-publish_period_sec', '1.0'],
             )
+            # Use TF lookup (map→base_footprint) so position stays accurate
+            # after Cartographer loop-closure corrections update map→odom.
             slam_burger_pose = ExecuteProcess(
-                cmd=['python3', leader_pose_script, '--ros-args',
-                     '-r', '__node:=burger_pose_publisher',
+                cmd=['python3', tf_pose_script, '--ros-args',
+                     '-r', '__node:=burger_pose_tf_publisher',
                      '-p', 'use_sim_time:=true',
-                     '-p', 'odom_topic:=/odom_nav',
-                     '-p', 'leader_pose_topic:=/burger_pose',
-                     '-p', 'output_frame_id:=map',
-                     '-p', 'initial_x:=0.0',
-                     '-p', 'initial_y:=0.0',
-                     '-p', 'initial_yaw:=0.0',
-                     '-p', 'apply_initial_offset:=false',
+                     '-p', 'target_frame:=map',
+                     '-p', 'source_frame:=base_footprint',
+                     '-p', 'output_topic:=/burger_pose',
+                     '-p', 'publish_rate_hz:=10.0',
                      '-p', 'log_every_n:=100'],
-                output='screen', name='burger_slam_pose_publisher',
+                output='screen', name='burger_slam_tf_pose_publisher',
             )
             return [slam_cartographer, slam_occ_grid, slam_burger_pose]
         return [map_odom_localization, burger_pose]
@@ -251,7 +252,7 @@ topics:
         DeclareLaunchArgument('burger_x', default_value='-3.20'),
         DeclareLaunchArgument('burger_y', default_value='-1.75'),
         DeclareLaunchArgument('burger_yaw', default_value='0.0'),
-        DeclareLaunchArgument('map_origin_x', default_value='-2.25', description='Static map mode only: map frame origin x.'),
+        DeclareLaunchArgument('map_origin_x', default_value='-3.20', description='Static map mode only: map frame origin x (= burger spawn = SLAM map origin).'),
         DeclareLaunchArgument('map_origin_y', default_value='-1.75', description='Static map mode only: map frame origin y.'),
         DeclareLaunchArgument('map_origin_yaw', default_value='0.0', description='Static map mode only: map frame origin yaw.'),
         DeclareLaunchArgument('auto_follow', default_value='true', description='Nav2 mode only: true means Burger follows /leader_pose with NavigateToPose goals.'),

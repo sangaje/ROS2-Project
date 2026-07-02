@@ -9,6 +9,7 @@ from typing import List, Optional, Tuple
 import rclpy
 from rclpy.node import Node
 from rclpy.exceptions import ParameterAlreadyDeclaredException
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy, QoSHistoryPolicy
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import OccupancyGrid
 
@@ -93,7 +94,13 @@ class FleetGoalDispatcher(Node):
                 continue
             seen_alias.add(topic)
             self._alias_subs.append(self.create_subscription(PoseStamped, topic, lambda msg, src=topic: self._on_fleet_goal(msg, src), 10))
-        self.create_subscription(OccupancyGrid, self.map_topic, self._on_map, 10)
+        map_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        self.create_subscription(OccupancyGrid, self.map_topic, self._on_map, map_qos)
         self.create_subscription(PoseStamped, self.waffle_pose_topic, self._on_waffle_pose, 10)
         self.create_subscription(PoseStamped, self.burger_pose_topic, self._on_burger_pose, 10)
         self.timer = self.create_timer(max(0.05, self.republish_period_sec), self._republish_pending)

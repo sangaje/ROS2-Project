@@ -577,6 +577,18 @@ def build_app(args):
         t0 = time.perf_counter()
         if 'image' not in request.files:
             return jsonify({'ok': False, 'error': 'missing multipart file field: image'}), 400
+        capture_wall_sec_early = float(request.form.get('capture_wall_sec') or 0.0)
+        if args.max_capture_age_sec > 0.0 and capture_wall_sec_early > 0.0:
+            early_age_sec = time.time() - capture_wall_sec_early
+            if early_age_sec > args.max_capture_age_sec:
+                return jsonify({
+                    'ok': False,
+                    'stale': True,
+                    'error': 'stale frame rejected before inference',
+                    'capture_age_ms': max(0.0, early_age_sec * 1000.0),
+                    'max_capture_age_ms': args.max_capture_age_sec * 1000.0,
+                    'detections': [],
+                })
         try:
             t_decode0 = time.perf_counter()
             original_jpeg, frame = _decode_image(request.files['image'])
@@ -621,16 +633,17 @@ def build_app(args):
                     'label': str(names.get(class_id, class_id)),
                 })
 
-        capture_ros_sec = float(
-            request.form.get('capture_ros_sec')
-            or request.form.get('capture_wall_sec')
-            or 0.0
-        )
-        wall_delta_sec = time.time() - capture_ros_sec if capture_ros_sec > 0.0 else -1.0
+        capture_ros_sec = float(request.form.get('capture_ros_sec') or 0.0)
+        capture_wall_sec = float(request.form.get('capture_wall_sec') or 0.0)
+        robot_frame_age_ms_at_send = float(request.form.get('robot_frame_age_ms_at_send') or -1.0)
+        age_reference_sec = capture_wall_sec or capture_ros_sec
+        wall_delta_sec = time.time() - age_reference_sec if age_reference_sec > 0.0 else -1.0
         capture_age_ms = (
             max(0.0, wall_delta_sec * 1000.0)
             if 0.0 <= wall_delta_sec <= 60.0 else -1.0
         )
+        if capture_age_ms < 0.0 and robot_frame_age_ms_at_send >= 0.0:
+            capture_age_ms = robot_frame_age_ms_at_send
         overlay = _draw_yolo_overlay(frame, detections, predict_ms)
         annotated_jpeg = _encode_jpeg(overlay, args.debug_jpeg_quality)
         post_ms = (time.perf_counter() - t_post0) * 1000.0
@@ -650,6 +663,8 @@ def build_app(args):
             'post_ms': post_ms,
             'capture_age_ms': capture_age_ms,
             'capture_ros_sec': capture_ros_sec,
+            'capture_wall_sec': capture_wall_sec,
+            'robot_frame_age_ms_at_send': robot_frame_age_ms_at_send,
             'image_width': int(w),
             'image_height': int(h),
             'detections': detections,
@@ -677,6 +692,7 @@ def parse_args():
     parser.add_argument('--max-det', type=int, default=64)
     parser.add_argument('--imgsz', type=int, default=640)
     parser.add_argument('--debug-jpeg-quality', type=int, default=80)
+    parser.add_argument('--max-capture-age-sec', type=float, default=1.5)
     parser.add_argument('--person-only', action='store_true', default=True)
     parser.add_argument('--all-classes', action='store_false', dest='person_only')
     return parser.parse_args()

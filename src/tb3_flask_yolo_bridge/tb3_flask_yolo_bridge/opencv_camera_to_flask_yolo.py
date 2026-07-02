@@ -11,6 +11,7 @@ import requests
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, DurabilityPolicy, HistoryPolicy, ReliabilityPolicy
 from std_msgs.msg import String
 
 from tb3_flask_yolo_bridge.ros_param_helpers import FlexibleParameterNodeMixin
@@ -44,15 +45,31 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         self.max_rate_hz = float(self.declare_parameter('max_rate_hz', 5.0).value)
         self.jpeg_quality = int(self.declare_parameter('jpeg_quality', 60).value)
         self.timeout_sec = float(self.declare_parameter('timeout_sec', 1.0).value)
+        self.max_http_roundtrip_sec = float(
+            self.declare_parameter('max_http_roundtrip_sec', 1.0).value
+        )
+        self.max_frame_age_sec = float(
+            self.declare_parameter('max_frame_age_sec', 1.2).value
+        )
         self.log_period_sec = float(self.declare_parameter('log_period_sec', 2.0).value)
         self.publish_empty_detections = self.declare_bool_parameter('publish_empty_detections', True)
 
-        self.pub = self.create_publisher(String, self.output_topic, 10)
+        self.pub = self.create_publisher(
+            String,
+            self.output_topic,
+            QoSProfile(
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                durability=DurabilityPolicy.VOLATILE,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=1,
+            ),
+        )
         self.http = requests.Session()
 
         self.frame_condition = threading.Condition()
         self.latest_frame = None
         self.latest_capture_sec = 0.0
+        self.latest_capture_mono_sec = 0.0
         self.latest_seq = 0
         self.sent_seq = 0
         self.stop_threads = False
@@ -100,7 +117,10 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             f'capture_request={self.width}x{self.height} send={self.send_width}x{self.send_height} '
             f'camera_fps={self.camera_fps:.1f} fourcc={self.fourcc or "default"} '
             f'server={self.server_url} out={self.output_topic} rate={self.max_rate_hz:.2f}Hz '
-            f'jpeg_quality={self.jpeg_quality} latest_frame_only=true ros_image_publish=false'
+            f'jpeg_quality={self.jpeg_quality} timeout={self.timeout_sec:.2f}s '
+            f'max_http_roundtrip={self.max_http_roundtrip_sec:.2f}s '
+            f'max_frame_age={self.max_frame_age_sec:.2f}s '
+            f'latest_frame_only=true ros_image_publish=false'
         )
 
     def capture_loop(self):
@@ -115,11 +135,13 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
                 time.sleep(0.02)
                 continue
             capture_sec = self.get_clock().now().nanoseconds * 1e-9
+            capture_mono_sec = time.monotonic()
             with self.frame_condition:
                 if self.latest_frame is not None and self.latest_seq != self.sent_seq:
                     self.drop_count += 1
                 self.latest_frame = frame
                 self.latest_capture_sec = capture_sec
+                self.latest_capture_mono_sec = capture_mono_sec
                 self.latest_seq += 1
                 self.rx_count += 1
                 self.frame_condition.notify()
@@ -134,12 +156,17 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
                     and now >= next_allowed
                 ):
                     self.sent_seq = self.latest_seq
-                    return self.latest_frame.copy(), self.latest_capture_sec, self.latest_seq
-                timeout = 0.5
+                    return (
+                        self.latest_frame.copy(),
+                        self.latest_capture_sec,
+                        self.latest_capture_mono_sec,
+                        self.latest_seq,
+                    )
+                timeout = 0.1
                 if self.latest_frame is not None and now < next_allowed:
-                    timeout = max(0.001, min(0.5, next_allowed - now))
+                    timeout = max(0.001, min(0.1, next_allowed - now))
                 self.frame_condition.wait(timeout=timeout)
-        return None, 0.0, 0
+        return None, 0.0, 0.0, 0
 
     def encode_jpeg(self, frame) -> bytes:
         import cv2
@@ -162,12 +189,12 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         period = 1.0 / self.max_rate_hz if self.max_rate_hz > 0.0 else 0.0
         next_allowed = 0.0
         while not self.stop_threads:
-            frame, capture_sec, seq = self.wait_latest_frame(next_allowed)
+            frame, capture_sec, capture_mono_sec, seq = self.wait_latest_frame(next_allowed)
             if frame is None:
                 continue
             next_allowed = time.monotonic() + period
             try:
-                self.post_frame(frame, capture_sec, seq)
+                self.post_frame(frame, capture_sec, capture_mono_sec, seq)
             except Exception as exc:
                 self.fail_count += 1
                 self.get_logger().warn(
@@ -176,17 +203,61 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
                 )
                 self.log_periodic()
 
-    def post_frame(self, frame, capture_sec: float, seq: int):
+    def post_frame(self, frame, capture_sec: float, capture_mono_sec: float, seq: int):
+        frame_age_before_send = time.monotonic() - capture_mono_sec if capture_mono_sec > 0.0 else 0.0
+        if self.max_frame_age_sec > 0.0 and frame_age_before_send > self.max_frame_age_sec:
+            self.drop_count += 1
+            self.get_logger().warn(
+                f'dropped stale frame before send: age={frame_age_before_send:.3f}s '
+                f'limit={self.max_frame_age_sec:.3f}s seq={seq}',
+                throttle_duration_sec=2.0,
+            )
+            self.log_periodic()
+            return
+
         jpeg, w, h = self.encode_jpeg(frame)
         self.sent_count += 1
         files = {'image': ('frame.jpg', jpeg, 'image/jpeg')}
         data = {
             'frame_id': self.frame_id,
             'capture_ros_sec': f'{capture_sec:.9f}' if capture_sec > 0.0 else '',
+            'capture_wall_sec': f'{time.time() - frame_age_before_send:.9f}',
+            'robot_frame_age_ms_at_send': f'{frame_age_before_send * 1000.0:.3f}',
         }
+        request_start = time.monotonic()
         resp = self.http.post(self.server_url, files=files, data=data, timeout=self.timeout_sec)
+        roundtrip_sec = time.monotonic() - request_start
         resp.raise_for_status()
         payload = resp.json()
+        if not payload.get('ok', True) or payload.get('stale', False):
+            self.drop_count += 1
+            self.get_logger().warn(
+                f'dropped server-rejected YOLO frame: stale={payload.get("stale", False)} '
+                f'error={payload.get("error", "unknown")} seq={seq}',
+                throttle_duration_sec=2.0,
+            )
+            self.log_periodic()
+            return
+
+        total_frame_age_sec = time.monotonic() - capture_mono_sec if capture_mono_sec > 0.0 else roundtrip_sec
+        if self.max_http_roundtrip_sec > 0.0 and roundtrip_sec > self.max_http_roundtrip_sec:
+            self.drop_count += 1
+            self.get_logger().warn(
+                f'dropped stale YOLO response: roundtrip={roundtrip_sec:.3f}s '
+                f'limit={self.max_http_roundtrip_sec:.3f}s seq={seq}',
+                throttle_duration_sec=2.0,
+            )
+            self.log_periodic()
+            return
+        if self.max_frame_age_sec > 0.0 and total_frame_age_sec > self.max_frame_age_sec:
+            self.drop_count += 1
+            self.get_logger().warn(
+                f'dropped stale YOLO result: frame_age={total_frame_age_sec:.3f}s '
+                f'limit={self.max_frame_age_sec:.3f}s seq={seq}',
+                throttle_duration_sec=2.0,
+            )
+            self.log_periodic()
+            return
 
         detections = payload.get('detections', [])
         if detections or self.publish_empty_detections:
@@ -195,6 +266,8 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             payload['ros_frame_id'] = self.frame_id
             payload['capture_ros_sec'] = capture_sec
             payload['robot_bridge_wall_sec'] = time.time()
+            payload['robot_frame_age_ms'] = total_frame_age_sec * 1000.0
+            payload['http_roundtrip_ms'] = roundtrip_sec * 1000.0
             payload['robot_frame_seq'] = int(seq)
 
             msg = String()

@@ -1,5 +1,5 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, SetEnvironmentVariable
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -19,6 +19,8 @@ def generate_launch_description():
         DeclareLaunchArgument('min_range_m', default_value='0.5'),
         DeclareLaunchArgument('max_range_m', default_value='5.0'),
         DeclareLaunchArgument('use_map_free_cells', default_value='true'),
+        SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp'),
+        SetEnvironmentVariable('FASTDDS_BUILTIN_TRANSPORTS', 'UDPv4'),
         Node(
             package='tb3_flask_yolo_bridge',
             executable='random_world_detection_test',

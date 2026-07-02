@@ -28,10 +28,14 @@ def generate_launch_description():
     central_domain_id = LaunchConfiguration('central_domain_id')
     source_domain_id = LaunchConfiguration('source_domain_id')
     risk_sink_domain_ids = LaunchConfiguration('risk_sink_domain_ids')
+    bridge_rviz_topics = LaunchConfiguration('bridge_rviz_topics')
 
     def _write_bridge_configs(context, *args, **kwargs):
         central_domain = central_domain_id.perform(context)
         source_domain = source_domain_id.perform(context)
+        include_rviz_topics = bridge_rviz_topics.perform(context).strip().lower() in (
+            '1', 'true', 'yes', 'on'
+        )
         sink_domains = [
             item.strip()
             for item in risk_sink_domain_ids.perform(context).split(',')
@@ -48,14 +52,15 @@ to_domain: {central_domain}
 
 topics:
 """
-        source_yaml += _topic_block('/clock', 'rosgraph_msgs/msg/Clock', reliability='best_effort', depth=10)
-        source_yaml += _topic_block('/map', 'nav_msgs/msg/OccupancyGrid', depth=5)
-        source_yaml += _topic_block('/tf', 'tf2_msgs/msg/TFMessage', reliability='best_effort', depth=100)
-        source_yaml += _topic_block('/tf_static', 'tf2_msgs/msg/TFMessage', durability='transient_local', depth=1)
-        source_yaml += _topic_block('/scan', 'sensor_msgs/msg/LaserScan', reliability='best_effort', depth=10)
-        source_yaml += _topic_block('/odom', 'nav_msgs/msg/Odometry', depth=10)
-        source_yaml += _topic_block('/leader_pose', 'geometry_msgs/msg/PoseStamped', depth=10)
-        source_yaml += _topic_block('/risk/yolo_detections', 'std_msgs/msg/String', depth=10)
+        source_yaml += _topic_block('/clock', 'rosgraph_msgs/msg/Clock', reliability='best_effort', depth=1)
+        source_yaml += _topic_block('/map', 'nav_msgs/msg/OccupancyGrid', depth=1)
+        if include_rviz_topics:
+            source_yaml += _topic_block('/tf', 'tf2_msgs/msg/TFMessage', reliability='best_effort', depth=20)
+            source_yaml += _topic_block('/tf_static', 'tf2_msgs/msg/TFMessage', durability='transient_local', depth=1)
+            source_yaml += _topic_block('/scan', 'sensor_msgs/msg/LaserScan', reliability='best_effort', depth=3)
+            source_yaml += _topic_block('/odom', 'nav_msgs/msg/Odometry', depth=3)
+        source_yaml += _topic_block('/leader_pose', 'geometry_msgs/msg/PoseStamped', depth=1)
+        source_yaml += _topic_block('/risk/yolo_detections', 'std_msgs/msg/String', reliability='best_effort', depth=1)
         source_to_central.write_text(source_yaml, encoding='utf-8')
 
         actions = [
@@ -129,6 +134,17 @@ topics:
         ],
     )
 
+    map_frame_anchor = ExecuteProcess(
+        cmd=[
+            'ros2', 'run', 'tf2_ros', 'static_transform_publisher',
+            '0', '0', '0', '0', '0', '0',
+            LaunchConfiguration('map_frame'),
+            'risk_map_anchor',
+        ],
+        output='screen',
+        name='risk_map_frame_anchor',
+    )
+
     return LaunchDescription([
         DeclareLaunchArgument('central_domain_id', default_value='20'),
         DeclareLaunchArgument('source_domain_id', default_value='21'),
@@ -136,6 +152,7 @@ topics:
         DeclareLaunchArgument('use_sim_time', default_value='false'),
         DeclareLaunchArgument('start_domain_bridges', default_value='true'),
         DeclareLaunchArgument('start_risk_map', default_value='true'),
+        DeclareLaunchArgument('bridge_rviz_topics', default_value='false'),
         DeclareLaunchArgument('config_file', default_value=default_config),
         DeclareLaunchArgument('map_topic', default_value='/map'),
         DeclareLaunchArgument('map_frame', default_value='map'),
@@ -154,7 +171,7 @@ topics:
         SetEnvironmentVariable('FASTDDS_BUILTIN_TRANSPORTS', 'UDPv4'),
         TimerAction(
             period=0.5,
-            actions=[OpaqueFunction(function=_write_bridge_configs)],
+            actions=[map_frame_anchor, OpaqueFunction(function=_write_bridge_configs)],
             condition=IfCondition(LaunchConfiguration('start_domain_bridges')),
         ),
         TimerAction(period=1.5, actions=[risk_node]),

@@ -384,12 +384,29 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
         )
+        self.qos_latest_best_effort = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        self.qos_latest_reliable = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
 
         # IO
         self.map_sub = self.create_subscription(OccupancyGrid, self.map_topic, self.on_map, self.qos_map_sub)
         self.pose_sub = None
         if self.pose_source in ('topic', 'pose_topic', 'pose'):
-            self.pose_sub = self.create_subscription(PoseStamped, self.pose_topic, self.on_pose_topic, 10)
+            self.pose_sub = self.create_subscription(
+                PoseStamped,
+                self.pose_topic,
+                self.on_pose_topic,
+                self.qos_latest_reliable,
+            )
         self.image_sub = None
         self.external_detection_sub = None
         self.use_opencv_camera = False
@@ -402,7 +419,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                 String,
                 self.external_detection_topic,
                 self.on_external_detections,
-                10,
+                self.qos_latest_best_effort,
             )
             self.enable_yolo = False
         elif self.detection_source in ('none', 'fake'):
@@ -415,7 +432,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                 String,
                 self.external_detection_topic,
                 self.on_external_detections,
-                10,
+                self.qos_latest_best_effort,
             )
             self.enable_yolo = False
         self.clear_point_sub = self.create_subscription(PointStamped, '/risk/clear_point', self.on_clear_point, 10)
@@ -2170,9 +2187,15 @@ def main(args=None):
                 cv2.destroyAllWindows()
             except Exception:
                 pass
-        node.destroy_node()
+        try:
+            node.destroy_node()
+        except KeyboardInterrupt:
+            pass
         if rclpy.ok():
-            rclpy.shutdown()
+            try:
+                rclpy.shutdown()
+            except KeyboardInterrupt:
+                pass
 
 
 if __name__ == '__main__':

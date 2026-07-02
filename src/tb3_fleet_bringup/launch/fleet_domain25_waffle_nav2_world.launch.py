@@ -193,7 +193,7 @@ def generate_launch_description():
     _clean_ld = ':'.join(p for p in _raw_ld.split(':') if p and '/snap/' not in p)
 
     gz_sim = ExecuteProcess(
-        cmd=['gz', 'sim', '-r', '-s', '-v', gz_verbosity, world],
+        cmd=['gz', 'sim', '-r', '-v', gz_verbosity, world],
         output='screen',
         name='gz_sim_v41',
         additional_env={'LD_LIBRARY_PATH': _clean_ld},
@@ -277,6 +277,16 @@ def generate_launch_description():
             return []
         return [map_server, map_lifecycle]
 
+    # OpaqueFunction: Domain 25 burger observer nodes.
+    # SLAM mode: burger pose + TF come from Domain 24 (Cartographer) via fleet_master bridge.
+    #   Running these here would publish /burger_pose at wrong offset (burger_x - waffle_x = -0.95)
+    #   conflicting with Domain 24's correct bridge → causes marker teleporting.
+    # Static-map mode: Domain 25 handles burger pose locally from Gazebo odom.
+    def _make_burger_domain25_nodes(context, *args, **kwargs):
+        if use_slam.perform(context) == 'true':
+            return []
+        return [burger_frame_tools, burger_pose]
+
     controller_server = Node(package='nav2_controller', executable='controller_server', name='controller_server', output='screen', parameters=[nav2_params])
     planner_server = Node(package='nav2_planner', executable='planner_server', name='planner_server', output='screen', parameters=[nav2_params])
     behavior_server = Node(package='nav2_behaviors', executable='behavior_server', name='behavior_server', output='screen', parameters=[nav2_params])
@@ -315,7 +325,8 @@ def generate_launch_description():
         TimerAction(period=2.0, actions=[converter, bridge, burger_converter, burger_bridge]),
         TimerAction(period=3.0, actions=[spawn_burger]),
         TimerAction(period=5.0, actions=[spawn_waffle]),
-        TimerAction(period=7.0, actions=[frame_tools, burger_frame_tools, burger_pose]),
+        TimerAction(period=7.0, actions=[frame_tools]),
+        TimerAction(period=7.0, actions=[OpaqueFunction(function=_make_burger_domain25_nodes)]),
         TimerAction(period=8.0, actions=[OpaqueFunction(function=_make_localization)]),
         TimerAction(period=10.0, actions=[OpaqueFunction(function=_make_static_map)]),
         TimerAction(period=16.0, actions=[controller_server, planner_server, behavior_server, bt_navigator]),
