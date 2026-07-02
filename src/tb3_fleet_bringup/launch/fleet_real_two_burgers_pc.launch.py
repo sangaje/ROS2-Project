@@ -27,44 +27,54 @@ def generate_launch_description():
 
     leader_use_slam   = PythonExpression(["'true' if '", slam_domain, "' == '25' else 'false'"])
     follower_use_slam = PythonExpression(["'true' if '", slam_domain, "' == '24' else 'false'"])
+    slam_on_leader    = PythonExpression(["'", slam_domain, "' == '25'"])
+    slam_on_follower  = PythonExpression(["'", slam_domain, "' == '24'"])
 
-    follower = ExecuteProcess(
-        cmd=[
-            'ros2', 'launch', 'tb3_fleet_bringup',
-            'fleet_real_domain24_burger_nav2_follower.launch.py',
-            'domain_id:=24',
-            'leader_domain_id:=25',
-            ['use_slam:=',    follower_use_slam],
-            ['slam_domain:=', slam_domain],
-            ['start_following:=',    start_following],
-            ['follow_distance:=',    follow_distance],
-            'enable_path_yield:=true',
-            'path_block_distance:=0.55',
-            'yield_lateral_distance:=0.75',
-            ['follower_initial_x:=',   follower_initial_x],
-            ['follower_initial_y:=',   follower_initial_y],
-            ['follower_initial_yaw:=', follower_initial_yaw],
-            ['robot1_ip:=', robot1_ip],
-            ['robot2_ip:=', robot2_ip],
-        ],
-        output='screen',
-        name='two_burgers_follower_stack',
-    )
-    leader = ExecuteProcess(
-        cmd=[
-            'ros2', 'launch', 'tb3_fleet_bringup',
-            'fleet_real_domain25_burger_nav2.launch.py',
-            'domain_id:=25',
-            ['use_slam:=',    leader_use_slam],
-            ['initial_x:=',   leader_initial_x],
-            ['initial_y:=',   leader_initial_y],
-            ['initial_yaw:=', leader_initial_yaw],
-            ['robot1_ip:=', robot1_ip],
-            ['robot2_ip:=', robot2_ip],
-        ],
-        output='screen',
-        name='two_burgers_leader_stack',
-    )
+    def make_follower(name):
+        return ExecuteProcess(
+            cmd=[
+                'ros2', 'launch', 'tb3_fleet_bringup',
+                'fleet_real_domain24_burger_nav2_follower.launch.py',
+                'domain_id:=24',
+                'leader_domain_id:=25',
+                ['use_slam:=',    follower_use_slam],
+                ['slam_domain:=', slam_domain],
+                ['start_following:=',    start_following],
+                ['follow_distance:=',    follow_distance],
+                'enable_path_yield:=true',
+                'path_block_distance:=0.55',
+                'yield_lateral_distance:=0.75',
+                ['follower_initial_x:=',   follower_initial_x],
+                ['follower_initial_y:=',   follower_initial_y],
+                ['follower_initial_yaw:=', follower_initial_yaw],
+                ['robot1_ip:=', robot1_ip],
+                ['robot2_ip:=', robot2_ip],
+            ],
+            output='screen',
+            name=name,
+        )
+
+    def make_leader(name):
+        return ExecuteProcess(
+            cmd=[
+                'ros2', 'launch', 'tb3_fleet_bringup',
+                'fleet_real_domain25_burger_nav2.launch.py',
+                'domain_id:=25',
+                ['use_slam:=',    leader_use_slam],
+                ['initial_x:=',   leader_initial_x],
+                ['initial_y:=',   leader_initial_y],
+                ['initial_yaw:=', leader_initial_yaw],
+                ['robot1_ip:=', robot1_ip],
+                ['robot2_ip:=', robot2_ip],
+            ],
+            output='screen',
+            name=name,
+        )
+
+    leader_slam_first = make_leader('two_burgers_leader_stack_slam_first')
+    follower_after_leader_slam = make_follower('two_burgers_follower_stack_after_leader_slam')
+    follower_slam_first = make_follower('two_burgers_follower_stack_slam_first')
+    leader_after_follower_slam = make_leader('two_burgers_leader_stack_after_follower_slam')
     rviz = ExecuteProcess(
         cmd=[
             'ros2', 'launch', 'tb3_fleet_bringup',
@@ -100,7 +110,10 @@ def generate_launch_description():
         LogInfo(msg=['REAL_TWO_BURGERS_PC | slam_domain=', slam_domain,
                      ' | start_following=', start_following,
                      ' | robot1=', robot1_ip, ' robot2=', robot2_ip]),
-        follower,
-        TimerAction(period=2.0, actions=[leader]),
-        TimerAction(period=5.0, actions=[rviz]),
+        LogInfo(msg='REAL_TWO_BURGERS_PC | start order: SLAM domain first, follower/AMCL second, RViz after map warmup.'),
+        TimerAction(period=0.0, actions=[leader_slam_first], condition=IfCondition(slam_on_leader)),
+        TimerAction(period=8.0, actions=[follower_after_leader_slam], condition=IfCondition(slam_on_leader)),
+        TimerAction(period=0.0, actions=[follower_slam_first], condition=IfCondition(slam_on_follower)),
+        TimerAction(period=8.0, actions=[leader_after_follower_slam], condition=IfCondition(slam_on_follower)),
+        TimerAction(period=18.0, actions=[rviz]),
     ])

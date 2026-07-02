@@ -49,6 +49,7 @@ def generate_launch_description():
         xml_path = Path(tempfile.gettempdir()) / f'fastdds_fleet_rviz_d{d}.xml'
         xml_path.write_text(xml, encoding='utf-8')
         return [
+            SetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE', str(xml_path)),
             SetEnvironmentVariable('FASTDDS_DEFAULT_PROFILES_FILE', str(xml_path)),
             SetEnvironmentVariable('ROS_STATIC_PEERS', f'{r1};{r2}'),
         ]
@@ -86,6 +87,7 @@ def generate_launch_description():
         UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
         UnsetEnvironmentVariable('ROS_LOCALHOST_ONLY'),
         UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),
+        UnsetEnvironmentVariable('FASTDDS_DEFAULT_PROFILES_FILE'),
         SetEnvironmentVariable('ROS_DOMAIN_ID',               domain_id),
         SetEnvironmentVariable('RMW_IMPLEMENTATION',          'rmw_fastrtps_cpp'),
         SetEnvironmentVariable('FASTDDS_BUILTIN_TRANSPORTS',  'UDPv4'),
