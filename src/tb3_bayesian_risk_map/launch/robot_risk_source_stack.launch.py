@@ -56,7 +56,7 @@ def generate_launch_description():
         DeclareLaunchArgument('pose_publisher_start_delay_sec', default_value='18.0'),
         DeclareLaunchArgument('rviz_config', default_value=rviz_config),
 
-        DeclareLaunchArgument('server_url', default_value='http://100.96.193.2:5005/detect'),
+        DeclareLaunchArgument('server_url', default_value='http://10.10.14.58:5005/detect'),
 
         DeclareLaunchArgument('camera_device', default_value='/dev/video1'),
         DeclareLaunchArgument('camera_fallback_devices', default_value='/dev/video1,/dev/video0,/dev/video2,/dev/video3'),
