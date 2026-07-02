@@ -1,8 +1,9 @@
 -- Cartographer config for combined robot risk runs.
 -- It avoids subscribing to /odom so startup-time odom timestamp jitter cannot
 -- abort Cartographer with "Non-sorted data added to queue".
--- TurtleBot3 still publishes odom->base_footprint TF; Cartographer publishes
--- map->odom from scan matching, keeping the normal map->odom->base_footprint tree.
+-- The robot launch uses turtlebot3_burger_no_odom_tf.yaml so OpenCR odometry
+-- does not publish odom->base_footprint. Cartographer owns the normal
+-- map->odom->base_footprint tree from scan matching.
 
 include "map_builder.lua"
 include "trajectory_builder.lua"
@@ -12,9 +13,9 @@ options = {
   trajectory_builder = TRAJECTORY_BUILDER,
   map_frame = "map",
   tracking_frame = "base_footprint",
-  published_frame = "odom",
+  published_frame = "base_footprint",
   odom_frame = "odom",
-  provide_odom_frame = false,
+  provide_odom_frame = true,
   publish_frame_projected_to_2d = true,
   use_odometry = false,
   use_nav_sat = false,
@@ -35,6 +36,7 @@ options = {
 }
 
 MAP_BUILDER.use_trajectory_builder_2d = true
+MAP_BUILDER.num_background_threads = 4
 
 TRAJECTORY_BUILDER_2D.min_range = 0.12
 TRAJECTORY_BUILDER_2D.max_range = 3.5
@@ -45,5 +47,6 @@ TRAJECTORY_BUILDER_2D.motion_filter.max_angle_radians = math.rad(0.1)
 
 POSE_GRAPH.constraint_builder.min_score = 0.65
 POSE_GRAPH.constraint_builder.global_localization_min_score = 0.7
+POSE_GRAPH.optimization_problem.ceres_solver_options.max_num_iterations = 10
 
 return options

@@ -27,6 +27,11 @@ def generate_launch_description():
         FindPackageShare('tb3_bayesian_risk_map'),
         'config',
     ])
+    default_tb3_param_dir = PathJoinSubstitution([
+        FindPackageShare('tb3_bayesian_risk_map'),
+        'config',
+        'turtlebot3_burger_no_odom_tf.yaml',
+    ])
     rviz_config = PathJoinSubstitution([
         FindPackageShare('tb3_bayesian_risk_map'),
         'rviz',
@@ -37,6 +42,8 @@ def generate_launch_description():
         DeclareLaunchArgument('domain_id', default_value='21'),
         DeclareLaunchArgument('use_sim_time', default_value='false'),
         DeclareLaunchArgument('turtlebot3_model', default_value='burger'),
+        DeclareLaunchArgument('lds_model', default_value='LDS-02'),
+        DeclareLaunchArgument('tb3_param_dir', default_value=default_tb3_param_dir),
 
         DeclareLaunchArgument('start_robot_bringup', default_value='true'),
         DeclareLaunchArgument('start_cartographer', default_value='true'),
@@ -49,7 +56,7 @@ def generate_launch_description():
         DeclareLaunchArgument('pose_publisher_start_delay_sec', default_value='18.0'),
         DeclareLaunchArgument('rviz_config', default_value=rviz_config),
 
-        DeclareLaunchArgument('server_url', default_value='http://100.96.193.2:5005/detect'),
+        DeclareLaunchArgument('server_url', default_value='http://10.10.14.58:5005/detect'),
 
         DeclareLaunchArgument('camera_device', default_value='/dev/video1'),
         DeclareLaunchArgument('camera_fallback_devices', default_value='/dev/video1,/dev/video0,/dev/video2,/dev/video3'),
@@ -84,11 +91,15 @@ def generate_launch_description():
         SetEnvironmentVariable('ROS_LOCALHOST_ONLY', '0'),
         SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', 'SUBNET'),
         SetEnvironmentVariable('TURTLEBOT3_MODEL', LaunchConfiguration('turtlebot3_model')),
+        SetEnvironmentVariable('LDS_MODEL', LaunchConfiguration('lds_model')),
 
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(robot_launch),
             condition=IfCondition(LaunchConfiguration('start_robot_bringup')),
-            launch_arguments={'use_sim_time': LaunchConfiguration('use_sim_time')}.items(),
+            launch_arguments={
+                'use_sim_time': LaunchConfiguration('use_sim_time'),
+                'tb3_param_dir': LaunchConfiguration('tb3_param_dir'),
+            }.items(),
         ),
         TimerAction(
             period=LaunchConfiguration('cartographer_start_delay_sec'),
