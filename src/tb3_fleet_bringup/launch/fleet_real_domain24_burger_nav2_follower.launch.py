@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 
+import math
 import os
 import tempfile
 from pathlib import Path
 
+import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (
@@ -36,7 +38,7 @@ def generate_launch_description():
     follower_initial_yaw = LaunchConfiguration('follower_initial_yaw')
 
     nav2_source = os.path.join(
-        bringup_share, 'config', 'domain26_burger_nav2_slam.yaml'
+        bringup_share, 'config', 'domain24_burger_nav2_amcl.yaml'
     )
     nav2_params = RewrittenYaml(
         source_file=nav2_source,
@@ -54,13 +56,11 @@ def generate_launch_description():
     tf_pose_script = os.path.join(
         bringup_share, 'scripts', 'tf_pose_publisher_direct_v44.py'
     )
-    map_odom_script = os.path.join(
-        bringup_share, 'scripts', 'map_odom_localization_direct_v40.py'
-    )
     goal_proxy_script = os.path.join(
         bringup_share, 'scripts', 'pose_to_nav2_action_direct_v41.py'
     )
 
+    # ── Domain bridge ──────────────────────────────────────────────────────────
     def make_domain_bridges(context, *args, **kwargs):
         leader_domain = leader_domain_id.perform(context)
         burger_domain = domain_id.perform(context)
@@ -74,7 +74,7 @@ def generate_launch_description():
             f'real_burger_{burger_domain}_to_leader_{leader_domain}.yaml'
         )
 
-        # Map is now built on domain 25 (leader SLAM) and sent to domain 24 (follower)
+        # Map is built by leader Cartographer (domain 25) → sent to follower (domain 24)
         leader_to_burger.write_text(
             f"""name: real_leader_{leader_domain}_to_burger_{burger_domain}
 from_domain: {leader_domain}
@@ -179,26 +179,48 @@ topics:
             ),
         ]
 
-    map_odom = ExecuteProcess(
-        cmd=[
-            'python3', map_odom_script, '--ros-args',
-            '-r', '__node:=burger_real_map_odom_localization',
-            '-p', 'use_sim_time:=false',
-            '-p', ['robot_name:=', robot_model],
-            '-p', 'odom_topic:=/odom',
-            '-p', 'map_frame:=map',
-            '-p', 'odom_frame:=odom',
-            '-p', 'base_frame:=base_footprint',
-            '-p', ['initial_x:=', follower_initial_x],
-            '-p', ['initial_y:=', follower_initial_y],
-            '-p', ['initial_yaw:=', follower_initial_yaw],
-            '-p', 'publish_rate_hz:=30.0',
-            '-p', 'publish_amcl_pose:=true',
-        ],
+    # ── AMCL node with dynamic initial pose ───────────────────────────────────
+    def make_amcl_node(context, *args, **kwargs):
+        ix = float(follower_initial_x.perform(context))
+        iy = float(follower_initial_y.perform(context))
+        iyaw = float(follower_initial_yaw.perform(context))
+
+        amcl_pose_overrides = {
+            'amcl': {
+                'ros__parameters': {
+                    'set_initial_pose': True,
+                    'initial_pose': {
+                        'x': ix,
+                        'y': iy,
+                        'z': 0.0,
+                        'yaw': iyaw,
+                    },
+                }
+            }
+        }
+        pose_yaml = Path(tempfile.gettempdir()) / 'burger_amcl_initial_pose.yaml'
+        pose_yaml.write_text(yaml.dump(amcl_pose_overrides), encoding='utf-8')
+
+        return [
+            Node(
+                package='nav2_amcl',
+                executable='amcl',
+                name='amcl',
+                output='screen',
+                parameters=[nav2_params, str(pose_yaml)],
+            )
+        ]
+
+    # ── AMCL lifecycle manager ─────────────────────────────────────────────────
+    lifecycle_localization = Node(
+        package='nav2_lifecycle_manager',
+        executable='lifecycle_manager',
+        name='lifecycle_manager_localization',
         output='screen',
-        name='burger_real_map_odom_localization',
+        parameters=[nav2_params],
     )
 
+    # ── Burger pose publisher (map → base_footprint via AMCL TF) ──────────────
     burger_pose = ExecuteProcess(
         cmd=[
             'python3', tf_pose_script, '--ros-args',
@@ -214,6 +236,7 @@ topics:
         name='burger_real_pose_publisher',
     )
 
+    # ── Nav2 nodes ─────────────────────────────────────────────────────────────
     controller_server = Node(
         package='nav2_controller',
         executable='controller_server',
@@ -242,7 +265,7 @@ topics:
         output='screen',
         parameters=[nav2_params],
     )
-    lifecycle = Node(
+    lifecycle_navigation = Node(
         package='nav2_lifecycle_manager',
         executable='lifecycle_manager',
         name='lifecycle_manager_navigation',
@@ -311,7 +334,7 @@ topics:
         DeclareLaunchArgument(
             'follower_initial_x',
             default_value='-1.05',
-            description='Follower start x in the leader Cartographer map frame (leader is origin).',
+            description='Follower start x in leader SLAM map frame (leader is origin 0,0).',
         ),
         DeclareLaunchArgument('follower_initial_y', default_value='0.0'),
         DeclareLaunchArgument('follower_initial_yaw', default_value='0.0'),
@@ -326,22 +349,30 @@ topics:
         SetEnvironmentVariable('TURTLEBOT3_MODEL', robot_model),
         LogInfo(
             msg=[
-                'REAL_BURGER_DOMAIN24 | follower | map_odom_localization initial=(',
+                'REAL_BURGER_DOMAIN24 | follower | AMCL initial=(',
                 follower_initial_x, ',', follower_initial_y, ',', follower_initial_yaw,
-                ') | map received from Domain25 via bridge | start_following=', start_following,
+                ') | /map from Domain25 bridge | start_following=', start_following,
             ]
         ),
+        # Bridge: /map + /leader_pose from domain 25 → domain 24
         TimerAction(
             period=0.5,
             actions=[OpaqueFunction(function=make_domain_bridges)],
         ),
-        TimerAction(period=2.0, actions=[map_odom]),
+        # AMCL: waits for /map (transient_local) from bridge, then localizes
+        TimerAction(
+            period=2.0,
+            actions=[OpaqueFunction(function=make_amcl_node)],
+        ),
+        TimerAction(period=2.5, actions=[lifecycle_localization]),
+        # Burger pose: reads map→base_footprint TF (published by AMCL)
         TimerAction(period=3.0, actions=[burger_pose]),
+        # Nav2 planning nodes
         TimerAction(
             period=4.0,
             actions=[controller_server, planner_server, behavior_server, bt_navigator],
         ),
-        TimerAction(period=7.0, actions=[lifecycle]),
+        TimerAction(period=7.0, actions=[lifecycle_navigation]),
         TimerAction(period=9.0, actions=[burger_named_goal]),
         TimerAction(period=10.0, actions=[follower]),
     ])

@@ -83,8 +83,6 @@ Visualization Manager:
           Value: true
         imu_link:
           Value: true
-        map:
-          Value: true
         odom:
           Value: true
         wheel_left_link:
@@ -97,20 +95,7 @@ Visualization Manager:
       Show Axes: true
       Show Names: true
       Tree:
-        map:
-          odom:
-            base_footprint:
-              base_link:
-                base_scan:
-                  {}
-                caster_back_link:
-                  {}
-                imu_link:
-                  {}
-                wheel_left_link:
-                  {}
-                wheel_right_link:
-                  {}
+        {}
       Update Interval: 0
       Value: true
     - Alpha: 1
@@ -284,9 +269,6 @@ Visualization Manager:
         burger: true
         burger_heading: true
         burger_label: true
-        waffle: true
-        waffle_heading: true
-        waffle_label: true
       Topic:
         Depth: 10
         Durability Policy: Volatile
@@ -332,7 +314,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 14.108323097229004
+      Distance: 21.254436492919922
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
