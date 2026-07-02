@@ -203,8 +203,10 @@ class DebugState:
     condition: threading.Condition = field(default_factory=threading.Condition)
     raw_jpeg: bytes | None = None
     yolo_jpeg: bytes | None = None
-    version: int = 0
-    frames: int = 0
+    raw_version: int = 0
+    yolo_version: int = 0
+    raw_frames: int = 0
+    yolo_frames: int = 0
     people: int = 0
     latency_ms: float = 0.0
     decode_ms: float = 0.0
@@ -213,19 +215,32 @@ class DebugState:
     image_width: int = 0
     image_height: int = 0
     capture_age_ms: float = -1.0
-    last_frame_wall_sec: float = 0.0
+    last_raw_wall_sec: float = 0.0
+    last_yolo_wall_sec: float = 0.0
     detections: list = field(default_factory=list)
-    frame_wall_times: deque = field(default_factory=lambda: deque(maxlen=90))
+    raw_wall_times: deque = field(default_factory=lambda: deque(maxlen=90))
+    yolo_wall_times: deque = field(default_factory=lambda: deque(maxlen=90))
 
-    def update(
-        self, raw_jpeg, yolo_jpeg, people, latency_ms, width, height, capture_age_ms,
+    def update_raw(self, raw_jpeg, width, height, capture_age_ms):
+        with self.condition:
+            self.raw_jpeg = raw_jpeg
+            self.raw_version += 1
+            self.raw_frames += 1
+            self.image_width = width
+            self.image_height = height
+            self.capture_age_ms = capture_age_ms
+            self.last_raw_wall_sec = time.time()
+            self.raw_wall_times.append(self.last_raw_wall_sec)
+            self.condition.notify_all()
+
+    def update_yolo(
+        self, yolo_jpeg, people, latency_ms, width, height, capture_age_ms,
         detections=None, decode_ms=0.0, predict_ms=0.0, post_ms=0.0,
     ):
         with self.condition:
-            self.raw_jpeg = raw_jpeg
             self.yolo_jpeg = yolo_jpeg
-            self.version += 1
-            self.frames += 1
+            self.yolo_version += 1
+            self.yolo_frames += 1
             self.people = people
             self.latency_ms = latency_ms
             self.decode_ms = decode_ms
@@ -234,24 +249,35 @@ class DebugState:
             self.image_width = width
             self.image_height = height
             self.capture_age_ms = capture_age_ms
-            self.last_frame_wall_sec = time.time()
+            self.last_yolo_wall_sec = time.time()
             self.detections = list(detections or [])
-            self.frame_wall_times.append(self.last_frame_wall_sec)
+            self.yolo_wall_times.append(self.last_yolo_wall_sec)
             self.condition.notify_all()
 
     def status(self):
         with self.condition:
-            age = time.time() - self.last_frame_wall_sec if self.last_frame_wall_sec else -1.0
-            fps = 0.0
-            if len(self.frame_wall_times) >= 2:
-                dt = self.frame_wall_times[-1] - self.frame_wall_times[0]
+            now = time.time()
+            raw_age = now - self.last_raw_wall_sec if self.last_raw_wall_sec else -1.0
+            yolo_age = now - self.last_yolo_wall_sec if self.last_yolo_wall_sec else -1.0
+            raw_fps = 0.0
+            if len(self.raw_wall_times) >= 2:
+                dt = self.raw_wall_times[-1] - self.raw_wall_times[0]
                 if dt > 1e-6:
-                    fps = (len(self.frame_wall_times) - 1) / dt
+                    raw_fps = (len(self.raw_wall_times) - 1) / dt
+            yolo_fps = 0.0
+            if len(self.yolo_wall_times) >= 2:
+                dt = self.yolo_wall_times[-1] - self.yolo_wall_times[0]
+                if dt > 1e-6:
+                    yolo_fps = (len(self.yolo_wall_times) - 1) / dt
             return {
-                'ok': self.frames > 0,
-                'frames': self.frames,
+                'ok': self.raw_frames > 0,
+                'frames': self.raw_frames,
+                'raw_frames': self.raw_frames,
+                'yolo_frames': self.yolo_frames,
                 'people': self.people,
-                'fps': fps,
+                'fps': raw_fps,
+                'raw_fps': raw_fps,
+                'yolo_fps': yolo_fps,
                 'latency_ms': self.latency_ms,
                 'decode_ms': self.decode_ms,
                 'predict_ms': self.predict_ms,
@@ -259,24 +285,30 @@ class DebugState:
                 'image_width': self.image_width,
                 'image_height': self.image_height,
                 'capture_age_ms': self.capture_age_ms,
-                'frame_age_sec': age,
+                'frame_age_sec': raw_age,
+                'raw_frame_age_sec': raw_age,
+                'yolo_frame_age_sec': yolo_age,
                 'detections': self.detections,
             }
 
     def latest_frame(self, kind):
         with self.condition:
             frame = self.raw_jpeg if kind == 'raw' else self.yolo_jpeg
-            return self.version, frame
+            version = self.raw_version if kind == 'raw' else self.yolo_version
+            return version, frame
 
     def wait_for_frame(self, kind, previous_version):
         with self.condition:
             self.condition.wait_for(
-                lambda: self.version != previous_version
+                lambda: (
+                    self.raw_version if kind == 'raw' else self.yolo_version
+                ) != previous_version
                 and (self.raw_jpeg if kind == 'raw' else self.yolo_jpeg) is not None,
                 timeout=1.0,
             )
             frame = self.raw_jpeg if kind == 'raw' else self.yolo_jpeg
-            return self.version, frame
+            version = self.raw_version if kind == 'raw' else self.yolo_version
+            return version, frame
 
 
 def _decode_image(file_storage):
@@ -610,29 +642,7 @@ def build_app(args):
         if 'image' not in request.files:
             return jsonify({'ok': False, 'error': 'missing multipart file field: image'}), 400
 
-        early_age_sec = _request_capture_age_sec(request)
-        if args.max_capture_age_sec > 0.0 and early_age_sec > args.max_capture_age_sec:
-            return jsonify({
-                'ok': False,
-                'stale': True,
-                'error': 'stale frame rejected before inference',
-                'capture_age_ms': max(0.0, early_age_sec * 1000.0),
-                'max_capture_age_ms': args.max_capture_age_sec * 1000.0,
-                'detections': [],
-            })
-
         try:
-            busy_age_sec = _request_capture_age_sec(request)
-            if args.max_capture_age_sec > 0.0 and busy_age_sec > args.max_capture_age_sec:
-                return jsonify({
-                    'ok': False,
-                    'stale': True,
-                    'error': 'stale frame rejected before decode',
-                    'capture_age_ms': max(0.0, busy_age_sec * 1000.0),
-                    'max_capture_age_ms': args.max_capture_age_sec * 1000.0,
-                    'detections': [],
-                })
-
             t_decode0 = time.perf_counter()
             original_jpeg, frame = _decode_image(request.files['image'])
             decode_ms = (time.perf_counter() - t_decode0) * 1000.0
@@ -640,6 +650,25 @@ def build_app(args):
             return jsonify({'ok': False, 'error': str(exc)}), 400
 
         h, w = frame.shape[:2]
+        capture_ros_sec = float(request.form.get('capture_ros_sec') or 0.0)
+        capture_wall_sec = float(request.form.get('capture_wall_sec') or 0.0)
+        robot_frame_age_ms_at_send = float(request.form.get('robot_frame_age_ms_at_send') or -1.0)
+        raw_age_sec = _request_capture_age_sec(request)
+        capture_age_ms = max(0.0, raw_age_sec * 1000.0) if raw_age_sec >= 0.0 else -1.0
+
+        # Keep the debug camera view live even when this frame is too old or YOLO is busy.
+        state.update_raw(original_jpeg, int(w), int(h), capture_age_ms)
+
+        if args.max_capture_age_sec > 0.0 and raw_age_sec > args.max_capture_age_sec:
+            return jsonify({
+                'ok': False,
+                'stale': True,
+                'error': 'stale frame rejected before inference',
+                'capture_age_ms': capture_age_ms,
+                'max_capture_age_ms': args.max_capture_age_sec * 1000.0,
+                'detections': [],
+            })
+
         try:
             results, input_shape, predict_ms = inference_worker.infer(frame)
         except InferenceBusyError as exc:
@@ -686,17 +715,9 @@ def build_app(args):
                     'label': str(names.get(class_id, class_id)),
                 })
 
-        capture_ros_sec = float(request.form.get('capture_ros_sec') or 0.0)
-        capture_wall_sec = float(request.form.get('capture_wall_sec') or 0.0)
-        robot_frame_age_ms_at_send = float(request.form.get('robot_frame_age_ms_at_send') or -1.0)
-        age_reference_sec = capture_wall_sec or capture_ros_sec
-        wall_delta_sec = time.time() - age_reference_sec if age_reference_sec > 0.0 else -1.0
-        capture_age_ms = (
-            max(0.0, wall_delta_sec * 1000.0)
-            if 0.0 <= wall_delta_sec <= 60.0 else -1.0
-        )
-        if capture_age_ms < 0.0 and robot_frame_age_ms_at_send >= 0.0:
-            capture_age_ms = robot_frame_age_ms_at_send
+        post_age_sec = _request_capture_age_sec(request)
+        if post_age_sec >= 0.0:
+            capture_age_ms = max(0.0, post_age_sec * 1000.0)
         if (
             args.max_capture_age_sec > 0.0
             and capture_age_ms >= 0.0
@@ -715,8 +736,8 @@ def build_app(args):
         annotated_jpeg = _encode_jpeg(overlay, args.debug_jpeg_quality)
         post_ms = (time.perf_counter() - t_post0) * 1000.0
         inference_ms = (time.perf_counter() - t0) * 1000.0
-        state.update(
-            original_jpeg, annotated_jpeg, len(detections),
+        state.update_yolo(
+            annotated_jpeg, len(detections),
             inference_ms, w, h, capture_age_ms, detections,
             decode_ms=decode_ms, predict_ms=predict_ms, post_ms=post_ms,
         )

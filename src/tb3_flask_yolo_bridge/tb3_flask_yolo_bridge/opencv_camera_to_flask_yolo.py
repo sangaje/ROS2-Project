@@ -315,11 +315,19 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
                 self.post_frame(frame, capture_sec, capture_mono_sec, seq)
             except Exception as exc:
                 self.fail_count += 1
+                self.reset_http_session()
                 self.get_logger().warn(
                     f'HTTP YOLO send failed: {exc}',
                     throttle_duration_sec=2.0,
                 )
                 self.log_periodic()
+
+    def reset_http_session(self):
+        try:
+            self.http.close()
+        except Exception:
+            pass
+        self.http = requests.Session()
 
     def post_frame(self, frame, capture_sec: float, capture_mono_sec: float, seq: int):
         frame_age_before_send = time.monotonic() - capture_mono_sec if capture_mono_sec > 0.0 else 0.0

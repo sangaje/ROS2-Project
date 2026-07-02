@@ -50,7 +50,7 @@ def generate_launch_description():
         DeclareLaunchArgument('camera_output_encoding', default_value='rgb8'),
         DeclareLaunchArgument('image_topic', default_value='/camera/image_raw'),
         DeclareLaunchArgument('input_type', default_value='raw'),
-        DeclareLaunchArgument('server_url', default_value='http://10.10.14.58:5005/detect'),
+        DeclareLaunchArgument('server_url', default_value='http://100.96.193.2:5005/detect'),
         DeclareLaunchArgument('output_topic', default_value='/risk/yolo_detections'),
         DeclareLaunchArgument('debug_image_topic', default_value='/risk/debug_yolo_image'),
         DeclareLaunchArgument('max_rate_hz', default_value='3.0'),
