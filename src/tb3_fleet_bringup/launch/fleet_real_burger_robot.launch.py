@@ -29,6 +29,8 @@ def generate_launch_description():
         'robot.launch.py',
     )
 
+    pc_ip = LaunchConfiguration('pc_ip')
+
     return LaunchDescription([
         DeclareLaunchArgument(
             'role',
@@ -41,6 +43,11 @@ def generate_launch_description():
             description='Set LDS-01, LDS-02, or LDS-03 to match the robot.',
         ),
         DeclareLaunchArgument('usb_port', default_value='/dev/ttyACM0'),
+        DeclareLaunchArgument(
+            'pc_ip', default_value='',
+            description='PC IP address for unicast DDS discovery (e.g. 10.10.14.5). '
+                        'Leave empty to rely on multicast only.',
+        ),
         UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
         UnsetEnvironmentVariable('ROS_LOCALHOST_ONLY'),
         UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),
@@ -49,6 +56,7 @@ def generate_launch_description():
         SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp'),
         SetEnvironmentVariable('FASTDDS_BUILTIN_TRANSPORTS', 'UDPv4'),
         SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', 'SUBNET'),
+        SetEnvironmentVariable('ROS_STATIC_PEERS', pc_ip),
         SetEnvironmentVariable('TURTLEBOT3_MODEL', 'burger'),
         SetEnvironmentVariable('LDS_MODEL', lds_model),
         LogInfo(

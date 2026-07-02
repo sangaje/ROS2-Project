@@ -67,6 +67,7 @@ def generate_launch_description():
         SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp'),
         SetEnvironmentVariable('FASTDDS_BUILTIN_TRANSPORTS', 'UDPv4'),
         SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', 'SUBNET'),
+        SetEnvironmentVariable('ROS_STATIC_PEERS', '10.10.14.10;10.10.14.14'),
         LogInfo(
             msg='REAL_FLEET_RVIZ_DOMAIN25 | /goal_pose controls Waffle; '
                 '/fleet/follow_command controls Burger following.'
