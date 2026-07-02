@@ -75,6 +75,9 @@ bayesian_risk_map_node:
     # Multi-view overlap still dominates and localizes the final high-risk area.
     bearing_single_view_gain: 0.28
     bearing_pair_min_vote: 0.02
+    # Printed/small detections can have confidence near 0.20. Keep the final
+    # directional seed above the geodesic halo cutoff in that case.
+    bearing_halo_seed_threshold: 0.03
     bearing_additional_view_bonus: 0.15
     bearing_use_bbox_range_prior: false
     bearing_range_sigma_m: 2.0

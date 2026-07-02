@@ -36,6 +36,7 @@ def make_node():
     node.bearing_consensus_gain = 1.0
     node.bearing_single_view_gain = 0.28
     node.bearing_pair_min_vote = 0.02
+    node.bearing_halo_seed_threshold = 0.03
     node.bearing_additional_view_bonus = 0.15
     node.bearing_use_bbox_range_prior = False
     node.bearing_range_sigma_m = 2.0
@@ -49,6 +50,11 @@ def make_node():
     node.next_bearing_viewpoint_id = 1
     node.bearing_viewpoint_origins = {}
     node.bearing_consensus_peaks = []
+    node.source_halo_seed_threshold = 0.12
+    node.source_halo_seed_separation_m = 0.08
+    node.source_halo_top_k = 80
+    node.source_halo_radius_m = 0.75
+    node.source_halo_sigma_m = 0.35
     return node
 
 
@@ -134,3 +140,24 @@ def test_repeated_consensus_map_does_not_saturate_memory():
 
     assert math.isclose(first_value, 0.68, rel_tol=1e-5)
     assert math.isclose(second_value, first_value, rel_tol=1e-6)
+
+
+def test_low_confidence_single_view_still_creates_halo_seed():
+    node = make_node()
+    origin = (1.0, 2.0)
+    target = (3.0, 3.0)
+    low_confidence_detection = detection_for(origin, target, confidence=0.20)
+
+    node.ingest_bearing_observations(
+        (origin[0], origin[1], 0.0),
+        [low_confidence_detection],
+        1.0,
+    )
+    candidate = node.build_bearing_consensus_map()
+    assert node.update_positive_memory(candidate)
+
+    seeds = node.select_source_seeds(node.positive_memory_map)
+    assert seeds
+    assert max(seed[2] for seed in seeds) >= node.bearing_halo_seed_threshold
+    risk = node.build_bounded_geodesic_halo(node.positive_memory_map)
+    assert float(np.max(risk)) >= node.bearing_halo_seed_threshold

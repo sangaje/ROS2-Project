@@ -4,7 +4,14 @@ from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, OpaqueFunction, SetEnvironmentVariable, TimerAction
+from launch.actions import (
+    DeclareLaunchArgument,
+    ExecuteProcess,
+    OpaqueFunction,
+    SetEnvironmentVariable,
+    TimerAction,
+    UnsetEnvironmentVariable,
+)
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -55,7 +62,9 @@ topics:
         source_yaml += _topic_block('/clock', 'rosgraph_msgs/msg/Clock', reliability='best_effort', depth=1)
         source_yaml += _topic_block('/map', 'nav_msgs/msg/OccupancyGrid', depth=1)
         if include_rviz_topics:
-            source_yaml += _topic_block('/tf', 'tf2_msgs/msg/TFMessage', reliability='best_effort', depth=20)
+            # Robot TF publishers are reliable, and RViz/tf2 reliable subscribers reject
+            # a best-effort bridge endpoint. Preserve reliable QoS across the bridge.
+            source_yaml += _topic_block('/tf', 'tf2_msgs/msg/TFMessage', reliability='reliable', depth=50)
             source_yaml += _topic_block('/tf_static', 'tf2_msgs/msg/TFMessage', durability='transient_local', depth=1)
             source_yaml += _topic_block('/scan', 'sensor_msgs/msg/LaserScan', reliability='best_effort', depth=3)
             source_yaml += _topic_block('/odom', 'nav_msgs/msg/Odometry', depth=3)
@@ -146,9 +155,9 @@ topics:
     )
 
     return LaunchDescription([
-        DeclareLaunchArgument('central_domain_id', default_value='20'),
-        DeclareLaunchArgument('source_domain_id', default_value='21'),
-        DeclareLaunchArgument('risk_sink_domain_ids', default_value='21', description='Comma-separated domains that should receive central /risk maps.'),
+        DeclareLaunchArgument('central_domain_id', default_value='25'),
+        DeclareLaunchArgument('source_domain_id', default_value='24'),
+        DeclareLaunchArgument('risk_sink_domain_ids', default_value='24', description='Comma-separated domains that should receive central /risk maps.'),
         DeclareLaunchArgument('use_sim_time', default_value='false'),
         DeclareLaunchArgument('start_domain_bridges', default_value='true'),
         DeclareLaunchArgument('start_risk_map', default_value='true'),
@@ -166,9 +175,16 @@ topics:
         DeclareLaunchArgument('enable_room_probability', default_value='false'),
         DeclareLaunchArgument('enable_region_segmentation', default_value='false'),
         DeclareLaunchArgument('enable_visibility_tracking', default_value='false'),
+        UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),
+        UnsetEnvironmentVariable('RMW_FASTRTPS_DEFAULT_PROFILES_FILE'),
+        UnsetEnvironmentVariable('FASTDDS_DEFAULT_PROFILES_FILE'),
+        UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
+        UnsetEnvironmentVariable('ROS_STATIC_PEERS'),
         SetEnvironmentVariable('ROS_DOMAIN_ID', central_domain_id),
         SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp'),
         SetEnvironmentVariable('FASTDDS_BUILTIN_TRANSPORTS', 'UDPv4'),
+        SetEnvironmentVariable('ROS_LOCALHOST_ONLY', '0'),
+        SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', 'SUBNET'),
         TimerAction(
             period=0.5,
             actions=[map_frame_anchor, OpaqueFunction(function=_write_bridge_configs)],

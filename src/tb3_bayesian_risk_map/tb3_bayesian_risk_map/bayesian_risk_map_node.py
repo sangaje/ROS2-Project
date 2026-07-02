@@ -15,7 +15,7 @@ from rclpy.node import Node
 from rclpy.duration import Duration
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy, HistoryPolicy
 
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, ColorRGBA, String
 from sensor_msgs.msg import CompressedImage, Image
 from nav_msgs.msg import OccupancyGrid
 from geometry_msgs.msg import PointStamped, Point, PoseStamped
@@ -218,6 +218,9 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.bearing_pair_min_vote = float(
             self.declare_parameter('bearing_pair_min_vote', 0.02).value
         )
+        self.bearing_halo_seed_threshold = float(
+            self.declare_parameter('bearing_halo_seed_threshold', 0.03).value
+        )
         self.bearing_additional_view_bonus = float(
             self.declare_parameter('bearing_additional_view_bonus', 0.15).value
         )
@@ -238,6 +241,23 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         )
         self.bearing_same_view_angle_merge_deg = float(
             self.declare_parameter('bearing_same_view_angle_merge_deg', 2.0).value
+        )
+
+        # Probability distribution map and enemy location estimation
+        self.enable_person_probability_map = self.declare_bool_parameter(
+            'enable_person_probability_map', True
+        )
+        self.bearing_consensus_accumulate = self.declare_bool_parameter(
+            'bearing_consensus_accumulate', True
+        )
+        self.person_prob_viz_threshold = float(
+            self.declare_parameter('person_prob_viz_threshold', 0.010).value
+        )
+        self.person_prob_marker_max_count = int(
+            self.declare_parameter('person_prob_marker_max_count', 1000).value
+        )
+        self.person_prob_estimate_min_views = int(
+            self.declare_parameter('person_prob_estimate_min_views', 2).value
         )
 
         # Halo
@@ -416,6 +436,8 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.next_bearing_viewpoint_id = 1
         self.bearing_viewpoint_origins: Dict[int, Tuple[float, float, float]] = {}
         self.bearing_consensus_peaks: List[Tuple[float, float, float]] = []
+        self.person_probability_map = None
+        self.person_location_estimate: Optional[Tuple[float, float, float]] = None
         self.topic_pose: Optional[PoseStamped] = None
         self.topic_pose_stamp = None
 
@@ -519,6 +541,9 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             '/risk/bearing_consensus_map',
             self.qos_grid_pub,
         )
+        self.pub_person_probability = self.create_publisher(
+            OccupancyGrid, '/risk/person_probability_map', self.qos_grid_pub
+        )
         self.pub_detection_candidate = None
         self.pub_positive_memory = None
         self.pub_visibility = None
@@ -587,6 +612,8 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             f'positive_projection_mode={self.positive_projection_mode} '
             f'bearing_min_views={self.bearing_min_viewpoints} '
             f'bearing_min_baseline={self.bearing_viewpoint_min_baseline_m:.2f}m '
+            f'bearing_single_gain={self.bearing_single_view_gain:.2f} '
+            f'bearing_halo_seed={self.bearing_halo_seed_threshold:.3f} '
             f'risk_source_mode={self.risk_source_mode} evidence_radius={self.evidence_distribution_radius_m:.2f} '
             f'publish_diagnostic_maps={self.publish_diagnostic_maps} '
             f'debug_raw={self.publish_debug_image}:{self.debug_image_topic} '
@@ -754,6 +781,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                 self.region_priority_map = np.zeros((h, w), dtype=np.float32)
                 self.region_checked_map = np.zeros((h, w), dtype=np.float32)
                 self.risk_map = np.zeros((h, w), dtype=np.float32)
+                self.person_probability_map = None  # rebuilt from reprojected positive_memory at next tick
 
                 free = self.valid_free_mask()
                 memory_mask = self.risk_memory_mask()
@@ -782,10 +810,17 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                 self.bearing_observations.clear()
                 self.bearing_viewpoint_origins.clear()
                 self.bearing_consensus_peaks.clear()
+                self.person_probability_map = np.zeros((h, w), dtype=np.float32)
+                self.person_location_estimate = None
                 self.get_logger().warn(f'map geometry initialized/changed: {sig}; internal maps initialized')
 
             self.map_signature = sig
             self.prev_map_geometry = new_geometry
+            if self.bearing_consensus_enabled() and self.bearing_observations:
+                self.bearing_consensus_map = self.build_bearing_consensus_map()
+                self.detection_candidate_map = self.bearing_consensus_map.copy()
+                if float(np.max(self.bearing_consensus_map)) > 1e-6:
+                    self.update_positive_memory(self.bearing_consensus_map)
             self.risk_dirty = True
 
     def grid_to_world_with_geometry(self, gx: int, gy: int, geom) -> Tuple[float, float]:
@@ -1749,6 +1784,121 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.extract_bearing_consensus_peaks(consensus)
         return candidate
 
+    def build_person_probability_map(self):
+        """
+        Normalize positive_memory_map into a proper probability distribution P(enemy at cell).
+        Uses all accumulated bearing evidence. Never decreases (max-fusion already in positive_memory).
+        """
+        if not self.enable_person_probability_map or self.occ_grid is None:
+            return
+        h, w = self.occ_grid.shape
+        if self.person_probability_map is None or self.person_probability_map.shape != (h, w):
+            self.person_probability_map = np.zeros((h, w), dtype=np.float32)
+
+        src = self.positive_memory_map
+        if src is None or float(np.max(src)) < 1e-8:
+            return
+
+        free = self.valid_free_mask()
+        evidence = src.copy()
+        evidence[~free] = 0.0
+
+        total = float(np.sum(evidence))
+        if total < 1e-8:
+            return
+
+        # Normalize to probability distribution; then max-fuse so it never decreases
+        # when the person goes out of view.
+        normalized = (evidence / total).astype(np.float32)
+        self.person_probability_map = np.maximum(self.person_probability_map, normalized)
+        self.person_probability_map[~free] = 0.0
+
+        # Update MAP (maximum a posteriori) location estimate
+        flat_idx = int(np.argmax(self.person_probability_map))
+        peak_val = float(self.person_probability_map.flat[flat_idx])
+        if peak_val > 1e-10:
+            gy, gx = np.unravel_index(flat_idx, self.person_probability_map.shape)
+            wx, wy = self.grid_to_world(int(gx), int(gy))
+            self.person_location_estimate = (wx, wy, peak_val)
+        else:
+            self.person_location_estimate = None
+
+    def compute_triangulation_estimate(self) -> Optional[Tuple[float, float, float]]:
+        """
+        Weighted least-squares triangulation from independent viewpoint bearing observations.
+        Returns (x, y, confidence) or None if fewer than 2 independent viewpoints are available.
+        Each bearing ray is a half-line; we minimize sum of squared perpendicular distances.
+        """
+        grouped: Dict[int, List[BearingObservation]] = {}
+        for obs in self.bearing_observations:
+            grouped.setdefault(obs.viewpoint_id, []).append(obs)
+
+        min_views = max(2, int(self.person_prob_estimate_min_views))
+        if len(grouped) < min_views:
+            return None
+
+        # One representative observation per viewpoint (highest confidence)
+        rep_obs = [
+            max(observations, key=lambda o: o.confidence)
+            for observations in grouped.values()
+        ]
+
+        # Build weighted system Ax = b
+        # Each ray direction d = (cos θ, sin θ) defines a line through origin (ox, oy).
+        # The perpendicular constraint: (-sin θ)(x - ox) + (cos θ)(y - oy) = 0
+        # → -sin θ * x + cos θ * y = -sin θ * ox + cos θ * oy
+        A_rows = []
+        b_vals = []
+        for obs in rep_obs:
+            dx = math.cos(obs.bearing_world_rad)
+            dy = math.sin(obs.bearing_world_rad)
+            w = math.sqrt(max(1e-3, float(obs.confidence)))
+            A_rows.append([-dy * w, dx * w])
+            b_vals.append((-dy * obs.origin_x + dx * obs.origin_y) * w)
+
+        try:
+            A = np.array(A_rows, dtype=np.float64)
+            b = np.array(b_vals, dtype=np.float64)
+            x, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+            est_x = float(x[0])
+            est_y = float(x[1])
+
+            # Sanity check: must be within reachable range from at least one viewpoint
+            max_range = float(self.max_range_m)
+            in_range = any(
+                math.hypot(est_x - obs.origin_x, est_y - obs.origin_y) <= max_range + 0.5
+                for obs in rep_obs
+            )
+            if not in_range:
+                return None
+
+            avg_conf = float(np.mean([o.confidence for o in rep_obs]))
+            return (est_x, est_y, avg_conf)
+        except Exception:
+            return None
+
+    def probability_map_spread_radius_m(self) -> float:
+        """Estimate 1-sigma spread of the current person_probability_map around its MAP peak."""
+        if self.person_probability_map is None or self.person_location_estimate is None:
+            return float(self.bearing_range_sigma_m)
+        peak_x, peak_y, _ = self.person_location_estimate
+        prob = self.person_probability_map
+        free = self.valid_free_mask()
+        ys, xs = np.where((prob >= self.person_prob_viz_threshold) & free)
+        if len(ys) < 4:
+            return float(self.bearing_range_sigma_m)
+        vals = prob[ys, xs].astype(np.float64)
+        wx = np.array([self.grid_to_world(int(x), int(y))[0] for x, y in zip(xs, ys)], dtype=np.float64)
+        wy = np.array([self.grid_to_world(int(x), int(y))[1] for x, y in zip(xs, ys)], dtype=np.float64)
+        total = float(np.sum(vals))
+        if total < 1e-12:
+            return float(self.bearing_range_sigma_m)
+        # Weighted variance
+        var_x = float(np.sum(vals * (wx - peak_x) ** 2)) / total
+        var_y = float(np.sum(vals * (wy - peak_y) ** 2)) / total
+        sigma = math.sqrt(max(0.0, 0.5 * (var_x + var_y)))
+        return max(float(self.map_resolution), sigma)
+
     def build_detection_candidate_map(self, robot_pose, detections):
         h, w = self.occ_grid.shape
         out = np.zeros((h, w), dtype=np.float32)
@@ -2148,7 +2298,13 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
 
     def select_source_seeds(self, source):
         flat = source.ravel()
-        idx = np.where(flat >= self.source_halo_seed_threshold)[0]
+        seed_threshold = float(self.source_halo_seed_threshold)
+        if self.bearing_consensus_enabled():
+            seed_threshold = min(
+                seed_threshold,
+                max(0.0, float(self.bearing_halo_seed_threshold)),
+            )
+        idx = np.where(flat >= seed_threshold)[0]
         if idx.size == 0:
             return []
         vals = flat[idx]
@@ -2345,8 +2501,18 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                     new_detections,
                     now_ros_sec,
                 ):
-                    self.bearing_consensus_map = self.build_bearing_consensus_map()
-                    self.detection_candidate_map = self.bearing_consensus_map.copy()
+                    new_consensus = self.build_bearing_consensus_map()
+                    # Accumulate bearing_consensus_map so it never decreases when person
+                    # goes out of view (only the best historical agreement is shown).
+                    if self.bearing_consensus_accumulate:
+                        self.bearing_consensus_map = np.maximum(
+                            self.bearing_consensus_map, new_consensus
+                        )
+                    else:
+                        self.bearing_consensus_map = new_consensus
+                    # Use only the current (non-accumulated) consensus to feed positive_memory,
+                    # preventing stale evidence from artificially inflating the risk kernel.
+                    self.detection_candidate_map = new_consensus.copy()
             else:
                 self.detection_candidate_map = self.build_detection_candidate_map(
                     projection_pose,
@@ -2370,6 +2536,11 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         if self.risk_dirty:
             self.risk_map = self.build_bounded_geodesic_halo(self.build_risk_source_map())
             self.risk_dirty = False
+
+        # Rebuild probability distribution from accumulated positive evidence every tick.
+        # This is cheap (just a normalization) and ensures the display always reflects
+        # the full history of bearing observations without decaying when person is out of view.
+        self.build_person_probability_map()
 
         self.publish_all_maps()
         self.publish_markers(robot_pose)
@@ -2400,6 +2571,9 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.bearing_observations.clear()
         self.bearing_viewpoint_origins.clear()
         self.bearing_consensus_peaks.clear()
+        self.person_location_estimate = None
+        if self.person_probability_map is not None:
+            self.person_probability_map.fill(0.0)
         self.risk_dirty = True
         self.get_logger().warn('cleared all room-aware risk/region maps')
 
@@ -2485,6 +2659,15 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             self.pub_bearing_consensus.publish(
                 self.array_to_occgrid(self.bearing_consensus_map, stamp)
             )
+            if self.enable_person_probability_map and self.person_probability_map is not None:
+                # Scale probability map for OccupancyGrid: multiply by 1/max so the peak
+                # cell is always 100, making the color gradient meaningful in RViz.
+                prob = self.person_probability_map
+                p_max = float(np.max(prob))
+                if p_max > 1e-10:
+                    self.pub_person_probability.publish(
+                        self.array_to_occgrid((prob / p_max).astype(np.float32), stamp)
+                    )
             self.last_risk_publish_ros_ns = now_ros_ns
         diagnostic_period_ns = (
             int(1e9 / self.diagnostic_publish_rate_hz)
@@ -2599,6 +2782,139 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             peak.color.b = 0.0
             peak.color.a = 0.95
             ma.markers.append(peak)
+
+        # --- Probability distribution cloud ---
+        # Each cube represents a free-space cell coloured by P(enemy at cell):
+        #   blue (low) → red (high).  Only cells above viz_threshold are shown,
+        #   and only the top-N cells by probability are displayed for performance.
+        if self.enable_person_probability_map and self.person_probability_map is not None:
+            prob = self.person_probability_map
+            threshold = max(1e-9, float(self.person_prob_viz_threshold))
+            p_max = float(np.max(prob))
+            if p_max > threshold:
+                ys_p, xs_p = np.where(prob >= threshold)
+                if len(ys_p) > 0:
+                    values_p = prob[ys_p, xs_p]
+                    max_cubes = max(10, int(self.person_prob_marker_max_count))
+                    if len(ys_p) > max_cubes:
+                        top_idx = np.argsort(-values_p)[:max_cubes]
+                        ys_p = ys_p[top_idx]
+                        xs_p = xs_p[top_idx]
+                        values_p = values_p[top_idx]
+
+                    prob_cloud = Marker()
+                    prob_cloud.header.frame_id = self.map_frame
+                    prob_cloud.header.stamp = stamp
+                    prob_cloud.ns = 'person_probability_cloud'
+                    prob_cloud.id = 5000
+                    prob_cloud.type = Marker.CUBE_LIST
+                    prob_cloud.action = Marker.ADD
+                    cell_sz = float(self.map_resolution)
+                    prob_cloud.scale.x = cell_sz
+                    prob_cloud.scale.y = cell_sz
+                    prob_cloud.scale.z = 0.02
+                    prob_cloud.color.a = 1.0  # required; per-vertex colors override this
+
+                    for gy_c, gx_c, val_c in zip(
+                        ys_p.tolist(), xs_p.tolist(), values_p.tolist()
+                    ):
+                        wx_c, wy_c = self.grid_to_world(int(gx_c), int(gy_c))
+                        prob_cloud.points.append(Point(x=wx_c, y=wy_c, z=0.02))
+                        t = clamp(float(val_c) / max(p_max, 1e-9), 0.0, 1.0)
+                        c = ColorRGBA()
+                        c.r = t
+                        c.g = clamp(1.8 * t * (1.0 - t), 0.0, 1.0)
+                        c.b = 1.0 - t
+                        c.a = 0.30 + 0.65 * t
+                        prob_cloud.colors.append(c)
+
+                    ma.markers.append(prob_cloud)
+
+            # MAP estimate: bright red cylinder at highest-probability cell
+            if self.person_location_estimate is not None:
+                est_x, est_y, est_conf = self.person_location_estimate
+                sigma_r = self.probability_map_spread_radius_m()
+
+                est_cyl = Marker()
+                est_cyl.header.frame_id = self.map_frame
+                est_cyl.header.stamp = stamp
+                est_cyl.ns = 'person_location_map_estimate'
+                est_cyl.id = 6000
+                est_cyl.type = Marker.CYLINDER
+                est_cyl.action = Marker.ADD
+                est_cyl.pose.position.x = est_x
+                est_cyl.pose.position.y = est_y
+                est_cyl.pose.position.z = 0.55
+                est_cyl.pose.orientation.w = 1.0
+                cyl_r = 0.25 + 0.15 * clamp(float(est_conf) / max(p_max, 1e-9), 0.0, 1.0)
+                est_cyl.scale.x = cyl_r
+                est_cyl.scale.y = cyl_r
+                est_cyl.scale.z = 1.1
+                est_cyl.color.r = 1.0
+                est_cyl.color.g = 0.05
+                est_cyl.color.b = 0.05
+                est_cyl.color.a = 0.92
+                ma.markers.append(est_cyl)
+
+                # 1-sigma uncertainty ring around MAP estimate
+                unc_ring = Marker()
+                unc_ring.header.frame_id = self.map_frame
+                unc_ring.header.stamp = stamp
+                unc_ring.ns = 'person_uncertainty_ring'
+                unc_ring.id = 6001
+                unc_ring.type = Marker.LINE_STRIP
+                unc_ring.action = Marker.ADD
+                unc_ring.scale.x = 0.045
+                unc_ring.color.r = 1.0
+                unc_ring.color.g = 0.55
+                unc_ring.color.b = 0.0
+                unc_ring.color.a = 0.88
+                n_seg = 32
+                r_ring = max(float(self.map_resolution), sigma_r)
+                for k in range(n_seg + 1):
+                    ang = 2.0 * math.pi * k / n_seg
+                    unc_ring.points.append(Point(
+                        x=est_x + r_ring * math.cos(ang),
+                        y=est_y + r_ring * math.sin(ang),
+                        z=0.12,
+                    ))
+                ma.markers.append(unc_ring)
+
+        # --- Triangulation estimate ---
+        # Least-squares intersection of bearing rays from independent viewpoints.
+        # Only shown when 2+ viewpoints with sufficient baseline are available.
+        tri_est = self.compute_triangulation_estimate()
+        if tri_est is not None:
+            tri_x, tri_y, tri_conf = tri_est
+            tri_g = self.world_to_grid(tri_x, tri_y)
+            tri_valid = tri_g is not None and self.traversable(tri_g[1], tri_g[0])
+            tri_marker = Marker()
+            tri_marker.header.frame_id = self.map_frame
+            tri_marker.header.stamp = stamp
+            tri_marker.ns = 'person_triangulation_estimate'
+            tri_marker.id = 7000
+            tri_marker.type = Marker.SPHERE
+            tri_marker.action = Marker.ADD if tri_valid else Marker.DELETE
+            tri_marker.pose.position.x = tri_x
+            tri_marker.pose.position.y = tri_y
+            tri_marker.pose.position.z = 0.35
+            tri_marker.pose.orientation.w = 1.0
+            tri_sz = 0.30 + 0.20 * clamp(tri_conf, 0.0, 1.0)
+            tri_marker.scale.x = tri_sz
+            tri_marker.scale.y = tri_sz
+            tri_marker.scale.z = tri_sz
+            tri_marker.color.r = 1.0
+            tri_marker.color.g = 1.0
+            tri_marker.color.b = 0.0
+            tri_marker.color.a = 0.97
+            ma.markers.append(tri_marker)
+        else:
+            # Remove stale triangulation marker if we lost enough viewpoints
+            del_tri = Marker()
+            del_tri.ns = 'person_triangulation_estimate'
+            del_tri.id = 7000
+            del_tri.action = Marker.DELETE
+            ma.markers.append(del_tri)
 
         for i, ev in enumerate(self.evidence_points[-80:]):
             m = Marker()
