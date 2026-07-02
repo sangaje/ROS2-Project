@@ -44,6 +44,18 @@ class EvidencePoint:
 
 
 @dataclass
+class BearingObservation:
+    observation_id: int
+    viewpoint_id: int
+    origin_x: float
+    origin_y: float
+    bearing_world_rad: float
+    confidence: float
+    range_hint_m: float
+    stamp_sec: float
+
+
+@dataclass
 class PoseSample:
     stamp_sec: float
     x: float
@@ -173,6 +185,55 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.source_min_value = float(self.declare_parameter('source_min_value', 0.03).value)
         self.positive_memory_alpha = float(self.declare_parameter('positive_memory_alpha', 0.85).value)
 
+        # Bearing-only multi-view localization.
+        #
+        # A printed/small person can make bbox-height range estimation collapse to max_range.
+        # In bearing_consensus mode, each spatially distinct robot viewpoint votes along the
+        # detected person's line of sight. Risk is created only where multiple independent
+        # viewpoint maps agree, so moving the robot triangulates the likely person location.
+        self.positive_projection_mode = str(
+            self.declare_parameter('positive_projection_mode', 'bearing_consensus').value
+        ).strip().lower()
+        self.bearing_consensus_sigma_deg = float(
+            self.declare_parameter('bearing_consensus_sigma_deg', 6.0).value
+        )
+        self.bearing_consensus_angle_step_deg = float(
+            self.declare_parameter('bearing_consensus_angle_step_deg', 1.0).value
+        )
+        self.bearing_viewpoint_min_baseline_m = float(
+            self.declare_parameter('bearing_viewpoint_min_baseline_m', 0.20).value
+        )
+        self.bearing_min_viewpoints = int(
+            self.declare_parameter('bearing_min_viewpoints', 2).value
+        )
+        self.bearing_support_threshold = float(
+            self.declare_parameter('bearing_support_threshold', 0.12).value
+        )
+        self.bearing_consensus_gain = float(
+            self.declare_parameter('bearing_consensus_gain', 1.0).value
+        )
+        self.bearing_additional_view_bonus = float(
+            self.declare_parameter('bearing_additional_view_bonus', 0.15).value
+        )
+        self.bearing_use_bbox_range_prior = self.declare_bool_parameter(
+            'bearing_use_bbox_range_prior', False
+        )
+        self.bearing_range_sigma_m = float(
+            self.declare_parameter('bearing_range_sigma_m', 2.0).value
+        )
+        self.bearing_observation_max_age_sec = float(
+            self.declare_parameter('bearing_observation_max_age_sec', 120.0).value
+        )
+        self.bearing_max_viewpoints = int(
+            self.declare_parameter('bearing_max_viewpoints', 24).value
+        )
+        self.bearing_max_observations_per_viewpoint = int(
+            self.declare_parameter('bearing_max_observations_per_viewpoint', 8).value
+        )
+        self.bearing_same_view_angle_merge_deg = float(
+            self.declare_parameter('bearing_same_view_angle_merge_deg', 2.0).value
+        )
+
         # Halo
         self.source_halo_radius_m = float(self.declare_parameter('source_halo_radius_m', 0.75).value)
         self.source_halo_sigma_m = float(self.declare_parameter('source_halo_sigma_m', 0.35).value)
@@ -285,6 +346,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.prev_map_geometry = None
 
         self.detection_candidate_map = None
+        self.bearing_consensus_map = None
         self.positive_memory_map = None
         self.risk_map = None
         self.risk_dirty = True
@@ -304,6 +366,8 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.last_risk_publish_ros_ns = 0
 
         self.latest_detections: List[Detection2D] = []
+        self.latest_detection_seq = 0
+        self.processed_detection_seq = 0
         self.last_yolo_wall_sec = 0.0
         self.last_yolo_ros_sec = None
         self.last_fake_wall_sec = 0.0
@@ -341,6 +405,11 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
 
         self.evidence_points: List[EvidencePoint] = []
         self.next_evidence_id = 1
+        self.bearing_observations: List[BearingObservation] = []
+        self.next_bearing_observation_id = 1
+        self.next_bearing_viewpoint_id = 1
+        self.bearing_viewpoint_origins: Dict[int, Tuple[float, float, float]] = {}
+        self.bearing_consensus_peaks: List[Tuple[float, float, float]] = []
         self.topic_pose: Optional[PoseStamped] = None
         self.topic_pose_stamp = None
 
@@ -439,6 +508,11 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.clear_all_sub = self.create_subscription(Bool, '/risk/clear_all', self.on_clear_all, 10)
 
         self.pub_risk = self.create_publisher(OccupancyGrid, '/risk/risk_map', self.qos_grid_pub)
+        self.pub_bearing_consensus = self.create_publisher(
+            OccupancyGrid,
+            '/risk/bearing_consensus_map',
+            self.qos_grid_pub,
+        )
         self.pub_detection_candidate = None
         self.pub_positive_memory = None
         self.pub_visibility = None
@@ -504,6 +578,9 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             f'detection_source={self.detection_source} external_detection_topic={self.external_detection_topic} '
             f'pose_source={self.pose_source} pose_topic={self.pose_topic} map_qos_durability={self.map_qos_durability} '
             f'teleop_mode={self.teleop_mode} risk_publish_rate_hz={self.risk_publish_rate_hz:.2f} '
+            f'positive_projection_mode={self.positive_projection_mode} '
+            f'bearing_min_views={self.bearing_min_viewpoints} '
+            f'bearing_min_baseline={self.bearing_viewpoint_min_baseline_m:.2f}m '
             f'risk_source_mode={self.risk_source_mode} evidence_radius={self.evidence_distribution_radius_m:.2f} '
             f'publish_diagnostic_maps={self.publish_diagnostic_maps} '
             f'debug_raw={self.publish_debug_image}:{self.debug_image_topic} '
@@ -653,6 +730,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                 self.detection_candidate_map = self.reproject_layer_to_new_map(
                     old_detection, old_geometry, new_geometry
                 )
+                self.bearing_consensus_map = np.zeros((h, w), dtype=np.float32)
                 self.positive_memory_map = self.reproject_layer_to_new_map(
                     old_positive, old_geometry, new_geometry
                 )
@@ -683,6 +761,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                 )
             else:
                 self.detection_candidate_map = np.zeros((h, w), dtype=np.float32)
+                self.bearing_consensus_map = np.zeros((h, w), dtype=np.float32)
                 self.positive_memory_map = np.zeros((h, w), dtype=np.float32)
                 self.risk_map = np.zeros((h, w), dtype=np.float32)
                 self.observed_empty_map = np.zeros((h, w), dtype=np.float32)
@@ -694,6 +773,9 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                 self.region_checked_map = np.zeros((h, w), dtype=np.float32)
                 self.region_states.clear()
                 self.evidence_points.clear()
+                self.bearing_observations.clear()
+                self.bearing_viewpoint_origins.clear()
+                self.bearing_consensus_peaks.clear()
                 self.get_logger().warn(f'map geometry initialized/changed: {sig}; internal maps initialized')
 
             self.map_signature = sig
@@ -1218,6 +1300,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             self.yolo_frame_count += 1
             self.yolo_det_count += len(detections)
             self.latest_detections = detections
+            self.latest_detection_seq += 1
             self.last_yolo_ros_sec = self.get_clock().now().nanoseconds * 1e-9
             self.update_detection_capture_pose(header, capture_sec)
 
@@ -1299,6 +1382,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             self.yolo_frame_count += 1
             self.yolo_det_count += len(detections)
             self.latest_detections = detections
+            self.latest_detection_seq += 1
             self.last_yolo_ros_sec = self.get_clock().now().nanoseconds * 1e-9
             self.latest_detection_capture_sec = capture_sec if capture_sec > 0.0 else None
             self.latest_detection_pose = self.lookup_pose_at(capture_sec)
@@ -1371,6 +1455,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             yolo_det_count = self.yolo_det_count
             current_det_count = len(self.latest_detections)
             yolo_drop_count = self.yolo_drop_count
+        bearing_view_count = len({obs.viewpoint_id for obs in self.bearing_observations})
         self.get_logger().info(
             f'YOLO_DEBUG | image_rx={self.image_rx_count} | external_rx={self.external_detection_rx_count} | yolo_frames={yolo_frame_count} | '
             f'total_dets={yolo_det_count} | current_dets={current_det_count} | yolo_dropped={yolo_drop_count} | '
@@ -1379,11 +1464,263 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             f'last_shape={self.last_image_shape} | enc={self.last_image_encoding} | '
             f'capture_delay_ms={self.latest_detection_delay_ms:.1f} | '
             f'history_pose={self.latest_detection_pose is not None} | '
+            f'bearing_obs={len(self.bearing_observations)} views={bearing_view_count} '
+            f'consensus_peaks={len(self.bearing_consensus_peaks)} | '
             f'source={self.detection_source} image_topic={self.image_topic} external_topic={self.external_detection_topic}',
             throttle_duration_sec=2.0
         )
 
     # ---------------- Positive candidate / empty observation ----------------
+
+    def bearing_consensus_enabled(self):
+        return self.positive_projection_mode in (
+            'bearing',
+            'bearing_only',
+            'bearing_consensus',
+            'multi_view_bearing',
+            'triangulation',
+        )
+
+    def prune_bearing_observations(self, now_sec):
+        max_age = max(0.0, float(self.bearing_observation_max_age_sec))
+        if max_age > 0.0:
+            keep_after = float(now_sec) - max_age
+            self.bearing_observations = [
+                obs for obs in self.bearing_observations
+                if obs.stamp_sec >= keep_after
+            ]
+
+        active_ids = {obs.viewpoint_id for obs in self.bearing_observations}
+        self.bearing_viewpoint_origins = {
+            view_id: value
+            for view_id, value in self.bearing_viewpoint_origins.items()
+            if view_id in active_ids
+        }
+
+        max_views = max(2, int(self.bearing_max_viewpoints))
+        if len(self.bearing_viewpoint_origins) <= max_views:
+            return
+
+        newest_first = sorted(
+            self.bearing_viewpoint_origins.items(),
+            key=lambda item: item[1][2],
+            reverse=True,
+        )
+        retained = {view_id for view_id, _ in newest_first[:max_views]}
+        self.bearing_observations = [
+            obs for obs in self.bearing_observations
+            if obs.viewpoint_id in retained
+        ]
+        self.bearing_viewpoint_origins = {
+            view_id: value
+            for view_id, value in self.bearing_viewpoint_origins.items()
+            if view_id in retained
+        }
+
+    def select_bearing_viewpoint(self, robot_pose, stamp_sec):
+        rx, ry, _ = robot_pose
+        baseline = max(self.map_resolution or 0.05, float(self.bearing_viewpoint_min_baseline_m))
+        nearest_id = None
+        nearest_distance = float('inf')
+        for view_id, (vx, vy, _) in self.bearing_viewpoint_origins.items():
+            distance = math.hypot(float(rx) - vx, float(ry) - vy)
+            if distance < nearest_distance:
+                nearest_distance = distance
+                nearest_id = view_id
+
+        if nearest_id is not None and nearest_distance < baseline:
+            vx, vy, _ = self.bearing_viewpoint_origins[nearest_id]
+            self.bearing_viewpoint_origins[nearest_id] = (vx, vy, float(stamp_sec))
+            return nearest_id
+
+        view_id = self.next_bearing_viewpoint_id
+        self.next_bearing_viewpoint_id += 1
+        self.bearing_viewpoint_origins[view_id] = (
+            float(rx),
+            float(ry),
+            float(stamp_sec),
+        )
+        return view_id
+
+    def ingest_bearing_observations(self, robot_pose, detections, stamp_sec):
+        if not detections:
+            return False
+
+        self.prune_bearing_observations(stamp_sec)
+        rx, ry, ryaw = robot_pose
+        viewpoint_id = self.select_bearing_viewpoint(robot_pose, stamp_sec)
+        merge_angle = math.radians(max(0.1, float(self.bearing_same_view_angle_merge_deg)))
+        changed = False
+
+        for det in detections:
+            world_bearing = wrap_angle(float(ryaw) + float(det.bearing_rad))
+            best_match = None
+            best_error = float('inf')
+            for obs in self.bearing_observations:
+                if obs.viewpoint_id != viewpoint_id:
+                    continue
+                error = abs(wrap_angle(obs.bearing_world_rad - world_bearing))
+                if error < merge_angle and error < best_error:
+                    best_match = obs
+                    best_error = error
+
+            if best_match is not None:
+                old_weight = max(1e-3, float(best_match.confidence))
+                new_weight = max(1e-3, float(det.conf))
+                sx = old_weight * math.cos(best_match.bearing_world_rad)
+                sy = old_weight * math.sin(best_match.bearing_world_rad)
+                sx += new_weight * math.cos(world_bearing)
+                sy += new_weight * math.sin(world_bearing)
+                best_match.bearing_world_rad = math.atan2(sy, sx)
+                best_match.confidence = max(best_match.confidence, float(det.conf))
+                best_match.range_hint_m = float(det.range_hat_m)
+                best_match.stamp_sec = float(stamp_sec)
+                changed = True
+                continue
+
+            self.bearing_observations.append(BearingObservation(
+                observation_id=self.next_bearing_observation_id,
+                viewpoint_id=viewpoint_id,
+                origin_x=float(rx),
+                origin_y=float(ry),
+                bearing_world_rad=world_bearing,
+                confidence=clamp(float(det.conf), 0.0, 1.0),
+                range_hint_m=float(det.range_hat_m),
+                stamp_sec=float(stamp_sec),
+            ))
+            self.next_bearing_observation_id += 1
+            changed = True
+
+        per_view_limit = max(1, int(self.bearing_max_observations_per_viewpoint))
+        same_view = [
+            obs for obs in self.bearing_observations
+            if obs.viewpoint_id == viewpoint_id
+        ]
+        if len(same_view) > per_view_limit:
+            keep_ids = {
+                obs.observation_id
+                for obs in sorted(
+                    same_view,
+                    key=lambda obs: (obs.stamp_sec, obs.confidence),
+                    reverse=True,
+                )[:per_view_limit]
+            }
+            self.bearing_observations = [
+                obs for obs in self.bearing_observations
+                if obs.viewpoint_id != viewpoint_id or obs.observation_id in keep_ids
+            ]
+
+        self.prune_bearing_observations(stamp_sec)
+        return changed
+
+    def build_bearing_observation_map(self, obs):
+        h, w = self.occ_grid.shape
+        out = np.zeros((h, w), dtype=np.float32)
+        sigma = math.radians(max(0.25, float(self.bearing_consensus_sigma_deg)))
+        angle_step = math.radians(max(0.25, float(self.bearing_consensus_angle_step_deg)))
+        width = max(3.0 * sigma, angle_step)
+        sample_count = max(1, int(math.ceil((2.0 * width) / angle_step)))
+        range_step = max(self.map_resolution, 0.03)
+        range_sigma = max(self.map_resolution, float(self.bearing_range_sigma_m))
+
+        for index in range(sample_count + 1):
+            theta = obs.bearing_world_rad - width + index * (2.0 * width / sample_count)
+            angular_error = wrap_angle(theta - obs.bearing_world_rad)
+            angular_weight = math.exp(-0.5 * (angular_error / sigma) ** 2)
+
+            distance = self.min_range_m
+            while distance <= self.max_range_m + 1e-6:
+                x = obs.origin_x + distance * math.cos(theta)
+                y = obs.origin_y + distance * math.sin(theta)
+                grid = self.world_to_grid(x, y)
+                if grid is None:
+                    break
+                gx, gy = grid
+                if not self.traversable(gy, gx):
+                    break
+
+                range_weight = 1.0
+                if self.bearing_use_bbox_range_prior:
+                    range_weight = math.exp(
+                        -0.5 * ((distance - obs.range_hint_m) / range_sigma) ** 2
+                    )
+                value = float(obs.confidence) * angular_weight * range_weight
+                if value > out[gy, gx]:
+                    out[gy, gx] = value
+                distance += range_step
+
+        out[~self.valid_free_mask()] = 0.0
+        return out
+
+    def extract_bearing_consensus_peaks(self, candidate, max_peaks=12):
+        self.bearing_consensus_peaks = []
+        if candidate is None or float(np.max(candidate)) <= 1e-6:
+            return
+
+        work = candidate.copy()
+        separation_m = max(0.30, float(self.evidence_distribution_radius_m))
+        separation_cells = max(1, int(math.ceil(separation_m / self.map_resolution)))
+        h, w = work.shape
+        for _ in range(max(1, int(max_peaks))):
+            flat_index = int(np.argmax(work))
+            value = float(work.flat[flat_index])
+            if value < max(self.source_min_value, self.bearing_support_threshold):
+                break
+            gy, gx = np.unravel_index(flat_index, work.shape)
+            wx, wy = self.grid_to_world(int(gx), int(gy))
+            self.bearing_consensus_peaks.append((float(wx), float(wy), value))
+
+            y0 = max(0, int(gy) - separation_cells)
+            y1 = min(h, int(gy) + separation_cells + 1)
+            x0 = max(0, int(gx) - separation_cells)
+            x1 = min(w, int(gx) + separation_cells + 1)
+            yy, xx = np.ogrid[y0:y1, x0:x1]
+            mask = (xx - int(gx)) ** 2 + (yy - int(gy)) ** 2 <= separation_cells ** 2
+            local = work[y0:y1, x0:x1]
+            local[mask] = 0.0
+
+    def build_bearing_consensus_map(self):
+        h, w = self.occ_grid.shape
+        empty = np.zeros((h, w), dtype=np.float32)
+        if not self.bearing_observations:
+            self.extract_bearing_consensus_peaks(empty)
+            return empty
+
+        grouped: Dict[int, List[BearingObservation]] = {}
+        for obs in self.bearing_observations:
+            grouped.setdefault(obs.viewpoint_id, []).append(obs)
+
+        required_views = max(2, min(3, int(self.bearing_min_viewpoints)))
+        if len(grouped) < required_views:
+            self.extract_bearing_consensus_peaks(empty)
+            return empty
+
+        viewpoint_maps = []
+        for observations in grouped.values():
+            group_map = np.zeros((h, w), dtype=np.float32)
+            for obs in observations:
+                np.maximum(group_map, self.build_bearing_observation_map(obs), out=group_map)
+            viewpoint_maps.append(group_map)
+
+        votes = np.stack(viewpoint_maps, axis=0)
+        ordered = np.sort(votes, axis=0)
+        strongest_required = ordered[-required_views:, :, :]
+        geometric_mean = np.exp(
+            np.mean(np.log(np.maximum(strongest_required, 1e-6)), axis=0)
+        )
+        support_count = np.sum(
+            votes >= max(0.0, float(self.bearing_support_threshold)),
+            axis=0,
+        )
+        extra_views = np.maximum(0, support_count - required_views).astype(np.float32)
+        bonus = 1.0 + max(0.0, float(self.bearing_additional_view_bonus)) * extra_views
+        candidate = geometric_mean * max(0.0, float(self.bearing_consensus_gain)) * bonus
+        candidate[support_count < required_views] = 0.0
+        candidate[candidate < self.source_min_value] = 0.0
+        candidate[~self.valid_free_mask()] = 0.0
+        candidate = np.clip(candidate, 0.0, 1.0).astype(np.float32)
+        self.extract_bearing_consensus_peaks(candidate)
+        return candidate
 
     def build_detection_candidate_map(self, robot_pose, detections):
         h, w = self.occ_grid.shape
@@ -1454,9 +1791,18 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             return False
         # Persistent positive evidence. No negative subtraction.
         alpha = clamp(self.positive_memory_alpha, 0.0, 1.0)
-        fused = 1.0 - (1.0 - self.positive_memory_map) * (1.0 - alpha * candidate)
-        self.positive_memory_map = np.maximum(self.positive_memory_map, fused)
-        self.positive_memory_map[~self.risk_memory_mask()] = 0.0
+        if self.bearing_consensus_enabled():
+            # Re-observing the same direction from the same viewpoint is not an
+            # independent event. Max fusion prevents timer/camera rate from
+            # artificially saturating a consensus that has no new geometry.
+            fused = np.maximum(self.positive_memory_map, alpha * candidate)
+        else:
+            fused = 1.0 - (1.0 - self.positive_memory_map) * (1.0 - alpha * candidate)
+        updated = np.maximum(self.positive_memory_map, fused)
+        updated[~self.risk_memory_mask()] = 0.0
+        if not np.any(updated > self.positive_memory_map + 1e-6):
+            return False
+        self.positive_memory_map = updated
         self.risk_dirty = True
         return True
 
@@ -1910,6 +2256,8 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         return np.clip(out, 0.0, 1.0)
 
     def build_risk_source_map(self):
+        if self.bearing_consensus_enabled():
+            return self.positive_memory_map
         if self.risk_source_mode in ('evidence', 'evidence_points', 'markers', 'marker_distribution'):
             evidence_source = self.build_evidence_source_map()
             if float(np.max(evidence_source)) > 1e-6:
@@ -1932,12 +2280,15 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         if self.pose_source not in ('topic', 'pose_topic', 'pose'):
             self.record_pose_sample(now_ros_sec, robot_pose)
 
-        detections = []
-        detections.extend(self.maybe_make_fake_detection())
+        fake_detections = self.maybe_make_fake_detection()
         with self.detection_lock:
             last_yolo_ros_sec = self.last_yolo_ros_sec
             latest_detection_pose = self.latest_detection_pose
             latest_detections = list(self.latest_detections)
+            latest_detection_seq = int(self.latest_detection_seq)
+        has_new_detection_batch = latest_detection_seq != self.processed_detection_seq
+        if has_new_detection_batch:
+            self.processed_detection_seq = latest_detection_seq
         can_reuse_detection = (
             last_yolo_ros_sec is not None
             and now_ros_sec - last_yolo_ros_sec <= self.detection_timeout_sec
@@ -1947,24 +2298,41 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             dy = float(robot_pose[1]) - float(latest_detection_pose[1])
             if math.hypot(dx, dy) > max(0.0, self.detection_reuse_max_distance_m):
                 can_reuse_detection = False
-        if can_reuse_detection:
-            detections.extend(latest_detections)
 
-        projection_pose = (
-            latest_detection_pose
-            if detections and latest_detection_pose is not None
-            else robot_pose
+        new_detections = list(fake_detections)
+        if has_new_detection_batch and can_reuse_detection:
+            new_detections.extend(latest_detections)
+        currently_detecting_person = bool(fake_detections) or (
+            can_reuse_detection and bool(latest_detections)
         )
-        self.detection_candidate_map = self.build_detection_candidate_map(projection_pose, detections)
-        had_detection = float(np.max(self.detection_candidate_map)) > 1e-6
 
-        if had_detection:
-            self.update_positive_memory(self.detection_candidate_map)
+        if new_detections:
+            projection_pose = (
+                latest_detection_pose
+                if has_new_detection_batch and latest_detection_pose is not None
+                else robot_pose
+            )
+            if self.bearing_consensus_enabled():
+                if self.ingest_bearing_observations(
+                    projection_pose,
+                    new_detections,
+                    now_ros_sec,
+                ):
+                    self.bearing_consensus_map = self.build_bearing_consensus_map()
+                    self.detection_candidate_map = self.bearing_consensus_map.copy()
+            else:
+                self.detection_candidate_map = self.build_detection_candidate_map(
+                    projection_pose,
+                    new_detections,
+                )
+
+            if float(np.max(self.detection_candidate_map)) > 1e-6:
+                self.update_positive_memory(self.detection_candidate_map)
 
         if self.enable_visibility_tracking:
             self.visibility_map = self.compute_visibility_map(robot_pose)
             self.update_visual_seen_map(self.visibility_map)
-            self.update_observed_empty(self.visibility_map, had_detection)
+            self.update_observed_empty(self.visibility_map, currently_detecting_person)
 
         if self.enable_region_segmentation:
             self.update_region_segmentation()
@@ -1986,6 +2354,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             return
         for arr in (
             self.detection_candidate_map,
+            self.bearing_consensus_map,
             self.positive_memory_map,
             self.risk_map,
             self.observed_empty_map,
@@ -2001,6 +2370,9 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             self.region_id_map.fill(0)
         self.region_states.clear()
         self.evidence_points.clear()
+        self.bearing_observations.clear()
+        self.bearing_viewpoint_origins.clear()
+        self.bearing_consensus_peaks.clear()
         self.risk_dirty = True
         self.get_logger().warn('cleared all room-aware risk/region maps')
 
@@ -2030,6 +2402,10 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.evidence_points = [
             ev for ev in self.evidence_points
             if math.hypot(ev.x - x, ev.y - y) > self.clear_radius_m
+        ]
+        self.bearing_consensus_peaks = [
+            peak for peak in self.bearing_consensus_peaks
+            if math.hypot(peak[0] - x, peak[1] - y) > self.clear_radius_m
         ]
         self.risk_dirty = True
         self.get_logger().warn(f'clear positive risk around ({x:.2f},{y:.2f}) r={self.clear_radius_m:.2f}m')
@@ -2079,6 +2455,9 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         )
         if risk_period_ns <= 0 or now_ros_ns - self.last_risk_publish_ros_ns >= risk_period_ns:
             self.pub_risk.publish(self.array_to_occgrid(self.risk_map, stamp))
+            self.pub_bearing_consensus.publish(
+                self.array_to_occgrid(self.bearing_consensus_map, stamp)
+            )
             self.last_risk_publish_ros_ns = now_ros_ns
         diagnostic_period_ns = (
             int(1e9 / self.diagnostic_publish_rate_hz)
@@ -2136,6 +2515,63 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                 z=0.05,
             ))
         ma.markers.append(fov)
+
+        # Historical person bearings. Each cyan ray is one accepted viewpoint
+        # observation; overlapping rays explain why a consensus cell gained risk.
+        for i, obs in enumerate(self.bearing_observations[-80:]):
+            end_x = obs.origin_x
+            end_y = obs.origin_y
+            distance = self.min_range_m
+            step = max(self.map_resolution or 0.05, 0.05)
+            while distance <= self.max_range_m + 1e-6:
+                x = obs.origin_x + distance * math.cos(obs.bearing_world_rad)
+                y = obs.origin_y + distance * math.sin(obs.bearing_world_rad)
+                grid = self.world_to_grid(x, y)
+                if grid is None:
+                    break
+                gx, gy = grid
+                if not self.traversable(gy, gx):
+                    break
+                end_x, end_y = x, y
+                distance += step
+
+            ray = Marker()
+            ray.header.frame_id = self.map_frame
+            ray.header.stamp = stamp
+            ray.ns = 'person_bearing_observations'
+            ray.id = 2000 + i
+            ray.type = Marker.LINE_STRIP
+            ray.action = Marker.ADD
+            ray.scale.x = 0.018
+            ray.color.r = 0.05
+            ray.color.g = 0.75
+            ray.color.b = 1.0
+            ray.color.a = 0.18 + 0.32 * clamp(obs.confidence, 0.0, 1.0)
+            ray.points.append(Point(x=obs.origin_x, y=obs.origin_y, z=0.07))
+            ray.points.append(Point(x=end_x, y=end_y, z=0.07))
+            ma.markers.append(ray)
+
+        for i, (peak_x, peak_y, peak_value) in enumerate(self.bearing_consensus_peaks):
+            peak = Marker()
+            peak.header.frame_id = self.map_frame
+            peak.header.stamp = stamp
+            peak.ns = 'bearing_consensus_peaks'
+            peak.id = 3000 + i
+            peak.type = Marker.SPHERE
+            peak.action = Marker.ADD
+            peak.pose.position.x = float(peak_x)
+            peak.pose.position.y = float(peak_y)
+            peak.pose.position.z = 0.10
+            peak.pose.orientation.w = 1.0
+            size = 0.18 + 0.22 * clamp(float(peak_value), 0.0, 1.0)
+            peak.scale.x = size
+            peak.scale.y = size
+            peak.scale.z = 0.10
+            peak.color.r = 1.0
+            peak.color.g = 0.85
+            peak.color.b = 0.0
+            peak.color.a = 0.95
+            ma.markers.append(peak)
 
         for i, ev in enumerate(self.evidence_points[-80:]):
             m = Marker()

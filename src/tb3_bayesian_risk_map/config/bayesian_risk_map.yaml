@@ -60,6 +60,25 @@ bayesian_risk_map_node:
     source_min_value: 0.03
     positive_memory_alpha: 0.85
 
+    # Multi-view bearing consensus.
+    # Small/printed people make bbox-height distance unreliable, so range is ignored by
+    # default. A person direction is stored at each robot viewpoint, and risk appears
+    # where rays from at least two spatially distinct viewpoints agree.
+    positive_projection_mode: "bearing_consensus"
+    bearing_consensus_sigma_deg: 6.0
+    bearing_consensus_angle_step_deg: 1.0
+    bearing_viewpoint_min_baseline_m: 0.20
+    bearing_min_viewpoints: 2
+    bearing_support_threshold: 0.12
+    bearing_consensus_gain: 1.0
+    bearing_additional_view_bonus: 0.15
+    bearing_use_bbox_range_prior: false
+    bearing_range_sigma_m: 2.0
+    bearing_observation_max_age_sec: 120.0
+    bearing_max_viewpoints: 24
+    bearing_max_observations_per_viewpoint: 8
+    bearing_same_view_angle_merge_deg: 2.0
+
     # Risk halo: bounded, wall-aware, not global diffusion
     source_halo_radius_m: 0.75
     source_halo_sigma_m: 0.35

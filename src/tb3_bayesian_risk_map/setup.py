@@ -18,6 +18,7 @@ setup(
         (os.path.join('share', package_name, 'scripts'), glob('scripts/*.bash')),
     ],
     install_requires=['setuptools'],
+    tests_require=['pytest'],
     zip_safe=True,
     maintainer='bomin',
     maintainer_email='qhals8380@gmail.com',
