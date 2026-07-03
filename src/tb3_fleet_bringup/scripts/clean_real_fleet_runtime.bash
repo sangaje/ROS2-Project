@@ -37,6 +37,8 @@ patterns=(
   'pose_to_nav2_action_direct_v41.py'
   'fleet_debug_marker.py'
   'sim_burger_scan_relay.py'
+  'scan_frame_relay.py'
+  'real_burger_scan_frame_relay'
   'sim_burger_tf_relay.py'
   'sim_map_relay.py'
   'sim_burger_tf_forwarder.py'
@@ -92,10 +94,7 @@ for pattern in "${patterns[@]}"; do
   kill_matches TERM "${pattern}"
 done
 
-rm -f /tmp/fastdds_fleet_d*.xml \
-      /tmp/fastdds_fleet_rviz_d*.xml \
-      /tmp/fastdds_robot_d*.xml \
-      /tmp/turtlebot3_burger_follower.sdf \
+rm -f /tmp/turtlebot3_burger_follower.sdf \
       /tmp/turtlebot3_burger_follower_bridge.yaml \
       /tmp/sim_burger_amcl_initial_pose.yaml \
       /tmp/burger_amcl_initial_pose.yaml

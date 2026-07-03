@@ -18,13 +18,8 @@ def main() -> None:
     args = parser.parse_args(sys.argv[1:])
 
     os.environ['ROS_DOMAIN_ID'] = str(args.domain)
-    os.environ['ROS_AUTOMATIC_DISCOVERY_RANGE'] = 'SUBNET'
-    os.environ.setdefault('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp')
-    os.environ.setdefault('FASTDDS_BUILTIN_TRANSPORTS', 'UDPv4')
     os.environ.pop('ROS_DISCOVERY_SERVER', None)
     os.environ.pop('ROS_LOCALHOST_ONLY', None)
-    os.environ.pop('FASTRTPS_DEFAULT_PROFILES_FILE', None)
-    os.environ.pop('FASTDDS_DEFAULT_PROFILES_FILE', None)
 
     import rclpy
     from rclpy.node import Node

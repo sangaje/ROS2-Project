@@ -30,8 +30,6 @@ def generate_launch_description():
     initial_x   = LaunchConfiguration('initial_x')
     initial_y   = LaunchConfiguration('initial_y')
     initial_yaw = LaunchConfiguration('initial_yaw')
-    robot1_ip   = LaunchConfiguration('robot1_ip')
-    robot2_ip   = LaunchConfiguration('robot2_ip')
 
     burger_slam_yaml = os.path.join(bringup_share, 'config', 'domain26_burger_nav2_slam.yaml')
     burger_amcl_yaml = os.path.join(bringup_share, 'config', 'domain24_burger_nav2_amcl.yaml')
@@ -52,56 +50,17 @@ def generate_launch_description():
     cartographer_config_dir = os.path.join(bringup_share, 'config')
     tf_pose_script    = os.path.join(bringup_share, 'scripts', 'tf_pose_publisher_direct_v44.py')
     goal_proxy_script = os.path.join(bringup_share, 'scripts', 'pose_to_nav2_action_direct_v41.py')
-
-    # ── FastDDS XML with configurable IPs (written at launch-time) ─────────────
-    def make_fastdds_env(context, *args, **kwargs):
-        peers = [p.strip() for p in (robot1_ip.perform(context), robot2_ip.perform(context)) if p.strip()]
-        d  = domain_id.perform(context)
-        if not peers:
-            return [
-                UnsetEnvironmentVariable('ROS_STATIC_PEERS'),
-                LogInfo(msg=['LEADER_D', d, ' | DDS discovery=subnet multicast']),
-            ]
-        locators = '\n'.join(
-            f'          <locator><udpv4><address>{peer}</address></udpv4></locator>'
-            for peer in peers
-        )
-        xml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
-  <participant profile_name="default_profile" is_default_profile="true">
-    <rtps>
-      <builtin>
-        <initialPeersList>
-{locators}
-        </initialPeersList>
-      </builtin>
-    </rtps>
-  </participant>
-</profiles>
-"""
-        xml_path = Path(tempfile.gettempdir()) / f'fastdds_fleet_d{d}.xml'
-        xml_path.write_text(xml, encoding='utf-8')
-        return [
-            SetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE', str(xml_path)),
-            SetEnvironmentVariable('FASTDDS_DEFAULT_PROFILES_FILE', str(xml_path)),
-            SetEnvironmentVariable('ROS_STATIC_PEERS', ';'.join(peers)),
-        ]
+    pose_tf_script    = os.path.join(bringup_share, 'scripts', 'pose_to_tf_broadcaster.py')
 
     # ── Localization: Cartographer SLAM or AMCL ────────────────────────────────
     def make_localization(context, *args, **kwargs):
         slam_mode = use_slam.perform(context).lower() in ('true', '1', 'yes')
         d = domain_id.perform(context)
-        xml_path = Path(tempfile.gettempdir()) / f'fastdds_fleet_d{d}.xml'
 
         extra_env = {
             'ROS_DOMAIN_ID': d,
             'RMW_IMPLEMENTATION': 'rmw_fastrtps_cpp',
-            'FASTDDS_BUILTIN_TRANSPORTS': 'UDPv4',
-            'ROS_AUTOMATIC_DISCOVERY_RANGE': 'SUBNET',
         }
-        if xml_path.exists():
-            extra_env['FASTRTPS_DEFAULT_PROFILES_FILE'] = str(xml_path)
-            extra_env['FASTDDS_DEFAULT_PROFILES_FILE']  = str(xml_path)
 
         if slam_mode:
             cartographer = Node(
@@ -168,6 +127,32 @@ def generate_launch_description():
         ],
         output='screen', name='waffle_real_leader_pose_publisher',
     )
+    burger_amcl_tf = ExecuteProcess(
+        cmd=[
+            'python3', pose_tf_script, '--ros-args',
+            '-r', '__node:=real_burger_amcl_tf_on_leader_domain',
+            '-p', 'use_sim_time:=false',
+            '-p', 'input_topic:=/burger_pose',
+            '-p', 'parent_frame:=map',
+            '-p', 'child_frame:=burger/base_footprint',
+            '-p', 'republish_hz:=10.0',
+        ],
+        output='screen', name='real_burger_amcl_tf_on_leader_domain',
+    )
+    burger_scan_static_tf = ExecuteProcess(
+        cmd=[
+            'ros2', 'run', 'tf2_ros', 'static_transform_publisher',
+            '--x', '-0.032',
+            '--y', '0.0',
+            '--z', '0.182',
+            '--roll', '0',
+            '--pitch', '0',
+            '--yaw', '0',
+            '--frame-id', 'burger/base_footprint',
+            '--child-frame-id', 'burger/base_scan',
+        ],
+        output='screen', name='real_burger_scan_static_tf',
+    )
 
     controller_server = Node(
         package='nav2_controller', executable='controller_server',
@@ -221,23 +206,17 @@ def generate_launch_description():
         DeclareLaunchArgument('initial_x',    default_value='1.05'),
         DeclareLaunchArgument('initial_y',    default_value='0.0'),
         DeclareLaunchArgument('initial_yaw',  default_value='0.0'),
-        DeclareLaunchArgument('robot1_ip',    default_value=''),
-        DeclareLaunchArgument('robot2_ip',    default_value=''),
         UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
         UnsetEnvironmentVariable('ROS_LOCALHOST_ONLY'),
         UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),
         UnsetEnvironmentVariable('FASTDDS_DEFAULT_PROFILES_FILE'),
         SetEnvironmentVariable('ROS_DOMAIN_ID',               domain_id),
         SetEnvironmentVariable('RMW_IMPLEMENTATION',          'rmw_fastrtps_cpp'),
-        SetEnvironmentVariable('FASTDDS_BUILTIN_TRANSPORTS',  'UDPv4'),
-        SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', 'SUBNET'),
         SetEnvironmentVariable('TURTLEBOT3_MODEL',            robot_model),
-        OpaqueFunction(function=make_fastdds_env),   # writes XML + sets env vars
         LogInfo(msg=['LEADER_D', domain_id, ' | model=', robot_model,
-                     ' | use_slam=', use_slam,
-                     ' | peers=', robot1_ip, ';', robot2_ip]),
+                     ' | use_slam=', use_slam]),
         OpaqueFunction(function=make_localization),
-        TimerAction(period=1.5, actions=[leader_pose]),
+        TimerAction(period=1.5, actions=[leader_pose, burger_scan_static_tf, burger_amcl_tf]),
         TimerAction(period=2.0, actions=[controller_server, planner_server,
                                          behavior_server, bt_navigator]),
         TimerAction(period=5.0, actions=[lifecycle_nav]),
