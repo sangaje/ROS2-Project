@@ -8,7 +8,7 @@ import time
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description='Send a short Burger follow-state command on Domain 25.'
+        description='Send a short Burger follow-state command on the selected fleet domain.'
     )
     parser.add_argument(
         'command',

@@ -8,7 +8,7 @@ controller_server:
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.5
     min_theta_velocity_threshold: 0.001
-    failure_tolerance: 0.8
+    failure_tolerance: 2.0
     odom_topic: "/odom_nav"
     enable_stamped_cmd_vel: true
     progress_checker_plugins: ["progress_checker"]
@@ -17,8 +17,8 @@ controller_server:
 
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      required_movement_radius: 0.05
-      movement_time_allowance: 25.0
+      required_movement_radius: 0.025
+      movement_time_allowance: 45.0
 
     general_goal_checker:
       stateful: true
@@ -49,7 +49,7 @@ controller_server:
       sim_time: 1.8             # look further ahead for obstacles
       linear_granularity: 0.05
       angular_granularity: 0.025
-      transform_tolerance: 1.0
+      transform_tolerance: 1.5
       xy_goal_tolerance: 0.30
       trans_stopped_velocity: 0.08
       short_circuit_trajectory_evaluation: true
@@ -96,7 +96,7 @@ behavior_server:
       plugin: "nav2_behaviors::Wait"
     global_frame: "map"
     robot_base_frame: "base_footprint"
-    transform_tolerance: 1.0
+    transform_tolerance: 1.5
     simulate_ahead_time: 2.5
     max_rotational_vel: 0.80
     min_rotational_vel: 0.10
@@ -188,12 +188,12 @@ lifecycle_manager_map:
   ros__parameters:
     use_sim_time: true
     autostart: true
-    bond_timeout: 4.0
+    bond_timeout: 8.0
     node_names: ["map_server"]
 
 lifecycle_manager_navigation:
   ros__parameters:
     use_sim_time: true
     autostart: true
-    bond_timeout: 4.0
+    bond_timeout: 8.0
     node_names: ["controller_server", "planner_server", "behavior_server", "bt_navigator"]

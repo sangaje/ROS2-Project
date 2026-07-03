@@ -79,11 +79,11 @@ def generate_launch_description():
             rviz_clean_script,
             '-d', rviz_config,
             '--ros-args',
-            '-r', '__node:=rviz2_real_domain25_fleet',
+            '-r', '__node:=rviz2_fleet',
             '-p', 'use_sim_time:=false',
         ],
         output='screen',
-        name='rviz2_real_domain25_fleet',
+        name='rviz2_fleet',
     )
 
     return LaunchDescription([
@@ -100,7 +100,8 @@ def generate_launch_description():
         SetEnvironmentVariable('FASTDDS_BUILTIN_TRANSPORTS',  'UDPv4'),
         SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', 'SUBNET'),
         OpaqueFunction(function=make_fastdds_env),
-        LogInfo(msg='REAL_FLEET_RVIZ_D25 | /goal_pose → Waffle | /fleet/follow_command → Burger'),
+        LogInfo(msg=['FLEET_RVIZ | domain=', domain_id,
+                     ' | /goal_pose -> leader | /fleet/follow_command -> follower']),
         marker,
         rviz,
     ])

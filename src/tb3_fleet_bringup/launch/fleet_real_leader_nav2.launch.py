@@ -91,6 +91,7 @@ def generate_launch_description():
     def make_localization(context, *args, **kwargs):
         slam_mode = use_slam.perform(context).lower() in ('true', '1', 'yes')
         d = domain_id.perform(context)
+        xml_path = Path(tempfile.gettempdir()) / f'fastdds_fleet_d{d}.xml'
 
         extra_env = {
             'ROS_DOMAIN_ID': d,
@@ -98,6 +99,9 @@ def generate_launch_description():
             'FASTDDS_BUILTIN_TRANSPORTS': 'UDPv4',
             'ROS_AUTOMATIC_DISCOVERY_RANGE': 'SUBNET',
         }
+        if xml_path.exists():
+            extra_env['FASTRTPS_DEFAULT_PROFILES_FILE'] = str(xml_path)
+            extra_env['FASTDDS_DEFAULT_PROFILES_FILE']  = str(xml_path)
 
         if slam_mode:
             cartographer = Node(

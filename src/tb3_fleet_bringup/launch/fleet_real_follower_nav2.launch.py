@@ -49,6 +49,7 @@ def generate_launch_description():
     follower_script   = os.path.join(bringup_share, 'scripts', 'domain_bridge_nav2_follower_direct_v40.py')
     tf_pose_script    = os.path.join(bringup_share, 'scripts', 'tf_pose_publisher_direct_v44.py')
     goal_proxy_script = os.path.join(bringup_share, 'scripts', 'pose_to_nav2_action_direct_v41.py')
+    map_relay_script  = os.path.join(bringup_share, 'scripts', 'sim_map_relay.py')
     cartographer_config_dir = os.path.join(bringup_share, 'config')
 
     # ── FastDDS XML with robot IPs (written at launch-time) ───────────────────
@@ -92,11 +93,32 @@ def generate_launch_description():
         sd = slam_domain.perform(context)
         out = Path(tempfile.gettempdir()) / 'tb3_fleet_real_domain_bridge'
         out.mkdir(parents=True, exist_ok=True)
+        xml_path = Path(tempfile.gettempdir()) / f'fastdds_fleet_d{bd}.xml'
+        bridge_env = {}
+        if xml_path.exists():
+            bridge_env['FASTRTPS_DEFAULT_PROFILES_FILE'] = str(xml_path)
+            bridge_env['FASTDDS_DEFAULT_PROFILES_FILE']  = str(xml_path)
 
         l2b = out / f'real_leader_{ld}_to_burger_{bd}.yaml'
         b2l = out / f'real_burger_{bd}_to_leader_{ld}.yaml'
 
-        map_block = """  /map:
+        l2b_map_block = """  /map:
+    type: nav_msgs/msg/OccupancyGrid
+    remap: /map_bridge
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 5
+  /map_metadata:
+    type: nav_msgs/msg/MapMetaData
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 1
+"""
+        b2l_map_block = """  /map:
     type: nav_msgs/msg/OccupancyGrid
     qos:
       reliability: reliable
@@ -111,8 +133,8 @@ def generate_launch_description():
       history: keep_last
       depth: 1
 """
-        l2b_map = map_block if sd == '25' else ''
-        b2l_map = map_block if sd == '24' else ''
+        l2b_map = l2b_map_block if sd == ld else ''
+        b2l_map = b2l_map_block if sd == bd else ''
 
         l2b.write_text(
             f"""name: real_leader_{ld}_to_burger_{bd}
@@ -127,6 +149,13 @@ topics:
       durability: volatile
       history: keep_last
       depth: 10
+  /initialpose:
+    type: geometry_msgs/msg/PoseWithCovarianceStamped
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 1
   /plan:
     type: nav_msgs/msg/Path
     remap: /waffle_plan
@@ -191,21 +220,28 @@ topics:
 
         return [
             ExecuteProcess(cmd=['ros2', 'run', 'domain_bridge', 'domain_bridge', str(l2b)],
-                           output='screen', name='real_leader_to_burger_bridge'),
+                           additional_env=bridge_env, output='screen',
+                           name='real_leader_to_burger_bridge'),
             ExecuteProcess(cmd=['ros2', 'run', 'domain_bridge', 'domain_bridge', str(b2l)],
-                           output='screen', name='real_burger_to_leader_bridge'),
+                           additional_env=bridge_env, output='screen',
+                           name='real_burger_to_leader_bridge'),
         ]
 
     # ── Localization: AMCL (default) or Cartographer ──────────────────────────
     def make_localization(context, *args, **kwargs):
         slam_mode = use_slam.perform(context).lower() in ('true', '1', 'yes')
         d = domain_id.perform(context)
+        xml_path = Path(tempfile.gettempdir()) / f'fastdds_fleet_d{d}.xml'
+
         extra_env = {
             'ROS_DOMAIN_ID': d,
             'RMW_IMPLEMENTATION': 'rmw_fastrtps_cpp',
             'FASTDDS_BUILTIN_TRANSPORTS': 'UDPv4',
             'ROS_AUTOMATIC_DISCOVERY_RANGE': 'SUBNET',
         }
+        if xml_path.exists():
+            extra_env['FASTRTPS_DEFAULT_PROFILES_FILE'] = str(xml_path)
+            extra_env['FASTDDS_DEFAULT_PROFILES_FILE']  = str(xml_path)
 
         if slam_mode:
             cartographer = Node(
@@ -257,6 +293,14 @@ topics:
              '-p', 'source_frame:=base_footprint', '-p', 'output_topic:=/burger_pose',
              '-p', 'publish_rate_hz:=10.0', '-p', 'log_every_n:=100'],
         output='screen', name='burger_real_pose_publisher',
+    )
+    map_relay = ExecuteProcess(
+        cmd=['python3', map_relay_script, '--ros-args',
+             '-r', '__node:=real_follower_map_relay',
+             '-p', 'use_sim_time:=false',
+             '-p', 'input_topic:=/map_bridge',
+             '-p', 'output_topic:=/map'],
+        output='screen', name='real_follower_map_relay',
     )
 
     controller_server = Node(package='nav2_controller', executable='controller_server',
@@ -331,6 +375,7 @@ topics:
                      ' | init=(', follower_initial_x, ',', follower_initial_y, ')',
                      ' | start_following=', start_following]),
         TimerAction(period=0.5, actions=[OpaqueFunction(function=make_domain_bridges)]),
+        TimerAction(period=1.0, actions=[map_relay]),
         OpaqueFunction(function=make_localization),
         TimerAction(period=3.5, actions=[burger_pose]),
         TimerAction(period=4.5, actions=[controller_server, planner_server,

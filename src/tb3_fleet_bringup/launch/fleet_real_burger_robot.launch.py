@@ -15,17 +15,22 @@ from launch.actions import (
 )
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PythonExpression
+from launch.substitutions import EnvironmentVariable
 from launch_ros.actions import Node
 
 
 def generate_launch_description():
     role      = LaunchConfiguration('role')
+    domain_id_arg = LaunchConfiguration('domain_id')
     lds_model = LaunchConfiguration('lds_model')
     usb_port  = LaunchConfiguration('usb_port')
     lidar_port = LaunchConfiguration('lidar_port')
     pc_ip     = LaunchConfiguration('pc_ip')
 
-    domain_id = PythonExpression(["'25' if '", role, "' == 'leader' else '24'"])
+    domain_id = PythonExpression([
+        "'", domain_id_arg, "' if '", domain_id_arg,
+        "' else ('25' if '", role, "' == 'leader' else '24')",
+    ])
 
     tb3_bringup_share = Path(get_package_share_directory('turtlebot3_bringup'))
     state_publisher_launch = str(tb3_bringup_share / 'launch' / 'turtlebot3_state_publisher.launch.py')
@@ -99,10 +104,13 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument(
             'role', default_value='leader',
-            description='leader uses Domain 25; follower uses Domain 24.',
+            description='Default domain selector when domain_id is empty.',
         ),
-        DeclareLaunchArgument('lds_model', default_value='LDS-01',
-                              description='LDS-01, LDS-02, or LDS-03.'),
+        DeclareLaunchArgument('domain_id', default_value='',
+                              description='Explicit ROS_DOMAIN_ID. Empty uses role default.'),
+        DeclareLaunchArgument('lds_model',
+                              default_value=EnvironmentVariable('LDS_MODEL', default_value='LDS-01'),
+                              description='LDS-01, LDS-02, or LDS-03. Defaults to the robot LDS_MODEL environment variable.'),
         DeclareLaunchArgument('usb_port', default_value='/dev/ttyACM0'),
         DeclareLaunchArgument('lidar_port', default_value='/dev/ttyUSB0',
                               description='LiDAR serial port. Check with: ls -l /dev/serial/by-id/'),

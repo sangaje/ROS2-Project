@@ -3,15 +3,29 @@ set -euo pipefail
 
 patterns=(
   'ros2 launch tb3_fleet_bringup fleet_real_two_burgers_pc.launch.py'
-  'ros2 launch tb3_fleet_bringup fleet_real_domain25_burger_nav2.launch.py'
-  'ros2 launch tb3_fleet_bringup fleet_real_domain25_waffle_nav2.launch.py'
-  'ros2 launch tb3_fleet_bringup fleet_real_domain24_burger_nav2_follower.launch.py'
-  'ros2 launch tb3_fleet_bringup fleet_real_domain25_rviz.launch.py'
+  'ros2 launch tb3_fleet_bringup fleet_real_leader_nav2.launch.py'
+  'ros2 launch tb3_fleet_bringup fleet_real_follower_nav2.launch.py'
+  'ros2 launch tb3_fleet_bringup fleet_rviz.launch.py'
   'ros2 launch tb3_fleet_bringup fleet_real_burger_robot.launch.py'
+  'ros2 launch tb3_fleet_bringup fleet_sim_master.launch.py'
+  'ros2 launch tb3_fleet_bringup fleet_sim_gazebo_world.launch.py'
+  'ros2 launch tb3_fleet_bringup fleet_sim_leader_nav2.launch.py'
+  'ros2 launch tb3_fleet_bringup fleet_sim_follower_nav2.launch.py'
   '/cartographer_ros/cartographer_node'
   '/cartographer_ros/cartographer_occupancy_grid_node'
   '/domain_bridge/domain_bridge'
+  '/ros_gz_sim/create'
+  '/ros_gz_bridge/parameter_bridge'
+  '/gz sim'
+  'gz sim -r -s'
+  'gz sim -g'
+  'ruby /opt/ros/jazzy/opt/gz_tools_vendor/bin/gz sim'
+  'leader_gz_bridge'
+  'follower_gz_bridge'
+  'spawn_leader'
+  'spawn_follower'
   '/rviz2/rviz2'
+  'rviz2_fleet'
   '/nav2_controller/controller_server'
   '/nav2_planner/planner_server'
   '/nav2_behaviors/behavior_server'
@@ -22,24 +36,72 @@ patterns=(
   'tf_pose_publisher_direct_v44.py'
   'pose_to_nav2_action_direct_v41.py'
   'fleet_debug_marker.py'
+  'sim_burger_scan_relay.py'
+  'sim_burger_tf_relay.py'
+  'sim_map_relay.py'
+  'sim_burger_tf_forwarder.py'
 )
 
+ancestor_pids() {
+  local pid="$$"
+  while [[ -n "${pid}" && "${pid}" != "0" ]]; do
+    echo "${pid}"
+    pid="$(ps -o ppid= -p "${pid}" 2>/dev/null | tr -d ' ')"
+  done
+}
+
+is_ancestor_pid() {
+  local needle="$1"
+  local ancestor
+  for ancestor in "${ancestors[@]}"; do
+    [[ "${needle}" == "${ancestor}" ]] && return 0
+  done
+  return 1
+}
+
+kill_matches() {
+  local signal="$1"
+  local pattern="$2"
+  local pid
+  while read -r pid; do
+    [[ -z "${pid}" ]] && continue
+    is_ancestor_pid "${pid}" && continue
+    kill "-${signal}" "${pid}" 2>/dev/null || true
+  done < <(pgrep -f "${pattern}" 2>/dev/null || true)
+}
+
+report_matches() {
+  local pattern="$1"
+  local pid
+  while read -r pid; do
+    [[ -z "${pid}" ]] && continue
+    is_ancestor_pid "${pid}" && continue
+    ps -o pid=,args= -p "${pid}" 2>/dev/null || true
+  done < <(pgrep -f "${pattern}" 2>/dev/null || true)
+}
+
 echo '[clean_real_fleet_runtime] stopping real fleet processes...'
+mapfile -t ancestors < <(ancestor_pids)
 for pattern in "${patterns[@]}"; do
-  pkill -INT -f "${pattern}" 2>/dev/null || true
+  kill_matches INT "${pattern}"
 done
 
 sleep 2
 
 for pattern in "${patterns[@]}"; do
-  pkill -TERM -f "${pattern}" 2>/dev/null || true
+  kill_matches TERM "${pattern}"
 done
 
-rm -f /tmp/fastdds_fleet_d24.xml \
-      /tmp/fastdds_fleet_d25.xml \
-      /tmp/fastdds_fleet_rviz_d25.xml \
-      /tmp/fastdds_robot_d24.xml \
-      /tmp/fastdds_robot_d25.xml
+rm -f /tmp/fastdds_fleet_d*.xml \
+      /tmp/fastdds_fleet_rviz_d*.xml \
+      /tmp/fastdds_robot_d*.xml \
+      /tmp/turtlebot3_burger_follower.sdf \
+      /tmp/turtlebot3_burger_follower_bridge.yaml \
+      /tmp/sim_burger_amcl_initial_pose.yaml \
+      /tmp/burger_amcl_initial_pose.yaml
+
+rm -rf /tmp/tb3_sim_domain_bridge \
+       /tmp/tb3_fleet_real_domain_bridge
 
 echo '[clean_real_fleet_runtime] remaining matching processes:'
-pgrep -af 'fleet_real|cartographer_node|domain_bridge|rviz2_real_domain25_fleet|domain_bridge_nav2_follower|fleet_real_debug_marker' || true
+report_matches 'fleet_real|fleet_sim|cartographer_node|domain_bridge|rviz2_fleet|domain_bridge_nav2_follower|fleet_real_debug_marker|sim_burger|sim_map|gz sim|parameter_bridge'

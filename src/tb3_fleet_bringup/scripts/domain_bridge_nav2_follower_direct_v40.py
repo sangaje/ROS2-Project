@@ -33,7 +33,7 @@ def _quat_from_yaw(yaw: float):
 class DomainBridgeNav2Follower(Node):
     """Follow Waffle with Nav2 and yield when Burger blocks Waffle's path.
 
-    Domain 24 inputs:
+    Follower-domain inputs:
       /leader_pose: bridged Waffle pose
       /waffle_plan: bridged and remapped Waffle Nav2 global path
       /burger_pose: Burger pose in the shared map frame

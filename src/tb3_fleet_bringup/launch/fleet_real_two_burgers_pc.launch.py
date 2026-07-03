@@ -18,6 +18,8 @@ def generate_launch_description():
     follow_distance      = LaunchConfiguration('follow_distance')
     start_following      = LaunchConfiguration('start_following')
     start_rviz           = LaunchConfiguration('start_rviz')
+    leader_domain_id     = LaunchConfiguration('leader_domain_id')
+    follower_domain_id   = LaunchConfiguration('follower_domain_id')
     robot1_ip            = LaunchConfiguration('robot1_ip')
     robot2_ip            = LaunchConfiguration('robot2_ip')
 
@@ -32,17 +34,18 @@ def generate_launch_description():
 
         leader_cmd = [
             'ros2', 'launch', 'tb3_fleet_bringup',
-            'fleet_real_domain25_burger_nav2.launch.py',
-            'domain_id:=25',
+            'fleet_real_leader_nav2.launch.py',
+            f'domain_id:={leader_domain_id.perform(context)}',
+            'robot_model:=burger',
             'use_slam:=true',
         ] + peer_args
         follower_cmd = [
             'ros2', 'launch', 'tb3_fleet_bringup',
-            'fleet_real_domain24_burger_nav2_follower.launch.py',
-            'domain_id:=24',
-            'leader_domain_id:=25',
+            'fleet_real_follower_nav2.launch.py',
+            f'domain_id:={follower_domain_id.perform(context)}',
+            f'leader_domain_id:={leader_domain_id.perform(context)}',
             'use_slam:=false',
-            'slam_domain:=25',
+            f'slam_domain:={leader_domain_id.perform(context)}',
             f'start_following:={start_following.perform(context)}',
             f'follow_distance:={follow_distance.perform(context)}',
             'enable_path_yield:=true',
@@ -54,8 +57,8 @@ def generate_launch_description():
         ] + peer_args
         rviz_cmd = [
             'ros2', 'launch', 'tb3_fleet_bringup',
-            'fleet_real_domain25_rviz.launch.py',
-            'domain_id:=25',
+            'fleet_rviz.launch.py',
+            f'domain_id:={leader_domain_id.perform(context)}',
         ] + peer_args
 
         actions = [
@@ -63,14 +66,14 @@ def generate_launch_description():
                 ExecuteProcess(
                     cmd=leader_cmd,
                     output='screen',
-                    name='real_nav2_leader_domain25_slam',
+                    name='real_nav2_leader_slam',
                 ),
             ]),
             TimerAction(period=10.0, actions=[
                 ExecuteProcess(
                     cmd=follower_cmd,
                     output='screen',
-                    name='real_nav2_follower_domain24_amcl',
+                    name='real_nav2_follower_amcl',
                 ),
             ]),
         ]
@@ -93,11 +96,14 @@ def generate_launch_description():
         DeclareLaunchArgument('start_following',  default_value='false',
                               description='Safe default: wait for fleet_follow_signal.'),
         DeclareLaunchArgument('start_rviz',  default_value='true'),
+        DeclareLaunchArgument('leader_domain_id', default_value='25'),
+        DeclareLaunchArgument('follower_domain_id', default_value='24'),
         DeclareLaunchArgument('robot1_ip',   default_value='',
                               description='Optional leader robot IP for static DDS peers. Empty uses subnet multicast.'),
         DeclareLaunchArgument('robot2_ip',   default_value='',
                               description='Optional follower robot IP for static DDS peers. Empty uses subnet multicast.'),
-        LogInfo(msg=['REAL_NAV2_CLEAN_PC | leader Domain25 SLAM, follower Domain24 AMCL/Nav2',
+        LogInfo(msg=['REAL_NAV2_CLEAN_PC | leader domain=', leader_domain_id,
+                     ' SLAM, follower domain=', follower_domain_id, ' AMCL/Nav2',
                      ' | start_following=', start_following,
                      ' | static_peers=', robot1_ip, ';', robot2_ip]),
         OpaqueFunction(function=make_processes),

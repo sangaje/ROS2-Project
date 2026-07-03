@@ -160,7 +160,7 @@ class FleetDebugMarker(Node):
             p = self.poses['waffle']
             arr.markers.append(self._make_body('waffle', 1, p, (0.38, 0.38, 0.18)))
             arr.markers.append(self._make_arrow('waffle', 2, p, 0.55))
-            arr.markers.append(self._make_text('waffle', 3, p, 'waffle / domain25'))
+            arr.markers.append(self._make_text('waffle', 3, p, 'leader / waffle'))
         elif self.last_seen['waffle'] is not None:
             arr.markers.append(self._make_delete('waffle', 1))
             arr.markers.append(self._make_delete('waffle_heading', 2))
@@ -169,7 +169,7 @@ class FleetDebugMarker(Node):
             p = self.poses['burger']
             arr.markers.append(self._make_body('burger', 11, p, (0.30, 0.30, 0.16)))
             arr.markers.append(self._make_arrow('burger', 12, p, 0.45))
-            arr.markers.append(self._make_text('burger', 13, p, 'burger / domain24'))
+            arr.markers.append(self._make_text('burger', 13, p, 'follower / burger'))
         elif self.last_seen['burger'] is not None:
             arr.markers.append(self._make_delete('burger', 11))
             arr.markers.append(self._make_delete('burger_heading', 12))
