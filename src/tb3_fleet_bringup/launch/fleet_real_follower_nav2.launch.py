@@ -38,6 +38,8 @@ def generate_launch_description():
     follower_initial_yaw = LaunchConfiguration('follower_initial_yaw')
     use_slam             = LaunchConfiguration('use_slam')
     slam_domain          = LaunchConfiguration('slam_domain')
+    start_domain_bridge  = LaunchConfiguration('start_domain_bridge')
+    bridge_start_delay   = LaunchConfiguration('bridge_start_delay')
 
     nav2_params = RewrittenYaml(
         source_file=os.path.join(bringup_share, 'config', 'domain24_burger_nav2_amcl.yaml'),
@@ -56,8 +58,14 @@ def generate_launch_description():
         legacy = leader_domain_id.perform(context).strip()
         return legacy if legacy else main_domain_id.perform(context)
 
+    def enabled(value):
+        return value.lower() in ('true', '1', 'yes', 'on')
+
     # ── Domain bridge (/map direction depends on slam_domain) ─────────────────
     def make_domain_bridges(context, *args, **kwargs):
+        if not enabled(start_domain_bridge.perform(context)):
+            return [LogInfo(msg='FOLLOWER_BRIDGE | disabled')]
+
         ld = selected_main_domain(context)
         bd = domain_id.perform(context)
         sd = slam_domain.perform(context).strip() or ld
@@ -330,6 +338,9 @@ topics:
         DeclareLaunchArgument('use_slam',    default_value='false'),
         DeclareLaunchArgument('slam_domain', default_value='',
                               description='Domain that publishes /map. Empty uses main_domain_id.'),
+        DeclareLaunchArgument('start_domain_bridge', default_value='true',
+                              description='Start 24<->main domain_bridge from the follower side.'),
+        DeclareLaunchArgument('bridge_start_delay', default_value='0.5'),
         UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
         UnsetEnvironmentVariable('ROS_LOCALHOST_ONLY'),
         UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),
@@ -339,10 +350,11 @@ topics:
         SetEnvironmentVariable('TURTLEBOT3_MODEL',            robot_model),
         LogInfo(msg=['FOLLOWER_D', domain_id, ' | main_domain=', main_domain_id,
                      ' | use_slam=', use_slam,
+                     ' | bridge=', start_domain_bridge,
                      ' | slam_domain=', slam_domain,
                      ' | init=(', follower_initial_x, ',', follower_initial_y, ')',
                      ' | start_following=', start_following]),
-        TimerAction(period=0.5, actions=[OpaqueFunction(function=make_domain_bridges)]),
+        TimerAction(period=bridge_start_delay, actions=[OpaqueFunction(function=make_domain_bridges)]),
         TimerAction(period=1.0, actions=[map_relay, scan_relay]),
         OpaqueFunction(function=make_localization),
         TimerAction(period=3.5, actions=[burger_pose]),

@@ -3,6 +3,7 @@
 from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
+from launch.conditions import IfCondition
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
@@ -24,6 +25,9 @@ def generate_launch_description():
     lds_model = LaunchConfiguration('lds_model')
     usb_port  = LaunchConfiguration('usb_port')
     lidar_port = LaunchConfiguration('lidar_port')
+    start_state_publisher = LaunchConfiguration('start_state_publisher')
+    start_lidar = LaunchConfiguration('start_lidar')
+    start_base = LaunchConfiguration('start_base')
 
     domain_id = PythonExpression([
         "'", domain_id_arg, "' if '", domain_id_arg,
@@ -35,6 +39,9 @@ def generate_launch_description():
     tb3_param_file = str(tb3_bringup_share / 'param' / 'burger.yaml')
 
     def make_lidar(context, *args, **kwargs):
+        if start_lidar.perform(context).lower() not in ('true', '1', 'yes', 'on'):
+            return [LogInfo(msg='REAL_BURGER_LIDAR | disabled')]
+
         model = lds_model.perform(context)
         port = lidar_port.perform(context)
 
@@ -60,6 +67,7 @@ def generate_launch_description():
     state_publisher = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(state_publisher_launch),
         launch_arguments={'use_sim_time': 'false', 'namespace': ''}.items(),
+        condition=IfCondition(start_state_publisher),
     )
     turtlebot3_node = Node(
         package='turtlebot3_node',
@@ -67,6 +75,7 @@ def generate_launch_description():
         parameters=[tb3_param_file, {'namespace': ''}],
         arguments=['-i', usb_port],
         output='screen',
+        condition=IfCondition(start_base),
     )
 
     return LaunchDescription([
@@ -82,6 +91,10 @@ def generate_launch_description():
         DeclareLaunchArgument('usb_port', default_value='/dev/ttyACM0'),
         DeclareLaunchArgument('lidar_port', default_value='/dev/ttyUSB0',
                               description='LiDAR serial port. Check with: ls -l /dev/serial/by-id/'),
+        DeclareLaunchArgument('start_state_publisher', default_value='true'),
+        DeclareLaunchArgument('start_lidar', default_value='true'),
+        DeclareLaunchArgument('start_base', default_value='true',
+                              description='Start turtlebot3_node/OpenCR base driver.'),
         UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
         UnsetEnvironmentVariable('ROS_LOCALHOST_ONLY'),
         UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),
@@ -92,7 +105,10 @@ def generate_launch_description():
         SetEnvironmentVariable('LDS_MODEL', lds_model),
         LogInfo(msg=['REAL_BURGER_BASE | role=', role,
                      ' domain=', domain_id, ' lds=', lds_model,
-                     ' opencr=', usb_port]),
+                     ' opencr=', usb_port,
+                     ' | state_pub=', start_state_publisher,
+                     ' lidar=', start_lidar,
+                     ' base=', start_base]),
         state_publisher,
         OpaqueFunction(function=make_lidar),
         turtlebot3_node,
