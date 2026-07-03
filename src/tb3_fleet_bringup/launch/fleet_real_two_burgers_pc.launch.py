@@ -18,14 +18,20 @@ def generate_launch_description():
     follow_distance      = LaunchConfiguration('follow_distance')
     start_following      = LaunchConfiguration('start_following')
     start_rviz           = LaunchConfiguration('start_rviz')
+    main_domain_id       = LaunchConfiguration('main_domain_id')
     leader_domain_id     = LaunchConfiguration('leader_domain_id')
     follower_domain_id   = LaunchConfiguration('follower_domain_id')
 
+    def selected_main_domain(context):
+        legacy = leader_domain_id.perform(context).strip()
+        return legacy if legacy else main_domain_id.perform(context)
+
     def make_processes(context, *args, **kwargs):
+        main_domain = selected_main_domain(context)
         leader_cmd = [
             'ros2', 'launch', 'tb3_fleet_bringup',
             'fleet_real_leader_nav2.launch.py',
-            f'domain_id:={leader_domain_id.perform(context)}',
+            f'domain_id:={main_domain}',
             'robot_model:=burger',
             'use_slam:=true',
         ]
@@ -33,9 +39,9 @@ def generate_launch_description():
             'ros2', 'launch', 'tb3_fleet_bringup',
             'fleet_real_follower_nav2.launch.py',
             f'domain_id:={follower_domain_id.perform(context)}',
-            f'leader_domain_id:={leader_domain_id.perform(context)}',
+            f'main_domain_id:={main_domain}',
             'use_slam:=false',
-            f'slam_domain:={leader_domain_id.perform(context)}',
+            f'slam_domain:={main_domain}',
             f'start_following:={start_following.perform(context)}',
             f'follow_distance:={follow_distance.perform(context)}',
             'enable_path_yield:=true',
@@ -48,7 +54,7 @@ def generate_launch_description():
         rviz_cmd = [
             'ros2', 'launch', 'tb3_fleet_bringup',
             'fleet_rviz.launch.py',
-            f'domain_id:={leader_domain_id.perform(context)}',
+            f'domain_id:={main_domain}',
         ]
 
         actions = [
@@ -86,9 +92,12 @@ def generate_launch_description():
         DeclareLaunchArgument('start_following',  default_value='false',
                               description='Safe default: wait for fleet_follow_signal.'),
         DeclareLaunchArgument('start_rviz',  default_value='true'),
-        DeclareLaunchArgument('leader_domain_id', default_value='25'),
+        DeclareLaunchArgument('main_domain_id', default_value='25',
+                              description='Main/leader ROS domain. RViz, SLAM, leader Nav2 run here.'),
+        DeclareLaunchArgument('leader_domain_id', default_value='',
+                              description='Deprecated alias for main_domain_id. Empty uses main_domain_id.'),
         DeclareLaunchArgument('follower_domain_id', default_value='24'),
-        LogInfo(msg=['REAL_NAV2_CLEAN_PC | leader domain=', leader_domain_id,
+        LogInfo(msg=['REAL_NAV2_CLEAN_PC | main domain=', main_domain_id,
                      ' SLAM, follower domain=', follower_domain_id, ' AMCL/Nav2',
                      ' | start_following=', start_following]),
         OpaqueFunction(function=make_processes),

@@ -25,6 +25,7 @@ def generate_launch_description():
     bringup_share = get_package_share_directory('tb3_fleet_bringup')
 
     domain_id            = LaunchConfiguration('domain_id')
+    main_domain_id       = LaunchConfiguration('main_domain_id')
     leader_domain_id     = LaunchConfiguration('leader_domain_id')
     robot_model          = LaunchConfiguration('robot_model')
     follow_distance      = LaunchConfiguration('follow_distance')
@@ -51,11 +52,15 @@ def generate_launch_description():
     scan_relay_script = os.path.join(bringup_share, 'scripts', 'scan_frame_relay.py')
     cartographer_config_dir = os.path.join(bringup_share, 'config')
 
+    def selected_main_domain(context):
+        legacy = leader_domain_id.perform(context).strip()
+        return legacy if legacy else main_domain_id.perform(context)
+
     # ── Domain bridge (/map direction depends on slam_domain) ─────────────────
     def make_domain_bridges(context, *args, **kwargs):
-        ld = leader_domain_id.perform(context)
+        ld = selected_main_domain(context)
         bd = domain_id.perform(context)
-        sd = slam_domain.perform(context)
+        sd = slam_domain.perform(context).strip() or ld
         out = Path(tempfile.gettempdir()) / 'tb3_fleet_real_domain_bridge'
         out.mkdir(parents=True, exist_ok=True)
 
@@ -309,7 +314,10 @@ topics:
 
     return LaunchDescription([
         DeclareLaunchArgument('domain_id',          default_value='24'),
-        DeclareLaunchArgument('leader_domain_id',   default_value='25'),
+        DeclareLaunchArgument('main_domain_id',     default_value='25',
+                              description='Main/leader ROS domain used by domain_bridge.'),
+        DeclareLaunchArgument('leader_domain_id',   default_value='',
+                              description='Deprecated alias for main_domain_id. Empty uses main_domain_id.'),
         DeclareLaunchArgument('robot_model',        default_value='burger'),
         DeclareLaunchArgument('follow_distance',    default_value='1.05'),
         DeclareLaunchArgument('start_following',    default_value='false'),
@@ -320,7 +328,8 @@ topics:
         DeclareLaunchArgument('follower_initial_y',  default_value='0.0'),
         DeclareLaunchArgument('follower_initial_yaw', default_value='0.0'),
         DeclareLaunchArgument('use_slam',    default_value='false'),
-        DeclareLaunchArgument('slam_domain', default_value='25'),
+        DeclareLaunchArgument('slam_domain', default_value='',
+                              description='Domain that publishes /map. Empty uses main_domain_id.'),
         UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
         UnsetEnvironmentVariable('ROS_LOCALHOST_ONLY'),
         UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),
@@ -328,7 +337,8 @@ topics:
         SetEnvironmentVariable('ROS_DOMAIN_ID',               domain_id),
         SetEnvironmentVariable('RMW_IMPLEMENTATION',          'rmw_fastrtps_cpp'),
         SetEnvironmentVariable('TURTLEBOT3_MODEL',            robot_model),
-        LogInfo(msg=['FOLLOWER_D', domain_id, ' | use_slam=', use_slam,
+        LogInfo(msg=['FOLLOWER_D', domain_id, ' | main_domain=', main_domain_id,
+                     ' | use_slam=', use_slam,
                      ' | slam_domain=', slam_domain,
                      ' | init=(', follower_initial_x, ',', follower_initial_y, ')',
                      ' | start_following=', start_following]),
