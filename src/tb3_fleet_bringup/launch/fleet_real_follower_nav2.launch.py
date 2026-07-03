@@ -10,12 +10,15 @@ from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     ExecuteProcess,
+    IncludeLaunchDescription,
     LogInfo,
     OpaqueFunction,
     SetEnvironmentVariable,
     TimerAction,
     UnsetEnvironmentVariable,
 )
+from launch.conditions import IfCondition
+from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from nav2_common.launch import RewrittenYaml
@@ -40,6 +43,13 @@ def generate_launch_description():
     slam_domain          = LaunchConfiguration('slam_domain')
     start_domain_bridge  = LaunchConfiguration('start_domain_bridge')
     bridge_start_delay   = LaunchConfiguration('bridge_start_delay')
+    start_robot_bringup  = LaunchConfiguration('start_robot_bringup')
+    start_state_publisher = LaunchConfiguration('start_state_publisher')
+    start_lidar          = LaunchConfiguration('start_lidar')
+    start_base           = LaunchConfiguration('start_base')
+    lds_model            = LaunchConfiguration('lds_model')
+    usb_port             = LaunchConfiguration('usb_port')
+    lidar_port           = LaunchConfiguration('lidar_port')
 
     nav2_params = RewrittenYaml(
         source_file=os.path.join(bringup_share, 'config', 'domain24_burger_nav2_amcl.yaml'),
@@ -53,6 +63,7 @@ def generate_launch_description():
     map_relay_script  = os.path.join(bringup_share, 'scripts', 'sim_map_relay.py')
     scan_relay_script = os.path.join(bringup_share, 'scripts', 'scan_frame_relay.py')
     cartographer_config_dir = os.path.join(bringup_share, 'config')
+    follower_robot_launch = os.path.join(bringup_share, 'launch', 'fleet_real_burger_robot.launch.py')
 
     def selected_main_domain(context):
         legacy = leader_domain_id.perform(context).strip()
@@ -278,6 +289,20 @@ topics:
              '-p', 'output_frame:=burger/base_scan'],
         output='screen', name='real_burger_scan_frame_relay',
     )
+    robot_bringup = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(follower_robot_launch),
+        launch_arguments={
+            'role': 'follower',
+            'domain_id': domain_id,
+            'lds_model': lds_model,
+            'usb_port': usb_port,
+            'lidar_port': lidar_port,
+            'start_state_publisher': start_state_publisher,
+            'start_lidar': start_lidar,
+            'start_base': start_base,
+        }.items(),
+        condition=IfCondition(start_robot_bringup),
+    )
 
     controller_server = Node(package='nav2_controller', executable='controller_server',
                              name='controller_server', output='screen', parameters=[nav2_params])
@@ -341,6 +366,14 @@ topics:
         DeclareLaunchArgument('start_domain_bridge', default_value='true',
                               description='Start 24<->main domain_bridge from the follower side.'),
         DeclareLaunchArgument('bridge_start_delay', default_value='0.5'),
+        DeclareLaunchArgument('start_robot_bringup', default_value='true',
+                              description='Start follower base, lidar, and state publisher in this launch.'),
+        DeclareLaunchArgument('start_state_publisher', default_value='true'),
+        DeclareLaunchArgument('start_lidar', default_value='true'),
+        DeclareLaunchArgument('start_base', default_value='true'),
+        DeclareLaunchArgument('lds_model', default_value='LDS-02'),
+        DeclareLaunchArgument('usb_port', default_value='/dev/ttyACM0'),
+        DeclareLaunchArgument('lidar_port', default_value='/dev/ttyUSB0'),
         UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
         UnsetEnvironmentVariable('ROS_LOCALHOST_ONLY'),
         UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),
@@ -351,9 +384,11 @@ topics:
         LogInfo(msg=['FOLLOWER_D', domain_id, ' | main_domain=', main_domain_id,
                      ' | use_slam=', use_slam,
                      ' | bridge=', start_domain_bridge,
+                     ' | robot_bringup=', start_robot_bringup,
                      ' | slam_domain=', slam_domain,
                      ' | init=(', follower_initial_x, ',', follower_initial_y, ')',
                      ' | start_following=', start_following]),
+        robot_bringup,
         TimerAction(period=bridge_start_delay, actions=[OpaqueFunction(function=make_domain_bridges)]),
         TimerAction(period=1.0, actions=[map_relay, scan_relay]),
         OpaqueFunction(function=make_localization),

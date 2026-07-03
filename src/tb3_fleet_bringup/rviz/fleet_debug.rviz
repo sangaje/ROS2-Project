@@ -81,19 +81,9 @@ Visualization Manager:
           Value: true
         burger/base_footprint:
           Value: true
-        burger/base_link:
-          Value: true
         burger/base_scan:
           Value: true
-        burger/caster_back_link:
-          Value: true
-        burger/imu_link:
-          Value: true
         burger/odom:
-          Value: true
-        burger/wheel_left_link:
-          Value: true
-        burger/wheel_right_link:
           Value: true
         caster_back_link:
           Value: true
@@ -115,18 +105,7 @@ Visualization Manager:
       Tree:
         map:
           burger/odom:
-            burger/base_footprint:
-              burger/base_link:
-                burger/base_scan:
-                  {}
-                burger/caster_back_link:
-                  {}
-                burger/imu_link:
-                  {}
-                burger/wheel_left_link:
-                  {}
-                burger/wheel_right_link:
-                  {}
+            {}
           odom:
             base_footprint:
               base_link:
@@ -310,9 +289,6 @@ Visualization Manager:
       Enabled: true
       Name: Fleet Debug Markers
       Namespaces:
-        burger: true
-        burger_heading: true
-        burger_label: true
         waffle: true
         waffle_heading: true
         waffle_label: true
@@ -391,5 +367,5 @@ Window Geometry:
   Views:
     collapsed: false
   Width: 1390
-  X: -229
-  Y: 489
+  X: 66
+  Y: 300
