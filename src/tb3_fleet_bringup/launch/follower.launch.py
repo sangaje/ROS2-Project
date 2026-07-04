@@ -18,7 +18,7 @@ from launch.actions import (
 )
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PythonExpression
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from nav2_common.launch import RewrittenYaml
 
@@ -37,10 +37,6 @@ def generate_launch_description():
     initial_x          = LaunchConfiguration('follower_initial_x')
     initial_y          = LaunchConfiguration('follower_initial_y')
     initial_yaw        = LaunchConfiguration('follower_initial_yaw')
-    start_bringup      = LaunchConfiguration('start_robot_bringup')
-    usb_port           = LaunchConfiguration('usb_port')
-    lidar_port         = LaunchConfiguration('lidar_port')
-
     def make_all(context, *args, **kwargs):
         sim = mode.perform(context).lower() == 'sim'
         ust = 'true' if sim else 'false'
@@ -359,10 +355,6 @@ topics:
         DeclareLaunchArgument('follower_initial_x', default_value='-1.0'),
         DeclareLaunchArgument('follower_initial_y', default_value='0.0'),
         DeclareLaunchArgument('follower_initial_yaw', default_value='0.0'),
-        DeclareLaunchArgument('start_robot_bringup', default_value='true'),
-        DeclareLaunchArgument('usb_port',           default_value='/dev/ttyACM0'),
-        DeclareLaunchArgument('lidar_port',
-                              default_value=EnvironmentVariable('LIDAR_PORT')),
         UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
         UnsetEnvironmentVariable('ROS_LOCALHOST_ONLY'),
         UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),
@@ -371,17 +363,10 @@ topics:
         SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', 'SUBNET'),
         SetEnvironmentVariable('ROS_LOCALHOST_ONLY',           '0'),
         SetEnvironmentVariable('RMW_IMPLEMENTATION',           'rmw_fastrtps_cpp'),
-        # Hardware bringup — real mode only
         IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(os.path.join(pkg, 'launch', 'robot.launch.py')),
-            launch_arguments={
-                'role': 'follower', 'domain_id': domain_id,
-                'usb_port': usb_port, 'lidar_port': lidar_port,
-            }.items(),
-            condition=IfCondition(PythonExpression([
-                "'", start_bringup, "'.lower() in ['true','1','yes','on']",
-                " and '", mode, "'.lower() != 'sim'",
-            ])),
+            PythonLaunchDescriptionSource(os.path.join(
+                get_package_share_directory('turtlebot3_bringup'), 'launch', 'robot.launch.py')),
+            condition=IfCondition(PythonExpression(["'", mode, "'.lower() != 'sim'"])),
         ),
 
         OpaqueFunction(function=make_all),
