@@ -30,6 +30,7 @@ def generate_launch_description():
     domain_id            = LaunchConfiguration('domain_id')
     main_domain_id       = LaunchConfiguration('main_domain_id')
     leader_domain_id     = LaunchConfiguration('leader_domain_id')
+    robot_name           = LaunchConfiguration('robot_name')
     robot_model          = LaunchConfiguration('robot_model')
     follow_distance      = LaunchConfiguration('follow_distance')
     start_following      = LaunchConfiguration('start_following')
@@ -65,6 +66,9 @@ def generate_launch_description():
     cartographer_config_dir = os.path.join(bringup_share, 'config')
     follower_robot_launch = os.path.join(bringup_share, 'launch', 'robot.launch.py')
 
+    def main_topic(name, suffix):
+        return f'/burger_{suffix}' if name == 'burger' else f'/{name}_{suffix}'
+
     def selected_main_domain(context):
         legacy = leader_domain_id.perform(context).strip()
         return legacy if legacy else main_domain_id.perform(context)
@@ -80,11 +84,17 @@ def generate_launch_description():
         ld = selected_main_domain(context)
         bd = domain_id.perform(context)
         sd = slam_domain.perform(context).strip() or ld
+        rn = robot_name.perform(context).strip() or 'burger'
         out = Path(tempfile.gettempdir()) / 'tb3_fleet_domain_bridge'
         out.mkdir(parents=True, exist_ok=True)
 
-        l2b = out / f'real_leader_{ld}_to_burger_{bd}.yaml'
-        b2l = out / f'real_burger_{bd}_to_leader_{ld}.yaml'
+        l2b = out / f'{rn}_{ld}_to_{bd}.yaml'
+        b2l = out / f'{rn}_{bd}_to_{ld}.yaml'
+        goal_main_topic = main_topic(rn, 'goal_pose')
+        pose_main_topic = main_topic(rn, 'pose')
+        scan_main_topic = main_topic(rn, 'scan')
+        plan_main_topic = main_topic(rn, 'plan')
+        follow_status_topic = '/fleet/follow_enabled' if rn == 'burger' else f'/fleet/{rn}/follow_enabled'
 
         l2b_map_block = """  /map:
     type: nav_msgs/msg/OccupancyGrid
@@ -121,7 +131,7 @@ def generate_launch_description():
         b2l_map = b2l_map_block if sd == bd else ''
 
         l2b.write_text(
-            f"""name: real_leader_{ld}_to_burger_{bd}
+            f"""name: {rn}_{ld}_to_{bd}
 from_domain: {ld}
 to_domain: {bd}
 
@@ -148,8 +158,9 @@ topics:
       durability: volatile
       history: keep_last
       depth: 10
-  /burger_goal_pose:
+  {goal_main_topic}:
     type: geometry_msgs/msg/PoseStamped
+    remap: /burger_goal_pose
     qos:
       reliability: reliable
       durability: volatile
@@ -165,13 +176,14 @@ topics:
 """, encoding='utf-8')
 
         b2l.write_text(
-            f"""name: real_burger_{bd}_to_leader_{ld}
+            f"""name: {rn}_{bd}_to_{ld}
 from_domain: {bd}
 to_domain: {ld}
 
 topics:
 {b2l_map}  /burger_pose:
     type: geometry_msgs/msg/PoseStamped
+    remap: {pose_main_topic}
     qos:
       reliability: reliable
       durability: volatile
@@ -179,7 +191,7 @@ topics:
       depth: 10
   /burger_scan_relay:
     type: sensor_msgs/msg/LaserScan
-    remap: /burger_scan
+    remap: {scan_main_topic}
     qos:
       reliability: best_effort
       durability: volatile
@@ -187,7 +199,7 @@ topics:
       depth: 10
   /plan:
     type: nav_msgs/msg/Path
-    remap: /burger_plan
+    remap: {plan_main_topic}
     qos:
       reliability: reliable
       durability: volatile
@@ -195,6 +207,7 @@ topics:
       depth: 10
   /fleet/follow_enabled:
     type: std_msgs/msg/Bool
+    remap: {follow_status_topic}
     qos:
       reliability: reliable
       durability: transient_local
@@ -205,10 +218,10 @@ topics:
         return [
             ExecuteProcess(cmd=['ros2', 'run', 'domain_bridge', 'domain_bridge', str(l2b)],
                            output='screen',
-                           name='real_leader_to_burger_bridge'),
+                           name=f'{rn}_main_to_robot_bridge'),
             ExecuteProcess(cmd=['ros2', 'run', 'domain_bridge', 'domain_bridge', str(b2l)],
                            output='screen',
-                           name='real_burger_to_leader_bridge'),
+                           name=f'{rn}_robot_to_main_bridge'),
         ]
 
     # ── Localization: AMCL (default) or Cartographer ──────────────────────────
@@ -356,6 +369,8 @@ topics:
                               description='Main/leader ROS domain used by domain_bridge.'),
         DeclareLaunchArgument('leader_domain_id',   default_value='',
                               description='Deprecated alias for main_domain_id. Empty uses main_domain_id.'),
+        DeclareLaunchArgument('robot_name',          default_value='burger',
+                              description='Main-domain name for this follower. Use burger for the first robot.'),
         DeclareLaunchArgument('robot_model',        default_value='burger'),
         DeclareLaunchArgument('follow_distance',    default_value='1.05'),
         DeclareLaunchArgument('start_following',    default_value='false'),
@@ -368,8 +383,8 @@ topics:
         DeclareLaunchArgument('use_slam',    default_value='false'),
         DeclareLaunchArgument('slam_domain', default_value='',
                               description='Domain that publishes /map. Empty uses main_domain_id.'),
-        DeclareLaunchArgument('start_domain_bridge', default_value='false',
-                              description='Start 24<->main domain_bridge from the follower side. Default false when using tb3_fleet_bridge/bridges.launch.py.'),
+        DeclareLaunchArgument('start_domain_bridge', default_value='true',
+                              description='Start robot<->main domain_bridge from the follower side.'),
         DeclareLaunchArgument('bridge_start_delay', default_value='0.5'),
         DeclareLaunchArgument('start_robot_bringup', default_value='true',
                               description='Start follower base, lidar, and state publisher in this launch.'),
@@ -386,7 +401,8 @@ topics:
         SetEnvironmentVariable('ROS_DOMAIN_ID',               domain_id),
         SetEnvironmentVariable('RMW_IMPLEMENTATION',          'rmw_fastrtps_cpp'),
         SetEnvironmentVariable('TURTLEBOT3_MODEL',            robot_model),
-        LogInfo(msg=['FOLLOWER_D', domain_id, ' | main_domain=', main_domain_id,
+        LogInfo(msg=['FOLLOWER_D', domain_id, ' | robot=', robot_name,
+                     ' | main_domain=', main_domain_id,
                      ' | use_slam=', use_slam,
                      ' | bridge=', start_domain_bridge,
                      ' | robot_bringup=', start_robot_bringup,

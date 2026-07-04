@@ -3,6 +3,7 @@ set -euo pipefail
 
 patterns=(
   'ros2 launch tb3_fleet_bringup pc.launch.py'
+  'ros2 launch tb3_fleet_bringup real.launch.py'
   'ros2 launch tb3_fleet_bringup leader.launch.py'
   'ros2 launch tb3_fleet_bringup follower.launch.py'
   'ros2 launch tb3_fleet_bringup rviz.launch.py'
@@ -105,4 +106,4 @@ rm -rf /tmp/tb3_sim_domain_bridge \
        /tmp/tb3_fleet_bridge_dynamic
 
 echo '[clean_real_fleet_runtime] remaining matching processes:'
-report_matches 'pc.launch.py|leader.launch.py|follower.launch.py|robot.launch.py|sim.launch.py|sim_world.launch.py|sim_leader.launch.py|sim_follower.launch.py|bridges.launch.py|cartographer_node|domain_bridge|rviz2_fleet|domain_bridge_nav2_follower|fleet_debug_marker|sim_burger|sim_map|gz sim|parameter_bridge'
+report_matches 'real.launch.py|pc.launch.py|leader.launch.py|follower.launch.py|robot.launch.py|sim.launch.py|sim_world.launch.py|sim_leader.launch.py|sim_follower.launch.py|bridges.launch.py|cartographer_node|domain_bridge|rviz2_fleet|domain_bridge_nav2_follower|fleet_debug_marker|sim_burger|sim_map|gz sim|parameter_bridge'
