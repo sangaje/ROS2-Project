@@ -6,11 +6,14 @@ options = {
   trajectory_builder = TRAJECTORY_BUILDER,
   map_frame = "map",
   tracking_frame = "base_footprint",
-  published_frame = "odom",
+  -- Let Cartographer create the map->odom->base_footprint TF chain from scan
+  -- matching. This keeps the leader map frame alive even when OpenCR /odom is
+  -- late or absent during real-robot startup.
+  published_frame = "base_footprint",
   odom_frame = "odom",
-  provide_odom_frame = false,
+  provide_odom_frame = true,
   publish_frame_projected_to_2d = true,
-  use_odometry = true,
+  use_odometry = false,
   use_nav_sat = false,
   use_landmarks = false,
   num_laser_scans = 1,

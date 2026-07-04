@@ -19,7 +19,7 @@ from launch.actions import (
 )
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PythonExpression
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from nav2_common.launch import RewrittenYaml
 
@@ -67,6 +67,7 @@ def generate_launch_description():
             'odom_topic': '/odom',
             'scan_topic': '/scan_nav',
             'topic': '/scan_nav',
+            'enable_stamped_cmd_vel': 'true',
         },
         convert_types=True,
     )
@@ -436,7 +437,9 @@ topics:
         DeclareLaunchArgument('start_state_publisher', default_value='true'),
         DeclareLaunchArgument('start_lidar', default_value='true'),
         DeclareLaunchArgument('start_base', default_value='true'),
-        DeclareLaunchArgument('lds_model', default_value='LDS-02'),
+        DeclareLaunchArgument('lds_model',
+                              default_value=EnvironmentVariable('LDS_MODEL', default_value='LDS-01'),
+                              description='LDS-01, LDS-02, or LDS-03. Defaults to LDS_MODEL env.'),
         DeclareLaunchArgument('usb_port', default_value='/dev/ttyACM0'),
         DeclareLaunchArgument('lidar_port', default_value='/dev/ttyUSB0'),
         UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),

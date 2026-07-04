@@ -19,7 +19,7 @@ from launch.actions import (
 )
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PythonExpression
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from nav2_common.launch import RewrittenYaml
 
@@ -66,6 +66,7 @@ def generate_launch_description():
             'odom_topic': '/odom',
             'scan_topic': '/scan_nav',
             'topic': '/scan_nav',
+            'enable_stamped_cmd_vel': 'true',
         },
         convert_types=True,
     )
@@ -292,7 +293,9 @@ def generate_launch_description():
         DeclareLaunchArgument('start_state_publisher', default_value='true'),
         DeclareLaunchArgument('start_lidar', default_value='true'),
         DeclareLaunchArgument('start_base', default_value='true'),
-        DeclareLaunchArgument('lds_model', default_value='LDS-02'),
+        DeclareLaunchArgument('lds_model',
+                              default_value=EnvironmentVariable('LDS_MODEL', default_value='LDS-01'),
+                              description='LDS-01, LDS-02, or LDS-03. Defaults to LDS_MODEL env.'),
         DeclareLaunchArgument('usb_port', default_value='/dev/ttyACM0'),
         DeclareLaunchArgument('lidar_port', default_value='/dev/ttyUSB0'),
         UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
@@ -312,11 +315,11 @@ def generate_launch_description():
         TimerAction(period=0.2, actions=[scan_cartographer_relay, scan_nav_relay],
                     condition=real_condition),
         OpaqueFunction(function=make_localization, condition=real_condition),
-        TimerAction(period=1.5, actions=[leader_pose, burger_scan_static_tf, burger_amcl_tf],
+        TimerAction(period=4.0, actions=[leader_pose, burger_scan_static_tf, burger_amcl_tf],
                     condition=real_condition),
-        TimerAction(period=2.0, actions=[controller_server, planner_server,
+        TimerAction(period=6.0, actions=[controller_server, planner_server,
                                          behavior_server, bt_navigator],
                     condition=real_condition),
-        TimerAction(period=5.0, actions=[lifecycle_nav], condition=real_condition),
-        TimerAction(period=7.0, actions=[default_goal, named_goal], condition=real_condition),
+        TimerAction(period=9.0, actions=[lifecycle_nav], condition=real_condition),
+        TimerAction(period=11.0, actions=[default_goal, named_goal], condition=real_condition),
     ])
