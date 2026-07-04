@@ -19,7 +19,7 @@ from launch.actions import (
 )
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from nav2_common.launch import RewrittenYaml
 
@@ -27,6 +27,7 @@ from nav2_common.launch import RewrittenYaml
 def generate_launch_description():
     bringup_share = get_package_share_directory('tb3_fleet_bringup')
 
+    mode                 = LaunchConfiguration('mode')
     domain_id            = LaunchConfiguration('domain_id')
     main_domain_id       = LaunchConfiguration('main_domain_id')
     leader_domain_id     = LaunchConfiguration('leader_domain_id')
@@ -52,6 +53,13 @@ def generate_launch_description():
     usb_port             = LaunchConfiguration('usb_port')
     lidar_port           = LaunchConfiguration('lidar_port')
 
+    real_condition = IfCondition(PythonExpression(["'", mode, "' == 'real'"]))
+    sim_condition = IfCondition(PythonExpression(["'", mode, "' == 'sim'"]))
+    robot_condition = IfCondition(PythonExpression([
+        "'", mode, "' == 'real' and '", start_robot_bringup,
+        "'.lower() in ['true', '1', 'yes', 'on']",
+    ]))
+
     nav2_params = RewrittenYaml(
         source_file=os.path.join(bringup_share, 'config', 'domain24_burger_nav2_amcl.yaml'),
         param_rewrites={
@@ -70,6 +78,7 @@ def generate_launch_description():
     scan_relay_script = os.path.join(bringup_share, 'scripts', 'scan_frame_relay.py')
     cartographer_config_dir = os.path.join(bringup_share, 'config')
     follower_robot_launch = os.path.join(bringup_share, 'launch', 'robot.launch.py')
+    sim_follower_launch = os.path.join(bringup_share, 'launch', 'sim_follower.launch.py')
 
     def main_topic(name, suffix):
         return f'/burger_{suffix}' if name == 'burger' else f'/{name}_{suffix}'
@@ -339,7 +348,20 @@ topics:
             'start_lidar': start_lidar,
             'start_base': start_base,
         }.items(),
-        condition=IfCondition(start_robot_bringup),
+        condition=robot_condition,
+    )
+    sim_follower = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(sim_follower_launch),
+        launch_arguments={
+            'domain_id': domain_id,
+            'leader_domain_id': main_domain_id,
+            'follow_distance': follow_distance,
+            'start_following': start_following,
+            'follower_initial_x': follower_initial_x,
+            'follower_initial_y': follower_initial_y,
+            'follower_initial_yaw': follower_initial_yaw,
+        }.items(),
+        condition=sim_condition,
     )
 
     controller_server = Node(package='nav2_controller', executable='controller_server',
@@ -384,6 +406,8 @@ topics:
     )
 
     return LaunchDescription([
+        DeclareLaunchArgument('mode',               default_value='real',
+                              description='real or sim.'),
         DeclareLaunchArgument('domain_id',          default_value='24'),
         DeclareLaunchArgument('main_domain_id',     default_value='25',
                               description='Main/leader ROS domain used by domain_bridge.'),
@@ -423,7 +447,8 @@ topics:
         SetEnvironmentVariable('ROS_LOCALHOST_ONLY',           '0'),
         SetEnvironmentVariable('RMW_IMPLEMENTATION',          'rmw_fastrtps_cpp'),
         SetEnvironmentVariable('TURTLEBOT3_MODEL',            robot_model),
-        LogInfo(msg=['FOLLOWER_D', domain_id, ' | robot=', robot_name,
+        LogInfo(msg=['FOLLOWER | mode=', mode, ' domain=', domain_id,
+                     ' | robot=', robot_name,
                      ' | main_domain=', main_domain_id,
                      ' | use_slam=', use_slam,
                      ' | bridge=', start_domain_bridge,
@@ -431,15 +456,19 @@ topics:
                      ' | slam_domain=', slam_domain,
                      ' | init=(', follower_initial_x, ',', follower_initial_y, ')',
                      ' | start_following=', start_following]),
+        sim_follower,
         robot_bringup,
-        TimerAction(period=0.2, actions=[domain_bridge_check]),
-        TimerAction(period=bridge_start_delay, actions=[OpaqueFunction(function=make_domain_bridges)]),
-        TimerAction(period=1.0, actions=[map_relay, scan_relay, scan_nav_relay]),
-        OpaqueFunction(function=make_localization),
-        TimerAction(period=3.5, actions=[burger_pose]),
+        TimerAction(period=0.2, actions=[domain_bridge_check], condition=real_condition),
+        TimerAction(period=bridge_start_delay, actions=[OpaqueFunction(function=make_domain_bridges)],
+                    condition=real_condition),
+        TimerAction(period=1.0, actions=[map_relay, scan_relay, scan_nav_relay],
+                    condition=real_condition),
+        OpaqueFunction(function=make_localization, condition=real_condition),
+        TimerAction(period=3.5, actions=[burger_pose], condition=real_condition),
         TimerAction(period=4.5, actions=[controller_server, planner_server,
-                                          behavior_server, bt_navigator]),
-        TimerAction(period=8.0, actions=[lifecycle_nav]),
-        TimerAction(period=10.0, actions=[burger_named_goal]),
-        TimerAction(period=11.0, actions=[follower]),
+                                          behavior_server, bt_navigator],
+                    condition=real_condition),
+        TimerAction(period=8.0, actions=[lifecycle_nav], condition=real_condition),
+        TimerAction(period=10.0, actions=[burger_named_goal], condition=real_condition),
+        TimerAction(period=11.0, actions=[follower], condition=real_condition),
     ])

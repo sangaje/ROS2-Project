@@ -6,176 +6,101 @@ from launch.actions import (
     ExecuteProcess,
     LogInfo,
     OpaqueFunction,
+    SetEnvironmentVariable,
     TimerAction,
+    UnsetEnvironmentVariable,
 )
 from launch.substitutions import LaunchConfiguration
 
 
+def _enabled(value):
+    return value.strip().lower() in ('true', '1', 'yes', 'on')
+
+
 def generate_launch_description():
-    follower_initial_x   = LaunchConfiguration('follower_initial_x')
-    follower_initial_y   = LaunchConfiguration('follower_initial_y')
-    follower_initial_yaw = LaunchConfiguration('follower_initial_yaw')
-    follow_distance      = LaunchConfiguration('follow_distance')
-    start_following      = LaunchConfiguration('start_following')
-    start_rviz           = LaunchConfiguration('start_rviz')
-    start_leader_stack   = LaunchConfiguration('start_leader_stack')
-    start_follower_stack = LaunchConfiguration('start_follower_stack')
-    leader_use_slam      = LaunchConfiguration('leader_use_slam')
-    start_leader_robot_bringup = LaunchConfiguration('start_leader_robot_bringup')
-    start_follower_robot_bringup = LaunchConfiguration('start_follower_robot_bringup')
-    main_domain_id       = LaunchConfiguration('main_domain_id')
-    leader_domain_id     = LaunchConfiguration('leader_domain_id')
-    follower_domain_id   = LaunchConfiguration('follower_domain_id')
-    leader_lds_model     = LaunchConfiguration('leader_lds_model')
-    follower_lds_model   = LaunchConfiguration('follower_lds_model')
-    leader_usb_port      = LaunchConfiguration('leader_usb_port')
-    follower_usb_port    = LaunchConfiguration('follower_usb_port')
-    leader_lidar_port    = LaunchConfiguration('leader_lidar_port')
-    follower_lidar_port  = LaunchConfiguration('follower_lidar_port')
-    leader_stack_delay   = LaunchConfiguration('leader_stack_delay')
-    follower_stack_delay = LaunchConfiguration('follower_stack_delay')
-    rviz_delay           = LaunchConfiguration('rviz_delay')
+    mode = LaunchConfiguration('mode')
+    main_domain_id = LaunchConfiguration('main_domain_id')
+    follower_domain_id = LaunchConfiguration('follower_domain_id')
+    robot_domains = LaunchConfiguration('robot_domains')
+    start_rviz = LaunchConfiguration('start_rviz')
+    start_gazebo = LaunchConfiguration('start_gazebo')
+    start_bridge = LaunchConfiguration('start_bridge')
+    start_gz_client = LaunchConfiguration('start_gz_client')
+    rviz_delay = LaunchConfiguration('rviz_delay')
 
-    def selected_main_domain(context):
-        legacy = leader_domain_id.perform(context).strip()
-        return legacy if legacy else main_domain_id.perform(context)
-
-    def enabled(value):
-        return value.lower() in ('true', '1', 'yes', 'on')
-
-    def make_processes(context, *args, **kwargs):
-        main_domain = selected_main_domain(context)
+    def make_actions(context, *args, **kwargs):
+        selected_mode = mode.perform(context).strip().lower()
+        main_domain = main_domain_id.perform(context)
         follower_domain = follower_domain_id.perform(context)
-        leader_slam = leader_use_slam.perform(context)
-        leader_cmd = [
-            'ros2', 'launch', 'tb3_fleet_bringup',
-            'leader.launch.py',
-            f'domain_id:={main_domain}',
-            'robot_model:=burger',
-            f'use_slam:={leader_slam}',
-        ]
-        follower_cmd = [
-            'ros2', 'launch', 'tb3_fleet_bringup',
-            'follower.launch.py',
-            f'domain_id:={follower_domain}',
-            f'main_domain_id:={main_domain}',
-            'use_slam:=false',
-            f'slam_domain:={main_domain}',
-            f'start_following:={start_following.perform(context)}',
-            f'follow_distance:={follow_distance.perform(context)}',
-            'enable_path_yield:=true',
-            'path_block_distance:=0.55',
-            'yield_lateral_distance:=0.75',
-            f'follower_initial_x:={follower_initial_x.perform(context)}',
-            f'follower_initial_y:={follower_initial_y.perform(context)}',
-            f'follower_initial_yaw:={follower_initial_yaw.perform(context)}',
-        ]
-        rviz_cmd = [
-            'ros2', 'launch', 'tb3_fleet_bringup',
-            'rviz.launch.py',
-            f'domain_id:={main_domain}',
-        ]
-        leader_robot_cmd = [
-            'ros2', 'launch', 'tb3_fleet_bringup',
-            'robot.launch.py',
-            'role:=leader',
-            f'domain_id:={main_domain}',
-            f'lds_model:={leader_lds_model.perform(context)}',
-            f'usb_port:={leader_usb_port.perform(context)}',
-            f'lidar_port:={leader_lidar_port.perform(context)}',
-        ]
-        follower_robot_cmd = [
-            'ros2', 'launch', 'tb3_fleet_bringup',
-            'robot.launch.py',
-            'role:=follower',
-            f'domain_id:={follower_domain}',
-            f'lds_model:={follower_lds_model.perform(context)}',
-            f'usb_port:={follower_usb_port.perform(context)}',
-            f'lidar_port:={follower_lidar_port.perform(context)}',
+
+        if selected_mode not in ('real', 'sim'):
+            raise RuntimeError("mode must be 'real' or 'sim'")
+
+        actions = [
+            LogInfo(msg=[
+                'PC_DEBUG | mode=', selected_mode,
+                ' main_domain=', main_domain,
+                ' follower_domain=', follower_domain,
+            ])
         ]
 
-        actions = []
-        if enabled(start_leader_robot_bringup.perform(context)):
-            actions.append(TimerAction(period=0.0, actions=[
-                ExecuteProcess(
-                    cmd=leader_robot_cmd,
+        if selected_mode == 'sim' and _enabled(start_gazebo.perform(context)):
+            actions.append(ExecuteProcess(
+                cmd=[
+                    'ros2', 'launch', 'tb3_fleet_bringup', 'sim_world.launch.py',
+                    f'domain_id:={main_domain}',
+                    f'start_gz_client:={start_gz_client.perform(context)}',
+                ],
+                output='screen',
+                name='sim_world',
+            ))
+
+        if _enabled(start_bridge.perform(context)):
+            actions.append(ExecuteProcess(
+                cmd=[
+                    'ros2', 'launch', 'tb3_fleet_bridge', 'bridges.launch.py',
+                    f'main_domain_id:={main_domain}',
+                    f'robot_domains:={robot_domains.perform(context)}',
+                ],
+                output='screen',
+                name='pc_bridge',
+            ))
+
+        if _enabled(start_rviz.perform(context)):
+            actions.append(TimerAction(
+                period=float(rviz_delay.perform(context)),
+                actions=[ExecuteProcess(
+                    cmd=[
+                        'ros2', 'launch', 'tb3_fleet_bringup', 'rviz.launch.py',
+                        f'domain_id:={main_domain}',
+                    ],
                     output='screen',
-                    name='leader_robot',
-                ),
-            ]))
-        if enabled(start_follower_robot_bringup.perform(context)):
-            actions.append(TimerAction(period=0.0, actions=[
-                ExecuteProcess(
-                    cmd=follower_robot_cmd,
-                    output='screen',
-                    name='follower_robot',
-                ),
-            ]))
-        if enabled(start_leader_stack.perform(context)):
-            actions.append(TimerAction(period=float(leader_stack_delay.perform(context)), actions=[
-                ExecuteProcess(
-                    cmd=leader_cmd,
-                    output='screen',
-                    name='leader_stack',
-                ),
-            ]))
-        if enabled(start_follower_stack.perform(context)):
-            actions.append(TimerAction(period=float(follower_stack_delay.perform(context)), actions=[
-                ExecuteProcess(
-                    cmd=follower_cmd,
-                    output='screen',
-                    name='follower_stack',
-                ),
-            ]))
-        if enabled(start_rviz.perform(context)):
-            actions.append(TimerAction(period=float(rviz_delay.perform(context)), actions=[
-                ExecuteProcess(
-                    cmd=rviz_cmd,
-                    output='screen',
-                    name='two_burgers_rviz',
-                ),
-            ]))
+                    name='rviz',
+                )],
+            ))
+
         return actions
 
     return LaunchDescription([
-        DeclareLaunchArgument('follower_initial_x', default_value='-1.05',
-                              description='Follower initial x in leader SLAM map.'),
-        DeclareLaunchArgument('follower_initial_y',   default_value='0.0'),
-        DeclareLaunchArgument('follower_initial_yaw', default_value='0.0'),
-        DeclareLaunchArgument('follow_distance',  default_value='1.05'),
-        DeclareLaunchArgument('start_following',  default_value='false',
-                              description='Safe default: wait for fleet_follow_signal.'),
-        DeclareLaunchArgument('start_rviz',  default_value='true'),
-        DeclareLaunchArgument('start_leader_stack', default_value='true',
-                              description='Start leader SLAM/Nav2 stack on this machine.'),
-        DeclareLaunchArgument('start_follower_stack', default_value='false',
-                              description='Start follower AMCL/Nav2/bridge stack on this machine. Default false: run it on the follower robot.'),
-        DeclareLaunchArgument('leader_use_slam', default_value='true',
-                              description='Use Cartographer SLAM for the main/leader stack. false starts AMCL mode.'),
-        DeclareLaunchArgument('start_leader_robot_bringup', default_value='false',
-                              description='Start leader hardware bringup locally. Use only on the leader robot PC.'),
-        DeclareLaunchArgument('start_follower_robot_bringup', default_value='false',
-                              description='Start follower hardware bringup locally. Use only on the follower robot PC.'),
+        DeclareLaunchArgument('mode', default_value='real',
+                              description='real or sim.'),
         DeclareLaunchArgument('main_domain_id', default_value='25',
-                              description='Main/leader ROS domain. RViz, SLAM, leader Nav2 run here.'),
-        DeclareLaunchArgument('leader_domain_id', default_value='',
-                              description='Deprecated alias for main_domain_id. Empty uses main_domain_id.'),
+                              description='Leader/main domain used by RViz.'),
         DeclareLaunchArgument('follower_domain_id', default_value='24'),
-        DeclareLaunchArgument('leader_lds_model', default_value='LDS-02'),
-        DeclareLaunchArgument('follower_lds_model', default_value='LDS-02'),
-        DeclareLaunchArgument('leader_usb_port', default_value='/dev/ttyACM0'),
-        DeclareLaunchArgument('follower_usb_port', default_value='/dev/ttyACM0'),
-        DeclareLaunchArgument('leader_lidar_port', default_value='/dev/ttyUSB0'),
-        DeclareLaunchArgument('follower_lidar_port', default_value='/dev/ttyUSB0'),
-        DeclareLaunchArgument('leader_stack_delay', default_value='0.0'),
-        DeclareLaunchArgument('follower_stack_delay', default_value='10.0'),
-        DeclareLaunchArgument('rviz_delay', default_value='18.0'),
-        LogInfo(msg=['FLEET_PC | main domain=', main_domain_id,
-                     ' leader_use_slam=', leader_use_slam,
-                     ' follower domain=', follower_domain_id, ' AMCL/Nav2',
-                     ' | local_follower_stack=', start_follower_stack,
-                     ' | start_following=', start_following,
-                     ' | local_robot_bringup leader=', start_leader_robot_bringup,
-                     ' follower=', start_follower_robot_bringup]),
-        OpaqueFunction(function=make_processes),
+        DeclareLaunchArgument('robot_domains', default_value='burger:24',
+                              description='Only used when start_bridge=true.'),
+        DeclareLaunchArgument('start_rviz', default_value='true'),
+        DeclareLaunchArgument('start_gazebo', default_value='true',
+                              description='Only used in mode=sim.'),
+        DeclareLaunchArgument('start_bridge', default_value='false',
+                              description='Normally false: follower.launch.py owns its bridge.'),
+        DeclareLaunchArgument('start_gz_client', default_value='true'),
+        DeclareLaunchArgument('rviz_delay', default_value='3.0'),
+        UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
+        UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),
+        UnsetEnvironmentVariable('FASTDDS_DEFAULT_PROFILES_FILE'),
+        SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', 'SUBNET'),
+        SetEnvironmentVariable('ROS_LOCALHOST_ONLY', '0'),
+        SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp'),
+        OpaqueFunction(function=make_actions),
     ])

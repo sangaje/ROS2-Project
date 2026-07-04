@@ -10,12 +10,15 @@ from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     ExecuteProcess,
+    IncludeLaunchDescription,
     LogInfo,
     OpaqueFunction,
     SetEnvironmentVariable,
     TimerAction,
     UnsetEnvironmentVariable,
 )
+from launch.conditions import IfCondition
+from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from nav2_common.launch import RewrittenYaml
@@ -24,12 +27,27 @@ from nav2_common.launch import RewrittenYaml
 def generate_launch_description():
     bringup_share = get_package_share_directory('tb3_fleet_bringup')
 
+    mode        = LaunchConfiguration('mode')
     domain_id   = LaunchConfiguration('domain_id')
     robot_model = LaunchConfiguration('robot_model')
     use_slam    = LaunchConfiguration('use_slam')
     initial_x   = LaunchConfiguration('initial_x')
     initial_y   = LaunchConfiguration('initial_y')
     initial_yaw = LaunchConfiguration('initial_yaw')
+    start_robot_bringup = LaunchConfiguration('start_robot_bringup')
+    start_state_publisher = LaunchConfiguration('start_state_publisher')
+    start_lidar = LaunchConfiguration('start_lidar')
+    start_base = LaunchConfiguration('start_base')
+    lds_model = LaunchConfiguration('lds_model')
+    usb_port = LaunchConfiguration('usb_port')
+    lidar_port = LaunchConfiguration('lidar_port')
+
+    real_condition = IfCondition(PythonExpression(["'", mode, "' == 'real'"]))
+    sim_condition = IfCondition(PythonExpression(["'", mode, "' == 'sim'"]))
+    robot_condition = IfCondition(PythonExpression([
+        "'", mode, "' == 'real' and '", start_robot_bringup,
+        "'.lower() in ['true', '1', 'yes', 'on']",
+    ]))
 
     burger_slam_yaml = os.path.join(bringup_share, 'config', 'domain26_burger_nav2_slam.yaml')
     burger_amcl_yaml = os.path.join(bringup_share, 'config', 'domain24_burger_nav2_amcl.yaml')
@@ -53,6 +71,7 @@ def generate_launch_description():
     )
 
     cartographer_config_dir = os.path.join(bringup_share, 'config')
+    robot_launch = os.path.join(bringup_share, 'launch', 'robot.launch.py')
     tf_pose_script    = os.path.join(bringup_share, 'scripts', 'tf_pose_publisher_direct_v44.py')
     goal_proxy_script = os.path.join(bringup_share, 'scripts', 'pose_to_nav2_action_direct_v41.py')
     pose_tf_script    = os.path.join(bringup_share, 'scripts', 'pose_to_tf_broadcaster.py')
@@ -188,6 +207,31 @@ def generate_launch_description():
         ],
         output='screen', name='real_burger_scan_static_tf',
     )
+    robot_bringup = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(robot_launch),
+        launch_arguments={
+            'role': 'leader',
+            'domain_id': domain_id,
+            'lds_model': lds_model,
+            'usb_port': usb_port,
+            'lidar_port': lidar_port,
+            'start_state_publisher': start_state_publisher,
+            'start_lidar': start_lidar,
+            'start_base': start_base,
+        }.items(),
+        condition=robot_condition,
+    )
+    sim_leader = ExecuteProcess(
+        cmd=[
+            'ros2', 'launch', 'tb3_fleet_bringup', 'sim_leader.launch.py',
+            ['domain_id:=', domain_id],
+            ['follower_initial_x:=', initial_x],
+            ['follower_initial_y:=', initial_y],
+        ],
+        output='screen',
+        name='sim_leader',
+        condition=sim_condition,
+    )
 
     controller_server = Node(
         package='nav2_controller', executable='controller_server',
@@ -235,12 +279,22 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        DeclareLaunchArgument('mode',         default_value='real',
+                              description='real or sim.'),
         DeclareLaunchArgument('domain_id',    default_value='25'),
-        DeclareLaunchArgument('robot_model',  default_value='waffle_pi'),
+        DeclareLaunchArgument('robot_model',  default_value='burger'),
         DeclareLaunchArgument('use_slam',     default_value='true'),
         DeclareLaunchArgument('initial_x',    default_value='1.05'),
         DeclareLaunchArgument('initial_y',    default_value='0.0'),
         DeclareLaunchArgument('initial_yaw',  default_value='0.0'),
+        DeclareLaunchArgument('start_robot_bringup', default_value='true',
+                              description='Real mode only: start base, lidar, and state publisher.'),
+        DeclareLaunchArgument('start_state_publisher', default_value='true'),
+        DeclareLaunchArgument('start_lidar', default_value='true'),
+        DeclareLaunchArgument('start_base', default_value='true'),
+        DeclareLaunchArgument('lds_model', default_value='LDS-02'),
+        DeclareLaunchArgument('usb_port', default_value='/dev/ttyACM0'),
+        DeclareLaunchArgument('lidar_port', default_value='/dev/ttyUSB0'),
         UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
         UnsetEnvironmentVariable('ROS_LOCALHOST_ONLY'),
         UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),
@@ -250,13 +304,19 @@ def generate_launch_description():
         SetEnvironmentVariable('ROS_LOCALHOST_ONLY',           '0'),
         SetEnvironmentVariable('RMW_IMPLEMENTATION',          'rmw_fastrtps_cpp'),
         SetEnvironmentVariable('TURTLEBOT3_MODEL',            robot_model),
-        LogInfo(msg=['LEADER_D', domain_id, ' | model=', robot_model,
-                     ' | use_slam=', use_slam]),
-        TimerAction(period=0.2, actions=[scan_cartographer_relay, scan_nav_relay]),
-        OpaqueFunction(function=make_localization),
-        TimerAction(period=1.5, actions=[leader_pose, burger_scan_static_tf, burger_amcl_tf]),
+        LogInfo(msg=['LEADER | mode=', mode, ' domain=', domain_id,
+                     ' | model=', robot_model, ' | use_slam=', use_slam,
+                     ' | robot_bringup=', start_robot_bringup]),
+        sim_leader,
+        robot_bringup,
+        TimerAction(period=0.2, actions=[scan_cartographer_relay, scan_nav_relay],
+                    condition=real_condition),
+        OpaqueFunction(function=make_localization, condition=real_condition),
+        TimerAction(period=1.5, actions=[leader_pose, burger_scan_static_tf, burger_amcl_tf],
+                    condition=real_condition),
         TimerAction(period=2.0, actions=[controller_server, planner_server,
-                                         behavior_server, bt_navigator]),
-        TimerAction(period=5.0, actions=[lifecycle_nav]),
-        TimerAction(period=7.0, actions=[default_goal, named_goal]),
+                                         behavior_server, bt_navigator],
+                    condition=real_condition),
+        TimerAction(period=5.0, actions=[lifecycle_nav], condition=real_condition),
+        TimerAction(period=7.0, actions=[default_goal, named_goal], condition=real_condition),
     ])

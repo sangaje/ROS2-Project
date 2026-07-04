@@ -2,8 +2,8 @@
 set -euo pipefail
 
 patterns=(
-  'ros2 launch tb3_fleet_bringup pc.launch.py'
   'ros2 launch tb3_fleet_bringup real.launch.py'
+  'ros2 launch tb3_fleet_bringup pc.launch.py'
   'ros2 launch tb3_fleet_bringup leader.launch.py'
   'ros2 launch tb3_fleet_bringup follower.launch.py'
   'ros2 launch tb3_fleet_bringup rviz.launch.py'
