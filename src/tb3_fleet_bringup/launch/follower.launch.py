@@ -362,7 +362,7 @@ topics:
         DeclareLaunchArgument('start_robot_bringup', default_value='true'),
         DeclareLaunchArgument('usb_port',           default_value='/dev/ttyACM0'),
         DeclareLaunchArgument('lidar_port',
-                              default_value=EnvironmentVariable('LIDAR_PORT', default_value='auto')),
+                              default_value=EnvironmentVariable('LIDAR_PORT')),
         UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
         UnsetEnvironmentVariable('ROS_LOCALHOST_ONLY'),
         UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import os
 from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
@@ -19,7 +20,8 @@ def generate_launch_description():
 
     tb3_share  = Path(get_package_share_directory('turtlebot3_bringup'))
     state_pub  = str(tb3_share / 'launch' / 'turtlebot3_state_publisher.launch.py')
-    tb3_params = str(tb3_share / 'param' / 'burger.yaml')
+    tb3_model  = os.environ['TURTLEBOT3_MODEL']
+    tb3_params = str(tb3_share / 'param' / f'{tb3_model}.yaml')
 
     def make_robot(context, *args, **kwargs):
         model = lds_model.perform(context).strip().upper()
@@ -56,7 +58,7 @@ def generate_launch_description():
         DeclareLaunchArgument('role',      default_value='leader'),
         DeclareLaunchArgument('domain_id', default_value=''),
         DeclareLaunchArgument('lds_model',
-                              default_value=EnvironmentVariable('LDS_MODEL', default_value='LDS-01')),
+                              default_value=EnvironmentVariable('LDS_MODEL')),
         DeclareLaunchArgument('usb_port',  default_value='/dev/ttyACM0'),
         DeclareLaunchArgument('lidar_port',
                               default_value=EnvironmentVariable('LIDAR_PORT', default_value='/dev/ttyUSB0')),
