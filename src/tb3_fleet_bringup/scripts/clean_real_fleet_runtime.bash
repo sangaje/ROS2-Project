@@ -40,6 +40,7 @@ patterns=(
   'fleet_debug_marker.py'
   'sim_burger_scan_relay.py'
   'scan_frame_relay.py'
+  'lidar_autostart.py'
   'real_burger_scan_frame_relay'
   'sim_burger_tf_relay.py'
   'sim_map_relay.py'

@@ -7,6 +7,7 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
+    ExecuteProcess,
     IncludeLaunchDescription,
     LogInfo,
     OpaqueFunction,
@@ -36,9 +37,11 @@ def generate_launch_description():
     ])
 
     tb3_bringup_share = Path(get_package_share_directory('turtlebot3_bringup'))
+    fleet_share = Path(get_package_share_directory('tb3_fleet_bringup'))
     official_robot_launch = str(tb3_bringup_share / 'launch' / 'robot.launch.py')
     state_publisher_launch = str(tb3_bringup_share / 'launch' / 'turtlebot3_state_publisher.launch.py')
     tb3_param_file = str(tb3_bringup_share / 'param' / 'burger.yaml')
+    lidar_autostart = str(fleet_share / 'scripts' / 'lidar_autostart.py')
 
     def enabled(value):
         return value.strip().lower() in ('true', '1', 'yes', 'on')
@@ -95,20 +98,45 @@ def generate_launch_description():
             ),
         ]
 
+    def make_lidar_autostart(context, *args, **kwargs):
+        model = lds_model.perform(context).strip()
+        port = lidar_port.perform(context).strip()
+        return [
+            LogInfo(msg=[
+                'REAL_BURGER_LIDAR | managed autostart model=', model,
+                ' requested_port=', port,
+                ' frame=base_scan',
+            ]),
+            ExecuteProcess(
+                cmd=[
+                    'python3', lidar_autostart,
+                    '--model', model,
+                    '--port', port,
+                    '--frame-id', 'base_scan',
+                    '--namespace', '',
+                    '--scan-topic', '/scan',
+                ],
+                output='screen',
+                name='lidar_autostart',
+            ),
+        ]
+
     def make_robot_bringup(context, *args, **kwargs):
         impl = bringup_impl.perform(context).strip().lower()
         state_on = enabled(start_state_publisher.perform(context))
         lidar_on = enabled(start_lidar.perform(context))
         base_on = enabled(start_base.perform(context))
         model = lds_model.perform(context).strip()
-        lidar_port_value = resolve_lidar_port(lidar_port.perform(context))
 
-        os.environ['TURTLEBOT3_MODEL'] = 'burger'
         os.environ['LDS_MODEL'] = model
 
-        if impl == 'official' and state_on and lidar_on and base_on and lidar_port_value == '/dev/ttyUSB0':
+        if impl == 'official' and state_on and lidar_on and base_on:
             return [
-                LogInfo(msg='REAL_BURGER_BASE | using turtlebot3_bringup robot.launch.py'),
+                LogInfo(msg=[
+                    'REAL_BURGER_BASE | using turtlebot3_bringup robot.launch.py',
+                    ' | LDS_MODEL=', model,
+                    ' | official lidar port=/dev/ttyUSB0',
+                ]),
                 IncludeLaunchDescription(
                     PythonLaunchDescriptionSource(official_robot_launch),
                     launch_arguments={
@@ -119,7 +147,7 @@ def generate_launch_description():
                 ),
             ]
 
-        actions = [LogInfo(msg='REAL_BURGER_BASE | using split bringup path')]
+        actions = [LogInfo(msg=['REAL_BURGER_BASE | using ', impl, ' bringup path'])]
 
         if state_on:
             actions.append(IncludeLaunchDescription(
@@ -130,7 +158,10 @@ def generate_launch_description():
             actions.append(LogInfo(msg='REAL_BURGER_STATE_PUBLISHER | disabled'))
 
         if lidar_on:
-            actions.extend(make_lidar(context))
+            if impl == 'split':
+                actions.extend(make_lidar(context))
+            else:
+                actions.extend(make_lidar_autostart(context))
         else:
             actions.append(LogInfo(msg='REAL_BURGER_LIDAR | disabled'))
 
@@ -165,8 +196,8 @@ def generate_launch_description():
         DeclareLaunchArgument('start_lidar', default_value='true'),
         DeclareLaunchArgument('start_base', default_value='true',
                               description='Start turtlebot3_node/OpenCR base driver.'),
-        DeclareLaunchArgument('bringup_impl', default_value='official',
-                              description='official uses turtlebot3_bringup robot.launch.py when all robot parts are enabled; split allows per-part toggles.'),
+        DeclareLaunchArgument('bringup_impl', default_value='managed',
+                              description='managed retries installed lidar driver until /scan works; official uses turtlebot3_bringup robot.launch.py; split launches one configured port.'),
         UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
         UnsetEnvironmentVariable('ROS_LOCALHOST_ONLY'),
         UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),
@@ -175,7 +206,6 @@ def generate_launch_description():
         SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', 'SUBNET'),
         SetEnvironmentVariable('ROS_LOCALHOST_ONLY',           '0'),
         SetEnvironmentVariable('RMW_IMPLEMENTATION',          'rmw_fastrtps_cpp'),
-        SetEnvironmentVariable('TURTLEBOT3_MODEL', 'burger'),
         SetEnvironmentVariable('LDS_MODEL', lds_model),
         LogInfo(msg=['REAL_BURGER_BASE | role=', role,
                      ' domain=', domain_id, ' lds=', lds_model,

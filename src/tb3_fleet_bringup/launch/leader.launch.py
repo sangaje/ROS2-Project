@@ -31,7 +31,6 @@ def generate_launch_description():
 
     mode        = LaunchConfiguration('mode')
     domain_id   = LaunchConfiguration('domain_id')
-    robot_model = LaunchConfiguration('robot_model')
     use_slam    = LaunchConfiguration('use_slam')
     slam_impl   = LaunchConfiguration('slam_impl')
     initial_x   = LaunchConfiguration('initial_x')
@@ -41,7 +40,6 @@ def generate_launch_description():
     start_state_publisher = LaunchConfiguration('start_state_publisher')
     start_lidar = LaunchConfiguration('start_lidar')
     start_base = LaunchConfiguration('start_base')
-    lds_model = LaunchConfiguration('lds_model')
     usb_port = LaunchConfiguration('usb_port')
     lidar_port = LaunchConfiguration('lidar_port')
 
@@ -52,18 +50,10 @@ def generate_launch_description():
         "'.lower() in ['true', '1', 'yes', 'on']",
     ]))
 
-    burger_slam_yaml = os.path.join(bringup_share, 'config', 'domain26_burger_nav2_slam.yaml')
-    burger_amcl_yaml = os.path.join(bringup_share, 'config', 'domain24_burger_nav2_amcl.yaml')
-    waffle_yaml      = os.path.join(bringup_share, 'config', 'domain25_waffle_nav2.yaml')
+    waffle_yaml = os.path.join(bringup_share, 'config', 'domain25_waffle_nav2.yaml')
 
-    nav2_source = PythonExpression([
-        "'", burger_amcl_yaml, "' if '", robot_model, "' == 'burger' and '",
-        use_slam, "' == 'false' else ('",
-        burger_slam_yaml, "' if '", robot_model, "' == 'burger' else '",
-        waffle_yaml, "')",
-    ])
     nav2_params = RewrittenYaml(
-        source_file=nav2_source,
+        source_file=waffle_yaml,
         param_rewrites={
             'use_sim_time': 'false',
             'odom_topic': '/odom',
@@ -177,6 +167,7 @@ def generate_launch_description():
             '-p', 'log_every_n:=100',
         ],
         output='screen', name='waffle_real_leader_pose_publisher',
+        additional_env={'ROS_DOMAIN_ID': domain_id},
     )
     scan_cartographer_relay = ExecuteProcess(
         cmd=[
@@ -190,6 +181,7 @@ def generate_launch_description():
             '-p', 'output_reliability:=reliable',
         ],
         output='screen', name='leader_scan_cartographer_relay',
+        additional_env={'ROS_DOMAIN_ID': domain_id},
     )
     scan_nav_relay = ExecuteProcess(
         cmd=[
@@ -203,6 +195,7 @@ def generate_launch_description():
             '-p', 'output_reliability:=reliable',
         ],
         output='screen', name='leader_scan_nav_relay',
+        additional_env={'ROS_DOMAIN_ID': domain_id},
     )
 
     def make_scan_relays(context, *args, **kwargs):
@@ -224,6 +217,7 @@ def generate_launch_description():
             '-p', 'republish_hz:=10.0',
         ],
         output='screen', name='real_burger_amcl_tf_on_leader_domain',
+        additional_env={'ROS_DOMAIN_ID': domain_id},
     )
     burger_scan_static_tf = ExecuteProcess(
         cmd=[
@@ -238,13 +232,13 @@ def generate_launch_description():
             '--child-frame-id', 'burger/base_scan',
         ],
         output='screen', name='real_burger_scan_static_tf',
+        additional_env={'ROS_DOMAIN_ID': domain_id},
     )
     robot_bringup = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(robot_launch),
         launch_arguments={
             'role': 'leader',
             'domain_id': domain_id,
-            'lds_model': lds_model,
             'usb_port': usb_port,
             'lidar_port': lidar_port,
             'start_state_publisher': start_state_publisher,
@@ -265,35 +259,39 @@ def generate_launch_description():
         condition=sim_condition,
     )
 
+    _d = {'ROS_DOMAIN_ID': domain_id}
     controller_server = Node(
         package='nav2_controller', executable='controller_server',
         name='controller_server', output='screen', parameters=[nav2_params],
+        additional_env=_d,
     )
     planner_server = Node(
         package='nav2_planner', executable='planner_server',
         name='planner_server', output='screen', parameters=[nav2_params],
+        additional_env=_d,
     )
     behavior_server = Node(
         package='nav2_behaviors', executable='behavior_server',
         name='behavior_server', output='screen', parameters=[nav2_params],
+        additional_env=_d,
     )
     bt_navigator = Node(
         package='nav2_bt_navigator', executable='bt_navigator',
         name='bt_navigator', output='screen', parameters=[nav2_params],
+        additional_env=_d,
     )
     lifecycle_nav = Node(
         package='nav2_lifecycle_manager', executable='lifecycle_manager',
         name='lifecycle_manager_navigation', output='screen', parameters=[nav2_params],
+        additional_env=_d,
     )
     wait_scan = ExecuteProcess(
         cmd=['bash', wait_ready_script, 'scan', '/scan', 'unused', '0'],
-        output='screen',
-        name='wait_leader_scan',
+        output='screen', name='wait_leader_scan', additional_env=_d,
     )
     wait_map_tf = ExecuteProcess(
         cmd=['bash', wait_ready_script, 'tf', 'map', 'base_footprint', '0'],
-        output='screen',
-        name='wait_leader_map_tf',
+        output='screen', name='wait_leader_map_tf', additional_env=_d,
     )
     default_goal = ExecuteProcess(
         cmd=[
@@ -305,7 +303,7 @@ def generate_launch_description():
             '-p', 'default_frame_id:=map',
             '-p', 'cancel_previous_goal:=true',
         ],
-        output='screen', name='waffle_default_goal',
+        output='screen', name='waffle_default_goal', additional_env=_d,
     )
     named_goal = ExecuteProcess(
         cmd=[
@@ -317,14 +315,13 @@ def generate_launch_description():
             '-p', 'default_frame_id:=map',
             '-p', 'cancel_previous_goal:=true',
         ],
-        output='screen', name='waffle_named_goal',
+        output='screen', name='waffle_named_goal', additional_env=_d,
     )
 
     return LaunchDescription([
         DeclareLaunchArgument('mode',         default_value='real',
                               description='real or sim.'),
         DeclareLaunchArgument('domain_id',    default_value='25'),
-        DeclareLaunchArgument('robot_model',  default_value='burger'),
         DeclareLaunchArgument('use_slam',     default_value='true'),
         DeclareLaunchArgument('slam_impl',    default_value='official',
                               description='official uses installed turtlebot3_cartographer; custom uses tb3_fleet_bringup config.'),
@@ -336,9 +333,6 @@ def generate_launch_description():
         DeclareLaunchArgument('start_state_publisher', default_value='true'),
         DeclareLaunchArgument('start_lidar', default_value='true'),
         DeclareLaunchArgument('start_base', default_value='true'),
-        DeclareLaunchArgument('lds_model',
-                              default_value=EnvironmentVariable('LDS_MODEL', default_value='LDS-02'),
-                              description='LDS-01, LDS-02, or LDS-03. Defaults to LDS_MODEL env.'),
         DeclareLaunchArgument('usb_port', default_value='/dev/ttyACM0'),
         DeclareLaunchArgument('lidar_port',
                               default_value=EnvironmentVariable('LIDAR_PORT', default_value='auto')),
@@ -350,9 +344,8 @@ def generate_launch_description():
         SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', 'SUBNET'),
         SetEnvironmentVariable('ROS_LOCALHOST_ONLY',           '0'),
         SetEnvironmentVariable('RMW_IMPLEMENTATION',          'rmw_fastrtps_cpp'),
-        SetEnvironmentVariable('TURTLEBOT3_MODEL',            robot_model),
         LogInfo(msg=['LEADER | mode=', mode, ' domain=', domain_id,
-                     ' | model=', robot_model, ' | use_slam=', use_slam,
+                     ' | use_slam=', use_slam,
                      ' | robot_bringup=', start_robot_bringup]),
         sim_leader,
         robot_bringup,

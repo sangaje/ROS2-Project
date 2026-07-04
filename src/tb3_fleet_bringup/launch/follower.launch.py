@@ -32,7 +32,6 @@ def generate_launch_description():
     main_domain_id       = LaunchConfiguration('main_domain_id')
     leader_domain_id     = LaunchConfiguration('leader_domain_id')
     robot_name           = LaunchConfiguration('robot_name')
-    robot_model          = LaunchConfiguration('robot_model')
     follow_distance      = LaunchConfiguration('follow_distance')
     start_following      = LaunchConfiguration('start_following')
     enable_path_yield    = LaunchConfiguration('enable_path_yield')
@@ -49,7 +48,6 @@ def generate_launch_description():
     start_state_publisher = LaunchConfiguration('start_state_publisher')
     start_lidar          = LaunchConfiguration('start_lidar')
     start_base           = LaunchConfiguration('start_base')
-    lds_model            = LaunchConfiguration('lds_model')
     usb_port             = LaunchConfiguration('usb_port')
     lidar_port           = LaunchConfiguration('lidar_port')
 
@@ -295,43 +293,41 @@ topics:
             TimerAction(period=2.5, actions=[lifecycle_loc]),
         ]
 
+    _d = {'ROS_DOMAIN_ID': domain_id}
     burger_pose = ExecuteProcess(
         cmd=['python3', tf_pose_script, '--ros-args',
              '-r', '__node:=burger_real_pose_publisher',
              '-p', 'use_sim_time:=false', '-p', 'target_frame:=map',
              '-p', 'source_frame:=base_footprint', '-p', 'output_topic:=/burger_pose',
              '-p', 'publish_rate_hz:=10.0', '-p', 'log_every_n:=100'],
-        output='screen', name='burger_real_pose_publisher',
+        output='screen', name='burger_real_pose_publisher', additional_env=_d,
     )
     map_relay = ExecuteProcess(
         cmd=['python3', map_relay_script, '--ros-args',
              '-r', '__node:=real_follower_map_relay',
-             '-p', 'use_sim_time:=false',
              '-p', 'input_topic:=/map_bridge',
              '-p', 'output_topic:=/map'],
-        output='screen', name='real_follower_map_relay',
+        output='screen', name='real_follower_map_relay', additional_env=_d,
     )
     scan_relay = ExecuteProcess(
         cmd=['python3', scan_relay_script, '--ros-args',
              '-r', '__node:=real_burger_scan_frame_relay',
-             '-p', 'use_sim_time:=false',
              '-p', 'input_topic:=/scan',
              '-p', 'output_topic:=/burger_scan_relay',
              '-p', 'output_frame:=burger/base_scan',
              '-p', 'input_reliability:=best_effort',
              '-p', 'output_reliability:=reliable'],
-        output='screen', name='real_burger_scan_frame_relay',
+        output='screen', name='real_burger_scan_frame_relay', additional_env=_d,
     )
     scan_nav_relay = ExecuteProcess(
         cmd=['python3', scan_relay_script, '--ros-args',
              '-r', '__node:=burger_scan_nav_relay',
-             '-p', 'use_sim_time:=false',
              '-p', 'input_topic:=/scan',
              '-p', 'output_topic:=/scan_nav',
              '-p', 'output_frame:=base_scan',
              '-p', 'input_reliability:=best_effort',
              '-p', 'output_reliability:=reliable'],
-        output='screen', name='burger_scan_nav_relay',
+        output='screen', name='burger_scan_nav_relay', additional_env=_d,
     )
     domain_bridge_check = ExecuteProcess(
         cmd=['ros2', 'pkg', 'prefix', 'domain_bridge'],
@@ -343,7 +339,6 @@ topics:
         launch_arguments={
             'role': 'follower',
             'domain_id': domain_id,
-            'lds_model': lds_model,
             'usb_port': usb_port,
             'lidar_port': lidar_port,
             'start_state_publisher': start_state_publisher,
@@ -367,23 +362,27 @@ topics:
     )
 
     controller_server = Node(package='nav2_controller', executable='controller_server',
-                             name='controller_server', output='screen', parameters=[nav2_params])
+                             name='controller_server', output='screen', parameters=[nav2_params],
+                             additional_env=_d)
     planner_server    = Node(package='nav2_planner', executable='planner_server',
-                             name='planner_server', output='screen', parameters=[nav2_params])
+                             name='planner_server', output='screen', parameters=[nav2_params],
+                             additional_env=_d)
     behavior_server   = Node(package='nav2_behaviors', executable='behavior_server',
-                             name='behavior_server', output='screen', parameters=[nav2_params])
+                             name='behavior_server', output='screen', parameters=[nav2_params],
+                             additional_env=_d)
     bt_navigator      = Node(package='nav2_bt_navigator', executable='bt_navigator',
-                             name='bt_navigator', output='screen', parameters=[nav2_params])
+                             name='bt_navigator', output='screen', parameters=[nav2_params],
+                             additional_env=_d)
     lifecycle_nav     = Node(package='nav2_lifecycle_manager', executable='lifecycle_manager',
                              name='lifecycle_manager_navigation', output='screen',
-                             parameters=[nav2_params])
+                             parameters=[nav2_params], additional_env=_d)
     burger_named_goal = ExecuteProcess(
         cmd=['python3', goal_proxy_script, '--ros-args',
              '-r', '__node:=burger_named_goal',
              '-p', 'use_sim_time:=false', '-p', 'goal_pose_topic:=/burger_goal_pose',
              '-p', 'navigate_action:=/navigate_to_pose', '-p', 'default_frame_id:=map',
              '-p', 'cancel_previous_goal:=true'],
-        output='screen', name='burger_named_goal',
+        output='screen', name='burger_named_goal', additional_env=_d,
     )
     follower = ExecuteProcess(
         cmd=['python3', follower_script, '--ros-args',
@@ -404,7 +403,7 @@ topics:
              '-p', ['yield_lateral_distance:=', yield_lateral_distance],
              '-p', 'yield_release_distance:=0.80', '-p', 'yield_map_clearance:=0.18',
              '-p', 'yield_min_hold_sec:=4.0', '-p', 'yield_max_hold_sec:=12.0'],
-        output='screen', name='burger_follower',
+        output='screen', name='burger_follower', additional_env=_d,
     )
 
     return LaunchDescription([
@@ -417,7 +416,6 @@ topics:
                               description='Deprecated alias for main_domain_id. Empty uses main_domain_id.'),
         DeclareLaunchArgument('robot_name',          default_value='burger',
                               description='Main-domain name for this follower. Use burger for the first robot.'),
-        DeclareLaunchArgument('robot_model',        default_value='burger'),
         DeclareLaunchArgument('follow_distance',    default_value='1.05'),
         DeclareLaunchArgument('start_following',    default_value='false'),
         DeclareLaunchArgument('enable_path_yield',      default_value='true'),
@@ -437,9 +435,6 @@ topics:
         DeclareLaunchArgument('start_state_publisher', default_value='true'),
         DeclareLaunchArgument('start_lidar', default_value='true'),
         DeclareLaunchArgument('start_base', default_value='true'),
-        DeclareLaunchArgument('lds_model',
-                              default_value=EnvironmentVariable('LDS_MODEL', default_value='LDS-02'),
-                              description='LDS-01, LDS-02, or LDS-03. Defaults to LDS_MODEL env.'),
         DeclareLaunchArgument('usb_port', default_value='/dev/ttyACM0'),
         DeclareLaunchArgument('lidar_port',
                               default_value=EnvironmentVariable('LIDAR_PORT', default_value='auto')),
@@ -451,7 +446,6 @@ topics:
         SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', 'SUBNET'),
         SetEnvironmentVariable('ROS_LOCALHOST_ONLY',           '0'),
         SetEnvironmentVariable('RMW_IMPLEMENTATION',          'rmw_fastrtps_cpp'),
-        SetEnvironmentVariable('TURTLEBOT3_MODEL',            robot_model),
         LogInfo(msg=['FOLLOWER | mode=', mode, ' domain=', domain_id,
                      ' | robot=', robot_name,
                      ' | main_domain=', main_domain_id,
