@@ -13,11 +13,13 @@ from launch.actions import (
     IncludeLaunchDescription,
     LogInfo,
     OpaqueFunction,
+    RegisterEventHandler,
     SetEnvironmentVariable,
     TimerAction,
     UnsetEnvironmentVariable,
 )
 from launch.conditions import IfCondition
+from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
@@ -82,6 +84,7 @@ def generate_launch_description():
     goal_proxy_script = os.path.join(bringup_share, 'scripts', 'pose_to_nav2_action_direct_v41.py')
     pose_tf_script    = os.path.join(bringup_share, 'scripts', 'pose_to_tf_broadcaster.py')
     scan_relay_script = os.path.join(bringup_share, 'scripts', 'scan_frame_relay.py')
+    wait_ready_script = os.path.join(bringup_share, 'scripts', 'wait_for_fleet_ready.bash')
 
     # ── Localization: Cartographer SLAM or AMCL ────────────────────────────────
     def make_localization(context, *args, **kwargs):
@@ -282,6 +285,16 @@ def generate_launch_description():
         package='nav2_lifecycle_manager', executable='lifecycle_manager',
         name='lifecycle_manager_navigation', output='screen', parameters=[nav2_params],
     )
+    wait_scan = ExecuteProcess(
+        cmd=['bash', wait_ready_script, 'scan', '/scan', 'unused', '0'],
+        output='screen',
+        name='wait_leader_scan',
+    )
+    wait_map_tf = ExecuteProcess(
+        cmd=['bash', wait_ready_script, 'tf', 'map', 'base_footprint', '0'],
+        output='screen',
+        name='wait_leader_map_tf',
+    )
     default_goal = ExecuteProcess(
         cmd=[
             'python3', goal_proxy_script, '--ros-args',
@@ -327,7 +340,8 @@ def generate_launch_description():
                               default_value=EnvironmentVariable('LDS_MODEL', default_value='LDS-02'),
                               description='LDS-01, LDS-02, or LDS-03. Defaults to LDS_MODEL env.'),
         DeclareLaunchArgument('usb_port', default_value='/dev/ttyACM0'),
-        DeclareLaunchArgument('lidar_port', default_value='/dev/ttyUSB0'),
+        DeclareLaunchArgument('lidar_port',
+                              default_value=EnvironmentVariable('LIDAR_PORT', default_value='auto')),
         UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
         UnsetEnvironmentVariable('ROS_LOCALHOST_ONLY'),
         UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),
@@ -342,6 +356,7 @@ def generate_launch_description():
                      ' | robot_bringup=', start_robot_bringup]),
         sim_leader,
         robot_bringup,
+        TimerAction(period=1.0, actions=[wait_scan], condition=real_condition),
         OpaqueFunction(function=make_scan_relays, condition=real_condition),
         OpaqueFunction(function=make_localization, condition=real_condition),
         TimerAction(period=4.0, actions=[leader_pose, burger_scan_static_tf, burger_amcl_tf],
@@ -349,6 +364,15 @@ def generate_launch_description():
         TimerAction(period=6.0, actions=[controller_server, planner_server,
                                          behavior_server, bt_navigator],
                     condition=real_condition),
-        TimerAction(period=9.0, actions=[lifecycle_nav], condition=real_condition),
-        TimerAction(period=11.0, actions=[default_goal, named_goal], condition=real_condition),
+        TimerAction(period=7.0, actions=[wait_map_tf], condition=real_condition),
+        RegisterEventHandler(
+            OnProcessExit(
+                target_action=wait_map_tf,
+                on_exit=[
+                    lifecycle_nav,
+                    TimerAction(period=2.0, actions=[default_goal, named_goal]),
+                ],
+            ),
+            condition=real_condition,
+        ),
     ])
