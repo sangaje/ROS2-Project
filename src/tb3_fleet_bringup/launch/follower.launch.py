@@ -172,6 +172,9 @@ topics:
   /fleet/follow_command:
     type: std_msgs/msg/String
     qos: {{reliability: reliable, durability: volatile, history: keep_last, depth: 10}}
+  /initialpose:
+    type: geometry_msgs/msg/PoseWithCovarianceStamped
+    qos: {{reliability: reliable, durability: volatile, history: keep_last, depth: 10}}
 """, encoding='utf-8')
             b2l.write_text(f"""\
 name: b2l_{d}_to_{ld}

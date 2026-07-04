@@ -54,6 +54,7 @@ class DomainBridgeNav2Follower(Node):
         self.declare_parameter('follow_distance', 1.05)
         self.declare_parameter('goal_period_sec', 1.0)
         self.declare_parameter('goal_update_distance', 0.20)
+        self.declare_parameter('follow_goal_refresh_sec', 3.0)
         self.declare_parameter('wait_for_action_timeout_sec', 1.0)
         self.declare_parameter('cancel_previous_goal', False)
         self.declare_parameter('log_wait_every_n', 10)
@@ -84,6 +85,10 @@ class DomainBridgeNav2Follower(Node):
         self.follow_distance = float(self.get_parameter('follow_distance').value)
         self.goal_period_sec = max(0.2, float(self.get_parameter('goal_period_sec').value))
         self.goal_update_distance = max(0.05, float(self.get_parameter('goal_update_distance').value))
+        self.follow_goal_refresh_sec = max(
+            1.0,
+            float(self.get_parameter('follow_goal_refresh_sec').value),
+        )
         self.wait_timeout = max(0.0, float(self.get_parameter('wait_for_action_timeout_sec').value))
         self.cancel_previous_goal = bool(self.get_parameter('cancel_previous_goal').value)
         self.log_wait_every_n = max(1, int(self.get_parameter('log_wait_every_n').value))
@@ -242,7 +247,9 @@ class DomainBridgeNav2Follower(Node):
     def _make_goal(self, x: float, y: float, yaw: float) -> PoseStamped:
         qx, qy, qz, qw = _quat_from_yaw(yaw)
         goal = PoseStamped()
-        goal.header.stamp = self.get_clock().now().to_msg()
+        # A zero stamp asks TF/Nav2 for the latest transform. This avoids stale
+        # cross-machine timestamps when a goal waits for AMCL to become ready.
+        goal.header.stamp = rclpy.time.Time().to_msg()
         goal.header.frame_id = 'map'
         goal.pose.position.x = x
         goal.pose.position.y = y
@@ -514,7 +521,12 @@ class DomainBridgeNav2Follower(Node):
         now = self._now_sec()
         if self.last_goal_xy is not None and self.last_goal_mode == mode:
             distance = math.hypot(gx - self.last_goal_xy[0], gy - self.last_goal_xy[1])
-            refresh_due = mode == 'yield' and now - self.last_goal_sent_sec >= self.yield_goal_refresh_sec
+            refresh_period = (
+                self.yield_goal_refresh_sec
+                if mode == 'yield'
+                else self.follow_goal_refresh_sec
+            )
+            refresh_due = now - self.last_goal_sent_sec >= refresh_period
             if distance < self.goal_update_distance and not refresh_due:
                 return
 
@@ -526,6 +538,7 @@ class DomainBridgeNav2Follower(Node):
 
         goal_msg = NavigateToPose.Goal()
         goal_msg.pose = goal_pose
+        goal_msg.pose.header.stamp = rclpy.time.Time().to_msg()
         self.last_goal_xy = (gx, gy)
         self.last_goal_mode = mode
         self.last_goal_sent_sec = now
@@ -543,6 +556,14 @@ class DomainBridgeNav2Follower(Node):
             self.wait_count += 1
             if self.wait_count % self.log_wait_every_n == 1:
                 self.get_logger().warn('V56_FOLLOW_WAIT | no /leader_pose yet')
+            return
+        if self.follower_pose is None:
+            self.wait_count += 1
+            if self.wait_count % self.log_wait_every_n == 1:
+                self.get_logger().warn(
+                    'V58_FOLLOW_WAIT | follower localization not ready '
+                    '(waiting for map -> base_footprint)'
+                )
             return
 
         if not self.client.wait_for_server(timeout_sec=self.wait_timeout):
