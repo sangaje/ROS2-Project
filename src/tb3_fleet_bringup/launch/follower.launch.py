@@ -438,7 +438,7 @@ topics:
         DeclareLaunchArgument('start_lidar', default_value='true'),
         DeclareLaunchArgument('start_base', default_value='true'),
         DeclareLaunchArgument('lds_model',
-                              default_value=EnvironmentVariable('LDS_MODEL', default_value='LDS-01'),
+                              default_value=EnvironmentVariable('LDS_MODEL', default_value='LDS-02'),
                               description='LDS-01, LDS-02, or LDS-03. Defaults to LDS_MODEL env.'),
         DeclareLaunchArgument('usb_port', default_value='/dev/ttyACM0'),
         DeclareLaunchArgument('lidar_port', default_value='/dev/ttyUSB0'),

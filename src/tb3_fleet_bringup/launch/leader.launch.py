@@ -31,6 +31,7 @@ def generate_launch_description():
     domain_id   = LaunchConfiguration('domain_id')
     robot_model = LaunchConfiguration('robot_model')
     use_slam    = LaunchConfiguration('use_slam')
+    slam_impl   = LaunchConfiguration('slam_impl')
     initial_x   = LaunchConfiguration('initial_x')
     initial_y   = LaunchConfiguration('initial_y')
     initial_yaw = LaunchConfiguration('initial_yaw')
@@ -72,6 +73,10 @@ def generate_launch_description():
     )
 
     cartographer_config_dir = os.path.join(bringup_share, 'config')
+    tb3_cartographer_share = get_package_share_directory('turtlebot3_cartographer')
+    tb3_cartographer_launch = os.path.join(
+        tb3_cartographer_share, 'launch', 'cartographer.launch.py'
+    )
     robot_launch = os.path.join(bringup_share, 'launch', 'robot.launch.py')
     tf_pose_script    = os.path.join(bringup_share, 'scripts', 'tf_pose_publisher_direct_v44.py')
     goal_proxy_script = os.path.join(bringup_share, 'scripts', 'pose_to_nav2_action_direct_v41.py')
@@ -91,6 +96,20 @@ def generate_launch_description():
         }
 
         if slam_mode:
+            if slam_impl.perform(context).strip().lower() == 'official':
+                return [TimerAction(period=0.5, actions=[
+                    LogInfo(msg='LEADER_SLAM | using turtlebot3_cartographer cartographer.launch.py'),
+                    IncludeLaunchDescription(
+                        PythonLaunchDescriptionSource(tb3_cartographer_launch),
+                        launch_arguments={
+                            'use_sim_time': 'false',
+                            'use_rviz': 'false',
+                            'resolution': '0.05',
+                            'publish_period_sec': '1.0',
+                        }.items(),
+                    ),
+                ])]
+
             cartographer = Node(
                 package='cartographer_ros',
                 executable='cartographer_node',
@@ -182,6 +201,15 @@ def generate_launch_description():
         ],
         output='screen', name='leader_scan_nav_relay',
     )
+
+    def make_scan_relays(context, *args, **kwargs):
+        actions = [scan_nav_relay]
+        slam_on = use_slam.perform(context).strip().lower() in ('true', '1', 'yes', 'on')
+        official_slam = slam_impl.perform(context).strip().lower() == 'official'
+        if not (slam_on and official_slam):
+            actions.insert(0, scan_cartographer_relay)
+        return [TimerAction(period=0.2, actions=actions)]
+
     burger_amcl_tf = ExecuteProcess(
         cmd=[
             'python3', pose_tf_script, '--ros-args',
@@ -285,6 +313,8 @@ def generate_launch_description():
         DeclareLaunchArgument('domain_id',    default_value='25'),
         DeclareLaunchArgument('robot_model',  default_value='burger'),
         DeclareLaunchArgument('use_slam',     default_value='true'),
+        DeclareLaunchArgument('slam_impl',    default_value='official',
+                              description='official uses installed turtlebot3_cartographer; custom uses tb3_fleet_bringup config.'),
         DeclareLaunchArgument('initial_x',    default_value='1.05'),
         DeclareLaunchArgument('initial_y',    default_value='0.0'),
         DeclareLaunchArgument('initial_yaw',  default_value='0.0'),
@@ -294,7 +324,7 @@ def generate_launch_description():
         DeclareLaunchArgument('start_lidar', default_value='true'),
         DeclareLaunchArgument('start_base', default_value='true'),
         DeclareLaunchArgument('lds_model',
-                              default_value=EnvironmentVariable('LDS_MODEL', default_value='LDS-01'),
+                              default_value=EnvironmentVariable('LDS_MODEL', default_value='LDS-02'),
                               description='LDS-01, LDS-02, or LDS-03. Defaults to LDS_MODEL env.'),
         DeclareLaunchArgument('usb_port', default_value='/dev/ttyACM0'),
         DeclareLaunchArgument('lidar_port', default_value='/dev/ttyUSB0'),
@@ -312,8 +342,7 @@ def generate_launch_description():
                      ' | robot_bringup=', start_robot_bringup]),
         sim_leader,
         robot_bringup,
-        TimerAction(period=0.2, actions=[scan_cartographer_relay, scan_nav_relay],
-                    condition=real_condition),
+        OpaqueFunction(function=make_scan_relays, condition=real_condition),
         OpaqueFunction(function=make_localization, condition=real_condition),
         TimerAction(period=4.0, actions=[leader_pose, burger_scan_static_tf, burger_amcl_tf],
                     condition=real_condition),

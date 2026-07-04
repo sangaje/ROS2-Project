@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 
+import os
 from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
-from launch.conditions import IfCondition
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
@@ -28,6 +28,7 @@ def generate_launch_description():
     start_state_publisher = LaunchConfiguration('start_state_publisher')
     start_lidar = LaunchConfiguration('start_lidar')
     start_base = LaunchConfiguration('start_base')
+    bringup_impl = LaunchConfiguration('bringup_impl')
 
     domain_id = PythonExpression([
         "'", domain_id_arg, "' if '", domain_id_arg,
@@ -35,13 +36,14 @@ def generate_launch_description():
     ])
 
     tb3_bringup_share = Path(get_package_share_directory('turtlebot3_bringup'))
+    official_robot_launch = str(tb3_bringup_share / 'launch' / 'robot.launch.py')
     state_publisher_launch = str(tb3_bringup_share / 'launch' / 'turtlebot3_state_publisher.launch.py')
     tb3_param_file = str(tb3_bringup_share / 'param' / 'burger.yaml')
 
-    def make_lidar(context, *args, **kwargs):
-        if start_lidar.perform(context).lower() not in ('true', '1', 'yes', 'on'):
-            return [LogInfo(msg='REAL_BURGER_LIDAR | disabled')]
+    def enabled(value):
+        return value.strip().lower() in ('true', '1', 'yes', 'on')
 
+    def make_lidar(context, *args, **kwargs):
         model = lds_model.perform(context)
         port = lidar_port.perform(context)
 
@@ -64,19 +66,57 @@ def generate_launch_description():
             ),
         ]
 
-    state_publisher = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(state_publisher_launch),
-        launch_arguments={'use_sim_time': 'false', 'namespace': ''}.items(),
-        condition=IfCondition(start_state_publisher),
-    )
-    turtlebot3_node = Node(
-        package='turtlebot3_node',
-        executable='turtlebot3_ros',
-        parameters=[tb3_param_file, {'namespace': ''}],
-        arguments=['-i', usb_port],
-        output='screen',
-        condition=IfCondition(start_base),
-    )
+    def make_robot_bringup(context, *args, **kwargs):
+        impl = bringup_impl.perform(context).strip().lower()
+        state_on = enabled(start_state_publisher.perform(context))
+        lidar_on = enabled(start_lidar.perform(context))
+        base_on = enabled(start_base.perform(context))
+        model = lds_model.perform(context).strip()
+        lidar_port_value = lidar_port.perform(context).strip()
+
+        os.environ['TURTLEBOT3_MODEL'] = 'burger'
+        os.environ['LDS_MODEL'] = model
+
+        if impl == 'official' and state_on and lidar_on and base_on and lidar_port_value == '/dev/ttyUSB0':
+            return [
+                LogInfo(msg='REAL_BURGER_BASE | using turtlebot3_bringup robot.launch.py'),
+                IncludeLaunchDescription(
+                    PythonLaunchDescriptionSource(official_robot_launch),
+                    launch_arguments={
+                        'use_sim_time': 'false',
+                        'usb_port': usb_port,
+                        'namespace': '',
+                    }.items(),
+                ),
+            ]
+
+        actions = [LogInfo(msg='REAL_BURGER_BASE | using split bringup path')]
+
+        if state_on:
+            actions.append(IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(state_publisher_launch),
+                launch_arguments={'use_sim_time': 'false', 'namespace': ''}.items(),
+            ))
+        else:
+            actions.append(LogInfo(msg='REAL_BURGER_STATE_PUBLISHER | disabled'))
+
+        if lidar_on:
+            actions.extend(make_lidar(context))
+        else:
+            actions.append(LogInfo(msg='REAL_BURGER_LIDAR | disabled'))
+
+        if base_on:
+            actions.append(Node(
+                package='turtlebot3_node',
+                executable='turtlebot3_ros',
+                parameters=[tb3_param_file, {'namespace': ''}],
+                arguments=['-i', usb_port],
+                output='screen',
+            ))
+        else:
+            actions.append(LogInfo(msg='REAL_BURGER_BASE_DRIVER | disabled'))
+
+        return actions
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -86,7 +126,7 @@ def generate_launch_description():
         DeclareLaunchArgument('domain_id', default_value='',
                               description='Explicit ROS_DOMAIN_ID. Empty uses role default.'),
         DeclareLaunchArgument('lds_model',
-                              default_value=EnvironmentVariable('LDS_MODEL', default_value='LDS-01'),
+                              default_value=EnvironmentVariable('LDS_MODEL', default_value='LDS-02'),
                               description='LDS-01, LDS-02, or LDS-03. Defaults to the robot LDS_MODEL environment variable.'),
         DeclareLaunchArgument('usb_port', default_value='/dev/ttyACM0'),
         DeclareLaunchArgument('lidar_port', default_value='/dev/ttyUSB0',
@@ -95,6 +135,8 @@ def generate_launch_description():
         DeclareLaunchArgument('start_lidar', default_value='true'),
         DeclareLaunchArgument('start_base', default_value='true',
                               description='Start turtlebot3_node/OpenCR base driver.'),
+        DeclareLaunchArgument('bringup_impl', default_value='official',
+                              description='official uses turtlebot3_bringup robot.launch.py when all robot parts are enabled; split allows per-part toggles.'),
         UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
         UnsetEnvironmentVariable('ROS_LOCALHOST_ONLY'),
         UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),
@@ -111,7 +153,5 @@ def generate_launch_description():
                      ' | state_pub=', start_state_publisher,
                      ' lidar=', start_lidar,
                      ' base=', start_base]),
-        state_publisher,
-        OpaqueFunction(function=make_lidar),
-        turtlebot3_node,
+        OpaqueFunction(function=make_robot_bringup),
     ])
