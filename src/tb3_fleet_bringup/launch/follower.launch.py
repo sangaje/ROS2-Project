@@ -12,13 +12,11 @@ import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (
-    DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription,
+    DeclareLaunchArgument, ExecuteProcess,
     OpaqueFunction, SetEnvironmentVariable, TimerAction,
     UnsetEnvironmentVariable,
 )
-from launch.conditions import IfCondition
-from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PythonExpression
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from nav2_common.launch import RewrittenYaml
 
@@ -363,11 +361,5 @@ topics:
         SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', 'SUBNET'),
         SetEnvironmentVariable('ROS_LOCALHOST_ONLY',           '0'),
         SetEnvironmentVariable('RMW_IMPLEMENTATION',           'rmw_fastrtps_cpp'),
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(os.path.join(
-                get_package_share_directory('turtlebot3_bringup'), 'launch', 'robot.launch.py')),
-            condition=IfCondition(PythonExpression(["'", mode, "'.lower() != 'sim'"])),
-        ),
-
         OpaqueFunction(function=make_all),
     ])
