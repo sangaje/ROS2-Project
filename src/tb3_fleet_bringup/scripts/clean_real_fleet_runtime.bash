@@ -44,6 +44,8 @@ patterns=(
   'sim_burger_tf_relay.py'
   'sim_map_relay.py'
   'sim_burger_tf_forwarder.py'
+  '/tf2_ros/static_transform_publisher'
+  'tf2_echo'
 )
 
 ancestor_pids() {

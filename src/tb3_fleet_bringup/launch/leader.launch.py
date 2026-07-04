@@ -43,7 +43,12 @@ def generate_launch_description():
     ])
     nav2_params = RewrittenYaml(
         source_file=nav2_source,
-        param_rewrites={'use_sim_time': 'false', 'odom_topic': '/odom', 'topic': '/scan'},
+        param_rewrites={
+            'use_sim_time': 'false',
+            'odom_topic': '/odom',
+            'scan_topic': '/scan_nav',
+            'topic': '/scan_nav',
+        },
         convert_types=True,
     )
 
@@ -51,6 +56,7 @@ def generate_launch_description():
     tf_pose_script    = os.path.join(bringup_share, 'scripts', 'tf_pose_publisher_direct_v44.py')
     goal_proxy_script = os.path.join(bringup_share, 'scripts', 'pose_to_nav2_action_direct_v41.py')
     pose_tf_script    = os.path.join(bringup_share, 'scripts', 'pose_to_tf_broadcaster.py')
+    scan_relay_script = os.path.join(bringup_share, 'scripts', 'scan_frame_relay.py')
 
     # ── Localization: Cartographer SLAM or AMCL ────────────────────────────────
     def make_localization(context, *args, **kwargs):
@@ -73,6 +79,7 @@ def generate_launch_description():
                     '-configuration_directory', cartographer_config_dir,
                     '-configuration_basename', 'cartographer_2d_lidar_odom_v44.lua',
                 ],
+                remappings=[('scan', '/scan_cartographer')],
                 additional_env=extra_env,
             )
             occupancy_grid = Node(
@@ -126,6 +133,32 @@ def generate_launch_description():
             '-p', 'log_every_n:=100',
         ],
         output='screen', name='waffle_real_leader_pose_publisher',
+    )
+    scan_cartographer_relay = ExecuteProcess(
+        cmd=[
+            'python3', scan_relay_script, '--ros-args',
+            '-r', '__node:=leader_scan_cartographer_relay',
+            '-p', 'use_sim_time:=false',
+            '-p', 'input_topic:=/scan',
+            '-p', 'output_topic:=/scan_cartographer',
+            '-p', 'output_frame:=base_scan',
+            '-p', 'input_reliability:=best_effort',
+            '-p', 'output_reliability:=reliable',
+        ],
+        output='screen', name='leader_scan_cartographer_relay',
+    )
+    scan_nav_relay = ExecuteProcess(
+        cmd=[
+            'python3', scan_relay_script, '--ros-args',
+            '-r', '__node:=leader_scan_nav_relay',
+            '-p', 'use_sim_time:=false',
+            '-p', 'input_topic:=/scan',
+            '-p', 'output_topic:=/scan_nav',
+            '-p', 'output_frame:=base_scan',
+            '-p', 'input_reliability:=best_effort',
+            '-p', 'output_reliability:=reliable',
+        ],
+        output='screen', name='leader_scan_nav_relay',
     )
     burger_amcl_tf = ExecuteProcess(
         cmd=[
@@ -215,6 +248,7 @@ def generate_launch_description():
         SetEnvironmentVariable('TURTLEBOT3_MODEL',            robot_model),
         LogInfo(msg=['LEADER_D', domain_id, ' | model=', robot_model,
                      ' | use_slam=', use_slam]),
+        TimerAction(period=0.2, actions=[scan_cartographer_relay, scan_nav_relay]),
         OpaqueFunction(function=make_localization),
         TimerAction(period=1.5, actions=[leader_pose, burger_scan_static_tf, burger_amcl_tf]),
         TimerAction(period=2.0, actions=[controller_server, planner_server,
