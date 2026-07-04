@@ -48,7 +48,6 @@ def generate_launch_description():
 
         SetEnvironmentVariable('ROS_DOMAIN_ID', LaunchConfiguration('domain_id')),
         SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp'),
-        SetEnvironmentVariable('FASTDDS_BUILTIN_TRANSPORTS', 'UDPv4'),
 
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(real_robot_launch),

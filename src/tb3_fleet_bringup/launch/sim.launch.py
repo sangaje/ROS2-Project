@@ -5,13 +5,13 @@ Master launcher for the full domain-bridge fleet simulation test.
 Topology:
   Gazebo on leader domain ─ two burger robots ─┐
   Leader: Cartographer SLAM + Nav2
-  Follower: domain_bridge + TF relay + AMCL + Nav2 + follower script
+  Follower: domain_bridge + TF relay + AMCL + follower script
   RViz on leader domain: fleet_debug.rviz
 
 Start order:
   T=0   Gazebo world (robot spawn at T+3, T+4 inside)
-  T=5   leader Nav2 stack
-  T=10  follower Nav2 stack
+  T=5   leader stack
+  T=10  follower stack
   T=15  RViz
 """
 
@@ -41,22 +41,22 @@ def generate_launch_description():
 
     gazebo = ExecuteProcess(
         cmd=['ros2', 'launch', 'tb3_fleet_bringup',
-             'fleet_sim_gazebo_world.launch.py',
+             'sim_world.launch.py',
              ['domain_id:=', leader_domain_id],
              ['start_gz_client:=', start_gz_client]],
         output='screen', name='sim_gazebo_world',
     )
     leader = ExecuteProcess(
         cmd=['ros2', 'launch', 'tb3_fleet_bringup',
-             'fleet_sim_leader_nav2.launch.py',
+             'sim_leader.launch.py',
              ['domain_id:=', leader_domain_id],
              ['follower_initial_x:=', follower_initial_x],
              ['follower_initial_y:=', follower_initial_y]],
-        output='screen', name='sim_leader_nav2',
+        output='screen', name='sim_leader',
     )
     follower = ExecuteProcess(
         cmd=['ros2', 'launch', 'tb3_fleet_bringup',
-             'fleet_sim_follower_nav2.launch.py',
+             'sim_follower.launch.py',
              ['domain_id:=', follower_domain_id],
              ['leader_domain_id:=', leader_domain_id],
              ['follow_distance:=', follow_distance],
@@ -64,11 +64,11 @@ def generate_launch_description():
              ['follower_initial_x:=', follower_initial_x],
              ['follower_initial_y:=', follower_initial_y],
              ['follower_initial_yaw:=', follower_initial_yaw]],
-        output='screen', name='sim_follower_nav2',
+        output='screen', name='sim_follower',
     )
     rviz = ExecuteProcess(
         cmd=['ros2', 'launch', 'tb3_fleet_bringup',
-             'fleet_rviz.launch.py',
+             'rviz.launch.py',
              ['domain_id:=', leader_domain_id]],
         output='screen', name='sim_rviz',
         condition=IfCondition(start_rviz),

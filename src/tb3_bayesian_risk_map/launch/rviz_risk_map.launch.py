@@ -16,7 +16,6 @@ def generate_launch_description():
     ])
     return LaunchDescription([
         SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp'),
-        SetEnvironmentVariable('FASTDDS_BUILTIN_TRANSPORTS', 'UDPv4'),
         ExecuteProcess(
             cmd=[rviz_clean, '-d', rviz_config],
             name='rviz2_risk_map',

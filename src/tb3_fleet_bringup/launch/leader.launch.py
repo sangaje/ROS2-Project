@@ -177,26 +177,26 @@ def generate_launch_description():
     default_goal = ExecuteProcess(
         cmd=[
             'python3', goal_proxy_script, '--ros-args',
-            '-r', '__node:=waffle_real_default_goal_to_nav2',
+            '-r', '__node:=waffle_default_goal',
             '-p', 'use_sim_time:=false',
             '-p', 'goal_pose_topic:=/goal_pose',
             '-p', 'navigate_action:=/navigate_to_pose',
             '-p', 'default_frame_id:=map',
             '-p', 'cancel_previous_goal:=true',
         ],
-        output='screen', name='waffle_real_default_goal_to_nav2',
+        output='screen', name='waffle_default_goal',
     )
     named_goal = ExecuteProcess(
         cmd=[
             'python3', goal_proxy_script, '--ros-args',
-            '-r', '__node:=waffle_real_named_goal_to_nav2',
+            '-r', '__node:=waffle_named_goal',
             '-p', 'use_sim_time:=false',
             '-p', 'goal_pose_topic:=/waffle_goal_pose',
             '-p', 'navigate_action:=/navigate_to_pose',
             '-p', 'default_frame_id:=map',
             '-p', 'cancel_previous_goal:=true',
         ],
-        output='screen', name='waffle_real_named_goal_to_nav2',
+        output='screen', name='waffle_named_goal',
     )
 
     return LaunchDescription([

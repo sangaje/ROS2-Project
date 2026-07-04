@@ -1,3 +1,5 @@
+"""Launch central risk-map processing and configurable domain_bridge links."""
+
 import os
 import tempfile
 from pathlib import Path
@@ -183,9 +185,7 @@ topics:
         UnsetEnvironmentVariable('ROS_STATIC_PEERS'),
         SetEnvironmentVariable('ROS_DOMAIN_ID', central_domain_id),
         SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp'),
-        SetEnvironmentVariable('FASTDDS_BUILTIN_TRANSPORTS', 'UDPv4'),
         SetEnvironmentVariable('ROS_LOCALHOST_ONLY', '0'),
-        SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', 'SUBNET'),
         TimerAction(
             period=0.5,
             actions=[map_frame_anchor, OpaqueFunction(function=_write_bridge_configs)],

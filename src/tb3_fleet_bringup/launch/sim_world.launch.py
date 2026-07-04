@@ -6,8 +6,8 @@ Leader  : standard topics (/scan, /odom, /tf, /cmd_vel …)
 Follower: burger-prefixed topics (/burger/scan, /burger/odom, /burger/tf …)
           Frame IDs also prefixed (burger/odom → burger/base_footprint)
 
-A separate follower stack (fleet_sim_follower_nav2.launch.py) bridges the
-follower's sensor data into the configured follower domain for AMCL/Nav2.
+A separate follower stack (sim_follower.launch.py) bridges the follower's
+sensor data into the configured follower domain for AMCL.
 """
 
 import os

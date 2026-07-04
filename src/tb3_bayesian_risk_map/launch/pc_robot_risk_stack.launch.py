@@ -22,7 +22,7 @@ def generate_launch_description():
     central_risk_launch = PathJoinSubstitution([
         FindPackageShare('tb3_bayesian_risk_map'),
         'launch',
-        'central_risk_map_domain20.launch.py',
+        'central_risk_map_bridge.launch.py',
     ])
     monitor_launch = PathJoinSubstitution([
         FindPackageShare('tb3_bayesian_risk_map'),
@@ -81,9 +81,7 @@ def generate_launch_description():
         UnsetEnvironmentVariable('ROS_STATIC_PEERS'),
         SetEnvironmentVariable('ROS_DOMAIN_ID', LaunchConfiguration('central_domain_id')),
         SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp'),
-        SetEnvironmentVariable('FASTDDS_BUILTIN_TRANSPORTS', 'UDPv4'),
         SetEnvironmentVariable('ROS_LOCALHOST_ONLY', '0'),
-        SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', 'SUBNET'),
 
         clean_flask_port,
         TimerAction(

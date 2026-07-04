@@ -27,7 +27,7 @@ def generate_launch_description():
     marker = ExecuteProcess(
         cmd=[
             'python3', marker_script, '--ros-args',
-            '-r', '__node:=fleet_real_debug_marker',
+            '-r', '__node:=fleet_debug_marker',
             '-p', 'use_sim_time:=false',
             '-p', 'waffle_pose_topic:=/leader_pose',
             '-p', 'burger_pose_topic:=/burger_pose',
@@ -35,7 +35,7 @@ def generate_launch_description():
             '-p', 'frame_id:=map',
         ],
         output='screen',
-        name='fleet_real_debug_marker',
+        name='fleet_debug_marker',
     )
     rviz = ExecuteProcess(
         cmd=[

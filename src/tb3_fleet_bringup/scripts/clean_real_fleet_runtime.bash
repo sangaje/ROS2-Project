@@ -2,15 +2,16 @@
 set -euo pipefail
 
 patterns=(
-  'ros2 launch tb3_fleet_bringup fleet_real_two_burgers_pc.launch.py'
-  'ros2 launch tb3_fleet_bringup fleet_real_leader_nav2.launch.py'
-  'ros2 launch tb3_fleet_bringup fleet_real_follower_nav2.launch.py'
-  'ros2 launch tb3_fleet_bringup fleet_rviz.launch.py'
-  'ros2 launch tb3_fleet_bringup fleet_real_burger_robot.launch.py'
-  'ros2 launch tb3_fleet_bringup fleet_sim_master.launch.py'
-  'ros2 launch tb3_fleet_bringup fleet_sim_gazebo_world.launch.py'
-  'ros2 launch tb3_fleet_bringup fleet_sim_leader_nav2.launch.py'
-  'ros2 launch tb3_fleet_bringup fleet_sim_follower_nav2.launch.py'
+  'ros2 launch tb3_fleet_bringup pc.launch.py'
+  'ros2 launch tb3_fleet_bringup leader.launch.py'
+  'ros2 launch tb3_fleet_bringup follower.launch.py'
+  'ros2 launch tb3_fleet_bringup rviz.launch.py'
+  'ros2 launch tb3_fleet_bringup robot.launch.py'
+  'ros2 launch tb3_fleet_bringup sim.launch.py'
+  'ros2 launch tb3_fleet_bringup sim_world.launch.py'
+  'ros2 launch tb3_fleet_bringup sim_leader.launch.py'
+  'ros2 launch tb3_fleet_bringup sim_follower.launch.py'
+  'ros2 launch tb3_fleet_bridge bridges.launch.py'
   '/cartographer_ros/cartographer_node'
   '/cartographer_ros/cartographer_occupancy_grid_node'
   '/domain_bridge/domain_bridge'
@@ -100,7 +101,8 @@ rm -f /tmp/turtlebot3_burger_follower.sdf \
       /tmp/burger_amcl_initial_pose.yaml
 
 rm -rf /tmp/tb3_sim_domain_bridge \
-       /tmp/tb3_fleet_real_domain_bridge
+       /tmp/tb3_fleet_domain_bridge \
+       /tmp/tb3_fleet_bridge_dynamic
 
 echo '[clean_real_fleet_runtime] remaining matching processes:'
-report_matches 'fleet_real|fleet_sim|cartographer_node|domain_bridge|rviz2_fleet|domain_bridge_nav2_follower|fleet_real_debug_marker|sim_burger|sim_map|gz sim|parameter_bridge'
+report_matches 'pc.launch.py|leader.launch.py|follower.launch.py|robot.launch.py|sim.launch.py|sim_world.launch.py|sim_leader.launch.py|sim_follower.launch.py|bridges.launch.py|cartographer_node|domain_bridge|rviz2_fleet|domain_bridge_nav2_follower|fleet_debug_marker|sim_burger|sim_map|gz sim|parameter_bridge'

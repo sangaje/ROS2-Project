@@ -49,14 +49,14 @@ def generate_launch_description():
         leader_slam = leader_use_slam.perform(context)
         leader_cmd = [
             'ros2', 'launch', 'tb3_fleet_bringup',
-            'fleet_real_leader_nav2.launch.py',
+            'leader.launch.py',
             f'domain_id:={main_domain}',
             'robot_model:=burger',
             f'use_slam:={leader_slam}',
         ]
         follower_cmd = [
             'ros2', 'launch', 'tb3_fleet_bringup',
-            'fleet_real_follower_nav2.launch.py',
+            'follower.launch.py',
             f'domain_id:={follower_domain}',
             f'main_domain_id:={main_domain}',
             'use_slam:=false',
@@ -72,12 +72,12 @@ def generate_launch_description():
         ]
         rviz_cmd = [
             'ros2', 'launch', 'tb3_fleet_bringup',
-            'fleet_rviz.launch.py',
+            'rviz.launch.py',
             f'domain_id:={main_domain}',
         ]
         leader_robot_cmd = [
             'ros2', 'launch', 'tb3_fleet_bringup',
-            'fleet_real_burger_robot.launch.py',
+            'robot.launch.py',
             'role:=leader',
             f'domain_id:={main_domain}',
             f'lds_model:={leader_lds_model.perform(context)}',
@@ -86,7 +86,7 @@ def generate_launch_description():
         ]
         follower_robot_cmd = [
             'ros2', 'launch', 'tb3_fleet_bringup',
-            'fleet_real_burger_robot.launch.py',
+            'robot.launch.py',
             'role:=follower',
             f'domain_id:={follower_domain}',
             f'lds_model:={follower_lds_model.perform(context)}',
@@ -100,7 +100,7 @@ def generate_launch_description():
                 ExecuteProcess(
                     cmd=leader_robot_cmd,
                     output='screen',
-                    name='real_leader_robot_bringup',
+                    name='leader_robot',
                 ),
             ]))
         if enabled(start_follower_robot_bringup.perform(context)):
@@ -108,7 +108,7 @@ def generate_launch_description():
                 ExecuteProcess(
                     cmd=follower_robot_cmd,
                     output='screen',
-                    name='real_follower_robot_bringup',
+                    name='follower_robot',
                 ),
             ]))
         if enabled(start_leader_stack.perform(context)):
@@ -116,7 +116,7 @@ def generate_launch_description():
                 ExecuteProcess(
                     cmd=leader_cmd,
                     output='screen',
-                    name='real_nav2_leader_slam',
+                    name='leader_stack',
                 ),
             ]))
         if enabled(start_follower_stack.perform(context)):
@@ -124,7 +124,7 @@ def generate_launch_description():
                 ExecuteProcess(
                     cmd=follower_cmd,
                     output='screen',
-                    name='real_nav2_follower_amcl',
+                    name='follower_stack',
                 ),
             ]))
         if enabled(start_rviz.perform(context)):
@@ -170,7 +170,7 @@ def generate_launch_description():
         DeclareLaunchArgument('leader_stack_delay', default_value='0.0'),
         DeclareLaunchArgument('follower_stack_delay', default_value='10.0'),
         DeclareLaunchArgument('rviz_delay', default_value='18.0'),
-        LogInfo(msg=['REAL_NAV2_CLEAN_PC | main domain=', main_domain_id,
+        LogInfo(msg=['FLEET_PC | main domain=', main_domain_id,
                      ' leader_use_slam=', leader_use_slam,
                      ' follower domain=', follower_domain_id, ' AMCL/Nav2',
                      ' | local_follower_stack=', start_follower_stack,

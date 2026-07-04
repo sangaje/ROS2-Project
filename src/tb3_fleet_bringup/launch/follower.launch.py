@@ -63,7 +63,7 @@ def generate_launch_description():
     map_relay_script  = os.path.join(bringup_share, 'scripts', 'sim_map_relay.py')
     scan_relay_script = os.path.join(bringup_share, 'scripts', 'scan_frame_relay.py')
     cartographer_config_dir = os.path.join(bringup_share, 'config')
-    follower_robot_launch = os.path.join(bringup_share, 'launch', 'fleet_real_burger_robot.launch.py')
+    follower_robot_launch = os.path.join(bringup_share, 'launch', 'robot.launch.py')
 
     def selected_main_domain(context):
         legacy = leader_domain_id.perform(context).strip()
@@ -80,7 +80,7 @@ def generate_launch_description():
         ld = selected_main_domain(context)
         bd = domain_id.perform(context)
         sd = slam_domain.perform(context).strip() or ld
-        out = Path(tempfile.gettempdir()) / 'tb3_fleet_real_domain_bridge'
+        out = Path(tempfile.gettempdir()) / 'tb3_fleet_domain_bridge'
         out.mkdir(parents=True, exist_ok=True)
 
         l2b = out / f'real_leader_{ld}_to_burger_{bd}.yaml'
@@ -289,6 +289,11 @@ topics:
              '-p', 'output_frame:=burger/base_scan'],
         output='screen', name='real_burger_scan_frame_relay',
     )
+    domain_bridge_check = ExecuteProcess(
+        cmd=['ros2', 'pkg', 'prefix', 'domain_bridge'],
+        output='screen',
+        name='check_domain_bridge_package',
+    )
     robot_bringup = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(follower_robot_launch),
         launch_arguments={
@@ -317,15 +322,15 @@ topics:
                              parameters=[nav2_params])
     burger_named_goal = ExecuteProcess(
         cmd=['python3', goal_proxy_script, '--ros-args',
-             '-r', '__node:=burger_real_named_goal_to_nav2',
+             '-r', '__node:=burger_named_goal',
              '-p', 'use_sim_time:=false', '-p', 'goal_pose_topic:=/burger_goal_pose',
              '-p', 'navigate_action:=/navigate_to_pose', '-p', 'default_frame_id:=map',
              '-p', 'cancel_previous_goal:=true'],
-        output='screen', name='burger_real_named_goal_to_nav2',
+        output='screen', name='burger_named_goal',
     )
     follower = ExecuteProcess(
         cmd=['python3', follower_script, '--ros-args',
-             '-r', '__node:=domain_bridge_nav2_follower',
+             '-r', '__node:=domain_bridge_follower',
              '-p', 'use_sim_time:=false',
              '-p', 'leader_pose_topic:=/leader_pose', '-p', 'leader_path_topic:=/waffle_plan',
              '-p', 'follower_pose_topic:=/burger_pose', '-p', 'map_topic:=/map',
@@ -342,7 +347,7 @@ topics:
              '-p', ['yield_lateral_distance:=', yield_lateral_distance],
              '-p', 'yield_release_distance:=0.80', '-p', 'yield_map_clearance:=0.18',
              '-p', 'yield_min_hold_sec:=4.0', '-p', 'yield_max_hold_sec:=12.0'],
-        output='screen', name='burger_real_nav2_follower',
+        output='screen', name='burger_follower',
     )
 
     return LaunchDescription([
@@ -363,8 +368,8 @@ topics:
         DeclareLaunchArgument('use_slam',    default_value='false'),
         DeclareLaunchArgument('slam_domain', default_value='',
                               description='Domain that publishes /map. Empty uses main_domain_id.'),
-        DeclareLaunchArgument('start_domain_bridge', default_value='true',
-                              description='Start 24<->main domain_bridge from the follower side.'),
+        DeclareLaunchArgument('start_domain_bridge', default_value='false',
+                              description='Start 24<->main domain_bridge from the follower side. Default false when using tb3_fleet_bridge/bridges.launch.py.'),
         DeclareLaunchArgument('bridge_start_delay', default_value='0.5'),
         DeclareLaunchArgument('start_robot_bringup', default_value='true',
                               description='Start follower base, lidar, and state publisher in this launch.'),
@@ -389,6 +394,7 @@ topics:
                      ' | init=(', follower_initial_x, ',', follower_initial_y, ')',
                      ' | start_following=', start_following]),
         robot_bringup,
+        TimerAction(period=0.2, actions=[domain_bridge_check]),
         TimerAction(period=bridge_start_delay, actions=[OpaqueFunction(function=make_domain_bridges)]),
         TimerAction(period=1.0, actions=[map_relay, scan_relay]),
         OpaqueFunction(function=make_localization),

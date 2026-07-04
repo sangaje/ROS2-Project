@@ -2,7 +2,7 @@
 """
 Leader stack for simulation.
 Cartographer SLAM + Nav2.
-Expects leader burger robot already running in Gazebo (fleet_sim_gazebo_world).
+Expects leader burger robot already running in Gazebo (sim_world.launch.py).
 """
 
 import os

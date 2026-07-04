@@ -104,9 +104,7 @@ def generate_launch_description():
         UnsetEnvironmentVariable('ROS_STATIC_PEERS'),
         SetEnvironmentVariable('ROS_DOMAIN_ID', LaunchConfiguration('domain_id')),
         SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp'),
-        SetEnvironmentVariable('FASTDDS_BUILTIN_TRANSPORTS', 'UDPv4'),
         SetEnvironmentVariable('ROS_LOCALHOST_ONLY', '0'),
-        SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', 'SUBNET'),
         SetEnvironmentVariable('TURTLEBOT3_MODEL', LaunchConfiguration('turtlebot3_model')),
         SetEnvironmentVariable('LDS_MODEL', LaunchConfiguration('lds_model')),
 
