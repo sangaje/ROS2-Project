@@ -57,6 +57,8 @@ def generate_launch_description():
         UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),
         UnsetEnvironmentVariable('FASTDDS_DEFAULT_PROFILES_FILE'),
         SetEnvironmentVariable('ROS_DOMAIN_ID',               domain_id),
+        SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', 'SUBNET'),
+        SetEnvironmentVariable('ROS_LOCALHOST_ONLY',           '0'),
         SetEnvironmentVariable('RMW_IMPLEMENTATION',          'rmw_fastrtps_cpp'),
         LogInfo(msg=['FLEET_RVIZ | domain=', domain_id,
                      ' | /goal_pose -> leader | /fleet/follow_command -> follower']),

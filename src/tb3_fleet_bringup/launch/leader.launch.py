@@ -65,6 +65,8 @@ def generate_launch_description():
 
         extra_env = {
             'ROS_DOMAIN_ID': d,
+            'ROS_AUTOMATIC_DISCOVERY_RANGE': 'SUBNET',
+            'ROS_LOCALHOST_ONLY': '0',
             'RMW_IMPLEMENTATION': 'rmw_fastrtps_cpp',
         }
 
@@ -244,6 +246,8 @@ def generate_launch_description():
         UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),
         UnsetEnvironmentVariable('FASTDDS_DEFAULT_PROFILES_FILE'),
         SetEnvironmentVariable('ROS_DOMAIN_ID',               domain_id),
+        SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', 'SUBNET'),
+        SetEnvironmentVariable('ROS_LOCALHOST_ONLY',           '0'),
         SetEnvironmentVariable('RMW_IMPLEMENTATION',          'rmw_fastrtps_cpp'),
         SetEnvironmentVariable('TURTLEBOT3_MODEL',            robot_model),
         LogInfo(msg=['LEADER_D', domain_id, ' | model=', robot_model,

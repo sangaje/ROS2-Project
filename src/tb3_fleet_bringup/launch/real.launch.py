@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, LogInfo, OpaqueFunction
+from launch.actions import (
+    DeclareLaunchArgument,
+    ExecuteProcess,
+    LogInfo,
+    OpaqueFunction,
+    SetEnvironmentVariable,
+    UnsetEnvironmentVariable,
+)
 from launch.substitutions import LaunchConfiguration
 
 
@@ -148,5 +155,11 @@ def generate_launch_description():
         DeclareLaunchArgument('start_state_publisher', default_value='true'),
         DeclareLaunchArgument('start_lidar', default_value='true'),
         DeclareLaunchArgument('start_base', default_value='true'),
+        UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
+        UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),
+        UnsetEnvironmentVariable('FASTDDS_DEFAULT_PROFILES_FILE'),
+        SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', 'SUBNET'),
+        SetEnvironmentVariable('ROS_LOCALHOST_ONLY', '0'),
+        SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp'),
         OpaqueFunction(function=make_actions),
     ])

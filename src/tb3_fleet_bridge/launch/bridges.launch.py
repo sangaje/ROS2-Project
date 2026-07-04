@@ -4,7 +4,14 @@ import tempfile
 from pathlib import Path
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, LogInfo, OpaqueFunction
+from launch.actions import (
+    DeclareLaunchArgument,
+    ExecuteProcess,
+    LogInfo,
+    OpaqueFunction,
+    SetEnvironmentVariable,
+    UnsetEnvironmentVariable,
+)
 from launch.substitutions import LaunchConfiguration
 
 
@@ -214,5 +221,11 @@ topics:
         DeclareLaunchArgument('bridge_scan', default_value='true'),
         DeclareLaunchArgument('bridge_nav', default_value='true'),
         DeclareLaunchArgument('bridge_follow_command', default_value='true'),
+        UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
+        UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),
+        UnsetEnvironmentVariable('FASTDDS_DEFAULT_PROFILES_FILE'),
+        SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', 'SUBNET'),
+        SetEnvironmentVariable('ROS_LOCALHOST_ONLY', '0'),
+        SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp'),
         OpaqueFunction(function=make_bridges),
     ])

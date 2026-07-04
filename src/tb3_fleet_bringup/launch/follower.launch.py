@@ -236,6 +236,8 @@ topics:
 
         extra_env = {
             'ROS_DOMAIN_ID': d,
+            'ROS_AUTOMATIC_DISCOVERY_RANGE': 'SUBNET',
+            'ROS_LOCALHOST_ONLY': '0',
             'RMW_IMPLEMENTATION': 'rmw_fastrtps_cpp',
         }
 
@@ -417,6 +419,8 @@ topics:
         UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),
         UnsetEnvironmentVariable('FASTDDS_DEFAULT_PROFILES_FILE'),
         SetEnvironmentVariable('ROS_DOMAIN_ID',               domain_id),
+        SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', 'SUBNET'),
+        SetEnvironmentVariable('ROS_LOCALHOST_ONLY',           '0'),
         SetEnvironmentVariable('RMW_IMPLEMENTATION',          'rmw_fastrtps_cpp'),
         SetEnvironmentVariable('TURTLEBOT3_MODEL',            robot_model),
         LogInfo(msg=['FOLLOWER_D', domain_id, ' | robot=', robot_name,
