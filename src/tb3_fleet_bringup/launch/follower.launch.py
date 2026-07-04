@@ -13,7 +13,7 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription,
-    LogInfo, OpaqueFunction, SetEnvironmentVariable, TimerAction,
+    OpaqueFunction, SetEnvironmentVariable, TimerAction,
     UnsetEnvironmentVariable,
 )
 from launch.conditions import IfCondition
@@ -371,8 +371,6 @@ topics:
         SetEnvironmentVariable('ROS_AUTOMATIC_DISCOVERY_RANGE', 'SUBNET'),
         SetEnvironmentVariable('ROS_LOCALHOST_ONLY',           '0'),
         SetEnvironmentVariable('RMW_IMPLEMENTATION',           'rmw_fastrtps_cpp'),
-        LogInfo(msg=['FOLLOWER | mode=', mode, ' domain=', domain_id, ' main=', main_domain_id]),
-
         # Hardware bringup — real mode only
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(os.path.join(pkg, 'launch', 'robot.launch.py')),
