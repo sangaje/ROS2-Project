@@ -65,7 +65,7 @@ controller_server:
     min_theta_velocity_threshold: 0.001
     failure_tolerance: 2.0
     odom_topic: "/odom"
-    enable_stamped_cmd_vel: true
+    enable_stamped_cmd_vel: false
     progress_checker_plugins: ["progress_checker"]
     goal_checker_plugins: ["general_goal_checker"]
     controller_plugins: ["FollowPath"]

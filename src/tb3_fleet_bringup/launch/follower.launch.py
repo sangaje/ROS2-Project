@@ -257,6 +257,7 @@ topics:
                 parameters=[{'use_sim_time': False}],
                 arguments=['-configuration_directory', cartographer_config_dir,
                            '-configuration_basename', 'cartographer_2d_lidar_odom_v44.lua'],
+                remappings=[('scan', '/scan_nav')],
                 additional_env=extra_env,
             )
             occ_grid = Node(

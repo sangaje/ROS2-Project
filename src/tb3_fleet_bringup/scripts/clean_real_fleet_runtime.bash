@@ -98,6 +98,12 @@ for pattern in "${patterns[@]}"; do
   kill_matches TERM "${pattern}"
 done
 
+sleep 1
+
+for pattern in "${patterns[@]}"; do
+  kill_matches KILL "${pattern}"
+done
+
 rm -f /tmp/turtlebot3_burger_follower.sdf \
       /tmp/turtlebot3_burger_follower_bridge.yaml \
       /tmp/sim_burger_amcl_initial_pose.yaml \
