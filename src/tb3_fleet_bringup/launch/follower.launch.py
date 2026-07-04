@@ -47,12 +47,19 @@ def generate_launch_description():
         ust = 'true' if sim else 'false'
         d  = domain_id.perform(context)
         ld = main_domain_id.perform(context)
-        extra = {
+        clean_env = os.environ.copy()
+        for key in (
+            'FASTRTPS_DEFAULT_PROFILES_FILE',
+            'FASTDDS_DEFAULT_PROFILES_FILE',
+            'ROS_DISCOVERY_SERVER',
+        ):
+            clean_env.pop(key, None)
+        clean_env.update({
             'ROS_DOMAIN_ID': d,
             'ROS_AUTOMATIC_DISCOVERY_RANGE': 'SUBNET',
             'ROS_LOCALHOST_ONLY': '0',
             'RMW_IMPLEMENTATION': 'rmw_fastrtps_cpp',
-        }
+        })
 
         # Nav2 + AMCL params
         if sim:
@@ -188,10 +195,28 @@ topics:
 """, encoding='utf-8')
 
         bridges = [
-            ExecuteProcess(cmd=['ros2', 'run', 'domain_bridge', 'domain_bridge', str(l2b)],
-                           output='screen', name='bridge_l2b'),
-            ExecuteProcess(cmd=['ros2', 'run', 'domain_bridge', 'domain_bridge', str(b2l)],
-                           output='screen', name='bridge_b2l'),
+            ExecuteProcess(
+                cmd=[
+                    'ros2', 'run', 'domain_bridge', 'domain_bridge', str(l2b),
+                    '--wait-for-publisher', 'false',
+                ],
+                output='screen',
+                name='bridge_l2b',
+                env=clean_env,
+                respawn=True,
+                respawn_delay=3.0,
+            ),
+            ExecuteProcess(
+                cmd=[
+                    'ros2', 'run', 'domain_bridge', 'domain_bridge', str(b2l),
+                    '--wait-for-publisher', 'false',
+                ],
+                output='screen',
+                name='bridge_b2l',
+                env=clean_env,
+                respawn=True,
+                respawn_delay=3.0,
+            ),
         ]
 
         map_relay = ExecuteProcess(
@@ -199,7 +224,8 @@ topics:
                  '--ros-args', '-r', '__node:=follower_map_relay',
                  '-p', f'use_sim_time:={ust}',
                  '-p', 'input_topic:=/map_bridge', '-p', 'output_topic:=/map'],
-            output='screen', name='follower_map_relay', additional_env=extra,
+            output='screen', name='follower_map_relay', env=clean_env,
+            respawn=True, respawn_delay=3.0,
         )
         burger_pose = ExecuteProcess(
             cmd=['python3', os.path.join(pkg, 'scripts', 'tf_pose_publisher_direct_v44.py'),
@@ -208,7 +234,7 @@ topics:
                  '-p', 'target_frame:=map', '-p', 'source_frame:=base_footprint',
                  '-p', 'output_topic:=/burger_pose',
                  '-p', 'publish_rate_hz:=10.0', '-p', 'log_every_n:=100'],
-            output='screen', name='burger_pose_pub', additional_env=extra,
+            output='screen', name='burger_pose_pub', env=clean_env,
         )
 
         if sim:
@@ -219,13 +245,13 @@ topics:
                 package='robot_state_publisher', executable='robot_state_publisher',
                 name='robot_state_publisher', output='screen',
                 parameters=[{'use_sim_time': True, 'robot_description': robot_desc}],
-                additional_env=extra,
+                env=clean_env,
             )
             tf_relay = ExecuteProcess(
                 cmd=['python3', os.path.join(pkg, 'scripts', 'sim_burger_tf_relay.py'),
                      '--ros-args', '-r', '__node:=follower_tf_relay',
                      '-p', 'use_sim_time:=true'],
-                output='screen', name='follower_tf_relay', additional_env=extra,
+                output='screen', name='follower_tf_relay', env=clean_env,
             )
             scan_relay = ExecuteProcess(
                 cmd=['python3', os.path.join(pkg, 'scripts', 'sim_burger_scan_relay.py'),
@@ -236,7 +262,7 @@ topics:
                      '-p', 'burger_scan_output_topic:=/burger_scan_relay',
                      '-p', 'odom_input_topic:=/odom_bridge',
                      '-p', 'odom_output_topic:=/odom'],
-                output='screen', name='follower_scan_relay', additional_env=extra,
+                output='screen', name='follower_scan_relay', env=clean_env,
             )
             relay_nodes = [tf_relay, scan_relay, map_relay]
         else:
@@ -249,7 +275,7 @@ topics:
                      '-p', 'output_frame:=burger/base_scan',
                      '-p', 'input_reliability:=best_effort',
                      '-p', 'output_reliability:=reliable'],
-                output='screen', name='burger_scan_relay', additional_env=extra,
+                output='screen', name='burger_scan_relay', env=clean_env,
             )
             relay_nodes = [scan_relay, map_relay]
 
@@ -263,26 +289,26 @@ topics:
         amcl_kwargs = dict(respawn=True, respawn_delay=3.0) if sim else {}
         amcl = Node(package='nav2_amcl', executable='amcl', name='amcl',
                     output='screen', parameters=[nav2_params, str(pose_yaml)],
-                    additional_env=extra, **amcl_kwargs)
+                    env=clean_env, **amcl_kwargs)
         lc_loc = Node(package='nav2_lifecycle_manager', executable='lifecycle_manager',
                       name='lifecycle_manager_localization', output='screen',
-                      parameters=[nav2_params], additional_env=extra)
+                      parameters=[nav2_params], env=clean_env)
 
         controller  = Node(package='nav2_controller', executable='controller_server',
                            name='controller_server', output='screen',
-                           parameters=[nav2_params], additional_env=extra)
+                           parameters=[nav2_params], env=clean_env)
         planner     = Node(package='nav2_planner', executable='planner_server',
                            name='planner_server', output='screen',
-                           parameters=[nav2_params], additional_env=extra)
+                           parameters=[nav2_params], env=clean_env)
         behaviors   = Node(package='nav2_behaviors', executable='behavior_server',
                            name='behavior_server', output='screen',
-                           parameters=[nav2_params], additional_env=extra)
+                           parameters=[nav2_params], env=clean_env)
         bt_nav      = Node(package='nav2_bt_navigator', executable='bt_navigator',
                            name='bt_navigator', output='screen',
-                           parameters=[nav2_params], additional_env=extra)
+                           parameters=[nav2_params], env=clean_env)
         lifecycle_nav = Node(package='nav2_lifecycle_manager', executable='lifecycle_manager',
                              name='lifecycle_manager_navigation', output='screen',
-                             parameters=[nav2_params], additional_env=extra)
+                             parameters=[nav2_params], env=clean_env)
         burger_goal = ExecuteProcess(
             cmd=['python3', os.path.join(pkg, 'scripts', 'pose_to_nav2_action_direct_v41.py'),
                  '--ros-args', '-r', '__node:=burger_named_goal',
@@ -290,7 +316,7 @@ topics:
                  '-p', 'goal_pose_topic:=/burger_goal_pose',
                  '-p', 'navigate_action:=/navigate_to_pose',
                  '-p', 'default_frame_id:=map', '-p', 'cancel_previous_goal:=true'],
-            output='screen', name='burger_named_goal', additional_env=extra,
+            output='screen', name='burger_named_goal', env=clean_env,
         )
 
         # Follower behavior script
@@ -325,7 +351,7 @@ topics:
                 '-p', 'yield_max_hold_sec:=12.0',
             ]
         follower_proc = ExecuteProcess(
-            cmd=follower_cmd, output='screen', name='fleet_follower', additional_env=extra,
+            cmd=follower_cmd, output='screen', name='fleet_follower', env=clean_env,
         )
 
         if sim:
@@ -367,8 +393,8 @@ topics:
         ),
         DeclareLaunchArgument(
             'main_domain_id',
-            default_value=EnvironmentVariable('FLEET_MAIN_DOMAIN_ID', default_value='25'),
-            description='Leader domain; defaults to FLEET_MAIN_DOMAIN_ID.',
+            default_value='25',
+            description='Leader DDS domain used by the domain bridge.',
         ),
         DeclareLaunchArgument(
             'start_robot_bringup',
