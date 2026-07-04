@@ -91,10 +91,12 @@ def generate_launch_description():
         if slam_mode:
             if slam_impl.perform(context).strip().lower() == 'official':
                 return [TimerAction(period=0.5, actions=[
-                    LogInfo(msg='LEADER_SLAM | using turtlebot3_cartographer cartographer.launch.py'),
+                    LogInfo(msg='LEADER_SLAM | using turtlebot3_cartographer launch with fleet base_footprint config'),
                     IncludeLaunchDescription(
                         PythonLaunchDescriptionSource(tb3_cartographer_launch),
                         launch_arguments={
+                            'cartographer_config_dir': cartographer_config_dir,
+                            'configuration_basename': 'cartographer_2d_lidar_odom_v44.lua',
                             'use_sim_time': 'false',
                             'use_rviz': 'false',
                             'resolution': '0.05',

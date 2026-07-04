@@ -76,26 +76,24 @@ def port_candidates(requested: str):
 
 def launch_cmd(model: str, port: str, frame_id: str, namespace: str):
     model = model.strip().upper()
+    ns_args = [f'namespace:={namespace}'] if namespace.strip() else []
     if model == 'LDS-02':
         return [
             'ros2', 'launch', 'ld08_driver', 'ld08.launch.py',
             f'port:={port}',
             f'frame_id:={frame_id}',
-            f'namespace:={namespace}',
-        ]
+        ] + ns_args
     if model == 'LDS-03':
         return [
             'ros2', 'launch', 'coin_d4_driver', 'single_lidar_node.launch.py',
             f'port:={port}',
             f'frame_id:={frame_id}',
-            f'namespace:={namespace}',
-        ]
+        ] + ns_args
     return [
         'ros2', 'launch', 'hls_lfcd_lds_driver', 'hlds_laser.launch.py',
         f'port:={port}',
         f'frame_id:={frame_id}',
-        f'namespace:={namespace}',
-    ]
+    ] + ns_args
 
 
 def stop_process(proc):
