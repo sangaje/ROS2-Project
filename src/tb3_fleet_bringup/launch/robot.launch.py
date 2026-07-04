@@ -43,9 +43,38 @@ def generate_launch_description():
     def enabled(value):
         return value.strip().lower() in ('true', '1', 'yes', 'on')
 
+    def resolve_lidar_port(value):
+        port = value.strip()
+        if port and port.lower() != 'auto':
+            return port
+
+        by_id = Path('/dev/serial/by-id')
+        if by_id.exists():
+            preferred = []
+            fallback = []
+            for candidate in sorted(by_id.iterdir()):
+                name = candidate.name.lower()
+                resolved_name = candidate.resolve().name
+                target = str(candidate)
+                if not resolved_name.startswith('ttyUSB'):
+                    continue
+                if any(key in name for key in ('ld', 'lidar', 'cp210', 'silicon', 'usb-serial', 'uart')):
+                    preferred.append(target)
+                else:
+                    fallback.append(target)
+            if preferred:
+                return preferred[0]
+            if fallback:
+                return fallback[0]
+
+        for candidate in ('/dev/ttyUSB0', '/dev/ttyUSB1', '/dev/ttyACM1'):
+            if Path(candidate).exists():
+                return candidate
+        return '/dev/ttyUSB0'
+
     def make_lidar(context, *args, **kwargs):
         model = lds_model.perform(context)
-        port = lidar_port.perform(context)
+        port = resolve_lidar_port(lidar_port.perform(context))
 
         if model == 'LDS-02':
             lidar_launch = Path(get_package_share_directory('ld08_driver')) / 'launch' / 'ld08.launch.py'
@@ -59,7 +88,7 @@ def generate_launch_description():
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(str(lidar_launch)),
                 launch_arguments={
-                    'port': lidar_port,
+                    'port': port,
                     'frame_id': 'base_scan',
                     'namespace': '',
                 }.items(),
@@ -72,7 +101,7 @@ def generate_launch_description():
         lidar_on = enabled(start_lidar.perform(context))
         base_on = enabled(start_base.perform(context))
         model = lds_model.perform(context).strip()
-        lidar_port_value = lidar_port.perform(context).strip()
+        lidar_port_value = resolve_lidar_port(lidar_port.perform(context))
 
         os.environ['TURTLEBOT3_MODEL'] = 'burger'
         os.environ['LDS_MODEL'] = model
@@ -129,8 +158,9 @@ def generate_launch_description():
                               default_value=EnvironmentVariable('LDS_MODEL', default_value='LDS-02'),
                               description='LDS-01, LDS-02, or LDS-03. Defaults to the robot LDS_MODEL environment variable.'),
         DeclareLaunchArgument('usb_port', default_value='/dev/ttyACM0'),
-        DeclareLaunchArgument('lidar_port', default_value='/dev/ttyUSB0',
-                              description='LiDAR serial port. Check with: ls -l /dev/serial/by-id/'),
+        DeclareLaunchArgument('lidar_port',
+                              default_value=EnvironmentVariable('LIDAR_PORT', default_value='auto'),
+                              description='LiDAR serial port, or auto to scan /dev/serial/by-id and ttyUSB*.'),
         DeclareLaunchArgument('start_state_publisher', default_value='true'),
         DeclareLaunchArgument('start_lidar', default_value='true'),
         DeclareLaunchArgument('start_base', default_value='true',
