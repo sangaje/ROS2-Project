@@ -10,7 +10,7 @@ from launch.actions import (
     DeclareLaunchArgument, SetEnvironmentVariable, TimerAction,
     UnsetEnvironmentVariable,
 )
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import Node
 
 
@@ -26,8 +26,11 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        DeclareLaunchArgument('domain_id', default_value='25',
-                              description='ROS domain to connect to (leader domain).'),
+        DeclareLaunchArgument(
+            'domain_id',
+            default_value=EnvironmentVariable('ROS_DOMAIN_ID', default_value='25'),
+            description='ROS domain; defaults to the shell ROS_DOMAIN_ID.',
+        ),
         UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
         UnsetEnvironmentVariable('ROS_LOCALHOST_ONLY'),
         UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),

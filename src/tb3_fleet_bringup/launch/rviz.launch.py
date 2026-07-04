@@ -11,7 +11,7 @@ from launch.actions import (
     SetEnvironmentVariable,
     UnsetEnvironmentVariable,
 )
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 
 
 def generate_launch_description():
@@ -50,7 +50,10 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        DeclareLaunchArgument('domain_id',    default_value='25'),
+        DeclareLaunchArgument(
+            'domain_id',
+            default_value=EnvironmentVariable('ROS_DOMAIN_ID', default_value='25'),
+        ),
         DeclareLaunchArgument('rviz_config',  default_value=default_rviz_config),
         UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
         UnsetEnvironmentVariable('ROS_LOCALHOST_ONLY'),

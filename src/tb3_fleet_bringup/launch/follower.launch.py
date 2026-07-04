@@ -12,21 +12,28 @@ import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (
-    DeclareLaunchArgument, ExecuteProcess,
+    DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription,
     OpaqueFunction, SetEnvironmentVariable, TimerAction,
     UnsetEnvironmentVariable,
 )
-from launch.substitutions import LaunchConfiguration
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import Node
 from nav2_common.launch import RewrittenYaml
 
 
 def generate_launch_description():
     pkg = get_package_share_directory('tb3_fleet_bringup')
+    robot_launch = os.path.join(
+        get_package_share_directory('turtlebot3_bringup'),
+        'launch',
+        'robot.launch.py',
+    )
 
     mode               = LaunchConfiguration('mode')
     domain_id          = LaunchConfiguration('domain_id')
     main_domain_id     = LaunchConfiguration('main_domain_id')
+    start_robot_bringup = LaunchConfiguration('start_robot_bringup')
     follow_distance    = LaunchConfiguration('follow_distance')
     start_following    = LaunchConfiguration('start_following')
     enable_path_yield  = LaunchConfiguration('enable_path_yield')
@@ -332,19 +339,42 @@ topics:
                     TimerAction(period=12.0, actions=[burger_pose]),
                     TimerAction(period=13.0, actions=[burger_goal, follower_proc])]
         else:
-            return [TimerAction(period=0.5, actions=bridges + [scan_relay]),
+            hardware = []
+            if start_robot_bringup.perform(context).lower() in ('true', '1', 'yes'):
+                hardware.append(IncludeLaunchDescription(
+                    PythonLaunchDescriptionSource(robot_launch),
+                    launch_arguments={
+                        'use_sim_time': 'false',
+                        'namespace': '',
+                    }.items(),
+                ))
+            return hardware + [
+                    TimerAction(period=0.5, actions=bridges + [scan_relay]),
                     TimerAction(period=1.0, actions=[map_relay, burger_pose]),
-                    TimerAction(period=2.0, actions=[amcl]),
-                    TimerAction(period=2.5, actions=[lc_loc]),
-                    TimerAction(period=5.0, actions=[controller, planner, behaviors, bt_nav]),
-                    TimerAction(period=9.0, actions=[lifecycle_nav]),
-                    TimerAction(period=11.0, actions=[burger_goal, follower_proc])]
+                    TimerAction(period=5.0, actions=[amcl]),
+                    TimerAction(period=5.5, actions=[lc_loc]),
+                    TimerAction(period=8.0, actions=[controller, planner, behaviors, bt_nav]),
+                    TimerAction(period=12.0, actions=[lifecycle_nav]),
+                    TimerAction(period=14.0, actions=[burger_goal, follower_proc])]
 
     return LaunchDescription([
         DeclareLaunchArgument('mode',               default_value='real',
                               description='real = physical robot | sim = Gazebo'),
-        DeclareLaunchArgument('domain_id',          default_value='24'),
-        DeclareLaunchArgument('main_domain_id',     default_value='25'),
+        DeclareLaunchArgument(
+            'domain_id',
+            default_value=EnvironmentVariable('ROS_DOMAIN_ID', default_value='24'),
+            description='DDS domain; defaults to the shell ROS_DOMAIN_ID.',
+        ),
+        DeclareLaunchArgument(
+            'main_domain_id',
+            default_value=EnvironmentVariable('FLEET_MAIN_DOMAIN_ID', default_value='25'),
+            description='Leader domain; defaults to FLEET_MAIN_DOMAIN_ID.',
+        ),
+        DeclareLaunchArgument(
+            'start_robot_bringup',
+            default_value='true',
+            description='Start TurtleBot3 hardware drivers in real mode.',
+        ),
         DeclareLaunchArgument('follow_distance',    default_value='1.05'),
         DeclareLaunchArgument('start_following',    default_value='false'),
         DeclareLaunchArgument('enable_path_yield',  default_value='true'),

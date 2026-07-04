@@ -14,12 +14,16 @@ def main() -> None:
         'command',
         choices=['follow', 'resume', 'pause', 'stop', 'toggle'],
     )
-    parser.add_argument('--domain', default='25')
+    parser.add_argument('--domain', default=os.environ.get('ROS_DOMAIN_ID', '25'))
     args = parser.parse_args(sys.argv[1:])
 
     os.environ['ROS_DOMAIN_ID'] = str(args.domain)
     os.environ.pop('ROS_DISCOVERY_SERVER', None)
-    os.environ.pop('ROS_LOCALHOST_ONLY', None)
+    os.environ.pop('FASTRTPS_DEFAULT_PROFILES_FILE', None)
+    os.environ.pop('FASTDDS_DEFAULT_PROFILES_FILE', None)
+    os.environ['ROS_LOCALHOST_ONLY'] = '0'
+    os.environ['ROS_AUTOMATIC_DISCOVERY_RANGE'] = 'SUBNET'
+    os.environ['RMW_IMPLEMENTATION'] = 'rmw_fastrtps_cpp'
 
     import rclpy
     from rclpy.node import Node
