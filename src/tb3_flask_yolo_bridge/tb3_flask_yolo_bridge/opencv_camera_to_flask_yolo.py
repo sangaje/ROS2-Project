@@ -50,6 +50,7 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         ).strip()
         self.output_topic = self.declare_parameter('output_topic', '/risk/yolo_detections').value
         self.max_rate_hz = float(self.declare_parameter('max_rate_hz', 5.0).value)
+        self.http_worker_count = int(self.declare_parameter('http_worker_count', 1).value)
         self.jpeg_quality = int(self.declare_parameter('jpeg_quality', 60).value)
         self.timeout_sec = float(self.declare_parameter('timeout_sec', 1.0).value)
         self.connect_timeout_sec = float(
@@ -88,6 +89,8 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         self.latest_capture_mono_sec = 0.0
         self.latest_seq = 0
         self.sent_seq = 0
+        self.publish_lock = threading.Lock()
+        self.published_seq = 0
         self.stop_threads = False
 
         self.rx_count = 0
@@ -112,13 +115,17 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             name='opencv_http_yolo_capture_latest_frame',
             daemon=True,
         )
-        self.worker_thread = threading.Thread(
-            target=self.http_worker_loop,
-            name='opencv_http_yolo_latest_frame_sender',
-            daemon=True,
-        )
+        self.worker_threads = [
+            threading.Thread(
+                target=self.http_worker_loop,
+                name=f'opencv_http_yolo_latest_frame_sender_{index + 1}',
+                daemon=True,
+            )
+            for index in range(max(1, self.http_worker_count))
+        ]
         self.capture_thread.start()
-        self.worker_thread.start()
+        for thread in self.worker_threads:
+            thread.start()
 
         self.get_logger().info(
             f'OPENCV_CAMERA_TO_FLASK_YOLO_READY | device={self.device} '
@@ -126,6 +133,7 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             f'capture_request={self.width}x{self.height} send={self.send_width}x{self.send_height} '
             f'camera_fps={self.camera_fps:.1f} fourcc={self.fourcc or "default"} '
             f'server={self.server_url} out={self.output_topic} rate={self.max_rate_hz:.2f}Hz '
+            f'http_workers={max(1, self.http_worker_count)} '
             f'jpeg_quality={self.jpeg_quality} timeout={self.timeout_sec:.2f}s '
             f'connect_timeout={self.connect_timeout_sec:.2f}s read_timeout={self.read_timeout_sec:.2f}s '
             f'max_http_roundtrip={self.max_http_roundtrip_sec:.2f}s '
@@ -391,6 +399,18 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             return
 
         detections = payload.get('detections', [])
+        with self.publish_lock:
+            if seq <= self.published_seq:
+                self.drop_count += 1
+                self.get_logger().warn(
+                    f'dropped out-of-order YOLO result: seq={seq} '
+                    f'latest_published_seq={self.published_seq}',
+                    throttle_duration_sec=2.0,
+                )
+                self.log_periodic()
+                return
+            self.published_seq = int(seq)
+
         if detections or self.publish_empty_detections:
             payload['image_width'] = int(payload.get('image_width') or w)
             payload['image_height'] = int(payload.get('image_height') or h)
@@ -428,7 +448,9 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         self.stop_threads = True
         with self.frame_condition:
             self.frame_condition.notify_all()
-        for thread in (getattr(self, 'capture_thread', None), getattr(self, 'worker_thread', None)):
+        threads = [getattr(self, 'capture_thread', None)]
+        threads.extend(getattr(self, 'worker_threads', []))
+        for thread in threads:
             if thread is not None and thread.is_alive():
                 thread.join(timeout=max(2.0, self.timeout_sec + 0.5))
         try:

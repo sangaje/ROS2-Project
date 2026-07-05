@@ -4,6 +4,8 @@
 
 - `leader.launch.py`: Cartographer, Nav2, fleet coordinator
 - `follower.launch.py`: domain_bridge, AMCL, Nav2, fleet follower
+- `guard.launch.py`: domain_bridge, AMCL, Nav2. 리더도 팔로워도 되지 않고,
+  코디네이터가 보내는 짧은 회피/복귀 목적지만 실행하는 대기 로봇
 - `robot.launch.py`: 하드웨어 드라이버만 별도로 실행할 때 사용
 - `rviz.launch.py`: PC 시각화
 - `sim_world.launch.py`: Gazebo 월드와 두 로봇 모델만 실행
@@ -37,11 +39,31 @@ export ROS_DOMAIN_ID=25
 ros2 launch tb3_fleet_bringup follower.launch.py main_domain_id:=24
 ```
 
-하드웨어 드라이버를 이미 별도로 실행했다면 양쪽 명령에 다음 옵션만 추가한다.
+가드(선택, 3번째 로봇):
+
+```bash
+export ROS_DOMAIN_ID=26
+ros2 launch tb3_fleet_bringup guard.launch.py main_domain_id:=24
+```
+
+하드웨어 드라이버를 이미 별도로 실행했다면 세 명령 모두에 다음 옵션만 추가한다.
 
 ```bash
 start_robot_bringup:=false
 ```
+
+## 초기 위치 자동 탐색 (`auto_localize`)
+
+`follower.launch.py`와 `guard.launch.py`는 기본적으로 `auto_localize:=true`다.
+매번 `follower_initial_x/y/yaw`(또는 `guard_initial_x/y/yaw`)로 고정된
+위치를 AMCL에 강제로 심는 대신, localization 스택이 뜨면
+`global_localize_kickstart` 노드가 `/reinitialize_global_localization`을
+호출해 맵 전체에 파티클을 고르게 뿌리고, 실물 로봇을 짧게(기본 8초) 제자리
+회전시켜 스캔 매칭이 여러 시점을 확보하도록 돕는다.
+
+고정 시드가 이미 정확히 맞는 상황이거나, 대칭적인 공간이라 자동 탐색이
+불안정하면 `auto_localize:=false`로 끄고 기존처럼 `follower_initial_x/y/yaw`
+(`guard_initial_x/y/yaw`)를 실측값으로 넣는다.
 
 ## 시뮬레이션
 
@@ -106,3 +128,14 @@ Waffle이 우선이다. follow 모드에서도 Waffle이 우선이며 Burger만 
 두 로봇 중 하나의 위치가 1.5초 이상 갱신되지 않거나 안전거리가 확보되지
 않은 채 회피 시간이 끝나면 원래 목적지를 재개하지 않고 안전 정지 상태를
 유지한다.
+
+## 가드 (guard)
+
+가드는 위 leader/follower 우선권 로직과는 완전히 분리된, 별도의 작은 상태
+머신으로 동작한다. `/guard_pose`로 자기 위치만 보고하고, 리더나 팔로워 중
+하나가 가까워지거나(예측 충돌 포함) 접근하면 코디네이터가 `_yield_goal`과
+동일한 방식으로 짧은 회피 지점을 계산해 `/guard_goal_pose`로 보낸다. 가드는
+스스로 목적지를 만들지 않으므로, 위협이 사라지면 회피 직전에 서 있던
+자리로 그대로 복귀한다. 가드가 없거나 `/guard_pose`가 들어오지 않으면 이
+로직은 완전히 비활성 상태이며 기존 leader/follower 동작에는 아무 영향도
+주지 않는다.

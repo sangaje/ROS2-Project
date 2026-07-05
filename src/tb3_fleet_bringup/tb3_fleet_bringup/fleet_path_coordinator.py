@@ -88,6 +88,8 @@ class FleetPathCoordinator(Node):
         )
         self.declare_parameter('status_topic', '/fleet/coordination_status')
         self.declare_parameter('marker_topic', '/fleet/coordination_markers')
+        self.declare_parameter('guard_pose_topic', '/guard_pose')
+        self.declare_parameter('guard_coord_goal_topic', '/guard_goal_pose')
 
         self.declare_parameter('check_period_sec', 0.30)
         self.declare_parameter('pose_stale_sec', 1.5)
@@ -135,6 +137,10 @@ class FleetPathCoordinator(Node):
         )
         self.status_topic = str(get('status_topic').value)
         self.marker_topic = str(get('marker_topic').value)
+        self.guard_pose_topic = str(get('guard_pose_topic').value)
+        self.guard_coord_goal_topic = str(
+            get('guard_coord_goal_topic').value
+        )
 
         self.check_period = max(0.1, float(get('check_period_sec').value))
         self.pose_stale = max(0.5, float(get('pose_stale_sec').value))
@@ -219,6 +225,24 @@ class FleetPathCoordinator(Node):
         self.follower_hold_sent = False
         self.release_separation = self.motion_trigger_distance + 0.25
 
+        # Guard: a third robot that never leads or follows. It only reports
+        # its pose and receives a short yield goal whenever the leader or
+        # follower gets close, then returns to where it was standing. It
+        # runs its own small state machine independent of the leader/
+        # follower one above so an unused guard topic is a total no-op.
+        self.guard_pose: Optional[PoseStamped] = None
+        self.guard_pose_time = -1.0e9
+        self.guard_velocity: Point2 = (0.0, 0.0)
+        self.guard_motion_sample: Optional[Tuple[float, Point2]] = None
+        self.guard_state = self.IDLE
+        self.guard_state_since = self._now()
+        self.guard_cooldown_until = -1.0e9
+        self.guard_resume_pose: Optional[PoseStamped] = None
+        self.guard_evasion_goal: Optional[PoseStamped] = None
+        self.guard_release_separation = self.motion_trigger_distance + 0.25
+        self.guard_last_evasion_publish = -1.0e9
+        self.guard_last_status = ''
+
         map_qos = QoSProfile(
             depth=1,
             history=HistoryPolicy.KEEP_LAST,
@@ -270,7 +294,13 @@ class FleetPathCoordinator(Node):
             self._follower_status_cb,
             coordination_qos,
         )
+        self.create_subscription(
+            PoseStamped, self.guard_pose_topic, self._guard_pose_cb, 20
+        )
 
+        self.guard_goal_pub = self.create_publisher(
+            PoseStamped, self.guard_coord_goal_topic, 10
+        )
         self.leader_goal_pub = self.create_publisher(
             PoseStamped, self.leader_coord_goal_topic, 10
         )
@@ -301,6 +331,7 @@ class FleetPathCoordinator(Node):
             'PRIORITY_FLEET_COORDINATOR_READY | '
             f'leader_pose={self.leader_pose_topic} '
             f'follower_pose={self.follower_pose_topic} '
+            f'guard_pose={self.guard_pose_topic} '
             f'motion_trigger={self.motion_trigger_distance:.2f}m '
             f'prediction={self.motion_prediction_horizon:.1f}s '
             f'evasion={self.evasion_offset:.2f}-{self.evasion_offset_max:.2f}m'
@@ -351,6 +382,15 @@ class FleetPathCoordinator(Node):
         ) = self._update_velocity(
             self.follower_velocity,
             self.follower_motion_sample,
+            self._xy(message),
+        )
+
+    def _guard_pose_cb(self, message: PoseStamped) -> None:
+        self.guard_pose = message
+        self.guard_pose_time = self._now()
+        self.guard_velocity, self.guard_motion_sample = self._update_velocity(
+            self.guard_velocity,
+            self.guard_motion_sample,
             self._xy(message),
         )
 
@@ -506,33 +546,14 @@ class FleetPathCoordinator(Node):
                     return False
         return True
 
-    def _yield_goal(self) -> Optional[PoseStamped]:
-        """Select one short goal for only the robot that must give way."""
-        if (
-            self.leader_pose is None
-            or self.follower_pose is None
-            or self.priority_robot is None
-        ):
-            return None
-
-        if self.priority_robot == self.LEADER:
-            priority_pose = self.leader_pose
-            yielding_pose = self.follower_pose
-            priority_velocity = self.leader_velocity
-            priority_sample = self.leader_motion_sample
-        else:
-            priority_pose = self.follower_pose
-            yielding_pose = self.leader_pose
-            priority_velocity = self.follower_velocity
-            priority_sample = self.follower_motion_sample
-
-        priority_now = self._xy(priority_pose)
-        yielding_now = self._xy(yielding_pose)
-        tangent = self._motion_tangent(
-            priority_pose,
-            priority_velocity,
-            priority_sample,
-        )
+    def _search_yield_candidate(
+        self,
+        priority_now: Point2,
+        tangent: Point2,
+        yielding_now: Point2,
+    ) -> Optional[Tuple[Point2, float]]:
+        """Find a short, map-free sidestep point next to `yielding_now`,
+        biased away from the priority robot's position and heading."""
         right = (tangent[1], -tangent[0])
         relative = (
             yielding_now[0] - priority_now[0],
@@ -552,7 +573,6 @@ class FleetPathCoordinator(Node):
         )
 
         current_separation = distance(priority_now, yielding_now)
-        yielding_yaw = yaw_from_quaternion(yielding_pose.pose.orientation)
         candidates = []
         offset = max(0.30, self.evasion_offset - 0.10)
         while offset <= self.evasion_offset_max + 1.0e-6:
@@ -604,6 +624,40 @@ class FleetPathCoordinator(Node):
             candidates,
             key=lambda item: item[0],
         )
+        return candidate, final_separation
+
+    def _yield_goal(self) -> Optional[PoseStamped]:
+        """Select one short goal for only the robot that must give way."""
+        if (
+            self.leader_pose is None
+            or self.follower_pose is None
+            or self.priority_robot is None
+        ):
+            return None
+
+        if self.priority_robot == self.LEADER:
+            priority_pose = self.leader_pose
+            yielding_pose = self.follower_pose
+            priority_velocity = self.leader_velocity
+            priority_sample = self.leader_motion_sample
+        else:
+            priority_pose = self.follower_pose
+            yielding_pose = self.leader_pose
+            priority_velocity = self.follower_velocity
+            priority_sample = self.follower_motion_sample
+
+        priority_now = self._xy(priority_pose)
+        yielding_now = self._xy(yielding_pose)
+        tangent = self._motion_tangent(
+            priority_pose,
+            priority_velocity,
+            priority_sample,
+        )
+        result = self._search_yield_candidate(priority_now, tangent, yielding_now)
+        if result is None:
+            return None
+        candidate, final_separation = result
+        yielding_yaw = yaw_from_quaternion(yielding_pose.pose.orientation)
         yielding_robot = (
             self.FOLLOWER
             if self.priority_robot == self.LEADER
@@ -615,6 +669,33 @@ class FleetPathCoordinator(Node):
             f'final_separation={final_separation:.2f}m'
         )
         return self._goal(*candidate, yielding_yaw)
+
+    def _guard_yield_goal(
+        self,
+        threat_pose: PoseStamped,
+        threat_velocity: Point2,
+        threat_sample: Optional[Tuple[float, Point2]],
+    ) -> Optional[PoseStamped]:
+        """Same sidestep search as `_yield_goal`, but for the guard robot
+        yielding to whichever of leader/follower is threatening it."""
+        if self.guard_pose is None:
+            return None
+        threat_now = self._xy(threat_pose)
+        guard_now = self._xy(self.guard_pose)
+        tangent = self._motion_tangent(
+            threat_pose, threat_velocity, threat_sample
+        )
+        result = self._search_yield_candidate(threat_now, tangent, guard_now)
+        if result is None:
+            return None
+        candidate, final_separation = result
+        guard_yaw = yaw_from_quaternion(self.guard_pose.pose.orientation)
+        self.get_logger().info(
+            'GUARD_YIELD_GOAL_SELECTED | '
+            f'distance={distance(guard_now, candidate):.2f}m '
+            f'final_separation={final_separation:.2f}m'
+        )
+        return self._goal(*candidate, guard_yaw)
 
     def _choose_motion_priority(self) -> str:
         if self.follower_was_following:
@@ -771,6 +852,194 @@ class FleetPathCoordinator(Node):
             closest_distance,
             closest_time,
         )
+
+    def _guard_conflict(
+        self,
+    ) -> Tuple[bool, Optional[PoseStamped], Point2, Optional[Tuple[float, Point2]]]:
+        """Return whether guard is currently threatened, and by which of
+        leader/follower. Guard itself is treated as stationary here since
+        it never moves on its own initiative except to yield and return."""
+        if self.guard_pose is None:
+            return False, None, (0.0, 0.0), None
+        guard_now = self._xy(self.guard_pose)
+        best: Optional[Tuple[float, PoseStamped, Point2, Optional[Tuple[float, Point2]]]] = None
+        for other_pose, other_velocity, other_sample in (
+            (self.leader_pose, self.leader_velocity, self.leader_motion_sample),
+            (self.follower_pose, self.follower_velocity, self.follower_motion_sample),
+        ):
+            if other_pose is None:
+                continue
+            other_now = self._xy(other_pose)
+            current_distance = distance(guard_now, other_now)
+            effective_velocity = self._effective_velocity(
+                other_velocity, other_sample
+            )
+            other_speed = math.hypot(*effective_velocity)
+
+            closest_distance = current_distance
+            closest_time = 0.0
+            if other_speed >= self.motion_speed_threshold:
+                relative_position = (
+                    other_now[0] - guard_now[0],
+                    other_now[1] - guard_now[1],
+                )
+                speed_squared = (
+                    effective_velocity[0] ** 2 + effective_velocity[1] ** 2
+                )
+                if speed_squared > 1.0e-6:
+                    closest_time = max(0.0, min(
+                        self.motion_prediction_horizon,
+                        -(
+                            relative_position[0] * effective_velocity[0]
+                            + relative_position[1] * effective_velocity[1]
+                        ) / speed_squared,
+                    ))
+                    closest_vector = (
+                        relative_position[0]
+                        + closest_time * effective_velocity[0],
+                        relative_position[1]
+                        + closest_time * effective_velocity[1],
+                    )
+                    closest_distance = math.hypot(*closest_vector)
+
+            emergency = current_distance < self.minimum_separation + 0.08
+            approaching = (
+                current_distance < self.motion_trigger_distance
+                and other_speed >= self.motion_speed_threshold
+            )
+            predicted = (
+                closest_time > 0.05
+                and closest_distance < self.motion_predicted_clearance
+            )
+            if emergency or approaching or predicted:
+                if best is None or current_distance < best[0]:
+                    best = (
+                        current_distance, other_pose, other_velocity,
+                        other_sample,
+                    )
+
+        if best is None:
+            return False, None, (0.0, 0.0), None
+        _, threat_pose, threat_velocity, threat_sample = best
+        return True, threat_pose, threat_velocity, threat_sample
+
+    def _set_guard_state(self, state: str, detail: str) -> None:
+        self.guard_state = state
+        self.guard_state_since = self._now()
+        text = f'GUARD_{state} | {detail}'
+        if text == self.guard_last_status:
+            return
+        message = String()
+        message.data = text
+        self.status_pub.publish(message)
+        self.get_logger().warning(f'FLEET_COORDINATION | {text}')
+        self.guard_last_status = text
+
+    def _begin_guard_escape(
+        self,
+        threat_pose: PoseStamped,
+        threat_velocity: Point2,
+        threat_sample: Optional[Tuple[float, Point2]],
+    ) -> None:
+        self.guard_resume_pose = self._copy_goal(self.guard_pose)
+        current_separation = distance(
+            self._xy(self.guard_pose), self._xy(threat_pose)
+        )
+        self.guard_release_separation = max(
+            self.motion_trigger_distance + 0.20,
+            current_separation + 0.30,
+        )
+        goal = self._guard_yield_goal(
+            threat_pose, threat_velocity, threat_sample
+        )
+        if goal is None:
+            self._set_guard_state(
+                self.BLOCKED,
+                'no short free goal is available for guard',
+            )
+            return
+        self.guard_evasion_goal = goal
+        self._publish_goal(self.guard_goal_pub, goal)
+        self.guard_last_evasion_publish = self._now()
+        self._set_guard_state(
+            self.CLEARING, 'guard yielding to nearby robot motion'
+        )
+
+    def _tick_guard(self) -> None:
+        if self.guard_pose is None:
+            return
+        now = self._now()
+        if now - self.guard_pose_time > self.pose_stale:
+            return
+
+        if self.guard_state == self.COOLDOWN:
+            if now < self.guard_cooldown_until:
+                return
+            self._set_guard_state(self.IDLE, 'ready')
+
+        conflict, threat_pose, threat_velocity, threat_sample = (
+            self._guard_conflict()
+        )
+
+        if self.guard_state == self.IDLE:
+            if conflict:
+                self._begin_guard_escape(
+                    threat_pose, threat_velocity, threat_sample
+                )
+            return
+
+        if self.guard_state not in (self.CLEARING, self.BLOCKED):
+            return
+
+        threat_now = self._xy(threat_pose) if threat_pose is not None else None
+        separated = (
+            threat_now is None
+            or distance(self._xy(self.guard_pose), threat_now)
+            >= self.guard_release_separation
+        )
+        if not conflict and separated:
+            self._publish_goal(self.guard_goal_pub, self.guard_resume_pose)
+            self.guard_evasion_goal = None
+            self.guard_resume_pose = None
+            self.guard_cooldown_until = now + self.cooldown_sec
+            self._set_guard_state(
+                self.COOLDOWN,
+                f'guard resumed; {self.cooldown_sec:.1f}s cooldown',
+            )
+            return
+
+        if self.guard_state == self.CLEARING:
+            if now - self.guard_last_evasion_publish >= 2.5:
+                self._publish_goal(
+                    self.guard_goal_pub, self.guard_evasion_goal
+                )
+                self.guard_last_evasion_publish = now
+            if now - self.guard_state_since >= self.clearing_timeout:
+                if not conflict:
+                    self._publish_goal(
+                        self.guard_goal_pub, self.guard_resume_pose
+                    )
+                    self.guard_cooldown_until = now + self.cooldown_sec
+                    self._set_guard_state(
+                        self.COOLDOWN, 'clearing timeout; resuming'
+                    )
+                else:
+                    self._set_guard_state(
+                        self.BLOCKED,
+                        'clearing timeout while a robot is still close',
+                    )
+        elif self.guard_state == self.BLOCKED and conflict:
+            goal = self._guard_yield_goal(
+                threat_pose, threat_velocity, threat_sample
+            )
+            if goal is not None:
+                self.guard_evasion_goal = goal
+                self._publish_goal(self.guard_goal_pub, goal)
+                self.guard_last_evasion_publish = now
+                self._set_guard_state(
+                    self.CLEARING,
+                    'a short free yield goal became available',
+                )
 
     def _publish_follow_command(
         self,
@@ -1066,6 +1335,7 @@ class FleetPathCoordinator(Node):
             self.hazard_pose_pub.publish(hazard)
 
     def _tick(self) -> None:
+        self._tick_guard()
         if self.leader_pose is None or self.follower_pose is None:
             self._hold_for_missing_pose()
             self._publish_safety_state(True)

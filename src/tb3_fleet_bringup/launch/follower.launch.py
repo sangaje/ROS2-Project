@@ -43,6 +43,7 @@ def generate_launch_description():
     initial_x = LaunchConfiguration('follower_initial_x')
     initial_y = LaunchConfiguration('follower_initial_y')
     initial_yaw = LaunchConfiguration('follower_initial_yaw')
+    auto_localize = LaunchConfiguration('auto_localize')
 
     def make_stack(context):
         simulation = launch_bool(use_sim_time.perform(context))
@@ -185,21 +186,27 @@ def generate_launch_description():
                 env=process_env,
             ))
 
+        auto = launch_bool(auto_localize.perform(context))
         pose_override = Path(tempfile.gettempdir()) / (
             f'tb3_follower_{follower_domain}_initial_pose.yaml'
         )
-        pose_override.write_text(yaml.safe_dump({
-            'amcl': {
-                'ros__parameters': {
-                    'set_initial_pose': True,
-                    'initial_pose': {
-                        'x': float(initial_x.perform(context)),
-                        'y': float(initial_y.perform(context)),
-                        'z': 0.0,
-                        'yaw': float(initial_yaw.perform(context)),
-                    },
+        if auto:
+            # Let AMCL search the whole map instead of trusting a fixed
+            # seed; global_localize_kickstart triggers the actual search
+            # once the localization stack is active.
+            amcl_overrides = {'set_initial_pose': False}
+        else:
+            amcl_overrides = {
+                'set_initial_pose': True,
+                'initial_pose': {
+                    'x': float(initial_x.perform(context)),
+                    'y': float(initial_y.perform(context)),
+                    'z': 0.0,
+                    'yaw': float(initial_yaw.perform(context)),
                 },
-            },
+            }
+        pose_override.write_text(yaml.safe_dump({
+            'amcl': {'ros__parameters': amcl_overrides},
         }), encoding='utf-8')
 
         amcl = Node(
@@ -263,6 +270,24 @@ def generate_launch_description():
             env=process_env,
         )
 
+        kickstart_node = None
+        if auto:
+            kickstart_node = Node(
+                package='tb3_fleet_bringup',
+                executable='global_localize_kickstart',
+                name='burger_global_localize',
+                output='screen',
+                parameters=[{
+                    'use_sim_time': simulation,
+                    'spin_enabled': not simulation,
+                    'spin_duration_sec': 8.0,
+                    'spin_speed_rad_s': 0.6,
+                    'cmd_vel_topic': '/cmd_vel',
+                    'use_stamped_cmd_vel': True,
+                }],
+                env=process_env,
+            )
+
         goal_proxy = Node(
             package='tb3_fleet_bringup',
             executable='pose_to_nav2',
@@ -302,11 +327,14 @@ def generate_launch_description():
             ))
 
         timing = (
-            (0.5, 1.0, 5.0, 5.5, 8.0, 12.0, 14.0)
+            (0.5, 1.0, 5.0, 5.5, 6.5, 8.0, 12.0, 14.0)
             if not simulation
-            else (0.5, 1.0, 5.0, 5.5, 7.0, 10.0, 13.0)
+            else (0.5, 1.0, 5.0, 5.5, 6.5, 7.0, 10.0, 13.0)
         )
-        bridge_t, relay_t, amcl_t, localization_t, nav_t, lifecycle_t, behavior_t = timing
+        (
+            bridge_t, relay_t, amcl_t, localization_t, kickstart_t,
+            nav_t, lifecycle_t, behavior_t,
+        ) = timing
         actions.extend([
             TimerAction(period=bridge_t, actions=bridges),
             TimerAction(period=relay_t, actions=relay_nodes + [follower_pose]),
@@ -316,6 +344,10 @@ def generate_launch_description():
             TimerAction(period=lifecycle_t, actions=[navigation_lifecycle]),
             TimerAction(period=behavior_t, actions=[goal_proxy, follower]),
         ])
+        if kickstart_node is not None:
+            actions.append(
+                TimerAction(period=kickstart_t, actions=[kickstart_node])
+            )
         return actions
 
     return LaunchDescription([
@@ -349,6 +381,17 @@ def generate_launch_description():
         DeclareLaunchArgument('follower_initial_x', default_value='-0.70'),
         DeclareLaunchArgument('follower_initial_y', default_value='0.0'),
         DeclareLaunchArgument('follower_initial_yaw', default_value='0.0'),
+        DeclareLaunchArgument(
+            'auto_localize',
+            default_value='true',
+            choices=['true', 'false'],
+            description=(
+                'Let AMCL search the whole map via '
+                'reinitialize_global_localization instead of trusting '
+                'follower_initial_x/y/yaw. Set false to fall back to the '
+                'fixed seed.'
+            ),
+        ),
         *dds_launch_environment(domain_id),
         OpaqueFunction(function=make_stack),
     ])

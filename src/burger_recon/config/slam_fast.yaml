@@ -1,8 +1,0 @@
-slam_toolbox:
-  ros__parameters:
-    use_sim_time: true
-    resolution: 0.10
-    map_update_interval: 0.3
-    max_laser_range: 3.5
-    minimum_time_interval: 0.1
-    transform_publish_period: 0.02

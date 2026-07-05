@@ -7,7 +7,6 @@ patterns=(
   'ros2 launch tb3_fleet_bringup rviz.launch.py'
   'ros2 launch tb3_fleet_bringup robot.launch.py'
   'ros2 launch tb3_fleet_bringup sim_world.launch.py'
-  'ros2 launch tb3_fleet_bridge bridges.launch.py'
   '/cartographer_ros/cartographer_node'
   '/cartographer_ros/cartographer_occupancy_grid_node'
   '/domain_bridge/domain_bridge'
@@ -107,8 +106,7 @@ rm -f /tmp/turtlebot3_burger_follower.sdf \
       /tmp/burger_amcl_initial_pose.yaml
 
 rm -rf /tmp/tb3_sim_domain_bridge \
-       /tmp/tb3_fleet_domain_bridge \
-       /tmp/tb3_fleet_bridge_dynamic
+       /tmp/tb3_fleet_domain_bridge
 
 echo '[clean_real_fleet_runtime] remaining matching processes:'
-report_matches 'leader.launch.py|follower.launch.py|robot.launch.py|rviz.launch.py|sim_world.launch.py|bridges.launch.py|cartographer_node|domain_bridge|rviz2_fleet|domain_bridge_nav2_follower|fleet_debug_marker|sim_burger|sim_map|gz sim|parameter_bridge'
+report_matches 'leader.launch.py|follower.launch.py|robot.launch.py|rviz.launch.py|sim_world.launch.py|cartographer_node|domain_bridge|rviz2_fleet|domain_bridge_nav2_follower|fleet_debug_marker|sim_burger|sim_map|gz sim|parameter_bridge'

@@ -17,10 +17,10 @@ def generate_launch_description():
         DeclareLaunchArgument('conf', default_value='0.20'),
         DeclareLaunchArgument('iou', default_value='0.45'),
         DeclareLaunchArgument('max_det', default_value='64'),
-        DeclareLaunchArgument('imgsz', default_value='640'),
-        DeclareLaunchArgument('debug_jpeg_quality', default_value='65'),
-        DeclareLaunchArgument('max_capture_age_sec', default_value='0.8'),
-        DeclareLaunchArgument('max_queue_wait_sec', default_value='0.0'),
+        DeclareLaunchArgument('imgsz', default_value='960'),
+        DeclareLaunchArgument('debug_jpeg_quality', default_value='75'),
+        DeclareLaunchArgument('max_capture_age_sec', default_value='1.5'),
+        DeclareLaunchArgument('max_queue_wait_sec', default_value='0.05'),
         ExecuteProcess(
             cmd=[
                 exe,

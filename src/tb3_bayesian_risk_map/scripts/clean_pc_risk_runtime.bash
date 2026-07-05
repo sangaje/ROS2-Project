@@ -37,7 +37,6 @@ if command -v ros2 >/dev/null 2>&1; then
   ros2 daemon stop >/dev/null 2>&1 || true
 fi
 
-rm -rf /tmp/tb3_central_risk_domain_bridge \
-       /tmp/tb3_fleet_bridge_dynamic
+rm -rf /tmp/tb3_central_risk_domain_bridge
 
 echo "PC Fleet/Gazebo/Risk runtime cleanup complete."

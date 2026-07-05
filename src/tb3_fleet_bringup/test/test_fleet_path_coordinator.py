@@ -334,6 +334,59 @@ def test_collision_risk_can_interrupt_cooldown():
         destroy_node(node)
 
 
+def test_guard_yields_when_leader_approaches_and_returns_when_clear():
+    node = make_node()
+    try:
+        node._leader_pose_cb(pose(-0.5, 0.0))
+        node._follower_pose_cb(pose(5.0, 5.0))
+        node._guard_pose_cb(pose(0.4, 0.0))
+        now = node._now()
+        node.leader_velocity = (0.20, 0.0)
+        node.leader_motion_sample = (now, (-0.5, 0.0))
+
+        node._tick()
+        node._tick()
+        assert node.guard_state == node.CLEARING
+        assert node.guard_evasion_goal is not None
+        assert node.guard_resume_pose is not None
+        assert node._xy(node.guard_resume_pose) == (0.4, 0.0)
+
+        # Leader moves away again; guard should resume its original spot.
+        expected_resume = node.guard_resume_pose
+        node._leader_pose_cb(pose(-3.0, 0.0))
+        node.leader_velocity = (0.0, 0.0)
+        node.leader_motion_sample = (node._now(), (-3.0, 0.0))
+        published = []
+        node._publish_goal = lambda publisher, message: published.append(
+            (publisher, message)
+        )
+        node._tick()
+        assert node.guard_state == node.COOLDOWN
+        assert published == [(node.guard_goal_pub, expected_resume)]
+    finally:
+        destroy_node(node)
+
+
+def test_guard_without_a_pose_never_triggers_any_guard_state():
+    node = make_node()
+    try:
+        node._leader_pose_cb(pose(-0.5, 0.0))
+        node._follower_pose_cb(pose(0.0, -0.5))
+        now = node._now()
+        node.leader_velocity = (0.20, 0.0)
+        node.follower_velocity = (0.0, 0.20)
+        node.leader_motion_sample = (now, (-0.5, 0.0))
+        node.follower_motion_sample = (now, (0.0, -0.5))
+
+        node._tick()
+        node._tick()
+        # Existing leader/follower behaviour is unaffected by an absent guard.
+        assert node.state == node.CLEARING
+        assert node.guard_state == node.IDLE
+    finally:
+        destroy_node(node)
+
+
 def test_stale_pose_forces_safety_warning():
     node = make_node()
     try:

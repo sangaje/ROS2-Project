@@ -13,6 +13,7 @@ Panels:
         - /Waffle Nav2 Plan1
         - /Burger Nav2 Plan1
         - /Fleet Debug Markers1
+        - /Map2
       Splitter Ratio: 0.5
     Tree Height: 375
   - Class: rviz_common/Views
@@ -100,6 +101,9 @@ Visualization Manager:
       Show Names: true
       Tree:
         map:
+          burger/base_footprint:
+            burger/base_scan:
+              {}
           odom:
             base_footprint:
               base_link:
@@ -283,6 +287,9 @@ Visualization Manager:
       Enabled: true
       Name: Fleet Debug Markers
       Namespaces:
+        burger: true
+        burger_heading: true
+        burger_label: true
         waffle: true
         waffle_heading: true
         waffle_label: true
@@ -292,6 +299,29 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /fleet_debug_markers
+      Value: true
+    - Alpha: 0.699999988079071
+      Binary representation: false
+      Binary threshold: 100
+      Class: rviz_default_plugins/Map
+      Color Scheme: map
+      Draw Behind: false
+      Enabled: true
+      Name: Map
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: ""
+      Update Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: ""
+      Use Timestamp: false
       Value: true
   Enabled: true
   Global Options:
@@ -331,16 +361,16 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 18.32250213623047
+      Distance: 6.589404106140137
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: -0.006971985101699829
-        Y: 0.3606417775154114
-        Z: 6.973130439291708e-06
+        X: -0.8528788089752197
+        Y: 0.6344964504241943
+        Z: 0.0008528818725608289
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false

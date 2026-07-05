@@ -37,6 +37,7 @@ setup(
             'fleet_follow_signal = tb3_fleet_bringup.fleet_follow_signal:main',
             'fleet_follower = tb3_fleet_bringup.fleet_follower:main',
             'fleet_path_coordinator = tb3_fleet_bringup.fleet_path_coordinator:main',
+            'global_localize_kickstart = tb3_fleet_bringup.global_localize_kickstart:main',
             'map_relay = tb3_fleet_bringup.map_relay:main',
             'pose_to_nav2 = tb3_fleet_bringup.pose_to_nav2:main',
             'pose_to_tf = tb3_fleet_bringup.pose_to_tf:main',
