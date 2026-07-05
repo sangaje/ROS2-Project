@@ -18,6 +18,13 @@ def test_real_bridge_directions_and_control_qos(tmp_path):
         'transient_local'
     )
     assert main['topics']['/fleet/coordination_status']['qos']['depth'] == 1
+    assert main['topics']['/fleet/collision_warning']['qos']['durability'] == (
+        'transient_local'
+    )
+    assert main['topics']['/fleet/robot_poses']['type'] == (
+        'geometry_msgs/msg/PoseArray'
+    )
+    assert '/fleet/hazard_pose' in main['topics']
     assert follower['topics']['/fleet/follow_enabled']['qos']['durability'] == (
         'transient_local'
     )

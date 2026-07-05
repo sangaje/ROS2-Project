@@ -15,6 +15,7 @@ Panels:
         - /Waffle Nav2 Plan1
         - /Burger Nav2 Plan1
         - /Fleet Debug Markers1
+        - /Fleet Hazard1
       Splitter Ratio: 0.5
     Tree Height: 219
   - Class: rviz_common/Views
@@ -304,13 +305,33 @@ Visualization Manager:
       Name: Fleet Coordination
       Namespaces:
         fleet_conflict: true
-        fleet_yield: true
+        fleet_evasion: true
       Topic:
         Depth: 10
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /fleet/coordination_markers
+      Value: true
+    - Alpha: 0.8500000238418579
+      Axes Length: 0.4000000059604645
+      Axes Radius: 0.05000000074505806
+      Class: rviz_default_plugins/Pose
+      Color: 255; 0; 0
+      Enabled: true
+      Head Length: 0.20000000298023224
+      Head Radius: 0.10000000149011612
+      Name: Fleet Hazard
+      Shaft Length: 0.30000001192092896
+      Shaft Radius: 0.05000000074505806
+      Shape: Axes
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /fleet/hazard_pose
       Value: true
   Enabled: true
   Global Options:

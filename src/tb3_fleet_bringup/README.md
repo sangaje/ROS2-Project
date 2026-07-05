@@ -71,3 +71,20 @@ ros2 launch tb3_fleet_bringup follower.launch.py \
 `start_robot_bringup`은 하드웨어 드라이버 실행 여부이고,
 `use_sim_time`은 Gazebo 시간과 가상 센서 relay 사용 여부다. 따라서 실물
 드라이버를 별도로 실행하는 경우에도 `use_sim_time`은 `false`로 유지한다.
+
+## 상호 회피
+
+중앙 코디네이터의 회피 판단은 Nav2 경로를 사용하지 않는다.
+`/leader_pose`와 `/burger_pose`의 상대 위치와 시간 변화를 이용해 실제
+속도와 미래 최근접 거리를 추정한다. 따라서 Nav2, 키보드 teleop, 직접
+`/cmd_vel` 제어 모두 같은 방식으로 감지된다. Nav2 path의 끝점은 회피 후
+원래 목적지를 복구하는 용도로만 사용한다.
+
+- `/fleet/robot_poses`: `[leader, follower]` 순서의 실시간 위치
+- `/fleet/collision_warning`: 현재 또는 예측 충돌 위험
+- `/fleet/hazard_pose`: 예상 충돌 지점
+- `/fleet/coordination_status`: 회피 상태와 통행 우선권
+
+이 안전 토픽은 leader domain에서 각 follower domain으로 브릿지된다.
+충돌 시 두 로봇은 서로 반대 회피 위치로 이동하고, follow 모드가 아닐
+때는 예상 충돌 지점 도착 시간에 따라 Burger도 통행 우선권을 가질 수 있다.

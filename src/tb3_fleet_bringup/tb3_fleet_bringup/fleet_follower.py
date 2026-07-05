@@ -4,7 +4,7 @@ import math
 from typing import Optional, Tuple
 
 import rclpy
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseArray, PoseStamped
 from nav2_msgs.action import NavigateToPose
 from rclpy.action import ActionClient
 from rclpy.node import Node
@@ -46,6 +46,10 @@ class FleetFollower(Node):
         self.declare_parameter('navigate_action', '/navigate_to_pose')
         self.declare_parameter('follow_command_topic', '/fleet/follow_command')
         self.declare_parameter('follow_status_topic', '/fleet/follow_enabled')
+        self.declare_parameter(
+            'collision_warning_topic', '/fleet/collision_warning'
+        )
+        self.declare_parameter('fleet_poses_topic', '/fleet/robot_poses')
         self.declare_parameter('follow_distance', 0.70)
         self.declare_parameter('goal_period_sec', 1.0)
         self.declare_parameter('goal_update_distance', 0.20)
@@ -70,6 +74,12 @@ class FleetFollower(Node):
         self.follow_status_topic = self._absolute(
             str(parameter('follow_status_topic').value)
         )
+        self.collision_warning_topic = self._absolute(
+            str(parameter('collision_warning_topic').value)
+        )
+        self.fleet_poses_topic = self._absolute(
+            str(parameter('fleet_poses_topic').value)
+        )
         self.follow_distance = max(0.25, float(parameter('follow_distance').value))
         self.goal_period = max(0.2, float(parameter('goal_period_sec').value))
         self.goal_update_distance = max(
@@ -91,6 +101,8 @@ class FleetFollower(Node):
         self.last_goal_time = -1.0e9
         self.wait_log_time = -1.0e9
         self.goal_count = 0
+        self.collision_warning = False
+        self.fleet_poses: Optional[PoseArray] = None
 
         coordination_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -115,6 +127,18 @@ class FleetFollower(Node):
             self.follow_command_topic,
             self._command_callback,
             coordination_qos,
+        )
+        self.create_subscription(
+            Bool,
+            self.collision_warning_topic,
+            self._warning_callback,
+            coordination_qos,
+        )
+        self.create_subscription(
+            PoseArray,
+            self.fleet_poses_topic,
+            self._fleet_poses_callback,
+            10,
         )
         self.status_publisher = self.create_publisher(
             Bool,
@@ -155,6 +179,19 @@ class FleetFollower(Node):
         message = Bool()
         message.data = self.follow_enabled
         self.status_publisher.publish(message)
+
+    def _warning_callback(self, message: Bool) -> None:
+        changed = message.data != self.collision_warning
+        self.collision_warning = bool(message.data)
+        if changed:
+            self.get_logger().warning(
+                'FLEET_SAFETY_WARNING | '
+                f'active={self.collision_warning} '
+                'robot_poses_order=[leader,follower]'
+            )
+
+    def _fleet_poses_callback(self, message: PoseArray) -> None:
+        self.fleet_poses = message
 
     def _cancel_goal(self, reason: str) -> None:
         handle = self.active_goal_handle

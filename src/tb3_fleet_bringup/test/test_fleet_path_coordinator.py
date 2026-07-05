@@ -3,7 +3,10 @@ from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import OccupancyGrid, Path
 from std_msgs.msg import Bool
 
-from tb3_fleet_bringup.fleet_path_coordinator import FleetPathCoordinator
+from tb3_fleet_bringup.fleet_path_coordinator import (
+    FleetPathCoordinator,
+    distance,
+)
 
 
 def pose(x: float, y: float) -> PoseStamped:
@@ -49,7 +52,100 @@ def destroy_node(node: FleetPathCoordinator) -> None:
         rclpy.shutdown()
 
 
-def test_crossing_paths_wait_for_pause_acknowledgement():
+def test_follow_mode_crossing_moves_both_and_gives_leader_priority():
+    node = make_node()
+    try:
+        node._follower_status_cb(Bool(data=True))
+        node._leader_pose_cb(pose(-0.5, 0.0))
+        node._follower_pose_cb(pose(0.0, -0.5))
+        node._leader_path_cb(path([(x / 10.0, 0.0) for x in range(-10, 11)]))
+        node._follower_path_cb(path([(0.0, y / 10.0) for y in range(-10, 11)]))
+        now = node._now()
+        node.leader_velocity = (0.20, 0.0)
+        node.follower_velocity = (0.0, 0.20)
+        node.leader_motion_sample = (now, (-0.5, 0.0))
+        node.follower_motion_sample = (now, (0.0, -0.5))
+
+        node._tick()
+        assert node.state == node.CLEARING
+        assert node.priority_robot == node.LEADER
+        assert node.leader_evasion_goal is not None
+        assert node.follower_evasion_goal is not None
+        assert node._xy(node.leader_evasion_goal) != node._xy(node.leader_pose)
+        assert node._xy(node.follower_evasion_goal) != node._xy(node.follower_pose)
+
+    finally:
+        destroy_node(node)
+
+
+def test_independent_follower_gets_priority_when_it_is_the_moving_robot():
+    node = make_node()
+    try:
+        node._follower_status_cb(Bool(data=False))
+        node._leader_pose_cb(pose(-0.5, 0.0))
+        node._follower_pose_cb(pose(0.0, -0.5))
+        node._leader_path_cb(path([(x / 10.0, 0.0) for x in range(-10, 11)]))
+        node._follower_path_cb(path([(0.0, y / 10.0) for y in range(-3, 11)]))
+        now = node._now()
+        node.leader_velocity = (0.05, 0.0)
+        node.follower_velocity = (0.0, 0.20)
+        node.leader_motion_sample = (now, (-0.5, 0.0))
+        node.follower_motion_sample = (now, (0.0, -0.5))
+
+        node._tick()
+        assert node.state == node.CLEARING
+        assert node.priority_robot == node.FOLLOWER
+        assert node.follower_was_following is False
+        assert node.follower_resume_goal is not None
+    finally:
+        destroy_node(node)
+
+
+def test_pose_motion_without_paths_triggers_opposite_escape_goals():
+    node = make_node()
+    try:
+        node._follower_status_cb(Bool(data=False))
+        node._leader_pose_cb(pose(-0.4, 0.0))
+        node._follower_pose_cb(pose(0.4, 0.0))
+        now = node._now()
+        node.leader_velocity = (0.20, 0.0)
+        node.follower_velocity = (0.0, 0.0)
+        node.leader_motion_sample = (now, (-0.4, 0.0))
+        node.follower_motion_sample = (now, (0.4, 0.0))
+
+        risk, _, _ = node._motion_risk()
+        assert risk is True
+        node._tick()
+        assert node.state == node.CLEARING
+        assert node.leader_evasion_goal is not None
+        assert node.follower_evasion_goal is not None
+        assert distance(
+            node._xy(node.leader_evasion_goal),
+            node._xy(node.follower_evasion_goal),
+        ) > 0.8
+    finally:
+        destroy_node(node)
+
+
+def test_normal_same_direction_follow_motion_is_not_a_proximity_hazard():
+    node = make_node()
+    try:
+        node._follower_status_cb(Bool(data=True))
+        node._leader_pose_cb(pose(0.0, 0.0))
+        node._follower_pose_cb(pose(-0.70, 0.0))
+        now = node._now()
+        node.leader_velocity = (0.15, 0.0)
+        node.follower_velocity = (0.15, 0.0)
+        node.leader_motion_sample = (now, (0.0, 0.0))
+        node.follower_motion_sample = (now, (-0.70, 0.0))
+
+        risk, _, _ = node._motion_risk()
+        assert risk is False
+    finally:
+        destroy_node(node)
+
+
+def test_path_intersection_without_position_motion_does_not_trigger_evasion():
     node = make_node()
     try:
         node._leader_pose_cb(pose(-1.0, 0.0))
@@ -59,26 +155,6 @@ def test_crossing_paths_wait_for_pause_acknowledgement():
 
         assert node._find_conflict() is not None
         node._tick()
-        assert node.state == node.PAUSING
-
-        node._follower_status_cb(Bool(data=False))
-        node._tick()
-        assert node.state == node.MOVE_ASIDE
-        assert node.leader_yield is not None
-        assert node.follower_yield is not None
-    finally:
-        destroy_node(node)
-
-
-def test_same_direction_following_is_not_a_path_conflict():
-    node = make_node()
-    try:
-        shared_route = [(x / 10.0, 0.0) for x in range(-15, 21)]
-        node._leader_pose_cb(pose(-0.5, 0.0))
-        node._follower_pose_cb(pose(-1.2, 0.0))
-        node._leader_path_cb(path(shared_route))
-        node._follower_path_cb(path(shared_route))
-
-        assert node._find_conflict() is None
+        assert node.state == node.IDLE
     finally:
         destroy_node(node)

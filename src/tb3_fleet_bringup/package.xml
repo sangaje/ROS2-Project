@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>tb3_fleet_bringup</name>
-  <version>0.9.0</version>
+  <version>0.10.0</version>
   <description>Unified real and simulated TurtleBot3 Nav2 fleet bringup.</description>
   <maintainer email="qhals8380@gmail.com">bomin</maintainer>
   <license>Apache-2.0</license>
