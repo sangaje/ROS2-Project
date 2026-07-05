@@ -81,6 +81,8 @@ def generate_launch_description():
                 'log_every_n': 100,
             }],
             env=process_env,
+            respawn=True,
+            respawn_delay=3.0,
         )
         follower_tf = Node(
             package='tb3_fleet_bringup',
@@ -89,6 +91,8 @@ def generate_launch_description():
             output='screen',
             parameters=[{'use_sim_time': simulation}],
             env=process_env,
+            respawn=True,
+            respawn_delay=3.0,
         )
         leader_scan = Node(
             package='tb3_fleet_bringup',

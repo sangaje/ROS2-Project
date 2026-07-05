@@ -129,6 +129,8 @@ def generate_launch_description():
                 'log_every_n': 100,
             }],
             env=process_env,
+            respawn=True,
+            respawn_delay=3.0,
         )
 
         relay_nodes = [map_relay]

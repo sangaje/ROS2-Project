@@ -8,8 +8,6 @@ Panels:
         - /Status1
         - /Map1
         - /TF1
-        - /Waffle Scan1
-        - /Burger Scan1
         - /Waffle Pose1
         - /Burger Pose1
         - /Waffle Nav2 Plan1
@@ -102,9 +100,6 @@ Visualization Manager:
       Show Names: true
       Tree:
         map:
-          burger/base_footprint:
-            burger/base_scan:
-              {}
           odom:
             base_footprint:
               base_link:
@@ -288,9 +283,6 @@ Visualization Manager:
       Enabled: true
       Name: Fleet Debug Markers
       Namespaces:
-        burger: true
-        burger_heading: true
-        burger_label: true
         waffle: true
         waffle_heading: true
         waffle_label: true
@@ -339,7 +331,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 7.400151252746582
+      Distance: 18.32250213623047
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
