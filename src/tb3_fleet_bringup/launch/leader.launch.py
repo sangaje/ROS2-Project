@@ -90,6 +90,20 @@ def generate_launch_description():
             parameters=[{'use_sim_time': simulation}],
             env=process_env,
         )
+        leader_scan = Node(
+            package='tb3_fleet_bringup',
+            executable='scan_frame_relay',
+            name='leader_fleet_scan_relay',
+            output='screen',
+            parameters=[{
+                'input_topic': '/scan',
+                'output_topic': '/leader/scan',
+                'output_frame': 'base_scan',
+                'input_reliability': 'best_effort',
+                'output_reliability': 'reliable',
+            }],
+            env=process_env,
+        )
 
         navigation = [
             Node(
@@ -197,7 +211,10 @@ def generate_launch_description():
         cartographer_t, pose_t, nav_t, lifecycle_t, goals_t, coordinator_t = timing
         actions.extend([
             TimerAction(period=cartographer_t, actions=[cartographer]),
-            TimerAction(period=pose_t, actions=[leader_pose, follower_tf]),
+            TimerAction(
+                period=pose_t,
+                actions=[leader_pose, follower_tf, leader_scan],
+            ),
             TimerAction(period=nav_t, actions=navigation),
             TimerAction(period=lifecycle_t, actions=[lifecycle]),
             TimerAction(period=goals_t, actions=goal_nodes),

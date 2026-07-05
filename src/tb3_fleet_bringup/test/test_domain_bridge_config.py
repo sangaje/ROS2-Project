@@ -28,6 +28,9 @@ def test_real_bridge_directions_and_control_qos(tmp_path):
     assert follower['topics']['/fleet/follow_enabled']['qos']['durability'] == (
         'transient_local'
     )
+    assert follower['topics']['/burger_scan_relay']['remap'] == (
+        '/follower25/scan'
+    )
     assert '/clock' not in main['topics']
     assert '/cmd_vel' not in follower['topics']
 
@@ -46,3 +49,16 @@ def test_simulation_bridge_adds_only_simulation_transport_topics(tmp_path):
     assert '/burger/scan' in main['topics']
     assert '/burger/odom' in main['topics']
     assert follower['topics']['/cmd_vel']['remap'] == '/burger/cmd_vel'
+
+
+def test_follower_scan_topic_uses_its_domain_id(tmp_path):
+    _, follower_path = write_fleet_bridge_configs(
+        24,
+        31,
+        output_directory=tmp_path,
+    )
+    follower = yaml.safe_load(follower_path.read_text())
+
+    assert follower['topics']['/burger_scan_relay']['remap'] == (
+        '/follower31/scan'
+    )

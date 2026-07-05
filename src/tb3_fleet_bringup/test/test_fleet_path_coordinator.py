@@ -52,7 +52,7 @@ def destroy_node(node: FleetPathCoordinator) -> None:
         rclpy.shutdown()
 
 
-def test_follow_mode_crossing_moves_both_and_gives_leader_priority():
+def test_follow_mode_crossing_preserves_leader_goal_and_moves_only_follower():
     node = make_node()
     try:
         node._follower_status_cb(Bool(data=True))
@@ -70,9 +70,8 @@ def test_follow_mode_crossing_moves_both_and_gives_leader_priority():
         node._tick()
         assert node.state == node.CLEARING
         assert node.priority_robot == node.LEADER
-        assert node.leader_evasion_goal is not None
+        assert node.leader_evasion_goal is None
         assert node.follower_evasion_goal is not None
-        assert node._xy(node.leader_evasion_goal) != node._xy(node.leader_pose)
         assert node._xy(node.follower_evasion_goal) != node._xy(node.follower_pose)
 
     finally:
@@ -99,11 +98,34 @@ def test_independent_follower_gets_priority_when_it_is_the_moving_robot():
         assert node.priority_robot == node.FOLLOWER
         assert node.follower_was_following is False
         assert node.follower_resume_goal is not None
+        assert node.leader_evasion_goal is not None
+        assert node.follower_evasion_goal is None
     finally:
         destroy_node(node)
 
 
-def test_pose_motion_without_paths_triggers_opposite_escape_goals():
+def test_waffle_keeps_priority_when_both_independent_robots_are_moving():
+    node = make_node()
+    try:
+        node._follower_status_cb(Bool(data=False))
+        node._leader_pose_cb(pose(-0.5, 0.0))
+        node._follower_pose_cb(pose(0.0, -0.5))
+        now = node._now()
+        node.leader_velocity = (0.10, 0.0)
+        node.follower_velocity = (0.0, 0.22)
+        node.leader_motion_sample = (now, (-0.5, 0.0))
+        node.follower_motion_sample = (now, (0.0, -0.5))
+
+        node._tick()
+        node._tick()
+        assert node.priority_robot == node.LEADER
+        assert node.leader_evasion_goal is None
+        assert node.follower_evasion_goal is not None
+    finally:
+        destroy_node(node)
+
+
+def test_pose_motion_without_paths_moves_only_the_yielding_robot():
     node = make_node()
     try:
         node._follower_status_cb(Bool(data=False))
@@ -120,12 +142,12 @@ def test_pose_motion_without_paths_triggers_opposite_escape_goals():
         node._tick()
         node._tick()
         assert node.state == node.CLEARING
-        assert node.leader_evasion_goal is not None
+        assert node.leader_evasion_goal is None
         assert node.follower_evasion_goal is not None
         assert distance(
-            node._xy(node.leader_evasion_goal),
+            node._xy(node.follower_pose),
             node._xy(node.follower_evasion_goal),
-        ) > 0.8
+        ) <= node.evasion_offset_max + 1.0e-6
     finally:
         destroy_node(node)
 
@@ -144,6 +166,27 @@ def test_normal_same_direction_follow_motion_is_not_a_proximity_hazard():
 
         risk, _, _ = node._motion_risk()
         assert risk is False
+    finally:
+        destroy_node(node)
+
+
+def test_robot_moving_away_does_not_trigger_yield_maneuver():
+    node = make_node()
+    try:
+        node._follower_status_cb(Bool(data=False))
+        node._leader_pose_cb(pose(0.0, 0.0))
+        node._follower_pose_cb(pose(0.65, 0.0))
+        now = node._now()
+        node.leader_velocity = (-0.20, 0.0)
+        node.follower_velocity = (0.0, 0.0)
+        node.leader_motion_sample = (now, (0.0, 0.0))
+        node.follower_motion_sample = (now, (0.65, 0.0))
+
+        risk, _, _ = node._motion_risk()
+        assert risk is False
+        node._tick()
+        node._tick()
+        assert node.state == node.IDLE
     finally:
         destroy_node(node)
 
@@ -173,6 +216,7 @@ def test_user_goals_remain_persistent_across_evasion_updates():
         assert node._xy(node.follower_user_goal) == (-1.0, 2.0)
 
         node.state = node.CLEARING
+        node.priority_robot = node.LEADER
         replacement = pose(3.0, -1.0)
         node._leader_goal_cb(replacement)
         assert node._xy(node.leader_user_goal) == (3.0, -1.0)
@@ -195,6 +239,61 @@ def test_independent_follower_goal_is_reasserted_after_pause_acknowledgement():
         destroy_node(node)
 
 
+def test_follower_yield_goal_is_reasserted_after_pause_acknowledgement():
+    node = make_node()
+    try:
+        published = []
+        node.state = node.CLEARING
+        node.priority_robot = node.LEADER
+        node.follower_evasion_goal = pose(0.5, 1.0)
+        node._publish_goal = lambda publisher, message: published.append(message)
+
+        node._follower_status_cb(Bool(data=False))
+        assert published == [node.follower_evasion_goal]
+    finally:
+        destroy_node(node)
+
+
+def test_releasing_right_of_way_does_not_resend_priority_goal():
+    node = make_node()
+    try:
+        published = []
+        node.priority_robot = node.LEADER
+        node.leader_resume_goal = pose(2.0, 0.0)
+        node.state = node.CLEARING
+        node._publish_goal = lambda publisher, message: published.append(message)
+
+        node._release_priority()
+        assert node.state == node.PRIORITY_PASS
+        assert published == []
+    finally:
+        destroy_node(node)
+
+
+def test_only_yielding_robot_resumes_its_saved_destination():
+    node = make_node()
+    try:
+        published = []
+        node.priority_robot = node.LEADER
+        node.follower_was_following = False
+        node.leader_resume_goal = pose(2.0, 0.0)
+        node.follower_resume_goal = pose(-2.0, 0.0)
+        node.leader_user_goal = pose(2.0, 0.0)
+        node.follower_user_goal = pose(-2.0, 0.0)
+        node._publish_goal = (
+            lambda publisher, message: published.append((publisher, message))
+        )
+
+        node._restore_after_maneuver()
+        assert published == [
+            (node.follower_goal_pub, node.follower_user_goal),
+        ]
+        assert node.leader_user_goal is not None
+        assert node.follower_user_goal is not None
+    finally:
+        destroy_node(node)
+
+
 def test_unsafe_clearing_timeout_enters_blocked_instead_of_restoring_goals():
     node = make_node()
     try:
@@ -203,7 +302,8 @@ def test_unsafe_clearing_timeout_enters_blocked_instead_of_restoring_goals():
         node.state = node.CLEARING
         node.state_since = node._now() - node.clearing_timeout - 0.1
         node.leader_evasion_goal = pose(-1.0, 0.0)
-        node.follower_evasion_goal = pose(1.0, 0.0)
+        node.follower_evasion_goal = None
+        node.priority_robot = node.FOLLOWER
 
         node._tick()
         assert node.state == node.BLOCKED

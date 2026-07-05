@@ -131,7 +131,7 @@ def write_fleet_bridge_configs(
         ),
         '/burger_scan_relay': topic(
             'sensor_msgs/msg/LaserScan',
-            remap='/burger_scan',
+            remap=f'/follower{int(follower_domain)}/scan',
             profile=qos('best_effort'),
         ),
     }

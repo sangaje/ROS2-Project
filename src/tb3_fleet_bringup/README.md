@@ -82,6 +82,8 @@ ros2 launch tb3_fleet_bringup follower.launch.py \
 
 - `/goal_pose`: Waffle의 사용자 목적지
 - `/burger_user_goal`: Burger의 사용자 목적지
+- `/leader/scan`: leader의 fleet용 LiDAR
+- `/follower25/scan`: domain 25 follower의 fleet용 LiDAR
 - `/fleet/leader_coord_goal`: 코디네이터가 Nav2에 전달하는 Waffle 목적지
 - `/burger_goal_pose`: 코디네이터가 Nav2에 전달하는 Burger 목적지
 - `/fleet/robot_poses`: `[leader, follower]` 순서의 실시간 위치
@@ -89,14 +91,18 @@ ros2 launch tb3_fleet_bringup follower.launch.py \
 - `/fleet/hazard_pose`: 예상 충돌 지점
 - `/fleet/coordination_status`: 회피 상태와 통행 우선권
 
-사용자 목적지는 코디네이터에 보존되므로 회피 목적지가 잠시 Nav2를
-선점해도 회피가 끝난 뒤 최신 사용자 목적지로 복귀한다. Nav2 액션 서버가
-아직 준비되지 않았거나 재시작 중이어도 최신 목적지는 폐기하지 않고
-준비될 때까지 재시도한다.
+사용자 목적지는 코디네이터가 계속 보존한다. 우선권 로봇은 기존 Nav2
+목적지를 중단하지 않고 그대로 진행하며, 양보 로봇만 짧은 회피 목적지로
+이동했다가 상대가 통과하거나 멈추면 최신 사용자 목적지로 복귀한다.
+Nav2 액션 서버가 아직 준비되지 않았거나 재시작 중이어도 최신 목적지는
+폐기하지 않고 준비될 때까지 재시도한다.
 
 이 안전 토픽은 leader domain에서 각 follower domain으로 브릿지된다.
-충돌 시 두 로봇은 서로 반대 회피 위치로 이동하고, follow 모드가 아닐
-때는 실제 이동 속도에 따라 Burger도 통행 우선권을 가질 수 있다.
+Follower LiDAR 토픽의 숫자는 follower의 `domain_id`에서 자동 생성된다.
+예를 들어 domain 31이면 `/follower31/scan`이다. 각 로봇 내부에서 Nav2가
+사용하는 `/scan`은 변경하지 않는다.
+한 대만 움직이면 움직이는 로봇이 우선이고, 두 대가 동시에 움직이면
+Waffle이 우선이다. follow 모드에서도 Waffle이 우선이며 Burger만 비킨다.
 두 로봇 중 하나의 위치가 1.5초 이상 갱신되지 않거나 안전거리가 확보되지
 않은 채 회피 시간이 끝나면 원래 목적지를 재개하지 않고 안전 정지 상태를
 유지한다.
