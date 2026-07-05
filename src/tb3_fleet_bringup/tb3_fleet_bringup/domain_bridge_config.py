@@ -157,28 +157,28 @@ def write_fleet_bridge_configs(
     return main_to_follower, follower_to_main
 
 
-def write_guard_bridge_configs(
+def write_member_bridge_configs(
     main_domain: int,
-    guard_domain: int,
+    member_domain: int,
     *,
     output_directory: Optional[Path] = None,
 ) -> Tuple[Path, Path]:
-    """Create the two directional domain_bridge configurations for a guard
-    robot: it never leads or follows, it only reports its pose and receives
-    a short yield goal from the coordinator when another robot needs to
-    pass. Map and initial-pose flow mirror the follower's bridge so the
-    same PC RViz can localize it.
+    """Create the two directional domain_bridge configurations for a plain
+    fleet member: it never leads or follows, it only reports its pose and
+    receives a short yield goal from the coordinator when another robot
+    needs to pass. Map and initial-pose flow mirror the follower's bridge
+    so the same PC RViz can localize it.
     """
     output = output_directory or (
         Path(tempfile.gettempdir()) / 'tb3_fleet_domain_bridge'
     )
     output.mkdir(parents=True, exist_ok=True)
 
-    main_to_guard = output / (
-        f'main_{main_domain}_to_guard_{guard_domain}.yaml'
+    main_to_member = output / (
+        f'main_{main_domain}_to_member_{member_domain}.yaml'
     )
-    guard_to_main = output / (
-        f'guard_{guard_domain}_to_main_{main_domain}.yaml'
+    member_to_main = output / (
+        f'member_{member_domain}_to_main_{main_domain}.yaml'
     )
 
     main_topics = {
@@ -187,27 +187,27 @@ def write_guard_bridge_configs(
             remap='/map_bridge',
             profile=qos(depth=5),
         ),
-        '/guard_goal_pose': topic('geometry_msgs/msg/PoseStamped'),
+        '/member_goal_pose': topic('geometry_msgs/msg/PoseStamped'),
         '/initialpose': topic(
             'geometry_msgs/msg/PoseWithCovarianceStamped',
             profile=qos(depth=1),
         ),
     }
-    guard_topics = {
-        '/guard_pose': topic('geometry_msgs/msg/PoseStamped'),
+    member_topics = {
+        '/member_pose': topic('geometry_msgs/msg/PoseStamped'),
     }
 
-    main_to_guard.write_text(yaml.safe_dump({
-        'name': f'main_{main_domain}_to_guard_{guard_domain}',
+    main_to_member.write_text(yaml.safe_dump({
+        'name': f'main_{main_domain}_to_member_{member_domain}',
         'from_domain': int(main_domain),
-        'to_domain': int(guard_domain),
+        'to_domain': int(member_domain),
         'topics': main_topics,
     }, sort_keys=False), encoding='utf-8')
-    guard_to_main.write_text(yaml.safe_dump({
-        'name': f'guard_{guard_domain}_to_main_{main_domain}',
-        'from_domain': int(guard_domain),
+    member_to_main.write_text(yaml.safe_dump({
+        'name': f'member_{member_domain}_to_main_{main_domain}',
+        'from_domain': int(member_domain),
         'to_domain': int(main_domain),
-        'topics': guard_topics,
+        'topics': member_topics,
     }, sort_keys=False), encoding='utf-8')
 
-    return main_to_guard, guard_to_main
+    return main_to_member, member_to_main

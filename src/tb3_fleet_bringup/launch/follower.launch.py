@@ -44,6 +44,7 @@ def generate_launch_description():
     initial_y = LaunchConfiguration('follower_initial_y')
     initial_yaw = LaunchConfiguration('follower_initial_yaw')
     auto_localize = LaunchConfiguration('auto_localize')
+    enable_amcl = LaunchConfiguration('enable_amcl')
 
     def make_stack(context):
         simulation = launch_bool(use_sim_time.perform(context))
@@ -186,47 +187,57 @@ def generate_launch_description():
                 env=process_env,
             ))
 
+        amcl_enabled = launch_bool(enable_amcl.perform(context))
         auto = launch_bool(auto_localize.perform(context))
-        pose_override = Path(tempfile.gettempdir()) / (
-            f'tb3_follower_{follower_domain}_initial_pose.yaml'
-        )
-        if auto:
-            # Let AMCL search the whole map instead of trusting a fixed
-            # seed; global_localize_kickstart triggers the actual search
-            # once the localization stack is active.
-            amcl_overrides = {'set_initial_pose': False}
-        else:
-            amcl_overrides = {
-                'set_initial_pose': True,
-                'initial_pose': {
-                    'x': float(initial_x.perform(context)),
-                    'y': float(initial_y.perform(context)),
-                    'z': 0.0,
-                    'yaw': float(initial_yaw.perform(context)),
-                },
-            }
-        pose_override.write_text(yaml.safe_dump({
-            'amcl': {'ros__parameters': amcl_overrides},
-        }), encoding='utf-8')
 
-        amcl = Node(
-            package='nav2_amcl',
-            executable='amcl',
-            name='amcl',
-            output='screen',
-            parameters=[nav2_params, str(pose_override)],
-            env=process_env,
-            respawn=True,
-            respawn_delay=3.0,
-        )
-        localization_lifecycle = Node(
-            package='nav2_lifecycle_manager',
-            executable='lifecycle_manager',
-            name='lifecycle_manager_localization',
-            output='screen',
-            parameters=[nav2_params],
-            env=process_env,
-        )
+        amcl = None
+        localization_lifecycle = None
+        if amcl_enabled:
+            # AMCL is the one TF source this stack owns by default (map->
+            # odom over a shared, bridged map). Set enable_amcl:=false only
+            # when something else (e.g. a risk-map Cartographer) will own
+            # SLAM/TF for this robot instead -- running both fights over
+            # the same transform.
+            pose_override = Path(tempfile.gettempdir()) / (
+                f'tb3_follower_{follower_domain}_initial_pose.yaml'
+            )
+            if auto:
+                # Let AMCL search the whole map instead of trusting a fixed
+                # seed; global_localize_kickstart triggers the actual
+                # search once the localization stack is active.
+                amcl_overrides = {'set_initial_pose': False}
+            else:
+                amcl_overrides = {
+                    'set_initial_pose': True,
+                    'initial_pose': {
+                        'x': float(initial_x.perform(context)),
+                        'y': float(initial_y.perform(context)),
+                        'z': 0.0,
+                        'yaw': float(initial_yaw.perform(context)),
+                    },
+                }
+            pose_override.write_text(yaml.safe_dump({
+                'amcl': {'ros__parameters': amcl_overrides},
+            }), encoding='utf-8')
+
+            amcl = Node(
+                package='nav2_amcl',
+                executable='amcl',
+                name='amcl',
+                output='screen',
+                parameters=[nav2_params, str(pose_override)],
+                env=process_env,
+                respawn=True,
+                respawn_delay=3.0,
+            )
+            localization_lifecycle = Node(
+                package='nav2_lifecycle_manager',
+                executable='lifecycle_manager',
+                name='lifecycle_manager_localization',
+                output='screen',
+                parameters=[nav2_params],
+                env=process_env,
+            )
         navigation = [
             Node(
                 package='nav2_controller',
@@ -271,7 +282,7 @@ def generate_launch_description():
         )
 
         kickstart_node = None
-        if auto:
+        if amcl_enabled and auto:
             kickstart_node = Node(
                 package='tb3_fleet_bringup',
                 executable='global_localize_kickstart',
@@ -338,12 +349,16 @@ def generate_launch_description():
         actions.extend([
             TimerAction(period=bridge_t, actions=bridges),
             TimerAction(period=relay_t, actions=relay_nodes + [follower_pose]),
-            TimerAction(period=amcl_t, actions=[amcl]),
-            TimerAction(period=localization_t, actions=[localization_lifecycle]),
             TimerAction(period=nav_t, actions=navigation),
             TimerAction(period=lifecycle_t, actions=[navigation_lifecycle]),
             TimerAction(period=behavior_t, actions=[goal_proxy, follower]),
         ])
+        if amcl is not None:
+            actions.append(TimerAction(period=amcl_t, actions=[amcl]))
+        if localization_lifecycle is not None:
+            actions.append(TimerAction(
+                period=localization_t, actions=[localization_lifecycle],
+            ))
         if kickstart_node is not None:
             actions.append(
                 TimerAction(period=kickstart_t, actions=[kickstart_node])
@@ -381,6 +396,17 @@ def generate_launch_description():
         DeclareLaunchArgument('follower_initial_x', default_value='-0.70'),
         DeclareLaunchArgument('follower_initial_y', default_value='0.0'),
         DeclareLaunchArgument('follower_initial_yaw', default_value='0.0'),
+        DeclareLaunchArgument(
+            'enable_amcl',
+            default_value='true',
+            choices=['true', 'false'],
+            description=(
+                'Run AMCL as this stack\'s map->odom TF source. Set false '
+                'only when something else (e.g. a risk-map Cartographer) '
+                'will own SLAM/TF for this robot instead -- running both '
+                'at once fights over the same transform.'
+            ),
+        ),
         DeclareLaunchArgument(
             'auto_localize',
             default_value='true',

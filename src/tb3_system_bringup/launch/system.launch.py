@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Single entry point that turns on everything a robot's fleet role needs.
 
-role:=scout  -> fleet bringup (default fleet_role=guard) + Bayesian risk map
+role:=scout  -> fleet bringup (default fleet_role=member) + Bayesian risk map
                 + the RL-trained exploration policy driving cmd_vel directly.
 role:=waffle -> fleet bringup only (default fleet_role=leader). This role is
                 a placeholder: the waffle-specific behaviour stack is still
@@ -33,10 +33,10 @@ from tb3_fleet_bringup.launch_utils import (
 FLEET_LAUNCH_FILES = {
     'leader': 'leader.launch.py',
     'follower': 'follower.launch.py',
-    'guard': 'guard.launch.py',
+    'member': 'member.launch.py',
 }
 DEFAULT_FLEET_ROLE = {
-    'scout': 'guard',
+    'scout': 'member',
     'waffle': 'leader',
 }
 
@@ -47,6 +47,7 @@ def generate_launch_description():
     main_domain_id = LaunchConfiguration('main_domain_id')
     fleet_role = LaunchConfiguration('fleet_role')
     start_robot_bringup = LaunchConfiguration('start_robot_bringup')
+    require_follower_pose = LaunchConfiguration('require_follower_pose')
     auto_localize = LaunchConfiguration('auto_localize')
     enable_amcl = LaunchConfiguration('enable_amcl')
     start_risk_map = LaunchConfiguration('start_risk_map')
@@ -89,23 +90,28 @@ def generate_launch_description():
             'domain_id': str(domain),
             'start_robot_bringup': start_robot_bringup.perform(context),
         }
-        if fleet_role_value in ('follower', 'guard'):
+        if fleet_role_value == 'leader':
+            fleet_launch_args['require_follower_pose'] = (
+                require_follower_pose.perform(context)
+            )
+        if fleet_role_value in ('follower', 'member'):
             fleet_launch_args['main_domain_id'] = str(main_domain)
             fleet_launch_args['auto_localize'] = (
                 auto_localize.perform(context)
             )
-        # Whether AMCL (fleet bringup's own map->odom TF source) will be
-        # running underneath, so start_cartographer below can refuse to
-        # also claim that transform. guard.launch.py is the only fleet
-        # role with an enable_amcl switch; follower.launch.py always runs
-        # AMCL, and leader.launch.py never does (it runs Cartographer).
-        if fleet_role_value == 'guard':
+        # Whether the fleet stack underneath already owns a map->odom TF
+        # source, so start_cartographer below can refuse to also claim
+        # that transform. member.launch.py is the only fleet role with an
+        # enable_amcl switch; follower.launch.py always runs AMCL with no
+        # off switch; leader.launch.py always runs its own Cartographer
+        # with no off switch either -- all three are conflicts.
+        if fleet_role_value == 'member':
             fleet_launch_args['enable_amcl'] = enable_amcl.perform(context)
-            amcl_will_run = launch_bool(enable_amcl.perform(context))
+            fleet_stack_owns_slam = launch_bool(enable_amcl.perform(context))
         elif fleet_role_value == 'follower':
-            amcl_will_run = True
-        else:
-            amcl_will_run = False
+            fleet_stack_owns_slam = True
+        else:  # leader: always runs its own Cartographer, no toggle exists
+            fleet_stack_owns_slam = True
 
         actions = [
             LogInfo(msg=[
@@ -134,11 +140,26 @@ def generate_launch_description():
                 risk_share, 'launch', 'real_robot_risk_slam.launch.py'
             )
             cartographer_on = launch_bool(start_cartographer.perform(context))
-            if cartographer_on and amcl_will_run:
+            if cartographer_on and fleet_stack_owns_slam:
+                if fleet_role_value == 'member':
+                    hint = 'Set enable_amcl:=false when turning start_cartographer on.'
+                elif fleet_role_value == 'follower':
+                    hint = (
+                        'follower.launch.py always runs AMCL with no off '
+                        'switch, so start_cartographer:=true cannot be used '
+                        "with fleet_role:=follower yet -- use fleet_role:="
+                        "member enable_amcl:=false instead."
+                    )
+                else:
+                    hint = (
+                        'leader.launch.py always runs its own Cartographer '
+                        'with no off switch, so start_cartographer:=true '
+                        "cannot be used with fleet_role:=leader."
+                    )
                 raise ValueError(
-                    'start_cartographer:=true and enable_amcl:=true would '
-                    'both try to own map->odom for this robot. Set '
-                    'enable_amcl:=false when turning start_cartographer on.'
+                    'start_cartographer:=true would fight with the '
+                    f"{fleet_role_value} fleet stack's own map->odom "
+                    f'source for this robot. {hint}'
                 )
             actions.append(IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(risk_launch_path),
@@ -223,10 +244,10 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'fleet_role',
             default_value='',
-            choices=['', 'leader', 'follower', 'guard'],
+            choices=['', 'leader', 'follower', 'member'],
             description=(
                 'Which tb3_fleet_bringup stack to run underneath. Empty '
-                "picks a default from role: scout->guard, waffle->leader."
+                "picks a default from role: scout->member, waffle->leader."
             ),
         ),
         DeclareLaunchArgument(
@@ -234,15 +255,25 @@ def generate_launch_description():
             choices=['true', 'false'],
         ),
         DeclareLaunchArgument(
+            'require_follower_pose', default_value='true',
+            choices=['true', 'false'],
+            description=(
+                "leader fleet_role only (role:=waffle): set false if no "
+                "follower.launch.py robot is in this fleet, otherwise the "
+                'coordinator holds the leader in place forever waiting '
+                'for a follower pose that will never arrive.'
+            ),
+        ),
+        DeclareLaunchArgument(
             'auto_localize', default_value='true',
             choices=['true', 'false'],
-            description='Passed through to follower/guard AMCL global localization.',
+            description='Passed through to follower/member AMCL global localization.',
         ),
         DeclareLaunchArgument(
             'enable_amcl', default_value='true',
             choices=['true', 'false'],
             description=(
-                'guard fleet_role only: run AMCL as the map->odom TF '
+                'member fleet_role only: run AMCL as the map->odom TF '
                 'source (fleet bringup\'s own default). Set false only '
                 'when start_cartographer below will own SLAM/TF instead.'
             ),

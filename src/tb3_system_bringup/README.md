@@ -25,6 +25,16 @@ export ROS_DOMAIN_ID=24
 ros2 launch tb3_system_bringup system.launch.py role:=waffle
 ```
 
+**follower.launch.py 로봇이 fleet에 없으면(예: 리더+정찰봇만 있는 구성)
+`require_follower_pose:=false`를 반드시 같이 줘야 한다** — 기본값(true)
+그대로면 코디네이터가 follower pose를 영원히 기다리다가 리더를 첫 위치에서
+그대로 멈춰 세운다(`tb3_fleet_bringup` README의 "팔로워 없는 리더" 참고).
+
+```bash
+ros2 launch tb3_system_bringup system.launch.py \
+  role:=waffle require_follower_pose:=false
+```
+
 PC 통합 뷰어 (fleet 디버그 마커 + 리스크맵을 같은 RViz 창에서):
 
 ```bash
@@ -38,12 +48,12 @@ ros2 launch tb3_system_bringup viewer.launch.py
 
 ## `role`이 실제로 켜는 것
 
-| role     | fleet_role 기본값 | 리스크맵 | RL 정책 |
-|----------|------------------|----------|---------|
-| `scout`  | `guard`          | 켜짐     | 켜짐    |
-| `waffle` | `leader`         | 안 켜짐 (베타 placeholder) | 안 켜짐 |
+| role     | fleet_role 기본값 | 리스크맵                   | RL 정책 |
+|----------|-------------------|----------------------------|---------|
+| `scout`  | `member`          | 켜짐                       | 켜짐    |
+| `waffle` | `leader`          | 안 켜짐 (베타 placeholder) | 안 켜짐 |
 
-`scout`는 리더를 따라가지도, 리더가 되지도 않는 `guard.launch.py` 위에서
+`scout`는 리더를 따라가지도, 리더가 되지도 않는 `member.launch.py` 위에서
 RL 정책이 직접 `/cmd_vel`을 몰아 정찰하고, 코디네이터가 다른 로봇을
 비켜줘야 할 때만 짧게 Nav2 목적지로 개입한다. `follower`처럼 리더를
 계속 쫓아가게 하고 싶으면 `fleet_role:=follower`로 바꾸면 된다.
@@ -63,7 +73,7 @@ RL 정책이 직접 `/cmd_vel`을 몰아 정찰하고, 코디네이터가 다른
 
 ### TF 소유권: AMCL vs 리스크맵 Cartographer
 
-`guard.launch.py`의 AMCL이 이 스택에서 기본으로 `map->odom` TF를 갖는
+`member.launch.py`의 AMCL이 이 스택에서 기본으로 `map->odom` TF를 갖는
 쪽이다(`enable_amcl`, 기본 true). 리스크맵의 Cartographer가 대신 SLAM을
 가지려면 반드시 `enable_amcl:=false`와 같이 써야 한다 — 그렇지 않으면
 `system.launch.py`가 `start_cartographer:=true` + `enable_amcl:=true`
@@ -76,20 +86,32 @@ ros2 launch tb3_system_bringup system.launch.py \
   role:=scout enable_amcl:=false start_cartographer:=true
 ```
 
+이 안전장치는 `fleet_role`이 `member`(AMCL, `enable_amcl`로 끌 수 있음)일
+때뿐 아니라 `follower`(AMCL, 끌 방법 없음)와 `leader`(자체 Cartographer,
+끌 방법 없음)일 때도 적용된다 — 즉 `fleet_role:=follower`나
+`fleet_role:=leader`로는 `start_cartographer:=true`를 아예 쓸 수 없고,
+지금은 `fleet_role:=member enable_amcl:=false` 조합만 유효하다.
+
+`/map` 이중 발행 문제는 `map_relay`가 `count_publishers()`로 Cartographer
+같은 다른 발행자가 있는지 감지해서 있으면 조용히 대기하도록 바뀌어서
+해결됐다 (`tb3_fleet_bringup` README의 "`/map` 페일오버" 참고).
+
 **아직 안 풀린 부분(고치지 않고 남겨둠):**
 - 이 스위치는 AMCL↔Cartographer 사이의 TF 소유권만 정리한 것이고, 로봇
   하드웨어 bringup(`turtlebot3_bringup/robot.launch.py`)이 기본 파라미터로
   여전히 `odom->base_footprint`를 직접 방송한다. Cartographer를 켜는
   쪽에서 이 TF까지 완전히 겹치지 않게 하려면 `tb3_bayesian_risk_map`의
   `turtlebot3_burger_no_odom_tf.yaml`(휠 오도메트리 TF 끔) 같은 하드웨어
-  파라미터 교체가 별도로 필요한데, `guard.launch.py`/`system.launch.py`
+  파라미터 교체가 별도로 필요한데, `member.launch.py`/`system.launch.py`
   둘 다 아직 그 파라미터 파일을 바꿔 끼울 옵션이 없다.
-- `guard.launch.py`의 `map_relay`(리더 맵을 브릿지받아 로컬 `/map`으로
-  republish)는 `enable_amcl`과 무관하게 항상 켜져 있어서, Cartographer도
-  켜면 같은 `/map` 토픽에 발행자가 둘이 된다. 이건 별도로 정리해야 한다.
-- 정찰봇이 자기 SLAM으로 독자 맵을 가지면 `/guard_pose`가 리더의 공유
+- 정찰봇이 자기 SLAM으로 독자 맵을 가지면 `/member_pose`가 리더의 공유
   맵 좌표계와 달라져서 `fleet_path_coordinator`의 회피 계산이 어긋날 수
   있다 — 아직 해결 방법을 논의 중.
+- `map_relay`의 `count_publishers()` 감지는 Cartographer가 막 뜨는 중이라
+  아직 discovery에 안 잡힌 순간(수 초)에는 "발행자 없음"으로 오판해서
+  잠깐 넘겨받을 수 있다. `start_cartographer:=true` 조합에서는
+  `takeover_grace_sec` 기본값(2초)이 너무 짧을 수 있으니 실기 테스트 때
+  Cartographer 기동 시간에 맞춰 늘리는 걸 권장.
 
 RL 정책(scout, `start_rl_policy:=true`가 기본): `rl_model_path`(SB3
 `.zip`), `rl_extra_args`(`eval_policy`에 그대로 넘길 추가 CLI 플래그
@@ -100,7 +122,7 @@ RL 정책(scout, `start_rl_policy:=true`가 기본): `rl_model_path`(SB3
 `turtlebot3_rl_training`의 `eval_policy --real-robot`은 **무조건**
 자기 자신의 SLAM(Cartographer/slam_toolbox)과 `map->odom` TF를 새로
 띄우려고 한다(`--no-auto-start-slam`을 줘도 무시하고 다시 켠다). 이
-패키지는 fleet 스택(guard/follower의 AMCL, leader의 Cartographer)이
+패키지는 fleet 스택(member/follower의 AMCL, leader의 Cartographer)이
 이미 그 TF를 갖고 있다고 가정하므로, 기본값으로 `--disable-slam-map`을
 같이 넘겨서 `eval_policy`가 자체 SLAM을 켜지 않게 막아둔다.
 
@@ -109,5 +131,5 @@ RL 정책(scout, `start_rl_policy:=true`가 기본): `rl_model_path`(SB3
 쓴 옵저베이션 구성에 따라 이게 정책 성능에 영향을 줄 수 있다 — 실제
 로봇에서 처음 돌릴 때는 반드시 동작을 확인하고, 필요하면
 `rl_disable_slam_map:=false`로 켜서 `eval_policy`가 자체 SLAM을 갖게
-하되 그 경우 `fleet_role:=guard`(AMCL)와는 같이 쓰지 말 것 — 두
+하되 그 경우 `fleet_role:=member`(AMCL)와는 같이 쓰지 말 것 — 두
 소스가 동시에 `map->odom`을 방송하면 TF가 깨진다.

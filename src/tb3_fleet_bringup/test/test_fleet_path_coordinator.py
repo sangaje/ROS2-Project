@@ -334,25 +334,25 @@ def test_collision_risk_can_interrupt_cooldown():
         destroy_node(node)
 
 
-def test_guard_yields_when_leader_approaches_and_returns_when_clear():
+def test_member_yields_when_leader_approaches_and_returns_when_clear():
     node = make_node()
     try:
         node._leader_pose_cb(pose(-0.5, 0.0))
         node._follower_pose_cb(pose(5.0, 5.0))
-        node._guard_pose_cb(pose(0.4, 0.0))
+        node._member_pose_cb(pose(0.4, 0.0))
         now = node._now()
         node.leader_velocity = (0.20, 0.0)
         node.leader_motion_sample = (now, (-0.5, 0.0))
 
         node._tick()
         node._tick()
-        assert node.guard_state == node.CLEARING
-        assert node.guard_evasion_goal is not None
-        assert node.guard_resume_pose is not None
-        assert node._xy(node.guard_resume_pose) == (0.4, 0.0)
+        assert node.member_state == node.CLEARING
+        assert node.member_evasion_goal is not None
+        assert node.member_resume_pose is not None
+        assert node._xy(node.member_resume_pose) == (0.4, 0.0)
 
-        # Leader moves away again; guard should resume its original spot.
-        expected_resume = node.guard_resume_pose
+        # Leader moves away again; member should resume its original spot.
+        expected_resume = node.member_resume_pose
         node._leader_pose_cb(pose(-3.0, 0.0))
         node.leader_velocity = (0.0, 0.0)
         node.leader_motion_sample = (node._now(), (-3.0, 0.0))
@@ -361,13 +361,13 @@ def test_guard_yields_when_leader_approaches_and_returns_when_clear():
             (publisher, message)
         )
         node._tick()
-        assert node.guard_state == node.COOLDOWN
-        assert published == [(node.guard_goal_pub, expected_resume)]
+        assert node.member_state == node.COOLDOWN
+        assert published == [(node.member_goal_pub, expected_resume)]
     finally:
         destroy_node(node)
 
 
-def test_guard_without_a_pose_never_triggers_any_guard_state():
+def test_member_without_a_pose_never_triggers_any_member_state():
     node = make_node()
     try:
         node._leader_pose_cb(pose(-0.5, 0.0))
@@ -380,9 +380,53 @@ def test_guard_without_a_pose_never_triggers_any_guard_state():
 
         node._tick()
         node._tick()
-        # Existing leader/follower behaviour is unaffected by an absent guard.
+        # Existing leader/follower behaviour is unaffected by an absent member.
         assert node.state == node.CLEARING
-        assert node.guard_state == node.IDLE
+        assert node.member_state == node.IDLE
+    finally:
+        destroy_node(node)
+
+
+def test_leader_goal_is_not_held_when_no_follower_is_expected():
+    node = make_node()
+    try:
+        node.require_follower_pose = False
+        published = []
+        node._publish_goal = lambda publisher, message: published.append(
+            (publisher, message)
+        )
+
+        node._leader_pose_cb(pose(0.0, 0.0))
+        node._tick()
+        node._tick()
+
+        # A leader+member-only fleet (no follower.launch.py robot) must not
+        # get treated as "follower pose missing" and frozen in place.
+        assert published == []
+        assert node.state == node.IDLE
+        assert node.collision_warning is False
+
+        leader_goal = pose(2.0, 1.0)
+        node._leader_goal_cb(leader_goal)
+        assert published == [(node.leader_goal_pub, node.leader_user_goal)]
+    finally:
+        destroy_node(node)
+
+
+def test_member_yielding_still_works_with_no_follower_expected():
+    node = make_node()
+    try:
+        node.require_follower_pose = False
+        node._leader_pose_cb(pose(-0.5, 0.0))
+        node._member_pose_cb(pose(0.4, 0.0))
+        now = node._now()
+        node.leader_velocity = (0.20, 0.0)
+        node.leader_motion_sample = (now, (-0.5, 0.0))
+
+        node._tick()
+        node._tick()
+        assert node.member_state == node.CLEARING
+        assert node.member_evasion_goal is not None
     finally:
         destroy_node(node)
 

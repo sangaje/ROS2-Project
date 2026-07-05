@@ -88,8 +88,9 @@ class FleetPathCoordinator(Node):
         )
         self.declare_parameter('status_topic', '/fleet/coordination_status')
         self.declare_parameter('marker_topic', '/fleet/coordination_markers')
-        self.declare_parameter('guard_pose_topic', '/guard_pose')
-        self.declare_parameter('guard_coord_goal_topic', '/guard_goal_pose')
+        self.declare_parameter('member_pose_topic', '/member_pose')
+        self.declare_parameter('member_coord_goal_topic', '/member_goal_pose')
+        self.declare_parameter('require_follower_pose', True)
 
         self.declare_parameter('check_period_sec', 0.30)
         self.declare_parameter('pose_stale_sec', 1.5)
@@ -137,10 +138,11 @@ class FleetPathCoordinator(Node):
         )
         self.status_topic = str(get('status_topic').value)
         self.marker_topic = str(get('marker_topic').value)
-        self.guard_pose_topic = str(get('guard_pose_topic').value)
-        self.guard_coord_goal_topic = str(
-            get('guard_coord_goal_topic').value
+        self.member_pose_topic = str(get('member_pose_topic').value)
+        self.member_coord_goal_topic = str(
+            get('member_coord_goal_topic').value
         )
+        self.require_follower_pose = bool(get('require_follower_pose').value)
 
         self.check_period = max(0.1, float(get('check_period_sec').value))
         self.pose_stale = max(0.5, float(get('pose_stale_sec').value))
@@ -225,23 +227,23 @@ class FleetPathCoordinator(Node):
         self.follower_hold_sent = False
         self.release_separation = self.motion_trigger_distance + 0.25
 
-        # Guard: a third robot that never leads or follows. It only reports
+        # Member: a third robot that never leads or follows. It only reports
         # its pose and receives a short yield goal whenever the leader or
         # follower gets close, then returns to where it was standing. It
         # runs its own small state machine independent of the leader/
-        # follower one above so an unused guard topic is a total no-op.
-        self.guard_pose: Optional[PoseStamped] = None
-        self.guard_pose_time = -1.0e9
-        self.guard_velocity: Point2 = (0.0, 0.0)
-        self.guard_motion_sample: Optional[Tuple[float, Point2]] = None
-        self.guard_state = self.IDLE
-        self.guard_state_since = self._now()
-        self.guard_cooldown_until = -1.0e9
-        self.guard_resume_pose: Optional[PoseStamped] = None
-        self.guard_evasion_goal: Optional[PoseStamped] = None
-        self.guard_release_separation = self.motion_trigger_distance + 0.25
-        self.guard_last_evasion_publish = -1.0e9
-        self.guard_last_status = ''
+        # follower one above so an unused member topic is a total no-op.
+        self.member_pose: Optional[PoseStamped] = None
+        self.member_pose_time = -1.0e9
+        self.member_velocity: Point2 = (0.0, 0.0)
+        self.member_motion_sample: Optional[Tuple[float, Point2]] = None
+        self.member_state = self.IDLE
+        self.member_state_since = self._now()
+        self.member_cooldown_until = -1.0e9
+        self.member_resume_pose: Optional[PoseStamped] = None
+        self.member_evasion_goal: Optional[PoseStamped] = None
+        self.member_release_separation = self.motion_trigger_distance + 0.25
+        self.member_last_evasion_publish = -1.0e9
+        self.member_last_status = ''
 
         map_qos = QoSProfile(
             depth=1,
@@ -295,11 +297,11 @@ class FleetPathCoordinator(Node):
             coordination_qos,
         )
         self.create_subscription(
-            PoseStamped, self.guard_pose_topic, self._guard_pose_cb, 20
+            PoseStamped, self.member_pose_topic, self._member_pose_cb, 20
         )
 
-        self.guard_goal_pub = self.create_publisher(
-            PoseStamped, self.guard_coord_goal_topic, 10
+        self.member_goal_pub = self.create_publisher(
+            PoseStamped, self.member_coord_goal_topic, 10
         )
         self.leader_goal_pub = self.create_publisher(
             PoseStamped, self.leader_coord_goal_topic, 10
@@ -331,7 +333,7 @@ class FleetPathCoordinator(Node):
             'PRIORITY_FLEET_COORDINATOR_READY | '
             f'leader_pose={self.leader_pose_topic} '
             f'follower_pose={self.follower_pose_topic} '
-            f'guard_pose={self.guard_pose_topic} '
+            f'member_pose={self.member_pose_topic} '
             f'motion_trigger={self.motion_trigger_distance:.2f}m '
             f'prediction={self.motion_prediction_horizon:.1f}s '
             f'evasion={self.evasion_offset:.2f}-{self.evasion_offset_max:.2f}m'
@@ -385,12 +387,12 @@ class FleetPathCoordinator(Node):
             self._xy(message),
         )
 
-    def _guard_pose_cb(self, message: PoseStamped) -> None:
-        self.guard_pose = message
-        self.guard_pose_time = self._now()
-        self.guard_velocity, self.guard_motion_sample = self._update_velocity(
-            self.guard_velocity,
-            self.guard_motion_sample,
+    def _member_pose_cb(self, message: PoseStamped) -> None:
+        self.member_pose = message
+        self.member_pose_time = self._now()
+        self.member_velocity, self.member_motion_sample = self._update_velocity(
+            self.member_velocity,
+            self.member_motion_sample,
             self._xy(message),
         )
 
@@ -670,32 +672,32 @@ class FleetPathCoordinator(Node):
         )
         return self._goal(*candidate, yielding_yaw)
 
-    def _guard_yield_goal(
+    def _member_yield_goal(
         self,
         threat_pose: PoseStamped,
         threat_velocity: Point2,
         threat_sample: Optional[Tuple[float, Point2]],
     ) -> Optional[PoseStamped]:
-        """Same sidestep search as `_yield_goal`, but for the guard robot
+        """Same sidestep search as `_yield_goal`, but for the member robot
         yielding to whichever of leader/follower is threatening it."""
-        if self.guard_pose is None:
+        if self.member_pose is None:
             return None
         threat_now = self._xy(threat_pose)
-        guard_now = self._xy(self.guard_pose)
+        member_now = self._xy(self.member_pose)
         tangent = self._motion_tangent(
             threat_pose, threat_velocity, threat_sample
         )
-        result = self._search_yield_candidate(threat_now, tangent, guard_now)
+        result = self._search_yield_candidate(threat_now, tangent, member_now)
         if result is None:
             return None
         candidate, final_separation = result
-        guard_yaw = yaw_from_quaternion(self.guard_pose.pose.orientation)
+        member_yaw = yaw_from_quaternion(self.member_pose.pose.orientation)
         self.get_logger().info(
-            'GUARD_YIELD_GOAL_SELECTED | '
-            f'distance={distance(guard_now, candidate):.2f}m '
+            'MEMBER_YIELD_GOAL_SELECTED | '
+            f'distance={distance(member_now, candidate):.2f}m '
             f'final_separation={final_separation:.2f}m'
         )
-        return self._goal(*candidate, guard_yaw)
+        return self._goal(*candidate, member_yaw)
 
     def _choose_motion_priority(self) -> str:
         if self.follower_was_following:
@@ -853,15 +855,15 @@ class FleetPathCoordinator(Node):
             closest_time,
         )
 
-    def _guard_conflict(
+    def _member_conflict(
         self,
     ) -> Tuple[bool, Optional[PoseStamped], Point2, Optional[Tuple[float, Point2]]]:
-        """Return whether guard is currently threatened, and by which of
-        leader/follower. Guard itself is treated as stationary here since
+        """Return whether member is currently threatened, and by which of
+        leader/follower. Member itself is treated as stationary here since
         it never moves on its own initiative except to yield and return."""
-        if self.guard_pose is None:
+        if self.member_pose is None:
             return False, None, (0.0, 0.0), None
-        guard_now = self._xy(self.guard_pose)
+        member_now = self._xy(self.member_pose)
         best: Optional[Tuple[float, PoseStamped, Point2, Optional[Tuple[float, Point2]]]] = None
         for other_pose, other_velocity, other_sample in (
             (self.leader_pose, self.leader_velocity, self.leader_motion_sample),
@@ -870,7 +872,7 @@ class FleetPathCoordinator(Node):
             if other_pose is None:
                 continue
             other_now = self._xy(other_pose)
-            current_distance = distance(guard_now, other_now)
+            current_distance = distance(member_now, other_now)
             effective_velocity = self._effective_velocity(
                 other_velocity, other_sample
             )
@@ -880,8 +882,8 @@ class FleetPathCoordinator(Node):
             closest_time = 0.0
             if other_speed >= self.motion_speed_threshold:
                 relative_position = (
-                    other_now[0] - guard_now[0],
-                    other_now[1] - guard_now[1],
+                    other_now[0] - member_now[0],
+                    other_now[1] - member_now[1],
                 )
                 speed_squared = (
                     effective_velocity[0] ** 2 + effective_velocity[1] ** 2
@@ -923,120 +925,120 @@ class FleetPathCoordinator(Node):
         _, threat_pose, threat_velocity, threat_sample = best
         return True, threat_pose, threat_velocity, threat_sample
 
-    def _set_guard_state(self, state: str, detail: str) -> None:
-        self.guard_state = state
-        self.guard_state_since = self._now()
-        text = f'GUARD_{state} | {detail}'
-        if text == self.guard_last_status:
+    def _set_member_state(self, state: str, detail: str) -> None:
+        self.member_state = state
+        self.member_state_since = self._now()
+        text = f'MEMBER_{state} | {detail}'
+        if text == self.member_last_status:
             return
         message = String()
         message.data = text
         self.status_pub.publish(message)
         self.get_logger().warning(f'FLEET_COORDINATION | {text}')
-        self.guard_last_status = text
+        self.member_last_status = text
 
-    def _begin_guard_escape(
+    def _begin_member_escape(
         self,
         threat_pose: PoseStamped,
         threat_velocity: Point2,
         threat_sample: Optional[Tuple[float, Point2]],
     ) -> None:
-        self.guard_resume_pose = self._copy_goal(self.guard_pose)
+        self.member_resume_pose = self._copy_goal(self.member_pose)
         current_separation = distance(
-            self._xy(self.guard_pose), self._xy(threat_pose)
+            self._xy(self.member_pose), self._xy(threat_pose)
         )
-        self.guard_release_separation = max(
+        self.member_release_separation = max(
             self.motion_trigger_distance + 0.20,
             current_separation + 0.30,
         )
-        goal = self._guard_yield_goal(
+        goal = self._member_yield_goal(
             threat_pose, threat_velocity, threat_sample
         )
         if goal is None:
-            self._set_guard_state(
+            self._set_member_state(
                 self.BLOCKED,
-                'no short free goal is available for guard',
+                'no short free goal is available for member',
             )
             return
-        self.guard_evasion_goal = goal
-        self._publish_goal(self.guard_goal_pub, goal)
-        self.guard_last_evasion_publish = self._now()
-        self._set_guard_state(
-            self.CLEARING, 'guard yielding to nearby robot motion'
+        self.member_evasion_goal = goal
+        self._publish_goal(self.member_goal_pub, goal)
+        self.member_last_evasion_publish = self._now()
+        self._set_member_state(
+            self.CLEARING, 'member yielding to nearby robot motion'
         )
 
-    def _tick_guard(self) -> None:
-        if self.guard_pose is None:
+    def _tick_member(self) -> None:
+        if self.member_pose is None:
             return
         now = self._now()
-        if now - self.guard_pose_time > self.pose_stale:
+        if now - self.member_pose_time > self.pose_stale:
             return
 
-        if self.guard_state == self.COOLDOWN:
-            if now < self.guard_cooldown_until:
+        if self.member_state == self.COOLDOWN:
+            if now < self.member_cooldown_until:
                 return
-            self._set_guard_state(self.IDLE, 'ready')
+            self._set_member_state(self.IDLE, 'ready')
 
         conflict, threat_pose, threat_velocity, threat_sample = (
-            self._guard_conflict()
+            self._member_conflict()
         )
 
-        if self.guard_state == self.IDLE:
+        if self.member_state == self.IDLE:
             if conflict:
-                self._begin_guard_escape(
+                self._begin_member_escape(
                     threat_pose, threat_velocity, threat_sample
                 )
             return
 
-        if self.guard_state not in (self.CLEARING, self.BLOCKED):
+        if self.member_state not in (self.CLEARING, self.BLOCKED):
             return
 
         threat_now = self._xy(threat_pose) if threat_pose is not None else None
         separated = (
             threat_now is None
-            or distance(self._xy(self.guard_pose), threat_now)
-            >= self.guard_release_separation
+            or distance(self._xy(self.member_pose), threat_now)
+            >= self.member_release_separation
         )
         if not conflict and separated:
-            self._publish_goal(self.guard_goal_pub, self.guard_resume_pose)
-            self.guard_evasion_goal = None
-            self.guard_resume_pose = None
-            self.guard_cooldown_until = now + self.cooldown_sec
-            self._set_guard_state(
+            self._publish_goal(self.member_goal_pub, self.member_resume_pose)
+            self.member_evasion_goal = None
+            self.member_resume_pose = None
+            self.member_cooldown_until = now + self.cooldown_sec
+            self._set_member_state(
                 self.COOLDOWN,
-                f'guard resumed; {self.cooldown_sec:.1f}s cooldown',
+                f'member resumed; {self.cooldown_sec:.1f}s cooldown',
             )
             return
 
-        if self.guard_state == self.CLEARING:
-            if now - self.guard_last_evasion_publish >= 2.5:
+        if self.member_state == self.CLEARING:
+            if now - self.member_last_evasion_publish >= 2.5:
                 self._publish_goal(
-                    self.guard_goal_pub, self.guard_evasion_goal
+                    self.member_goal_pub, self.member_evasion_goal
                 )
-                self.guard_last_evasion_publish = now
-            if now - self.guard_state_since >= self.clearing_timeout:
+                self.member_last_evasion_publish = now
+            if now - self.member_state_since >= self.clearing_timeout:
                 if not conflict:
                     self._publish_goal(
-                        self.guard_goal_pub, self.guard_resume_pose
+                        self.member_goal_pub, self.member_resume_pose
                     )
-                    self.guard_cooldown_until = now + self.cooldown_sec
-                    self._set_guard_state(
+                    self.member_cooldown_until = now + self.cooldown_sec
+                    self._set_member_state(
                         self.COOLDOWN, 'clearing timeout; resuming'
                     )
                 else:
-                    self._set_guard_state(
+                    self._set_member_state(
                         self.BLOCKED,
                         'clearing timeout while a robot is still close',
                     )
-        elif self.guard_state == self.BLOCKED and conflict:
-            goal = self._guard_yield_goal(
+        elif self.member_state == self.BLOCKED and conflict:
+            goal = self._member_yield_goal(
                 threat_pose, threat_velocity, threat_sample
             )
             if goal is not None:
-                self.guard_evasion_goal = goal
-                self._publish_goal(self.guard_goal_pub, goal)
-                self.guard_last_evasion_publish = now
-                self._set_guard_state(
+                self.member_evasion_goal = goal
+                self._publish_goal(self.member_goal_pub, goal)
+                self.member_last_evasion_publish = now
+                self._set_member_state(
                     self.CLEARING,
                     'a short free yield goal became available',
                 )
@@ -1335,11 +1337,27 @@ class FleetPathCoordinator(Node):
             self.hazard_pose_pub.publish(hazard)
 
     def _tick(self) -> None:
-        self._tick_guard()
-        if self.leader_pose is None or self.follower_pose is None:
+        self._tick_member()
+
+        if self.leader_pose is None:
             self._hold_for_missing_pose()
             self._publish_safety_state(True)
             return
+
+        if not self.require_follower_pose and self.follower_pose is None:
+            # No follower in this fleet (e.g. leader + member only); there
+            # is nothing to coordinate between leader and follower, so let
+            # the leader's own goals through untouched. Member yielding
+            # already ran above via _tick_member() and does not depend on
+            # a follower existing.
+            self._publish_safety_state(False)
+            return
+
+        if self.follower_pose is None:
+            self._hold_for_missing_pose()
+            self._publish_safety_state(True)
+            return
+
         now = self._now()
         if (
             now - self.leader_pose_time > self.pose_stale

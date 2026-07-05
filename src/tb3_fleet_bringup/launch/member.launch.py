@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Guard stack: domain bridge, AMCL and Nav2 for a passive fleet member.
+"""Member stack: domain bridge, AMCL and (via base.launch.py) Nav2 for a
+generic fleet member.
 
-The guard never leads and never follows. It only reports its pose to the
-coordinator and executes whatever short yield/return goal the coordinator
-sends on /guard_goal_pose when the leader or follower needs to pass.
+A member never leads and never follows on its own. It reports its pose to
+the coordinator and executes whatever short yield/return goal the
+coordinator sends on /member_goal_pose when the leader or follower needs to
+pass. follower.launch.py builds on top of this file by adding its own
+trailing behaviour; leader.launch.py is a sibling that builds on
+base.launch.py directly with Cartographer instead of AMCL.
 """
 
 import os
@@ -24,7 +28,7 @@ from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import Node
 from nav2_common.launch import RewrittenYaml
 
-from tb3_fleet_bringup.domain_bridge_config import write_guard_bridge_configs
+from tb3_fleet_bringup.domain_bridge_config import write_member_bridge_configs
 from tb3_fleet_bringup.launch_utils import (
     clean_process_environment,
     dds_launch_environment,
@@ -34,28 +38,24 @@ from tb3_fleet_bringup.launch_utils import (
 
 def generate_launch_description():
     package_share = get_package_share_directory('tb3_fleet_bringup')
-    robot_launch = os.path.join(
-        get_package_share_directory('turtlebot3_bringup'),
-        'launch',
-        'robot.launch.py',
-    )
+    base_launch = os.path.join(package_share, 'launch', 'base.launch.py')
 
     domain_id = LaunchConfiguration('domain_id')
     main_domain_id = LaunchConfiguration('main_domain_id')
     start_robot_bringup = LaunchConfiguration('start_robot_bringup')
-    initial_x = LaunchConfiguration('guard_initial_x')
-    initial_y = LaunchConfiguration('guard_initial_y')
-    initial_yaw = LaunchConfiguration('guard_initial_yaw')
+    initial_x = LaunchConfiguration('member_initial_x')
+    initial_y = LaunchConfiguration('member_initial_y')
+    initial_yaw = LaunchConfiguration('member_initial_yaw')
     auto_localize = LaunchConfiguration('auto_localize')
     enable_amcl = LaunchConfiguration('enable_amcl')
 
     def make_stack(context):
-        guard_domain = int(domain_id.perform(context))
+        member_domain = int(domain_id.perform(context))
         main_domain = int(main_domain_id.perform(context))
-        process_env = clean_process_environment(str(guard_domain))
+        process_env = clean_process_environment(str(member_domain))
 
-        # Reuses the follower's Burger Nav2/AMCL tuning; the guard is the
-        # same robot class localizing against the same shared map.
+        # Reuses the follower's Burger Nav2/AMCL tuning; a plain member is
+        # the same robot class localizing against the same shared map.
         nav2_params = RewrittenYaml(
             source_file=os.path.join(
                 package_share, 'config', 'follower_nav2_amcl.yaml'
@@ -70,17 +70,17 @@ def generate_launch_description():
             convert_types=True,
         )
 
-        main_to_guard, guard_to_main = write_guard_bridge_configs(
-            main_domain, guard_domain,
+        main_to_member, member_to_main = write_member_bridge_configs(
+            main_domain, member_domain,
         )
         bridges = [
             Node(
                 package='domain_bridge',
                 executable='domain_bridge',
-                name='bridge_main_to_guard',
+                name='bridge_main_to_member',
                 output='screen',
                 arguments=[
-                    str(main_to_guard), '--wait-for-publisher', 'false',
+                    str(main_to_member), '--wait-for-publisher', 'false',
                 ],
                 env=process_env,
                 respawn=True,
@@ -89,10 +89,10 @@ def generate_launch_description():
             Node(
                 package='domain_bridge',
                 executable='domain_bridge',
-                name='bridge_guard_to_main',
+                name='bridge_member_to_main',
                 output='screen',
                 arguments=[
-                    str(guard_to_main), '--wait-for-publisher', 'false',
+                    str(member_to_main), '--wait-for-publisher', 'false',
                 ],
                 env=process_env,
                 respawn=True,
@@ -103,21 +103,21 @@ def generate_launch_description():
         map_relay = Node(
             package='tb3_fleet_bringup',
             executable='map_relay',
-            name='guard_map_relay',
+            name='member_map_relay',
             output='screen',
             parameters=[{'use_sim_time': False}],
             env=process_env,
             respawn=True,
             respawn_delay=3.0,
         )
-        guard_pose = Node(
+        member_pose = Node(
             package='tb3_fleet_bringup',
             executable='tf_pose_publisher',
-            name='guard_pose_pub',
+            name='member_pose_pub',
             output='screen',
             parameters=[{
                 'use_sim_time': False,
-                'output_topic': '/guard_pose',
+                'output_topic': '/member_pose',
                 'publish_rate_hz': 10.0,
                 'log_every_n': 100,
             }],
@@ -138,7 +138,7 @@ def generate_launch_description():
             # to own SLAM/TF for this robot (e.g. a risk-map Cartographer)
             # must come with enable_amcl:=false so the two never collide.
             pose_override = Path(tempfile.gettempdir()) / (
-                f'tb3_guard_{guard_domain}_initial_pose.yaml'
+                f'tb3_member_{member_domain}_initial_pose.yaml'
             )
             if auto:
                 # Let AMCL search the whole map instead of trusting a fixed
@@ -177,55 +177,13 @@ def generate_launch_description():
                 parameters=[nav2_params],
                 env=process_env,
             )
-        navigation = [
-            Node(
-                package='nav2_controller',
-                executable='controller_server',
-                name='controller_server',
-                output='screen',
-                parameters=[nav2_params],
-                env=process_env,
-            ),
-            Node(
-                package='nav2_planner',
-                executable='planner_server',
-                name='planner_server',
-                output='screen',
-                parameters=[nav2_params],
-                env=process_env,
-            ),
-            Node(
-                package='nav2_behaviors',
-                executable='behavior_server',
-                name='behavior_server',
-                output='screen',
-                parameters=[nav2_params],
-                env=process_env,
-            ),
-            Node(
-                package='nav2_bt_navigator',
-                executable='bt_navigator',
-                name='bt_navigator',
-                output='screen',
-                parameters=[nav2_params],
-                env=process_env,
-            ),
-        ]
-        navigation_lifecycle = Node(
-            package='nav2_lifecycle_manager',
-            executable='lifecycle_manager',
-            name='lifecycle_manager_navigation',
-            output='screen',
-            parameters=[nav2_params],
-            env=process_env,
-        )
 
         kickstart_node = None
         if amcl_enabled and auto:
             kickstart_node = Node(
                 package='tb3_fleet_bringup',
                 executable='global_localize_kickstart',
-                name='guard_global_localize',
+                name='member_global_localize',
                 output='screen',
                 parameters=[{
                     'spin_enabled': True,
@@ -237,42 +195,26 @@ def generate_launch_description():
                 env=process_env,
             )
 
-        goal_proxy = Node(
-            package='tb3_fleet_bringup',
-            executable='pose_to_nav2',
-            name='guard_coord_goal',
-            output='screen',
-            parameters=[{
-                'use_sim_time': False,
-                'goal_pose_topic': '/guard_goal_pose',
-            }],
-            env=process_env,
+        base = IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(base_launch),
+            launch_arguments={
+                'domain_id': str(member_domain),
+                'start_robot_bringup': start_robot_bringup.perform(context),
+                'nav2_params_file': nav2_params,
+                'goal_pose_topic': '/member_goal_pose',
+                'goal_proxy_name': 'member_coord_goal',
+                'nav_delay_sec': '8.0',
+                'lifecycle_delay_sec': '12.0',
+            }.items(),
         )
 
-        actions = []
-        if launch_bool(start_robot_bringup.perform(context)):
-            actions.append(IncludeLaunchDescription(
-                PythonLaunchDescriptionSource(robot_launch),
-                launch_arguments={
-                    'use_sim_time': 'false',
-                    'namespace': '',
-                }.items(),
-            ))
-
-        timing = (0.5, 1.0, 5.0, 5.5, 6.5, 8.0, 12.0)
-        (
-            bridge_t, relay_t, amcl_t, localization_t, kickstart_t,
-            nav_t, lifecycle_t,
-        ) = timing
-        actions.extend([
+        timing = (0.5, 1.0, 5.0, 5.5, 6.5)
+        bridge_t, relay_t, amcl_t, localization_t, kickstart_t = timing
+        actions = [
+            base,
             TimerAction(period=bridge_t, actions=bridges),
-            TimerAction(period=relay_t, actions=[map_relay, guard_pose]),
-            TimerAction(period=nav_t, actions=navigation),
-            TimerAction(
-                period=lifecycle_t,
-                actions=[navigation_lifecycle, goal_proxy],
-            ),
-        ])
+            TimerAction(period=relay_t, actions=[map_relay, member_pose]),
+        ]
         if amcl is not None:
             actions.append(TimerAction(period=amcl_t, actions=[amcl]))
         if localization_lifecycle is not None:
@@ -289,7 +231,7 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'domain_id',
             default_value=EnvironmentVariable('ROS_DOMAIN_ID', default_value='26'),
-            description='Guard DDS domain.',
+            description='Member DDS domain.',
         ),
         DeclareLaunchArgument(
             'main_domain_id',
@@ -302,9 +244,9 @@ def generate_launch_description():
             choices=['true', 'false'],
             description='Start TurtleBot3 hardware drivers.',
         ),
-        DeclareLaunchArgument('guard_initial_x', default_value='0.0'),
-        DeclareLaunchArgument('guard_initial_y', default_value='0.0'),
-        DeclareLaunchArgument('guard_initial_yaw', default_value='0.0'),
+        DeclareLaunchArgument('member_initial_x', default_value='0.0'),
+        DeclareLaunchArgument('member_initial_y', default_value='0.0'),
+        DeclareLaunchArgument('member_initial_yaw', default_value='0.0'),
         DeclareLaunchArgument(
             'enable_amcl',
             default_value='true',
@@ -323,7 +265,7 @@ def generate_launch_description():
             description=(
                 'Let AMCL search the whole map via '
                 'reinitialize_global_localization instead of trusting '
-                'guard_initial_x/y/yaw. Set false to fall back to the '
+                'member_initial_x/y/yaw. Set false to fall back to the '
                 'fixed seed.'
             ),
         ),

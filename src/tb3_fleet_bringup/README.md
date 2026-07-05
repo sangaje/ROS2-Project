@@ -2,10 +2,21 @@
 
 리더와 팔로워의 실기·시뮬레이션 스택은 각각 하나의 런치 파일을 사용한다.
 
-- `leader.launch.py`: Cartographer, Nav2, fleet coordinator
+- `base.launch.py`: 모든 실물 로봇 역할의 공통 뼈대 — 하드웨어 bringup +
+  Nav2 core(controller/planner/behavior/bt_navigator + lifecycle) +
+  goal_pose→NavigateToPose 프록시만 있다. Cartographer, AMCL,
+  domain_bridge는 일부러 안 들어있다 — 로컬라이제이션/브릿징 방식은
+  역할마다 다르므로 이 파일을 include하는 쪽이 그 위에 얹는다.
+- `member.launch.py`: `base.launch.py` + domain_bridge + AMCL. 리더도
+  팔로워도 되지 않고, 코디네이터가 보내는 짧은 회피/복귀 목적지만
+  실행하는 범용 fleet 멤버. `follower.launch.py`가 여기서 한 단계 더
+  나가는 개념이고, `leader.launch.py`는 로컬라이제이션 방식이 완전히
+  달라서(Cartographer, 브릿징 없음) `base.launch.py`만 직접 공유한다.
 - `follower.launch.py`: domain_bridge, AMCL, Nav2, fleet follower
-- `guard.launch.py`: domain_bridge, AMCL, Nav2. 리더도 팔로워도 되지 않고,
-  코디네이터가 보내는 짧은 회피/복귀 목적지만 실행하는 대기 로봇
+  (실물 모드는 내부적으로 `base.launch.py`를 사용, 시뮬레이션 모드는
+  기존처럼 자체 구성)
+- `leader.launch.py`: Cartographer, Nav2, fleet coordinator (실물 모드는
+  내부적으로 `base.launch.py`를 사용, 시뮬레이션 모드는 기존처럼 자체 구성)
 - `robot.launch.py`: 하드웨어 드라이버만 별도로 실행할 때 사용
 - `rviz.launch.py`: PC 시각화
 - `sim_world.launch.py`: Gazebo 월드와 두 로봇 모델만 실행
@@ -39,11 +50,11 @@ export ROS_DOMAIN_ID=25
 ros2 launch tb3_fleet_bringup follower.launch.py main_domain_id:=24
 ```
 
-가드(선택, 3번째 로봇):
+멤버(선택, 3번째 이상의 로봇):
 
 ```bash
 export ROS_DOMAIN_ID=26
-ros2 launch tb3_fleet_bringup guard.launch.py main_domain_id:=24
+ros2 launch tb3_fleet_bringup member.launch.py main_domain_id:=24
 ```
 
 하드웨어 드라이버를 이미 별도로 실행했다면 세 명령 모두에 다음 옵션만 추가한다.
@@ -54,8 +65,8 @@ start_robot_bringup:=false
 
 ## 초기 위치 자동 탐색 (`auto_localize`)
 
-`follower.launch.py`와 `guard.launch.py`는 기본적으로 `auto_localize:=true`다.
-매번 `follower_initial_x/y/yaw`(또는 `guard_initial_x/y/yaw`)로 고정된
+`follower.launch.py`와 `member.launch.py`는 기본적으로 `auto_localize:=true`다.
+매번 `follower_initial_x/y/yaw`(또는 `member_initial_x/y/yaw`)로 고정된
 위치를 AMCL에 강제로 심는 대신, localization 스택이 뜨면
 `global_localize_kickstart` 노드가 `/reinitialize_global_localization`을
 호출해 맵 전체에 파티클을 고르게 뿌리고, 실물 로봇을 짧게(기본 8초) 제자리
@@ -63,7 +74,17 @@ start_robot_bringup:=false
 
 고정 시드가 이미 정확히 맞는 상황이거나, 대칭적인 공간이라 자동 탐색이
 불안정하면 `auto_localize:=false`로 끄고 기존처럼 `follower_initial_x/y/yaw`
-(`guard_initial_x/y/yaw`)를 실측값으로 넣는다.
+(`member_initial_x/y/yaw`)를 실측값으로 넣는다.
+
+## AMCL을 끄는 옵션 (`enable_amcl`)
+
+`follower.launch.py`와 `member.launch.py` 둘 다 `enable_amcl`(기본 true)을
+받는다. AMCL은 이 스택이 기본으로 갖는 `map->odom` TF 소스다. 다른 무언가
+(예: 리스크맵 쪽 Cartographer)가 이 로봇의 SLAM/TF를 대신 갖게 하려면
+`enable_amcl:=false`로 꺼야 한다 — 켠 채로 다른 SLAM까지 띄우면 같은 TF를
+동시에 방송하게 된다. `enable_amcl:=false`면 AMCL, 그 lifecycle manager,
+`global_localize_kickstart`(AMCL 전용 서비스라 AMCL 없이는 의미가 없다)가
+전부 스킵된다.
 
 ## 시뮬레이션
 
@@ -93,6 +114,17 @@ ros2 launch tb3_fleet_bringup follower.launch.py \
 `start_robot_bringup`은 하드웨어 드라이버 실행 여부이고,
 `use_sim_time`은 Gazebo 시간과 가상 센서 relay 사용 여부다. 따라서 실물
 드라이버를 별도로 실행하는 경우에도 `use_sim_time`은 `false`로 유지한다.
+
+## 팔로워 없는 리더 (`require_follower_pose`)
+
+`leader.launch.py`의 코디네이터는 기본적으로(`require_follower_pose:=true`)
+`/leader_pose`와 `/burger_pose`(follower)가 둘 다 있어야 리더를 움직이게
+둔다 — follower가 아예 없는 fleet(예: 리더+멤버만 있는 구성)에서 이 기본값
+그대로 쓰면 `/burger_pose`가 영원히 안 들어오기 때문에 **리더가 첫 pose를
+받는 순간 그 자리에 정지 목적지를 박고 다시는 안 풀린다.** 실제로
+`follower.launch.py`를 쓰는 로봇이 이 fleet에 없다면 반드시
+`require_follower_pose:=false`로 꺼야 한다. 꺼도 멤버(`member.launch.py`)
+관련 회피/양보 로직은 완전히 별개 상태 머신이라 그대로 동작한다.
 
 ## 상호 회피
 
@@ -129,13 +161,23 @@ Waffle이 우선이다. follow 모드에서도 Waffle이 우선이며 Burger만 
 않은 채 회피 시간이 끝나면 원래 목적지를 재개하지 않고 안전 정지 상태를
 유지한다.
 
-## 가드 (guard)
+## 멤버 (member)
 
-가드는 위 leader/follower 우선권 로직과는 완전히 분리된, 별도의 작은 상태
-머신으로 동작한다. `/guard_pose`로 자기 위치만 보고하고, 리더나 팔로워 중
+멤버는 위 leader/follower 우선권 로직과는 완전히 분리된, 별도의 작은 상태
+머신으로 동작한다. `/member_pose`로 자기 위치만 보고하고, 리더나 팔로워 중
 하나가 가까워지거나(예측 충돌 포함) 접근하면 코디네이터가 `_yield_goal`과
-동일한 방식으로 짧은 회피 지점을 계산해 `/guard_goal_pose`로 보낸다. 가드는
+동일한 방식으로 짧은 회피 지점을 계산해 `/member_goal_pose`로 보낸다. 멤버는
 스스로 목적지를 만들지 않으므로, 위협이 사라지면 회피 직전에 서 있던
-자리로 그대로 복귀한다. 가드가 없거나 `/guard_pose`가 들어오지 않으면 이
+자리로 그대로 복귀한다. 멤버가 없거나 `/member_pose`가 들어오지 않으면 이
 로직은 완전히 비활성 상태이며 기존 leader/follower 동작에는 아무 영향도
 주지 않는다.
+
+## `/map` 페일오버 (`map_relay`)
+
+`follower.launch.py`/`member.launch.py`의 `map_relay`는 더 이상 브릿지된
+맵을 무조건 재발행하지 않는다. `count_publishers()`로 `/map`에 자기 말고
+다른 발행자(예: 리스크맵 Cartographer, `enable_amcl:=false` 조합일 때)가
+있는지 계속 확인해서, 있으면 조용히 대기하고 `takeover_grace_sec`(기본
+2초) 이상 사라지면 그때만 넘겨받는다. 이어받을 때는 Cartographer가
+마지막으로 냈던 맵을 우선 이어가고, 그런 적이 없으면 브릿지된 리더 맵으로
+대체한다. 원래 발행자가 돌아오면 즉시 다시 조용해진다.
