@@ -358,12 +358,21 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /initialpose
     - Class: rviz_default_plugins/SetGoal
+      Name: Waffle Goal
       Topic:
         Depth: 10
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /goal_pose
+    - Class: rviz_default_plugins/SetGoal
+      Name: Burger Goal
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /burger_user_goal
   Transformation:
     Current:
       Class: rviz_default_plugins/TF

@@ -80,11 +80,23 @@ ros2 launch tb3_fleet_bringup follower.launch.py \
 `/cmd_vel` 제어 모두 같은 방식으로 감지된다. Nav2 path의 끝점은 회피 후
 원래 목적지를 복구하는 용도로만 사용한다.
 
+- `/goal_pose`: Waffle의 사용자 목적지
+- `/burger_user_goal`: Burger의 사용자 목적지
+- `/fleet/leader_coord_goal`: 코디네이터가 Nav2에 전달하는 Waffle 목적지
+- `/burger_goal_pose`: 코디네이터가 Nav2에 전달하는 Burger 목적지
 - `/fleet/robot_poses`: `[leader, follower]` 순서의 실시간 위치
 - `/fleet/collision_warning`: 현재 또는 예측 충돌 위험
 - `/fleet/hazard_pose`: 예상 충돌 지점
 - `/fleet/coordination_status`: 회피 상태와 통행 우선권
 
+사용자 목적지는 코디네이터에 보존되므로 회피 목적지가 잠시 Nav2를
+선점해도 회피가 끝난 뒤 최신 사용자 목적지로 복귀한다. Nav2 액션 서버가
+아직 준비되지 않았거나 재시작 중이어도 최신 목적지는 폐기하지 않고
+준비될 때까지 재시도한다.
+
 이 안전 토픽은 leader domain에서 각 follower domain으로 브릿지된다.
 충돌 시 두 로봇은 서로 반대 회피 위치로 이동하고, follow 모드가 아닐
-때는 예상 충돌 지점 도착 시간에 따라 Burger도 통행 우선권을 가질 수 있다.
+때는 실제 이동 속도에 따라 Burger도 통행 우선권을 가질 수 있다.
+두 로봇 중 하나의 위치가 1.5초 이상 갱신되지 않거나 안전거리가 확보되지
+않은 채 회피 시간이 끝나면 원래 목적지를 재개하지 않고 안전 정지 상태를
+유지한다.

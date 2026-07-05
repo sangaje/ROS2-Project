@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from functools import partial
 from typing import Optional, Tuple
 
 import rclpy
@@ -97,6 +98,7 @@ class FleetFollower(Node):
         self.leader_pose: Optional[PoseStamped] = None
         self.follower_pose: Optional[PoseStamped] = None
         self.active_goal_handle = None
+        self.active_goal_id = 0
         self.last_goal_xy: Optional[Point2] = None
         self.last_goal_time = -1.0e9
         self.wait_log_time = -1.0e9
@@ -196,6 +198,7 @@ class FleetFollower(Node):
     def _cancel_goal(self, reason: str) -> None:
         handle = self.active_goal_handle
         self.active_goal_handle = None
+        self.active_goal_id = 0
         if handle is None:
             return
         try:
@@ -302,10 +305,13 @@ class FleetFollower(Node):
         )
         self.last_goal_time = self._now()
         self.goal_count += 1
+        goal_id = self.goal_count
         future = self.navigation_client.send_goal_async(goal)
-        future.add_done_callback(self._goal_response_callback)
+        future.add_done_callback(
+            partial(self._goal_response_callback, goal_id=goal_id)
+        )
 
-    def _goal_response_callback(self, future) -> None:
+    def _goal_response_callback(self, future, goal_id: int) -> None:
         try:
             handle = future.result()
         except Exception as error:
@@ -314,13 +320,26 @@ class FleetFollower(Node):
         if not handle.accepted:
             self.get_logger().warning('FOLLOW_GOAL_REJECTED')
             return
-        if not self.follow_enabled:
+        if not self.follow_enabled or goal_id != self.goal_count:
             handle.cancel_goal_async()
             return
         self.active_goal_handle = handle
+        self.active_goal_id = goal_id
+        handle.get_result_async().add_done_callback(
+            partial(self._goal_result_callback, goal_id=goal_id)
+        )
         self.get_logger().info(
             f'FOLLOW_GOAL_ACCEPTED | count={self.goal_count}'
         )
+
+    def _goal_result_callback(self, future, goal_id: int) -> None:
+        try:
+            future.result()
+        except Exception as error:
+            self.get_logger().warning(f'FOLLOW_GOAL_RESULT_ERROR | {error}')
+        if goal_id == self.active_goal_id:
+            self.active_goal_handle = None
+            self.active_goal_id = 0
 
 
 def main() -> None:

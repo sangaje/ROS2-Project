@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import rclpy
 from geometry_msgs.msg import PoseArray, PoseStamped
@@ -56,26 +55,6 @@ def quaternion_from_yaw(yaw: float):
     return 0.0, 0.0, math.sin(half), math.cos(half)
 
 
-@dataclass
-class PathSample:
-    x: float
-    y: float
-    tx: float
-    ty: float
-    along: float
-
-
-@dataclass
-class Conflict:
-    x: float
-    y: float
-    leader_tangent: Point2
-    follower_tangent: Point2
-    path_distance: float
-    leader_eta: float
-    follower_eta: float
-
-
 class FleetPathCoordinator(Node):
     """Coordinate reciprocal avoidance for the Waffle and Burger.
 
@@ -88,7 +67,6 @@ class FleetPathCoordinator(Node):
     IDLE = 'IDLE'
     CLEARING = 'CLEARING'
     PRIORITY_PASS = 'PRIORITY_PASS'
-    ESCAPING = 'ESCAPING'
     BLOCKED = 'BLOCKED'
     COOLDOWN = 'COOLDOWN'
 
@@ -105,6 +83,7 @@ class FleetPathCoordinator(Node):
         self.declare_parameter('map_topic', '/map')
         self.declare_parameter('leader_user_goal_topic', '/goal_pose')
         self.declare_parameter('leader_named_goal_topic', '/waffle_goal_pose')
+        self.declare_parameter('follower_user_goal_topic', '/burger_user_goal')
         self.declare_parameter(
             'leader_coord_goal_topic', '/fleet/leader_coord_goal'
         )
@@ -121,14 +100,7 @@ class FleetPathCoordinator(Node):
         self.declare_parameter('marker_topic', '/fleet/coordination_markers')
 
         self.declare_parameter('check_period_sec', 0.30)
-        self.declare_parameter('path_stale_sec', 4.0)
-        self.declare_parameter('lookahead_distance_m', 3.5)
-        self.declare_parameter('sample_step_m', 0.10)
-        self.declare_parameter('conflict_distance_m', 0.50)
-        self.declare_parameter('conflict_time_window_sec', 4.0)
-        self.declare_parameter('same_direction_cosine', 0.72)
-        self.declare_parameter('leader_nominal_speed_mps', 0.18)
-        self.declare_parameter('follower_nominal_speed_mps', 0.18)
+        self.declare_parameter('pose_stale_sec', 1.5)
         self.declare_parameter('minimum_robot_separation_m', 0.48)
 
         self.declare_parameter('evasion_offset_m', 0.42)
@@ -139,15 +111,13 @@ class FleetPathCoordinator(Node):
         self.declare_parameter('allow_unknown_evasion', False)
         self.declare_parameter('evasion_reached_radius_m', 0.23)
         self.declare_parameter('clearing_timeout_sec', 7.0)
-        self.declare_parameter('pass_distance_m', 0.65)
         self.declare_parameter('pass_timeout_sec', 14.0)
-        self.declare_parameter('escape_timeout_sec', 7.0)
         self.declare_parameter('cooldown_sec', 4.0)
-        self.declare_parameter('priority_eta_margin_sec', 0.8)
-        self.declare_parameter('motion_speed_threshold_mps', 0.04)
+        self.declare_parameter('motion_speed_threshold_mps', 0.055)
         self.declare_parameter('motion_trigger_distance_m', 0.90)
         self.declare_parameter('motion_prediction_horizon_sec', 2.5)
         self.declare_parameter('motion_predicted_clearance_m', 0.62)
+        self.declare_parameter('risk_confirmation_cycles', 2)
 
         get = self.get_parameter
         self.leader_pose_topic = str(get('leader_pose_topic').value)
@@ -158,6 +128,9 @@ class FleetPathCoordinator(Node):
         self.leader_user_goal_topic = str(get('leader_user_goal_topic').value)
         self.leader_named_goal_topic = str(
             get('leader_named_goal_topic').value
+        )
+        self.follower_user_goal_topic = str(
+            get('follower_user_goal_topic').value
         )
         self.leader_coord_goal_topic = str(
             get('leader_coord_goal_topic').value
@@ -175,24 +148,7 @@ class FleetPathCoordinator(Node):
         self.marker_topic = str(get('marker_topic').value)
 
         self.check_period = max(0.1, float(get('check_period_sec').value))
-        self.path_stale = max(0.5, float(get('path_stale_sec').value))
-        self.lookahead = max(0.8, float(get('lookahead_distance_m').value))
-        self.sample_step = max(0.05, float(get('sample_step_m').value))
-        self.conflict_distance = max(
-            0.30, float(get('conflict_distance_m').value)
-        )
-        self.conflict_time_window = max(
-            0.5, float(get('conflict_time_window_sec').value)
-        )
-        self.same_direction_cosine = float(
-            get('same_direction_cosine').value
-        )
-        self.leader_speed = max(
-            0.05, float(get('leader_nominal_speed_mps').value)
-        )
-        self.follower_speed = max(
-            0.05, float(get('follower_nominal_speed_mps').value)
-        )
+        self.pose_stale = max(0.5, float(get('pose_stale_sec').value))
         self.minimum_separation = max(
             0.35, float(get('minimum_robot_separation_m').value)
         )
@@ -218,15 +174,8 @@ class FleetPathCoordinator(Node):
         self.clearing_timeout = max(
             2.0, float(get('clearing_timeout_sec').value)
         )
-        self.pass_distance = max(0.35, float(get('pass_distance_m').value))
         self.pass_timeout = max(4.0, float(get('pass_timeout_sec').value))
-        self.escape_timeout = max(
-            2.0, float(get('escape_timeout_sec').value)
-        )
         self.cooldown_sec = max(1.0, float(get('cooldown_sec').value))
-        self.priority_eta_margin = max(
-            0.0, float(get('priority_eta_margin_sec').value)
-        )
         self.motion_speed_threshold = max(
             0.01, float(get('motion_speed_threshold_mps').value)
         )
@@ -241,20 +190,24 @@ class FleetPathCoordinator(Node):
             self.minimum_separation,
             float(get('motion_predicted_clearance_m').value),
         )
+        self.risk_confirmation_cycles = max(
+            1, int(get('risk_confirmation_cycles').value)
+        )
 
         self.leader_pose: Optional[PoseStamped] = None
         self.follower_pose: Optional[PoseStamped] = None
+        self.leader_pose_time = -1.0e9
+        self.follower_pose_time = -1.0e9
         self.leader_path: Optional[Path] = None
         self.follower_path: Optional[Path] = None
         self.map_msg: Optional[OccupancyGrid] = None
-        self.leader_path_time = -1.0e9
-        self.follower_path_time = -1.0e9
         self.follower_follow_enabled: Optional[bool] = None
         self.leader_velocity: Point2 = (0.0, 0.0)
         self.follower_velocity: Point2 = (0.0, 0.0)
         self.leader_motion_sample: Optional[Tuple[float, Point2]] = None
         self.follower_motion_sample: Optional[Tuple[float, Point2]] = None
         self.collision_warning = False
+        self.risk_observation_count = 0
 
         self.state = self.IDLE
         self.state_since = self._now()
@@ -262,15 +215,23 @@ class FleetPathCoordinator(Node):
         self.last_status = ''
         self.last_command_time = -1.0e9
         self.last_evasion_publish = -1.0e9
+        self.last_pose_warning_log = -1.0e9
         self.last_priority = self.FOLLOWER
+        self.leader_goal_subscription_count = 0
+        self.follower_goal_subscription_count = 0
 
-        self.active_conflict: Optional[Conflict] = None
         self.priority_robot: Optional[str] = None
         self.leader_evasion_goal: Optional[PoseStamped] = None
         self.follower_evasion_goal: Optional[PoseStamped] = None
         self.leader_resume_goal: Optional[PoseStamped] = None
         self.follower_resume_goal: Optional[PoseStamped] = None
+        self.leader_user_goal: Optional[PoseStamped] = None
+        self.follower_user_goal: Optional[PoseStamped] = None
         self.follower_was_following = True
+        self.follower_desired_following = True
+        self.pose_hold_active = False
+        self.leader_hold_sent = False
+        self.follower_hold_sent = False
         self.release_separation = self.motion_trigger_distance + 0.25
 
         map_qos = QoSProfile(
@@ -310,6 +271,12 @@ class FleetPathCoordinator(Node):
             PoseStamped,
             self.leader_named_goal_topic,
             self._leader_goal_cb,
+            10,
+        )
+        self.create_subscription(
+            PoseStamped,
+            self.follower_user_goal_topic,
+            self._follower_goal_cb,
             10,
         )
         self.create_subscription(
@@ -383,6 +350,7 @@ class FleetPathCoordinator(Node):
 
     def _leader_pose_cb(self, message: PoseStamped) -> None:
         self.leader_pose = message
+        self.leader_pose_time = self._now()
         self.leader_velocity, self.leader_motion_sample = self._update_velocity(
             self.leader_velocity,
             self.leader_motion_sample,
@@ -391,6 +359,7 @@ class FleetPathCoordinator(Node):
 
     def _follower_pose_cb(self, message: PoseStamped) -> None:
         self.follower_pose = message
+        self.follower_pose_time = self._now()
         (
             self.follower_velocity,
             self.follower_motion_sample,
@@ -420,7 +389,7 @@ class FleetPathCoordinator(Node):
         )
         # Low-pass filtering rejects AMCL/SLAM pose jitter while retaining
         # teleoperation motion quickly enough for a 2.5 second prediction.
-        alpha = 0.45
+        alpha = 0.30
         velocity = (
             alpha * measured[0] + (1.0 - alpha) * previous_velocity[0],
             alpha * measured[1] + (1.0 - alpha) * previous_velocity[1],
@@ -432,128 +401,52 @@ class FleetPathCoordinator(Node):
     def _leader_path_cb(self, message: Path) -> None:
         if len(message.poses) >= 2:
             self.leader_path = message
-            self.leader_path_time = self._now()
 
     def _follower_path_cb(self, message: Path) -> None:
         if len(message.poses) >= 2:
             self.follower_path = message
-            self.follower_path_time = self._now()
 
     def _map_cb(self, message: OccupancyGrid) -> None:
         self.map_msg = message
 
     def _leader_goal_cb(self, message: PoseStamped) -> None:
+        self.leader_user_goal = self._copy_goal(message)
         if self.state in (self.IDLE, self.COOLDOWN):
+            self._publish_goal(self.leader_goal_pub, self.leader_user_goal)
+        else:
             self.leader_resume_goal = self._copy_goal(message)
+
+    def _follower_goal_cb(self, message: PoseStamped) -> None:
+        self.follower_user_goal = self._copy_goal(message)
+        self.follower_desired_following = False
+        if self.state in (self.IDLE, self.COOLDOWN):
+            self.follower_follow_enabled = False
+            self._publish_follow_command('PAUSE', force=True)
+            self._publish_goal(self.follower_goal_pub, self.follower_user_goal)
+        else:
+            self.follower_was_following = False
+            self.follower_resume_goal = self._copy_goal(message)
 
     def _follower_status_cb(self, message: Bool) -> None:
         self.follower_follow_enabled = bool(message.data)
+        if self.state == self.IDLE and not self.pose_hold_active:
+            self.follower_desired_following = bool(message.data)
+            # PAUSE and a named Burger goal cross DDS as different topics, so
+            # ordering is not guaranteed. Reassert the independent goal only
+            # after the follower confirms that follow-mode actions are stopped.
+            if (
+                not message.data
+                and self.follower_user_goal is not None
+            ):
+                self._publish_goal(
+                    self.follower_goal_pub,
+                    self.follower_user_goal,
+                )
 
     def _path_endpoint(self, path: Optional[Path]) -> Optional[PoseStamped]:
         if path is None or not path.poses:
             return None
         return self._copy_goal(path.poses[-1])
-
-    def _samples(self, path: Path, pose: PoseStamped) -> List[PathSample]:
-        raw = [(item.pose.position.x, item.pose.position.y) for item in path.poses]
-        if len(raw) < 2:
-            return []
-        robot = self._xy(pose)
-        start = min(
-            range(len(raw)),
-            key=lambda index: distance(raw[index], robot),
-        )
-        samples: List[PathSample] = []
-        along = 0.0
-        next_sample = 0.0
-        for index in range(start, len(raw)):
-            if index > start:
-                along += distance(raw[index - 1], raw[index])
-            if along > self.lookahead:
-                break
-            if along + 1.0e-9 < next_sample and index < len(raw) - 1:
-                continue
-            previous = max(start, index - 1)
-            following = min(len(raw) - 1, index + 1)
-            tangent = normalize((
-                raw[following][0] - raw[previous][0],
-                raw[following][1] - raw[previous][1],
-            ))
-            samples.append(PathSample(
-                raw[index][0],
-                raw[index][1],
-                tangent[0],
-                tangent[1],
-                along,
-            ))
-            next_sample = along + self.sample_step
-        return samples
-
-    def _find_conflict(self) -> Optional[Conflict]:
-        if (
-            self.leader_pose is None
-            or self.follower_pose is None
-            or self.leader_path is None
-            or self.follower_path is None
-        ):
-            return None
-        now = self._now()
-        if (
-            now - self.leader_path_time > self.path_stale
-            or now - self.follower_path_time > self.path_stale
-        ):
-            return None
-
-        best = None
-        leader_samples = self._samples(self.leader_path, self.leader_pose)
-        follower_samples = self._samples(
-            self.follower_path, self.follower_pose
-        )
-        for leader in leader_samples:
-            for follower in follower_samples:
-                spatial = math.hypot(
-                    leader.x - follower.x,
-                    leader.y - follower.y,
-                )
-                if spatial > self.conflict_distance:
-                    continue
-                direction_dot = (
-                    leader.tx * follower.tx + leader.ty * follower.ty
-                )
-                if direction_dot >= self.same_direction_cosine:
-                    continue
-                leader_eta = leader.along / self.leader_speed
-                follower_eta = follower.along / self.follower_speed
-                eta_delta = abs(leader_eta - follower_eta)
-                if eta_delta > self.conflict_time_window:
-                    continue
-                score = (
-                    spatial
-                    + 0.08 * eta_delta
-                    + 0.01 * (leader.along + follower.along)
-                )
-                item = (
-                    score,
-                    leader,
-                    follower,
-                    spatial,
-                    leader_eta,
-                    follower_eta,
-                )
-                if best is None or score < best[0]:
-                    best = item
-        if best is None:
-            return None
-        _, leader, follower, spatial, leader_eta, follower_eta = best
-        return Conflict(
-            x=0.5 * (leader.x + follower.x),
-            y=0.5 * (leader.y + follower.y),
-            leader_tangent=(leader.tx, leader.ty),
-            follower_tangent=(follower.tx, follower.ty),
-            path_distance=spatial,
-            leader_eta=leader_eta,
-            follower_eta=follower_eta,
-        )
 
     def _world_to_map(self, x: float, y: float) -> Optional[Tuple[int, int]]:
         if self.map_msg is None:
@@ -779,30 +672,6 @@ class FleetPathCoordinator(Node):
         )
         return leader_goal, follower_goal
 
-    def _choose_priority(self, conflict: Conflict) -> str:
-        # Follow mode is intentionally leader-centric. Independent Burger
-        # navigation is symmetric and uses ETA with alternating tie-breaks.
-        if self.follower_was_following:
-            priority = self.LEADER
-        elif (
-            conflict.leader_eta + self.priority_eta_margin
-            < conflict.follower_eta
-        ):
-            priority = self.LEADER
-        elif (
-            conflict.follower_eta + self.priority_eta_margin
-            < conflict.leader_eta
-        ):
-            priority = self.FOLLOWER
-        else:
-            priority = (
-                self.FOLLOWER
-                if self.last_priority == self.LEADER
-                else self.LEADER
-            )
-        self.last_priority = priority
-        return priority
-
     def _choose_motion_priority(self) -> str:
         if self.follower_was_following:
             priority = self.LEADER
@@ -901,6 +770,10 @@ class FleetPathCoordinator(Node):
             relative_position[1] + closest_time * relative_velocity[1],
         )
         closest_distance = math.hypot(*closest_vector)
+        closing_speed = -(
+            relative_position[0] * relative_velocity[0]
+            + relative_position[1] * relative_velocity[1]
+        ) / max(current_distance, 1.0e-6)
 
         # Normal leader-following at the configured 0.70 m spacing must not
         # look like a teleoperation hazard.
@@ -922,12 +795,23 @@ class FleetPathCoordinator(Node):
         if same_direction_following:
             return False, closest_distance, closest_time
 
-        immediate = current_distance < self.motion_trigger_distance
+        emergency = current_distance < self.minimum_separation + 0.08
+        near_motion = current_distance < max(
+            self.minimum_separation + 0.20, 0.72
+        )
+        approaching = (
+            current_distance < self.motion_trigger_distance
+            and closing_speed > 0.02
+        )
         predicted = (
             closest_time > 0.05
             and closest_distance < self.motion_predicted_clearance
         )
-        return immediate or predicted, closest_distance, closest_time
+        return (
+            emergency or near_motion or approaching or predicted,
+            closest_distance,
+            closest_time,
+        )
 
     def _publish_follow_command(
         self,
@@ -948,6 +832,74 @@ class FleetPathCoordinator(Node):
             return
         goal.header.stamp = rclpy.time.Time().to_msg()
         publisher.publish(goal)
+
+    def _republish_goals_to_new_consumers(self) -> None:
+        leader_count = self.leader_goal_pub.get_subscription_count()
+        follower_count = self.follower_goal_pub.get_subscription_count()
+        if (
+            leader_count > 0
+            and self.leader_goal_subscription_count == 0
+            and self.state in (self.IDLE, self.COOLDOWN)
+        ):
+            self._publish_goal(self.leader_goal_pub, self.leader_user_goal)
+        if (
+            follower_count > 0
+            and self.follower_goal_subscription_count == 0
+            and self.state in (self.IDLE, self.COOLDOWN)
+            and not self.follower_desired_following
+        ):
+            self._publish_goal(self.follower_goal_pub, self.follower_user_goal)
+        self.leader_goal_subscription_count = leader_count
+        self.follower_goal_subscription_count = follower_count
+
+    def _hold_for_missing_pose(self) -> None:
+        self._publish_follow_command('PAUSE')
+        if not self.pose_hold_active:
+            self.pose_hold_active = True
+            self.leader_hold_sent = False
+            self.follower_hold_sent = False
+        # A goal at the last known pose preempts outstanding Nav2 motion while
+        # retaining the real user goal in leader/follower_user_goal.
+        if self.leader_pose is not None and not self.leader_hold_sent:
+            self._publish_goal(self.leader_goal_pub, self.leader_pose)
+            self.leader_hold_sent = True
+        if self.follower_pose is not None and not self.follower_hold_sent:
+            self._publish_goal(self.follower_goal_pub, self.follower_pose)
+            self.follower_hold_sent = True
+
+    def _resume_after_pose_hold(self) -> None:
+        if not self.pose_hold_active:
+            return
+        self.pose_hold_active = False
+        self.leader_hold_sent = False
+        self.follower_hold_sent = False
+        if self.state in (self.IDLE, self.COOLDOWN):
+            self._publish_goal(self.leader_goal_pub, self.leader_user_goal)
+            if self.follower_desired_following:
+                self._publish_follow_command('RESUME', force=True)
+            else:
+                self._publish_goal(
+                    self.follower_goal_pub,
+                    self.follower_user_goal,
+                )
+            return
+
+        if self.state in (self.CLEARING, self.BLOCKED):
+            self._publish_evasion_goals(force=True)
+            return
+
+        if self.state == self.PRIORITY_PASS:
+            self._publish_evasion_goals(force=True)
+            if self.priority_robot == self.LEADER:
+                self._publish_goal(
+                    self.leader_goal_pub,
+                    self.leader_resume_goal,
+                )
+            elif self.priority_robot == self.FOLLOWER:
+                self._publish_goal(
+                    self.follower_goal_pub,
+                    self.follower_resume_goal,
+                )
 
     def _publish_evasion_goals(self, *, force: bool = False) -> None:
         now = self._now()
@@ -971,45 +923,20 @@ class FleetPathCoordinator(Node):
 
     def _capture_resume_goals(self) -> None:
         self.leader_resume_goal = (
-            self.leader_resume_goal
-            or self._path_endpoint(self.leader_path)
+            self._copy_goal(self.leader_user_goal)
+            if self.leader_user_goal is not None
+            else self._path_endpoint(self.leader_path)
         )
-        self.follower_resume_goal = self._path_endpoint(self.follower_path)
+        self.follower_resume_goal = (
+            self._copy_goal(self.follower_user_goal)
+            if self.follower_user_goal is not None
+            else self._path_endpoint(self.follower_path)
+        )
         self.follower_was_following = (
-            self.follower_follow_enabled is not False
-        )
-
-    def _begin_conflict(self, conflict: Conflict) -> None:
-        self.active_conflict = conflict
-        self._capture_resume_goals()
-        self.priority_robot = self._choose_priority(conflict)
-        (
-            self.leader_evasion_goal,
-            self.follower_evasion_goal,
-        ) = self._reciprocal_goals(
-            conflict.leader_tangent,
-            conflict.follower_tangent,
-        )
-        self._publish_follow_command('PAUSE', force=True)
-        if (
-            self.leader_evasion_goal is None
-            or self.follower_evasion_goal is None
-        ):
-            self._set_state(
-                self.BLOCKED,
-                'no unoccupied reciprocal maneuver is available',
-            )
-            return
-        self._publish_evasion_goals(force=True)
-        self._set_state(
-            self.CLEARING,
-            f'priority={self.priority_robot} '
-            f'conflict=({conflict.x:.2f},{conflict.y:.2f}) '
-            f'eta=({conflict.leader_eta:.1f},{conflict.follower_eta:.1f})',
+            self.follower_desired_following
         )
 
     def _begin_escape(self, reason: str = 'proximity') -> None:
-        self.active_conflict = None
         self._capture_resume_goals()
         self.priority_robot = self._choose_motion_priority()
         current_separation = distance(
@@ -1066,31 +993,12 @@ class FleetPathCoordinator(Node):
     def _priority_passed(self) -> bool:
         if self.leader_pose is None or self.follower_pose is None:
             return False
-        if self.active_conflict is None:
-            separation = distance(
-                self._xy(self.leader_pose),
-                self._xy(self.follower_pose),
-            )
-            motion_risk, _, _ = self._motion_risk()
-            return separation >= self.release_separation and not motion_risk
-        if self.priority_robot == self.LEADER:
-            pose = self.leader_pose
-            tangent = self.active_conflict.leader_tangent
-        else:
-            pose = self.follower_pose
-            tangent = self.active_conflict.follower_tangent
-        if pose is None:
-            return False
-        position = self._xy(pose)
-        displacement = (
-            position[0] - self.active_conflict.x,
-            position[1] - self.active_conflict.y,
+        separation = distance(
+            self._xy(self.leader_pose),
+            self._xy(self.follower_pose),
         )
-        return (
-            displacement[0] * tangent[0]
-            + displacement[1] * tangent[1]
-            >= self.pass_distance
-        )
+        motion_risk, _, _ = self._motion_risk()
+        return separation >= self.release_separation and not motion_risk
 
     def _release_priority(self) -> None:
         if self.priority_robot == self.LEADER:
@@ -1135,7 +1043,6 @@ class FleetPathCoordinator(Node):
                     self.follower_resume_goal,
                 )
 
-        self.active_conflict = None
         self.priority_robot = None
         self.leader_evasion_goal = None
         self.follower_evasion_goal = None
@@ -1154,27 +1061,6 @@ class FleetPathCoordinator(Node):
         clear.header.stamp = self.get_clock().now().to_msg()
         clear.action = Marker.DELETEALL
         message.markers.append(clear)
-
-        if self.active_conflict is not None:
-            conflict = Marker()
-            conflict.header.frame_id = 'map'
-            conflict.header.stamp = self.get_clock().now().to_msg()
-            conflict.ns = 'fleet_conflict'
-            conflict.id = 0
-            conflict.type = Marker.SPHERE
-            conflict.action = Marker.ADD
-            conflict.pose.position.x = self.active_conflict.x
-            conflict.pose.position.y = self.active_conflict.y
-            conflict.pose.orientation.w = 1.0
-            conflict.scale.x = conflict.scale.y = (
-                2.0 * self.conflict_distance
-            )
-            conflict.scale.z = 0.08
-            conflict.color.r = 1.0
-            conflict.color.g = 0.1
-            conflict.color.b = 0.1
-            conflict.color.a = 0.55
-            message.markers.append(conflict)
 
         goals = (
             (self.leader_evasion_goal, (0.1, 0.4, 1.0)),
@@ -1199,6 +1085,11 @@ class FleetPathCoordinator(Node):
         self.marker_pub.publish(message)
 
     def _publish_safety_state(self, warning: bool) -> None:
+        warning_message = Bool()
+        warning_message.data = warning
+        self.warning_pub.publish(warning_message)
+        self.collision_warning = warning
+
         if self.leader_pose is None or self.follower_pose is None:
             return
         poses = PoseArray()
@@ -1208,56 +1099,91 @@ class FleetPathCoordinator(Node):
         poses.poses = [self.leader_pose.pose, self.follower_pose.pose]
         self.robot_poses_pub.publish(poses)
 
-        warning_message = Bool()
-        warning_message.data = warning
-        self.warning_pub.publish(warning_message)
-        self.collision_warning = warning
-
         if warning:
             hazard = PoseStamped()
             hazard.header.frame_id = 'map'
             hazard.header.stamp = poses.header.stamp
-            if self.active_conflict is not None:
-                hazard.pose.position.x = self.active_conflict.x
-                hazard.pose.position.y = self.active_conflict.y
-            else:
-                hazard.pose.position.x = 0.5 * (
-                    self.leader_pose.pose.position.x
-                    + self.follower_pose.pose.position.x
-                )
-                hazard.pose.position.y = 0.5 * (
-                    self.leader_pose.pose.position.y
-                    + self.follower_pose.pose.position.y
-                )
+            hazard.pose.position.x = 0.5 * (
+                self.leader_pose.pose.position.x
+                + self.follower_pose.pose.position.x
+            )
+            hazard.pose.position.y = 0.5 * (
+                self.leader_pose.pose.position.y
+                + self.follower_pose.pose.position.y
+            )
             hazard.pose.orientation.w = 1.0
             self.hazard_pose_pub.publish(hazard)
 
     def _tick(self) -> None:
         if self.leader_pose is None or self.follower_pose is None:
+            self._hold_for_missing_pose()
+            self._publish_safety_state(True)
             return
         now = self._now()
+        if (
+            now - self.leader_pose_time > self.pose_stale
+            or now - self.follower_pose_time > self.pose_stale
+        ):
+            self._hold_for_missing_pose()
+            self._publish_safety_state(True)
+            if now - self.last_pose_warning_log >= 5.0:
+                self.get_logger().error(
+                    'FLEET_SAFETY_POSE_STALE | motion held until both '
+                    'robot poses are fresh'
+                )
+                self.last_pose_warning_log = now
+            return
+
+        self._resume_after_pose_hold()
         separation = distance(
             self._xy(self.leader_pose),
             self._xy(self.follower_pose),
         )
+        self._republish_goals_to_new_consumers()
 
         if self.state == self.COOLDOWN:
-            if now >= self.cooldown_until:
+            motion_risk, closest_distance, closest_time = self._motion_risk()
+            if motion_risk:
+                self.risk_observation_count += 1
+            else:
+                self.risk_observation_count = 0
+            emergency = separation < self.minimum_separation
+            if emergency or (
+                motion_risk
+                and self.risk_observation_count
+                >= self.risk_confirmation_cycles
+            ):
+                self.risk_observation_count = 0
+                self._begin_escape(
+                    'risk returned during cooldown '
+                    f'closest={closest_distance:.2f}m '
+                    f'in={closest_time:.1f}s'
+                )
+            elif now >= self.cooldown_until:
                 self._set_state(self.IDLE, 'ready')
-            self._publish_safety_state(False)
-            self._publish_markers()
-            return
+            else:
+                self._publish_safety_state(False)
+                self._publish_markers()
+                return
 
         if self.state == self.IDLE:
             motion_risk, closest_distance, closest_time = self._motion_risk()
             if motion_risk:
+                self.risk_observation_count += 1
+            else:
+                self.risk_observation_count = 0
+            emergency = separation < self.minimum_separation
+            if emergency or (
+                motion_risk
+                and self.risk_observation_count
+                >= self.risk_confirmation_cycles
+            ):
+                self.risk_observation_count = 0
                 self._begin_escape(
                     'motion risk '
                     f'closest={closest_distance:.2f}m '
                     f'in={closest_time:.1f}s'
                 )
-            elif separation < self.minimum_separation:
-                self._begin_escape('minimum separation violation')
 
         elif self.state == self.CLEARING:
             self._publish_follow_command('PAUSE')
@@ -1268,41 +1194,38 @@ class FleetPathCoordinator(Node):
             follower_ready = self._goal_reached(
                 self.follower_pose, self.follower_evasion_goal
             )
-            if (
-                (leader_ready and follower_ready)
-                or now - self.state_since >= self.clearing_timeout
-            ):
+            if leader_ready and follower_ready:
                 self._release_priority()
+            elif now - self.state_since >= self.clearing_timeout:
+                motion_risk, _, _ = self._motion_risk()
+                if (
+                    separation >= self.minimum_separation + 0.20
+                    and not motion_risk
+                ):
+                    self._release_priority()
+                else:
+                    self._set_state(
+                        self.BLOCKED,
+                        'clearing timeout while separation is still unsafe',
+                    )
 
         elif self.state == self.PRIORITY_PASS:
             self._publish_follow_command('PAUSE')
-            if (
-                self._priority_passed()
-                or now - self.state_since >= self.pass_timeout
-            ):
+            if self._priority_passed():
                 self._restore_after_maneuver()
-
-        elif self.state == self.ESCAPING:
-            self._publish_follow_command('PAUSE')
-            self._publish_evasion_goals()
-            both_ready = (
-                self._goal_reached(
-                    self.leader_pose, self.leader_evasion_goal
+            elif now - self.state_since >= self.pass_timeout:
+                self._set_state(
+                    self.BLOCKED,
+                    'priority pass timeout while separation is still unsafe',
                 )
-                and self._goal_reached(
-                    self.follower_pose, self.follower_evasion_goal
-                )
-            )
-            if (
-                both_ready
-                or separation >= self.minimum_separation + 0.18
-                or now - self.state_since >= self.escape_timeout
-            ):
-                self._restore_after_maneuver()
 
         elif self.state == self.BLOCKED:
             self._publish_follow_command('PAUSE')
-            if separation >= self.minimum_separation + 0.18:
+            motion_risk, _, _ = self._motion_risk()
+            if (
+                separation >= self.minimum_separation + 0.20
+                and not motion_risk
+            ):
                 self._restore_after_maneuver()
             else:
                 leader_goal, follower_goal = self._escape_goals()

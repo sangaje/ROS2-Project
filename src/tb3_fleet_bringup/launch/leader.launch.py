@@ -138,26 +138,7 @@ def generate_launch_description():
             Node(
                 package='tb3_fleet_bringup',
                 executable='pose_to_nav2',
-                name='waffle_default_goal',
-                output='screen',
-                parameters=[{'use_sim_time': simulation}],
-                env=process_env,
-            ),
-            Node(
-                package='tb3_fleet_bringup',
-                executable='pose_to_nav2',
-                name='waffle_named_goal',
-                output='screen',
-                parameters=[{
-                    'use_sim_time': simulation,
-                    'goal_pose_topic': '/waffle_goal_pose',
-                }],
-                env=process_env,
-            ),
-            Node(
-                package='tb3_fleet_bringup',
-                executable='pose_to_nav2',
-                name='leader_coord_goal',
+                name='leader_goal_arbiter_output',
                 output='screen',
                 parameters=[{
                     'use_sim_time': simulation,
