@@ -13,9 +13,9 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPo
 from nav_msgs.msg import OccupancyGrid
 
 
-class SimMapRelay(Node):
+class MapRelay(Node):
     def __init__(self):
-        super().__init__('sim_map_relay')
+        super().__init__('map_relay')
         self.declare_parameter('input_topic', '/map_bridge')
         self.declare_parameter('output_topic', '/map')
 
@@ -50,7 +50,7 @@ class SimMapRelay(Node):
 
 def main():
     rclpy.init()
-    node = SimMapRelay()
+    node = MapRelay()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

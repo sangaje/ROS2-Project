@@ -299,6 +299,19 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /fleet_debug_markers
       Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Fleet Coordination
+      Namespaces:
+        fleet_conflict: true
+        fleet_yield: true
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /fleet/coordination_markers
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48

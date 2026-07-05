@@ -12,14 +12,9 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
-from ament_index_python.packages import get_package_share_directory
-import os
 
 
 def generate_launch_description():
-    bringup_share = get_package_share_directory('tb3_fleet_bringup')
-    tf_pose_script = os.path.join(bringup_share, 'scripts', 'tf_pose_publisher_direct_v44.py')
-
     robot_launch = PathJoinSubstitution([
         FindPackageShare('turtlebot3_bringup'),
         'launch',
@@ -178,20 +173,20 @@ def generate_launch_description():
         TimerAction(
             period=LaunchConfiguration('pose_publisher_start_delay_sec'),
             actions=[
-                ExecuteProcess(
-                    cmd=[
-                        'python3', tf_pose_script, '--ros-args',
-                        '-r', '__node:=robot_tf_pose_publisher',
-                        '-p', ['use_sim_time:=', LaunchConfiguration('use_sim_time')],
-                        '-p', ['target_frame:=', LaunchConfiguration('map_frame')],
-                        '-p', ['source_frame:=', LaunchConfiguration('base_frame')],
-                        '-p', ['output_topic:=', LaunchConfiguration('pose_topic')],
-                        '-p', 'publish_rate_hz:=10.0',
-                        '-p', 'timeout_sec:=0.05',
-                        '-p', 'log_every_n:=100',
-                    ],
-                    output='screen',
+                Node(
+                    package='tb3_fleet_bringup',
+                    executable='tf_pose_publisher',
                     name='robot_tf_pose_publisher',
+                    output='screen',
+                    parameters=[{
+                        'use_sim_time': LaunchConfiguration('use_sim_time'),
+                        'target_frame': LaunchConfiguration('map_frame'),
+                        'source_frame': LaunchConfiguration('base_frame'),
+                        'output_topic': LaunchConfiguration('pose_topic'),
+                        'publish_rate_hz': 10.0,
+                        'timeout_sec': 0.05,
+                        'log_every_n': 100,
+                    }],
                     condition=IfCondition(LaunchConfiguration('start_pose_publisher')),
                 ),
             ],

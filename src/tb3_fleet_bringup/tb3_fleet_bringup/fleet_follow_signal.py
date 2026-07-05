@@ -14,7 +14,7 @@ def main() -> None:
         'command',
         choices=['follow', 'resume', 'pause', 'stop', 'toggle'],
     )
-    parser.add_argument('--domain', default=os.environ.get('ROS_DOMAIN_ID', '25'))
+    parser.add_argument('--domain', default=os.environ.get('ROS_DOMAIN_ID', '24'))
     args = parser.parse_args(sys.argv[1:])
 
     os.environ['ROS_DOMAIN_ID'] = str(args.domain)
@@ -27,12 +27,16 @@ def main() -> None:
 
     import rclpy
     from rclpy.node import Node
-    from rclpy.qos import QoSProfile, ReliabilityPolicy
+    from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
     from std_msgs.msg import String
 
     rclpy.init()
     node = Node('fleet_follow_signal')
-    qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
+    qos = QoSProfile(
+        depth=1,
+        reliability=ReliabilityPolicy.RELIABLE,
+        durability=DurabilityPolicy.TRANSIENT_LOCAL,
+    )
     pub = node.create_publisher(String, '/fleet/follow_command', qos)
 
     deadline = time.monotonic() + 3.0

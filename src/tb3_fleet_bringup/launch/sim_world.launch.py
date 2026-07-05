@@ -6,8 +6,8 @@ Leader  : standard topics (/scan, /odom, /tf, /cmd_vel …)
 Follower: burger-prefixed topics (/burger/scan, /burger/odom, /burger/tf …)
           Frame IDs also prefixed (burger/odom → burger/base_footprint)
 
-A separate follower stack (sim_follower.launch.py) bridges the follower's
-sensor data into the configured follower domain for AMCL.
+Run follower.launch.py with use_sim_time:=true and
+start_robot_bringup:=false to bridge the follower into its DDS domain.
 """
 
 import os
@@ -21,33 +21,23 @@ from launch.actions import (
     DeclareLaunchArgument,
     IncludeLaunchDescription,
     OpaqueFunction,
-    SetEnvironmentVariable,
     TimerAction,
-    UnsetEnvironmentVariable,
 )
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
+from tb3_fleet_bringup.launch_utils import dds_launch_environment
+
 
 def generate_launch_description():
-    os.environ.pop('ROS_DISCOVERY_SERVER', None)
-    os.environ.pop('ROS_LOCALHOST_ONLY', None)
-    os.environ.pop('FASTRTPS_DEFAULT_PROFILES_FILE', None)
-    os.environ.pop('FASTDDS_DEFAULT_PROFILES_FILE', None)
-
     tb3_gz_share = get_package_share_directory('turtlebot3_gazebo')
     ros_gz_share  = get_package_share_directory('ros_gz_sim')
 
     world       = LaunchConfiguration('world')
-    use_sim_time = LaunchConfiguration('use_sim_time')
     domain_id = LaunchConfiguration('domain_id')
     start_gz_client = LaunchConfiguration('start_gz_client')
-    leader_x    = LaunchConfiguration('leader_x')
-    leader_y    = LaunchConfiguration('leader_y')
-    follower_x  = LaunchConfiguration('follower_x')
-    follower_y  = LaunchConfiguration('follower_y')
 
     default_world = os.path.join(tb3_gz_share, 'worlds', 'turtlebot3_world.world')
     leader_sdf    = os.path.join(tb3_gz_share, 'models', 'turtlebot3_burger', 'model.sdf')
@@ -97,7 +87,7 @@ def generate_launch_description():
     spawn_leader = Node(
         package='ros_gz_sim', executable='create', name='spawn_leader', output='screen',
         arguments=['-name', 'turtlebot3_burger', '-file', leader_sdf,
-                   '-x', leader_x, '-y', leader_y, '-z', '0.01'],
+                   '-x', '-1.5', '-y', '-0.5', '-z', '0.01'],
     )
     # Leader Gazebo-to-ROS bridge with standard topic names.
     leader_bridge = Node(
@@ -107,9 +97,6 @@ def generate_launch_description():
     )
 
     def make_follower(context, *args, **kwargs):
-        fx = follower_x.perform(context)
-        fy = follower_y.perform(context)
-
         # Modify burger SDF: prefix all topics and frame IDs with 'burger/'
         sdf_text = Path(leader_sdf).read_text()
         subs = [
@@ -165,7 +152,7 @@ def generate_launch_description():
                  name='spawn_follower', output='screen',
                  arguments=['-name', 'turtlebot3_burger_follower',
                              '-file', str(follower_sdf),
-                             '-x', fx, '-y', fy, '-z', '0.01']),
+                             '-x', '-2.2', '-y', '-0.5', '-z', '0.01']),
             Node(package='ros_gz_bridge', executable='parameter_bridge',
                  name='follower_gz_bridge', output='screen',
                  arguments=['--ros-args', '-p', f'config_file:={bridge_yaml}']),
@@ -173,20 +160,10 @@ def generate_launch_description():
 
     return LaunchDescription([
         DeclareLaunchArgument('world',        default_value=default_world),
-        DeclareLaunchArgument('use_sim_time', default_value='true'),
-        DeclareLaunchArgument('domain_id',    default_value='25'),
+        DeclareLaunchArgument('domain_id',    default_value='24'),
         DeclareLaunchArgument('start_gz_client', default_value='false',
                               description='Start the Gazebo GUI client. False keeps the headless server running.'),
-        DeclareLaunchArgument('leader_x',     default_value='-1.5'),
-        DeclareLaunchArgument('leader_y',     default_value='-0.5'),
-        DeclareLaunchArgument('follower_x',   default_value='-2.5'),
-        DeclareLaunchArgument('follower_y',   default_value='-0.5'),
-        UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
-        UnsetEnvironmentVariable('ROS_LOCALHOST_ONLY'),
-        UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),
-        UnsetEnvironmentVariable('FASTDDS_DEFAULT_PROFILES_FILE'),
-        SetEnvironmentVariable('TURTLEBOT3_MODEL', 'burger'),
-        SetEnvironmentVariable('ROS_DOMAIN_ID', domain_id),
+        *dds_launch_environment(domain_id),
         AppendEnvironmentVariable('GZ_SIM_RESOURCE_PATH',
                                   os.path.join(tb3_gz_share, 'models')),
         gz_server,
