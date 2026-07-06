@@ -14,7 +14,7 @@ amcl:
     beam_skip_error_threshold: 0.9
     beam_skip_threshold: 0.3
     do_beamskip: true
-    first_map_only: false
+    first_map_only: true
     global_frame_id: "map"
     lambda_short: 0.1
     laser_likelihood_max_dist: 1.5
