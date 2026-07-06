@@ -8,9 +8,9 @@ Panels:
     - /Status1
     - /Map1
     - /TF1
-    - /Waffle Pose1
+    - /Leader Pose1
     - /Burger Pose1
-    - /Waffle Nav2 Plan1
+    - /Leader Nav2 Plan1
     - /Burger Nav2 Plan1
     - /Fleet Debug Markers1
     - /Risk Map Positive Halo1
@@ -188,7 +188,7 @@ Visualization Manager:
     Enabled: true
     Head Length: 0.25
     Head Radius: 0.07999999821186066
-    Name: Waffle Pose
+    Name: Leader Pose
     Shaft Length: 0.44999998807907104
     Shaft Radius: 0.029999999329447746
     Shape: Arrow
@@ -230,7 +230,7 @@ Visualization Manager:
     Length: 0.30000001192092896
     Line Style: Lines
     Line Width: 0.03999999910593033
-    Name: Waffle Nav2 Plan
+    Name: Leader Nav2 Plan
     Offset:
       X: 0
       Y: 0
@@ -280,9 +280,9 @@ Visualization Manager:
     Enabled: true
     Name: Fleet Debug Markers
     Namespaces:
-      waffle: true
-      waffle_heading: true
-      waffle_label: true
+      leader: true
+      leader_heading: true
+      leader_label: true
     Topic:
       Depth: 10
       Durability Policy: Volatile

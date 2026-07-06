@@ -83,7 +83,7 @@ show_domain "${main_domain}" "MAIN/LEADER" \
   /fleet/follow_enabled /fleet/follow_command /fleet/coordination_status \
   /fleet/robot_poses /fleet/collision_warning /fleet/hazard_pose /cmd_vel
 show_domain "${follower_domain}" "FOLLOWER" \
-  /scan /scan_nav /odom /map /map_bridge /tf /leader_pose /waffle_plan \
+  /scan /scan_nav /odom /map /map_bridge /tf /leader_pose /leader_plan \
   /burger_pose /plan /burger_scan_relay /fleet/follow_enabled \
   /fleet/follow_command /fleet/coordination_status /fleet/robot_poses \
   /fleet/collision_warning /fleet/hazard_pose /cmd_vel

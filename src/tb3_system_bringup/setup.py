@@ -28,7 +28,7 @@ setup(
     maintainer_email='qhals8380@gmail.com',
     description=(
         'Role-based orchestrator: turns on fleet bringup, the scout\'s '
-        'Bayesian risk map and its RL policy (or the waffle\'s fleet '
+        'Bayesian risk map and its RL policy (or the leader\'s fleet '
         'stack) from one launch file.'
     ),
     license='Apache-2.0',

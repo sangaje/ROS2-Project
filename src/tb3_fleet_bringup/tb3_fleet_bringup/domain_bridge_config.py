@@ -88,7 +88,7 @@ def write_fleet_bridge_configs(
         '/leader_pose': topic('geometry_msgs/msg/PoseStamped'),
         '/plan': topic(
             'nav_msgs/msg/Path',
-            remap='/waffle_plan',
+            remap='/leader_plan',
             profile=qos(depth=3),
         ),
         '/burger_goal_pose': topic('geometry_msgs/msg/PoseStamped'),

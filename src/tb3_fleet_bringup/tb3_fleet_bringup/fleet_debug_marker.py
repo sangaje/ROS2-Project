@@ -27,7 +27,7 @@ def _quat_to_yaw(q) -> float:
 
 
 class FleetDebugMarker(Node):
-    """Publish simple RViz markers for Waffle and Burger poses in the shared map frame.
+    """Publish simple RViz markers for leader and follower poses in the shared map frame.
 
     This avoids bridging /tf across domains. /tf would collide because both Nav2 stacks
     intentionally use map->odom->base_footprint inside their own domain.
@@ -36,24 +36,24 @@ class FleetDebugMarker(Node):
     def __init__(self) -> None:
         super().__init__('fleet_debug_marker')
         _safe_declare(self, 'use_sim_time', True)
-        self.waffle_pose_topic = self._abs(str(_safe_declare(self, 'waffle_pose_topic', '/leader_pose')))
+        self.leader_pose_topic = self._abs(str(_safe_declare(self, 'leader_pose_topic', '/leader_pose')))
         self.burger_pose_topic = self._abs(str(_safe_declare(self, 'burger_pose_topic', '/burger_pose')))
         self.marker_topic = self._abs(str(_safe_declare(self, 'marker_topic', '/fleet_debug_markers')))
         self.frame_id = str(_safe_declare(self, 'frame_id', 'map'))
         self.publish_rate_hz = max(1.0, float(_safe_declare(self, 'publish_rate_hz', 10.0)))
         self.stale_timeout_sec = max(0.5, float(_safe_declare(self, 'stale_timeout_sec', 5.0)))
 
-        self.poses: Dict[str, Optional[PoseStamped]] = {'waffle': None, 'burger': None}
-        self.last_seen: Dict[str, Optional[rclpy.time.Time]] = {'waffle': None, 'burger': None}
+        self.poses: Dict[str, Optional[PoseStamped]] = {'leader': None, 'burger': None}
+        self.last_seen: Dict[str, Optional[rclpy.time.Time]] = {'leader': None, 'burger': None}
 
-        self.sub_w = self.create_subscription(PoseStamped, self.waffle_pose_topic, lambda m: self._on_pose('waffle', m), 10)
+        self.sub_w = self.create_subscription(PoseStamped, self.leader_pose_topic, lambda m: self._on_pose('leader', m), 10)
         self.sub_b = self.create_subscription(PoseStamped, self.burger_pose_topic, lambda m: self._on_pose('burger', m), 10)
         self.pub = self.create_publisher(MarkerArray, self.marker_topic, 10)
         self.create_timer(1.0 / self.publish_rate_hz, self._tick)
 
         self.get_logger().info(
             'V41_FLEET_DEBUG_MARKER_READY | '
-            f'waffle={self.waffle_pose_topic} burger={self.burger_pose_topic} out={self.marker_topic}'
+            f'leader={self.leader_pose_topic} burger={self.burger_pose_topic} out={self.marker_topic}'
         )
 
     @staticmethod
@@ -86,7 +86,7 @@ class FleetDebugMarker(Node):
         m.pose.orientation = pose.pose.orientation
         m.scale.x, m.scale.y, m.scale.z = scale
         # Do not rely on color semantics for correctness; use different alpha/intensity only for visual separation.
-        if ns == 'waffle':
+        if ns == 'leader':
             m.color.r, m.color.g, m.color.b, m.color.a = 0.1, 0.4, 1.0, 0.85
         else:
             m.color.r, m.color.g, m.color.b, m.color.a = 1.0, 0.35, 0.05, 0.85
@@ -107,7 +107,7 @@ class FleetDebugMarker(Node):
         m.scale.x = 0.035
         m.scale.y = 0.08
         m.scale.z = 0.08
-        if ns == 'waffle':
+        if ns == 'leader':
             m.color.r, m.color.g, m.color.b, m.color.a = 0.1, 0.4, 1.0, 0.95
         else:
             m.color.r, m.color.g, m.color.b, m.color.a = 1.0, 0.35, 0.05, 0.95
@@ -156,15 +156,15 @@ class FleetDebugMarker(Node):
 
     def _tick(self) -> None:
         arr = MarkerArray()
-        if self._fresh('waffle') and self.poses['waffle'] is not None:
-            p = self.poses['waffle']
-            arr.markers.append(self._make_body('waffle', 1, p, (0.38, 0.38, 0.18)))
-            arr.markers.append(self._make_arrow('waffle', 2, p, 0.55))
-            arr.markers.append(self._make_text('waffle', 3, p, 'leader / waffle'))
-        elif self.last_seen['waffle'] is not None:
-            arr.markers.append(self._make_delete('waffle', 1))
-            arr.markers.append(self._make_delete('waffle_heading', 2))
-            arr.markers.append(self._make_delete('waffle_label', 3))
+        if self._fresh('leader') and self.poses['leader'] is not None:
+            p = self.poses['leader']
+            arr.markers.append(self._make_body('leader', 1, p, (0.38, 0.38, 0.18)))
+            arr.markers.append(self._make_arrow('leader', 2, p, 0.55))
+            arr.markers.append(self._make_text('leader', 3, p, 'leader'))
+        elif self.last_seen['leader'] is not None:
+            arr.markers.append(self._make_delete('leader', 1))
+            arr.markers.append(self._make_delete('leader_heading', 2))
+            arr.markers.append(self._make_delete('leader_label', 3))
         if self._fresh('burger') and self.poses['burger'] is not None:
             p = self.poses['burger']
             arr.markers.append(self._make_body('burger', 11, p, (0.30, 0.30, 0.16)))

@@ -47,11 +47,11 @@ def quaternion_from_yaw(yaw: float):
 
 
 class FleetPathCoordinator(Node):
-    """Coordinate priority-preserving avoidance for Waffle and Burger.
+    """Coordinate priority-preserving avoidance for leader and follower robots.
 
     The priority robot keeps its original Nav2 goal. Only the yielding robot
     receives a short move-aside goal and later resumes its saved destination.
-    A sole moving robot has priority; Waffle has priority when both move.
+    A sole moving robot has priority; the leader has priority when both move.
     """
 
     IDLE = 'IDLE'
@@ -72,7 +72,7 @@ class FleetPathCoordinator(Node):
         self.declare_parameter('follower_path_topic', '/burger_plan')
         self.declare_parameter('map_topic', '/map')
         self.declare_parameter('leader_user_goal_topic', '/goal_pose')
-        self.declare_parameter('leader_named_goal_topic', '/waffle_goal_pose')
+        self.declare_parameter('leader_named_goal_topic', '/leader_goal_pose')
         self.declare_parameter('follower_user_goal_topic', '/burger_user_goal')
         self.declare_parameter(
             'leader_coord_goal_topic', '/fleet/leader_coord_goal'
@@ -712,7 +712,7 @@ class FleetPathCoordinator(Node):
             leader_moving = leader_speed >= self.motion_speed_threshold
             follower_moving = follower_speed >= self.motion_speed_threshold
             if leader_moving:
-                # Waffle keeps fleet right-of-way whenever both robots move.
+                # The leader keeps fleet right-of-way whenever both robots move.
                 priority = self.LEADER
             elif follower_moving:
                 priority = self.FOLLOWER
@@ -1317,7 +1317,7 @@ class FleetPathCoordinator(Node):
         poses = PoseArray()
         poses.header.frame_id = 'map'
         poses.header.stamp = self.get_clock().now().to_msg()
-        # Stable ordering: index 0 is Waffle/leader, index 1 is Burger/follower.
+        # Stable ordering: index 0 is leader, index 1 is follower.
         poses.poses = [self.leader_pose.pose, self.follower_pose.pose]
         self.robot_poses_pub.publish(poses)
 

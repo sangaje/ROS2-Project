@@ -45,7 +45,7 @@ def generate_launch_description():
             output='screen',
             parameters=[{
                 'use_sim_time': False,
-                'waffle_pose_topic': '/leader_pose',
+                'leader_pose_topic': '/leader_pose',
                 'burger_pose_topic': '/burger_pose',
                 'marker_topic': '/fleet_debug_markers',
                 'frame_id': 'map',

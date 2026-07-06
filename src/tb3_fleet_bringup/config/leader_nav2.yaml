@@ -1,4 +1,4 @@
-# Narrow-space Nav2 tuning for the Waffle leader.
+# Narrow-space Nav2 tuning for the leader.
 # The footprint follows the TurtleBot3 footprint instead of an oversized circle.
 
 controller_server:

@@ -26,6 +26,7 @@ setup(
         (os.path.join('share', package_name, 'map'), only_files('map/*.yaml') + only_files('map/*.pgm')),
     ],
     install_requires=['setuptools'],
+    tests_require=['pytest'],
     zip_safe=True,
     maintainer='seil',
     maintainer_email='none@example.com',

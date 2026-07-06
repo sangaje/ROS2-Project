@@ -1,6 +1,6 @@
 # tb3_system_bringup
 
-로봇의 역할(정찰/와플)에 맞춰 `tb3_fleet_bringup` + 베이지안 리스크맵 +
+로봇의 역할(정찰/리더)에 맞춰 `tb3_fleet_bringup` + 베이지안 리스크맵 +
 RL 정책까지 한 번에 켜는 오케스트레이터. 로봇마다 이 패키지의 런치 파일
 하나만 실행하면 된다.
 
@@ -18,11 +18,11 @@ ros2 launch tb3_system_bringup system.launch.py \
   role:=scout main_domain_id:=24
 ```
 
-와플 (베타, 아직 정찰 behavior 미통합 — 지금은 fleet bringup만 뜬다):
+리더:
 
 ```bash
 export ROS_DOMAIN_ID=24
-ros2 launch tb3_system_bringup system.launch.py role:=waffle
+ros2 launch tb3_system_bringup system.launch.py role:=leader
 ```
 
 **follower.launch.py 로봇이 fleet에 없으면(예: 리더+정찰봇만 있는 구성)
@@ -32,7 +32,7 @@ ros2 launch tb3_system_bringup system.launch.py role:=waffle
 
 ```bash
 ros2 launch tb3_system_bringup system.launch.py \
-  role:=waffle require_follower_pose:=false
+  role:=leader require_follower_pose:=false
 ```
 
 PC 통합 뷰어 (fleet 디버그 마커 + 리스크맵을 같은 RViz 창에서):
@@ -51,15 +51,14 @@ ros2 launch tb3_system_bringup viewer.launch.py
 | role     | fleet_role 기본값 | 리스크맵                   | RL 정책 |
 |----------|-------------------|----------------------------|---------|
 | `scout`  | `member`          | 켜짐                       | 켜짐    |
-| `waffle` | `leader`          | 안 켜짐 (베타 placeholder) | 안 켜짐 |
+| `leader` | `leader`          | 안 켜짐                    | 안 켜짐 |
 
 `scout`는 리더를 따라가지도, 리더가 되지도 않는 `member.launch.py` 위에서
 RL 정책이 직접 `/cmd_vel`을 몰아 정찰하고, 코디네이터가 다른 로봇을
 비켜줘야 할 때만 짧게 Nav2 목적지로 개입한다. `follower`처럼 리더를
 계속 쫓아가게 하고 싶으면 `fleet_role:=follower`로 바꾸면 된다.
 
-`waffle`은 아직 정찰봇 behavior와 합쳐지지 않은 베타 자리표시자다.
-지금은 `tb3_fleet_bringup/leader.launch.py`만 실행한다.
+`leader`는 `tb3_fleet_bringup/leader.launch.py`만 실행한다.
 
 ### follower는 결국 정찰봇이다
 
@@ -134,18 +133,18 @@ SLAM을 계속 소유해야 한다, 위 "follower는 결국 정찰봇이다" 참
 같은 다른 발행자가 있는지 감지해서 있으면 조용히 대기하도록 바뀌어서
 해결됐다 (`tb3_fleet_bringup` README의 "`/map` 페일오버" 참고).
 
-### 정찰봇이 SLAM을 갖고, 와플이 그 맵을 받아서 재발행
+### 정찰봇이 SLAM을 갖고, 리더가 그 맵을 받아서 재발행
 
-`role:=waffle`에 `enable_cartographer:=false`를 주면 와플(`leader.launch.py`)이
+`role:=leader`에 `enable_cartographer:=false`를 주면 리더(`leader.launch.py`)가
 자체 Cartographer 대신, `/map_from_member`로 브릿지되어 들어오는 맵을
 받아 AMCL로 로컬라이즈하고 그걸 자기 도메인의 `/map`으로 재발행한다.
 정찰봇 쪽에서 `enable_amcl:=false start_cartographer:=true`로 SLAM을
 갖고 있어야 짝이 맞는다.
 
 ```bash
-# 와플: 정찰봇이 만든 맵을 받아서 AMCL + 재발행
+# 리더: 정찰봇이 만든 맵을 받아서 AMCL + 재발행
 ros2 launch tb3_system_bringup system.launch.py \
-  role:=waffle enable_cartographer:=false
+  role:=leader enable_cartographer:=false
 
 # 정찰봇: 직접 SLAM 소유
 ros2 launch tb3_system_bringup system.launch.py \
@@ -154,8 +153,8 @@ ros2 launch tb3_system_bringup system.launch.py \
 
 `/map_from_member` 브릿지는 정찰봇(member)의 `write_member_bridge_configs`가
 매 실행마다 `main_domain_id`/`domain_id` 실행값으로 동적으로
-`/tmp/tb3_fleet_domain_bridge/`에 다시 써서 만든다 — 와플 쪽 도메인이
-바뀌어도 캐싱 없이 항상 최신 값으로 반영된다. 별도로 와플 쪽에 새
+`/tmp/tb3_fleet_domain_bridge/`에 다시 써서 만든다 — 리더 쪽 도메인이
+바뀌어도 캐싱 없이 항상 최신 값으로 반영된다. 별도로 리더 쪽에 새
 domain_bridge 프로세스를 띄울 필요는 없다(정찰봇이 양방향 다 실행).
 
 ### 하드웨어 odom TF 자동 교체 (해결됨, 2026-07-06)

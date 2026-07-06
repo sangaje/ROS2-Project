@@ -104,7 +104,7 @@ def test_independent_follower_gets_priority_when_it_is_the_moving_robot():
         destroy_node(node)
 
 
-def test_waffle_keeps_priority_when_both_independent_robots_are_moving():
+def test_leader_keeps_priority_when_both_independent_robots_are_moving():
     node = make_node()
     try:
         node._follower_status_cb(Bool(data=False))

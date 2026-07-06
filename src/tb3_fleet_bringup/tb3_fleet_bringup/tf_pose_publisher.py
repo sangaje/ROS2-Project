@@ -24,7 +24,7 @@ class TfPosePublisher(Node):
     """Publish PoseStamped from a TF transform.
 
     v44 purpose:
-      - Waffle leader pose under Cartographer: publish map->base_footprint, not dead-reckoned odom.
+      - Leader pose under Cartographer: publish map->base_footprint, not dead-reckoned odom.
       - Burger debug pose: publish map->base_footprint using its local map->odom publisher.
     """
 

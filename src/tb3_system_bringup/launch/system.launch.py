@@ -3,9 +3,7 @@
 
 role:=scout  -> fleet bringup (default fleet_role=member) + Bayesian risk map
                 + the RL-trained exploration policy driving cmd_vel directly.
-role:=waffle -> fleet bringup only (default fleet_role=leader). This role is
-                a placeholder: the waffle-specific behaviour stack is still
-                beta and is meant to be merged in later.
+role:=leader -> fleet bringup only (default fleet_role=leader).
 """
 
 import os
@@ -37,7 +35,7 @@ FLEET_LAUNCH_FILES = {
 }
 DEFAULT_FLEET_ROLE = {
     'scout': 'member',
-    'waffle': 'leader',
+    'leader': 'leader',
 }
 
 
@@ -75,7 +73,7 @@ def generate_launch_description():
         role_value = role.perform(context).strip().lower()
         if role_value not in DEFAULT_FLEET_ROLE:
             raise ValueError(
-                f"role must be 'scout' or 'waffle', got {role_value!r}"
+                f"role must be 'scout' or 'leader', got {role_value!r}"
             )
 
         domain = int(domain_id.perform(context))
@@ -162,12 +160,6 @@ def generate_launch_description():
         ]
 
         if role_value != 'scout':
-            if role_value == 'waffle':
-                actions.append(LogInfo(msg=[
-                    'SYSTEM_BRINGUP | role=waffle is a beta placeholder: '
-                    'only fleet bringup runs. Risk map and RL policy are '
-                    'scout-only for now.'
-                ]))
             return actions
 
         camera_sender_on = launch_bool(start_camera_sender.perform(context))
@@ -311,11 +303,10 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'role',
             default_value='scout',
-            choices=['scout', 'waffle'],
+            choices=['scout', 'leader'],
             description=(
                 "This robot's fleet role: 'scout' (fleet bringup + risk "
-                "map + RL policy) or 'waffle' (fleet bringup only, beta "
-                'placeholder).'
+                "map + RL policy) or 'leader' (fleet bringup only)."
             ),
         ),
         DeclareLaunchArgument(
@@ -334,7 +325,7 @@ def generate_launch_description():
             choices=['', 'leader', 'follower', 'member'],
             description=(
                 'Which tb3_fleet_bringup stack to run underneath. Empty '
-                "picks a default from role: scout->member, waffle->leader."
+                "picks a default from role: scout->member, leader->leader."
             ),
         ),
         DeclareLaunchArgument(
@@ -361,7 +352,7 @@ def generate_launch_description():
             'require_follower_pose', default_value='true',
             choices=['true', 'false'],
             description=(
-                "leader fleet_role only (role:=waffle): set false if no "
+                "leader fleet_role only (role:=leader): set false if no "
                 "follower.launch.py robot is in this fleet, otherwise the "
                 'coordinator holds the leader in place forever waiting '
                 'for a follower pose that will never arrive.'
@@ -371,7 +362,7 @@ def generate_launch_description():
             'enable_cartographer', default_value='true',
             choices=['true', 'false'],
             description=(
-                'leader fleet_role only (role:=waffle), real mode only: '
+                'leader fleet_role only (role:=leader), real mode only: '
                 'run Cartographer here (default). Set false to instead '
                 'run AMCL against a map received from a member robot '
                 'that owns its own SLAM (that member needs '
