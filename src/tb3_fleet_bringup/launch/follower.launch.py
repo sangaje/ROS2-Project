@@ -46,7 +46,6 @@ def generate_launch_description():
     initial_yaw = LaunchConfiguration('follower_initial_yaw')
     auto_localize = LaunchConfiguration('auto_localize')
     enable_amcl = LaunchConfiguration('enable_amcl')
-    ros_static_peers = LaunchConfiguration('ros_static_peers')
 
     def make_stack(context):
         simulation = launch_bool(use_sim_time.perform(context))
@@ -58,8 +57,7 @@ def generate_launch_description():
                 'Pass the launch option main_domain_id:=<leader_domain>.'
             )
         main_domain = int(main_domain_value)
-        peers = ros_static_peers.perform(context)
-        process_env = clean_process_environment(str(follower_domain), peers)
+        process_env = clean_process_environment(str(follower_domain))
 
         nav2_source = os.path.join(
             package_share,
@@ -442,18 +440,6 @@ def generate_launch_description():
                 'fixed seed.'
             ),
         ),
-        DeclareLaunchArgument(
-            'ros_static_peers',
-            default_value=EnvironmentVariable('ROS_STATIC_PEERS', default_value=''),
-            description=(
-                'Optional ROS_STATIC_PEERS value (semicolon-separated '
-                'addresses) forcing unicast DDS discovery to specific '
-                'peers in addition to SUBNET multicast discovery -- needed '
-                'when the main/PC domain is only reachable over a link '
-                'that does not carry multicast, such as a Tailscale/VPN '
-                'hop between machines on different physical LANs.'
-            ),
-        ),
-        *dds_launch_environment(domain_id, LaunchConfiguration('ros_static_peers')),
+        *dds_launch_environment(domain_id),
         OpaqueFunction(function=make_stack),
     ])

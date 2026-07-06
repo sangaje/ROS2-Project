@@ -32,10 +32,7 @@ def _missing_required_environment() -> List[str]:
     return missing
 
 
-def validate_shell_environment(
-    expected_domain_id: str | None = None,
-    expected_ros_static_peers: str | None = None,
-) -> None:
+def validate_shell_environment(expected_domain_id: str | None = None) -> None:
     """Fail fast when launch-time DDS values are missing or conflicting.
 
     Launch files in this workspace intentionally inherit DDS settings from the
@@ -57,32 +54,18 @@ def validate_shell_environment(
             'Use the shell environment value or update your bashrc.'
         )
 
-    expected_peers = (expected_ros_static_peers or '').strip()
-    actual_peers = os.environ.get('ROS_STATIC_PEERS', '').strip()
-    if expected_peers and expected_peers != actual_peers:
-        raise RuntimeError(
-            'Launch ros_static_peers does not match shell ROS_STATIC_PEERS: '
-            f'ros_static_peers={expected_peers}, ROS_STATIC_PEERS={actual_peers}. '
-            'Use the shell environment value or update your bashrc.'
-        )
 
-
-def clean_process_environment(
-    domain_id: str, ros_static_peers: str = '',
-) -> Dict[str, str]:
+def clean_process_environment(domain_id: str) -> Dict[str, str]:
     """Return the current shell environment after validating it."""
-    validate_shell_environment(str(domain_id), ros_static_peers)
+    validate_shell_environment(str(domain_id))
     return os.environ.copy()
 
 
-def dds_launch_environment(domain_id, ros_static_peers='') -> List:
+def dds_launch_environment(domain_id) -> List:
     """Launch actions that validate DDS settings inherited from the shell."""
 
     def _validate(context, *args, **kwargs):
-        validate_shell_environment(
-            _perform_if_needed(domain_id, context),
-            _perform_if_needed(ros_static_peers, context),
-        )
+        validate_shell_environment(_perform_if_needed(domain_id, context))
         return []
 
     return [OpaqueFunction(function=_validate)]

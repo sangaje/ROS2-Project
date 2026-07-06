@@ -37,10 +37,6 @@ def generate_launch_description():
             default_value=EnvironmentVariable('ROS_DOMAIN_ID'),
             description='PC DDS domain. Usually the same shell ROS_DOMAIN_ID as the leader domain.',
         ),
-        DeclareLaunchArgument(
-            'ros_static_peers',
-            default_value=EnvironmentVariable('ROS_STATIC_PEERS', default_value=''),
-        ),
 
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(yolo_server_launch),
@@ -51,7 +47,6 @@ def generate_launch_description():
             condition=IfCondition(LaunchConfiguration('start_viewer')),
             launch_arguments={
                 'domain_id': LaunchConfiguration('domain_id'),
-                'ros_static_peers': LaunchConfiguration('ros_static_peers'),
             }.items(),
         ),
     ])

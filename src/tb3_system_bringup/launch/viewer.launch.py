@@ -24,19 +24,7 @@ def generate_launch_description():
             default_value=EnvironmentVariable('ROS_DOMAIN_ID'),
             description='Leader/PC DDS domain that fleet and risk topics are bridged to.',
         ),
-        DeclareLaunchArgument(
-            'ros_static_peers',
-            default_value=EnvironmentVariable('ROS_STATIC_PEERS', default_value=''),
-            description=(
-                'Optional ROS_STATIC_PEERS value (semicolon-separated '
-                'addresses) forcing unicast DDS discovery to specific '
-                'peers in addition to SUBNET multicast discovery -- needed '
-                'when the robots are only reachable over a link that does '
-                'not carry multicast, such as a Tailscale/VPN hop between '
-                'machines on different physical LANs.'
-            ),
-        ),
-        *dds_launch_environment(domain_id, LaunchConfiguration('ros_static_peers')),
+        *dds_launch_environment(domain_id),
         LogInfo(msg=['SYSTEM_VIEWER | domain=', domain_id]),
         Node(
             package='tb3_fleet_bringup',
