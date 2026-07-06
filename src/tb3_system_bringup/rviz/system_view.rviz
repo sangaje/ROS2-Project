@@ -164,7 +164,7 @@ Visualization Manager:
     Max Intensity: 4096
     Min Color: 0; 0; 0
     Min Intensity: 0
-    Name: Follower25 Scan
+    Name: Follower22 Scan
     Position Transformer: XYZ
     Selectable: true
     Size (Pixels): 3
@@ -176,7 +176,7 @@ Visualization Manager:
       Filter size: 10
       History Policy: Keep Last
       Reliability Policy: Best Effort
-      Value: /follower25/scan
+      Value: /follower22/scan
     Use Fixed Frame: true
     Use rainbow: true
     Value: true
@@ -219,6 +219,26 @@ Visualization Manager:
       History Policy: Keep Last
       Reliability Policy: Reliable
       Value: /burger_pose
+    Value: true
+  - Alpha: 1
+    Axes Length: 0.30000001192092896
+    Axes Radius: 0.029999999329447746
+    Class: rviz_default_plugins/Pose
+    Color: 0; 220; 90
+    Enabled: true
+    Head Length: 0.2199999988079071
+    Head Radius: 0.07000000029802322
+    Name: Member Pose
+    Shaft Length: 0.4000000059604645
+    Shaft Radius: 0.029999999329447746
+    Shape: Arrow
+    Topic:
+      Depth: 10
+      Durability Policy: Volatile
+      Filter size: 10
+      History Policy: Keep Last
+      Reliability Policy: Reliable
+      Value: /member_pose
     Value: true
   - Alpha: 1
     Buffer Length: 1
@@ -280,15 +300,80 @@ Visualization Manager:
     Enabled: true
     Name: Fleet Debug Markers
     Namespaces:
+      burger: true
+      burger_heading: true
+      burger_label: true
+      burger_goal: true
+      burger_goal_label: true
       leader: true
       leader_heading: true
       leader_label: true
+      leader_coord_goal: true
+      leader_coord_goal_label: true
+      leader_user_goal: true
+      leader_user_goal_label: true
+      member: true
+      member_heading: true
+      member_label: true
+      member_goal: true
+      member_goal_label: true
     Topic:
       Depth: 10
       Durability Policy: Volatile
       History Policy: Keep Last
       Reliability Policy: Reliable
       Value: /fleet_debug_markers
+    Value: true
+  - Class: rviz_default_plugins/MarkerArray
+    Enabled: true
+    Name: Coordination Markers
+    Namespaces: {}
+    Topic:
+      Depth: 10
+      Durability Policy: Volatile
+      History Policy: Keep Last
+      Reliability Policy: Reliable
+      Value: /fleet/coordination_markers
+    Value: true
+  - Alpha: 1
+    Axes Length: 0.30000001192092896
+    Axes Radius: 0.029999999329447746
+    Class: rviz_default_plugins/Pose
+    Color: 255; 230; 25
+    Enabled: true
+    Head Length: 0.2199999988079071
+    Head Radius: 0.07000000029802322
+    Name: Clicked Goal Pose
+    Shaft Length: 0.4000000059604645
+    Shaft Radius: 0.029999999329447746
+    Shape: Arrow
+    Topic:
+      Depth: 10
+      Durability Policy: Volatile
+      Filter size: 10
+      History Policy: Keep Last
+      Reliability Policy: Reliable
+      Value: /goal_pose
+    Value: true
+  - Alpha: 1
+    Axes Length: 0.30000001192092896
+    Axes Radius: 0.029999999329447746
+    Class: rviz_default_plugins/Pose
+    Color: 0; 220; 90
+    Enabled: true
+    Head Length: 0.2199999988079071
+    Head Radius: 0.07000000029802322
+    Name: Member Goal Pose
+    Shaft Length: 0.4000000059604645
+    Shaft Radius: 0.029999999329447746
+    Shape: Arrow
+    Topic:
+      Depth: 10
+      Durability Policy: Volatile
+      Filter size: 10
+      History Policy: Keep Last
+      Reliability Policy: Reliable
+      Value: /member_goal_pose
     Value: true
   - Alpha: 0.800000011920929
     Binary representation: false

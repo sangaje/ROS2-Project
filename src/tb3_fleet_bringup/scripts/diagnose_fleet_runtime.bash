@@ -76,25 +76,37 @@ show_tf() {
   run_domain "${domain}" timeout 5 ros2 run tf2_ros tf2_echo "${target}" "${source}" 2>&1 | sed -n '1,12p' || true
 }
 
+show_lifecycle() {
+  local domain="$1"
+  local node="$2"
+
+  echo
+  echo "===== Lifecycle domain ${domain}: ${node} ====="
+  run_domain "${domain}" timeout 4 ros2 lifecycle get "${node}" 2>&1 || true
+}
+
 echo "Fleet runtime diagnosis"
 echo "main_domain=${main_domain} follower_domain=${follower_domain}"
 echo "RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION}"
-echo "ROS_AUTOMATIC_DISCOVERY_RANGE=${ROS_AUTOMATIC_DISCOVERY_RANGE}"
-echo "ROS_LOCALHOST_ONLY=${ROS_LOCALHOST_ONLY}"
+echo "ROS_AUTOMATIC_DISCOVERY_RANGE=${ROS_AUTOMATIC_DISCOVERY_RANGE:-}"
+echo "ROS_LOCALHOST_ONLY=${ROS_LOCALHOST_ONLY:-}"
 
 echo
 echo "===== local matching processes ====="
 ps -eo pid,ppid,cmd | rg -i 'ros2 launch|domain_bridge|rviz2|cartographer|nav2|turtlebot3|robot_state_publisher|ld08|hls_lfcd|leader.launch|follower.launch' || true
 
 show_domain "${main_domain}" "MAIN/LEADER" \
-  /scan /scan_nav /odom /map /tf /leader_pose /plan /burger_pose /burger_plan \
+  /scan /scan_nav /odom /map /amcl_pose /tf /leader_pose /plan /burger_pose /burger_plan \
   /fleet/follow_enabled /fleet/follow_command /fleet/coordination_status \
   /fleet/robot_poses /fleet/collision_warning /fleet/hazard_pose /cmd_vel
 show_domain "${follower_domain}" "FOLLOWER" \
-  /scan /scan_nav /odom /map /map_bridge /tf /leader_pose /leader_plan \
+  /scan /scan_nav /odom /map /map_bridge /amcl_pose /tf /leader_pose /leader_plan \
   /burger_pose /plan /burger_scan_relay /fleet/follow_enabled \
   /fleet/follow_command /fleet/coordination_status /fleet/robot_poses \
   /fleet/collision_warning /fleet/hazard_pose /cmd_vel
+
+show_lifecycle "${main_domain}" /amcl
+show_lifecycle "${follower_domain}" /amcl
 
 show_tf "${main_domain}" map base_footprint
 show_tf "${follower_domain}" map base_footprint

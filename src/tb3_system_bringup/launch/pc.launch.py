@@ -37,6 +37,16 @@ def generate_launch_description():
             default_value=EnvironmentVariable('ROS_DOMAIN_ID'),
             description='PC DDS domain. Usually the same shell ROS_DOMAIN_ID as the leader domain.',
         ),
+        DeclareLaunchArgument(
+            'scout_domain_id',
+            default_value='22',
+            description='Scout/member DDS domain shown in RViz marker labels.',
+        ),
+        DeclareLaunchArgument(
+            'follower_domain_id',
+            default_value=LaunchConfiguration('scout_domain_id'),
+            description='Follower/Burger DDS domain shown in RViz marker labels.',
+        ),
 
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(yolo_server_launch),
@@ -47,6 +57,8 @@ def generate_launch_description():
             condition=IfCondition(LaunchConfiguration('start_viewer')),
             launch_arguments={
                 'domain_id': LaunchConfiguration('domain_id'),
+                'member_domain_id': LaunchConfiguration('scout_domain_id'),
+                'burger_domain_id': LaunchConfiguration('follower_domain_id'),
             }.items(),
         ),
     ])
