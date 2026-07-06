@@ -12,6 +12,7 @@
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>tb3_fleet_bringup</exec_depend>
   <exec_depend>tb3_bayesian_risk_map</exec_depend>
+  <exec_depend>tb3_flask_yolo_bridge</exec_depend>
   <exec_depend>turtlebot3_rl_training</exec_depend>
   <exec_depend>rviz2</exec_depend>
   <test_depend>python3-pytest</test_depend>

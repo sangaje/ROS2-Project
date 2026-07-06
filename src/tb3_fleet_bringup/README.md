@@ -24,36 +24,31 @@
 ## 공통 환경
 
 ```bash
-source ~/venv/ros/bin/activate
+source ~/.bashrc
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash
-
-unset FASTRTPS_DEFAULT_PROFILES_FILE
-unset RMW_FASTRTPS_DEFAULT_PROFILES_FILE
-unset FASTDDS_DEFAULT_PROFILES_FILE
-unset ROS_DISCOVERY_SERVER
 ```
+
+DDS/Cyclone 관련 값은 런치 파일에서 새로 만들거나 지우지 않는다.
+각 머신의 shell 환경(`~/.bashrc`)에 있는 값을 그대로 사용한다.
 
 ## 실물
 
 리더:
 
 ```bash
-export ROS_DOMAIN_ID=24
 ros2 launch tb3_fleet_bringup leader.launch.py
 ```
 
 팔로워:
 
 ```bash
-export ROS_DOMAIN_ID=25
 ros2 launch tb3_fleet_bringup follower.launch.py main_domain_id:=24
 ```
 
 멤버(선택, 3번째 이상의 로봇):
 
 ```bash
-export ROS_DOMAIN_ID=26
 ros2 launch tb3_fleet_bringup member.launch.py main_domain_id:=24
 ```
 
@@ -122,14 +117,12 @@ ros2 launch tb3_fleet_bringup leader.launch.py enable_cartographer:=false
 리더 도메인의 터미널 1:
 
 ```bash
-export ROS_DOMAIN_ID=24
 ros2 launch tb3_fleet_bringup sim_world.launch.py
 ```
 
 리더 도메인의 터미널 2:
 
 ```bash
-export ROS_DOMAIN_ID=24
 ros2 launch tb3_fleet_bringup leader.launch.py \
   use_sim_time:=true start_robot_bringup:=false
 ```
@@ -137,7 +130,6 @@ ros2 launch tb3_fleet_bringup leader.launch.py \
 팔로워 도메인:
 
 ```bash
-export ROS_DOMAIN_ID=25
 ros2 launch tb3_fleet_bringup follower.launch.py \
   use_sim_time:=true start_robot_bringup:=false main_domain_id:=24
 ```

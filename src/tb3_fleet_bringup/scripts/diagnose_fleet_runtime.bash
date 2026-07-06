@@ -23,12 +23,20 @@ elif [[ -f install/setup.bash ]]; then
   set -u
 fi
 
-export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
-export ROS_AUTOMATIC_DISCOVERY_RANGE="${ROS_AUTOMATIC_DISCOVERY_RANGE:-SUBNET}"
-export ROS_LOCALHOST_ONLY=0
-unset ROS_DISCOVERY_SERVER
-unset FASTRTPS_DEFAULT_PROFILES_FILE
-unset FASTDDS_DEFAULT_PROFILES_FILE
+missing=()
+for name in ROS_DOMAIN_ID RMW_IMPLEMENTATION; do
+  if [[ -z "${!name:-}" ]]; then
+    missing+=("${name}")
+  fi
+done
+if [[ "${RMW_IMPLEMENTATION:-}" == "rmw_cyclonedds_cpp" && -z "${CYCLONEDDS_URI:-}" ]]; then
+  missing+=("CYCLONEDDS_URI")
+fi
+if (( ${#missing[@]} > 0 )); then
+  printf 'Missing required shell environment variable(s): %s\n' "${missing[*]}" >&2
+  printf 'Source ~/.bashrc before running this diagnostic script.\n' >&2
+  exit 2
+fi
 
 run_domain() {
   local domain="$1"

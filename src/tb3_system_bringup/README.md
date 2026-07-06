@@ -5,6 +5,7 @@ RL 정책까지 한 번에 켜는 오케스트레이터. 로봇마다 이 패키
 하나만 실행하면 된다.
 
 - `system.launch.py`: 역할별 전체 스택
+- `pc.launch.py`: PC에서 YOLO 서버 + 통합 RViz를 같이 실행
 - `viewer.launch.py`: PC에서 fleet 디버그 마커 + 리스크맵을 하나의 RViz로
   같이 보는 뷰어 (로봇을 켜지 않음)
 
@@ -33,15 +34,13 @@ ros2 launch tb3_system_bringup system.launch.py \
   role:=leader require_follower_pose:=false
 ```
 
-PC 통합 뷰어 (fleet 디버그 마커 + 리스크맵을 같은 RViz 창에서):
+PC 통합 실행 (YOLO 서버 + fleet/risk RViz):
 
 ```bash
-ros2 launch tb3_system_bringup viewer.launch.py
+ros2 launch tb3_system_bringup pc.launch.py
 ```
 
-`system.launch.py`에 `start_rviz:=true`를 주면 스카우트 쪽에서 바로
-같은 뷰어를 띄울 수도 있다 (내부적으로 `viewer.launch.py`를
-`main_domain_id`로 include).
+PC에서 RViz만 켜려면 `start_yolo_server:=false`를 준다.
 
 ## `role`이 실제로 켜는 것
 
@@ -80,6 +79,10 @@ follower 중에도 계속 켜져 있다 — 위험도만 수동적으로 계속 
 
 ### YOLO를 PC로 오프로드 (`start_camera_sender`)
 
+리스크맵은 정찰봇에서 실행된다. `start_camera_sender:=true`는 정찰봇의
+카메라 프레임만 PC의 Flask YOLO 서버로 보내고, YOLO 결과(`/risk/yolo_detections`)를
+다시 정찰봇에서 받아 로컬 리스크맵에 넣는다.
+
 `start_camera_sender:=true`를 주면 `system.launch.py`가 직접
 `tb3_flask_yolo_bridge/opencv_camera_to_flask_yolo.launch.py`를 이
 로봇에서 같이 띄운다 — 카메라를 잡아서 PC의 `flask_yolo_server`로 HTTP로
@@ -94,7 +97,7 @@ ros2 launch tb3_system_bringup system.launch.py \
   role:=scout main_domain_id:=24 start_camera_sender:=true
 
 # PC: flask_yolo_server (YOLO 추론 서버)
-ros2 launch tb3_flask_yolo_bridge flask_yolo_server.launch.py
+ros2 launch tb3_system_bringup pc.launch.py
 ```
 
 - `camera_sender_device`(기본 `/dev/video1`): 이 로봇에서 잡을 카메라 장치.
