@@ -13,7 +13,6 @@ RL 정책까지 한 번에 켜는 오케스트레이터. 로봇마다 이 패키
 정찰봇:
 
 ```bash
-export ROS_DOMAIN_ID=26
 ros2 launch tb3_system_bringup system.launch.py \
   role:=scout main_domain_id:=24
 ```
@@ -21,7 +20,6 @@ ros2 launch tb3_system_bringup system.launch.py \
 리더:
 
 ```bash
-export ROS_DOMAIN_ID=24
 ros2 launch tb3_system_bringup system.launch.py role:=leader
 ```
 
@@ -38,7 +36,6 @@ ros2 launch tb3_system_bringup system.launch.py \
 PC 통합 뷰어 (fleet 디버그 마커 + 리스크맵을 같은 RViz 창에서):
 
 ```bash
-export ROS_DOMAIN_ID=24
 ros2 launch tb3_system_bringup viewer.launch.py
 ```
 
@@ -94,7 +91,7 @@ follower 중에도 계속 켜져 있다 — 위험도만 수동적으로 계속 
 ```bash
 # 정찰봇: YOLO는 PC(flask_yolo_server)에서 돌리고 여기선 카메라만 전송
 ros2 launch tb3_system_bringup system.launch.py \
-  role:=scout start_camera_sender:=true
+  role:=scout main_domain_id:=24 start_camera_sender:=true
 
 # PC: flask_yolo_server (YOLO 추론 서버)
 ros2 launch tb3_flask_yolo_bridge flask_yolo_server.launch.py

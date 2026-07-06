@@ -51,7 +51,13 @@ def generate_launch_description():
     def make_stack(context):
         simulation = launch_bool(use_sim_time.perform(context))
         follower_domain = int(domain_id.perform(context))
-        main_domain = int(main_domain_id.perform(context))
+        main_domain_value = main_domain_id.perform(context).strip()
+        if not main_domain_value:
+            raise ValueError(
+                'main_domain_id is required for follower.launch.py domain_bridge. '
+                'Pass the launch option main_domain_id:=<leader_domain>.'
+            )
+        main_domain = int(main_domain_value)
         peers = ros_static_peers.perform(context)
         process_env = clean_process_environment(str(follower_domain), peers)
 
@@ -383,8 +389,11 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'main_domain_id',
-            default_value=EnvironmentVariable('MAIN_DOMAIN_ID'),
-            description='Leader/PC DDS domain used by domain_bridge.',
+            default_value='',
+            description=(
+                'Leader/PC DDS domain used by domain_bridge. Required; pass '
+                'main_domain_id:=<leader_domain>.'
+            ),
         ),
         DeclareLaunchArgument(
             'start_robot_bringup',

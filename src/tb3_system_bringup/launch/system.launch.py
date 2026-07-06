@@ -77,7 +77,6 @@ def generate_launch_description():
             )
 
         domain = int(domain_id.perform(context))
-        main_domain = int(main_domain_id.perform(context))
 
         fleet_role_value = fleet_role.perform(context).strip().lower()
         if not fleet_role_value:
@@ -87,6 +86,17 @@ def generate_launch_description():
                 f"fleet_role must be one of {sorted(FLEET_LAUNCH_FILES)}, "
                 f'got {fleet_role_value!r}'
             )
+
+        main_domain_value = main_domain_id.perform(context).strip()
+        main_domain = domain
+        if fleet_role_value in ('follower', 'member') or launch_bool(start_rviz.perform(context)):
+            if not main_domain_value:
+                raise ValueError(
+                    'main_domain_id is required for scout/member/follower '
+                    'bridging or start_rviz:=true. Pass the launch option '
+                    'main_domain_id:=<leader_domain>.'
+                )
+            main_domain = int(main_domain_value)
 
         fleet_share = get_package_share_directory('tb3_fleet_bringup')
         fleet_launch_path = os.path.join(
@@ -316,8 +326,12 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'main_domain_id',
-            default_value=EnvironmentVariable('MAIN_DOMAIN_ID'),
-            description='Leader/PC DDS domain used by domain_bridge.',
+            default_value='',
+            description=(
+                'Leader/PC DDS domain used by domain_bridge. Required for '
+                'scout/member/follower bridging or start_rviz:=true; optional '
+                'for role:=leader. Pass as main_domain_id:=<leader_domain>.'
+            ),
         ),
         DeclareLaunchArgument(
             'fleet_role',

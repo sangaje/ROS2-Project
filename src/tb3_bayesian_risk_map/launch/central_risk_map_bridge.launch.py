@@ -40,7 +40,12 @@ def generate_launch_description():
 
     def _write_bridge_configs(context, *args, **kwargs):
         central_domain = central_domain_id.perform(context)
-        source_domain = source_domain_id.perform(context)
+        source_domain = source_domain_id.perform(context).strip()
+        if not source_domain:
+            raise ValueError(
+                'source_domain_id is required when start_domain_bridges:=true. '
+                'Pass the launch option source_domain_id:=<robot_domain>.'
+            )
         include_rviz_topics = bridge_rviz_topics.perform(context).strip().lower() in (
             '1', 'true', 'yes', 'on'
         )
@@ -158,8 +163,19 @@ topics:
 
     return LaunchDescription([
         DeclareLaunchArgument('central_domain_id', default_value=EnvironmentVariable('ROS_DOMAIN_ID')),
-        DeclareLaunchArgument('source_domain_id', default_value=EnvironmentVariable('SOURCE_DOMAIN_ID')),
-        DeclareLaunchArgument('risk_sink_domain_ids', default_value=EnvironmentVariable('RISK_SINK_DOMAIN_IDS'), description='Comma-separated domains that should receive central /risk maps.'),
+        DeclareLaunchArgument(
+            'source_domain_id',
+            default_value='',
+            description=(
+                'Robot DDS domain to bridge into the central risk map. Required '
+                'when start_domain_bridges:=true; pass source_domain_id:=<robot_domain>.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'risk_sink_domain_ids',
+            default_value='',
+            description='Comma-separated domains that should receive central /risk maps.',
+        ),
         DeclareLaunchArgument('use_sim_time', default_value='false'),
         DeclareLaunchArgument('start_domain_bridges', default_value='true'),
         DeclareLaunchArgument('start_risk_map', default_value='true'),

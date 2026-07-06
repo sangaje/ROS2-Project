@@ -45,7 +45,14 @@ def generate_launch_description():
 
     return LaunchDescription([
         DeclareLaunchArgument('central_domain_id', default_value=EnvironmentVariable('ROS_DOMAIN_ID')),
-        DeclareLaunchArgument('robot_domain_id', default_value=EnvironmentVariable('ROBOT_DOMAIN_ID')),
+        DeclareLaunchArgument(
+            'robot_domain_id',
+            default_value='',
+            description=(
+                'Robot DDS domain for PC-side bridges. Required when '
+                'start_domain_bridges:=true; pass robot_domain_id:=<robot_domain>.'
+            ),
+        ),
         DeclareLaunchArgument('use_sim_time', default_value='false'),
 
         DeclareLaunchArgument('start_flask_server', default_value='true'),
