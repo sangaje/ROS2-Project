@@ -83,7 +83,7 @@ def write_fleet_bridge_configs(
         '/map': topic(
             'nav_msgs/msg/OccupancyGrid',
             remap='/map_bridge',
-            profile=qos(depth=5),
+            profile=qos(durability='transient_local', depth=5),
         ),
         '/leader_pose': topic('geometry_msgs/msg/PoseStamped'),
         '/plan': topic(
@@ -206,7 +206,7 @@ def write_member_bridge_configs(
         '/map': topic(
             'nav_msgs/msg/OccupancyGrid',
             remap='/map_bridge',
-            profile=qos(depth=5),
+            profile=qos(durability='transient_local', depth=5),
         ),
         '/member_goal_pose': topic('geometry_msgs/msg/PoseStamped'),
         '/initialpose': topic(
@@ -224,7 +224,7 @@ def write_member_bridge_configs(
         '/map': topic(
             'nav_msgs/msg/OccupancyGrid',
             remap='/map_from_member',
-            profile=qos(depth=5),
+            profile=qos(durability='transient_local', depth=5),
         ),
         **risk_topics(),
     }
