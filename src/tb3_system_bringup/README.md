@@ -119,14 +119,26 @@ ros2 launch tb3_system_bringup system.launch.py \
 바뀌어도 캐싱 없이 항상 최신 값으로 반영된다. 별도로 와플 쪽에 새
 domain_bridge 프로세스를 띄울 필요는 없다(정찰봇이 양방향 다 실행).
 
-**아직 안 풀린 부분(고치지 않고 남겨둠):**
-- 이 스위치는 AMCL↔Cartographer 사이의 TF 소유권만 정리한 것이고, 로봇
-  하드웨어 bringup(`turtlebot3_bringup/robot.launch.py`)이 기본 파라미터로
-  여전히 `odom->base_footprint`를 직접 방송한다. Cartographer를 켜는
-  쪽에서 이 TF까지 완전히 겹치지 않게 하려면 `tb3_bayesian_risk_map`의
-  `turtlebot3_burger_no_odom_tf.yaml`(휠 오도메트리 TF 끔) 같은 하드웨어
-  파라미터 교체가 별도로 필요한데, `member.launch.py`/`system.launch.py`
-  둘 다 아직 그 파라미터 파일을 바꿔 끼울 옵션이 없다.
+### 하드웨어 odom TF 자동 교체 (해결됨, 2026-07-06)
+
+`role:=scout enable_amcl:=false start_cartographer:=true` 조합을 쓰면
+(정찰봇이 SLAM 소유), `system.launch.py`가 자동으로:
+- `member.launch.py`의 하드웨어 bringup에 `tb3_bayesian_risk_map`의
+  `turtlebot3_burger_no_odom_tf.yaml`을 `hardware_param_file`로 넘겨서
+  휠 오도메트리의 `odom->base_footprint` 자체 방송을 끈다.
+- 리스크맵의 `cartographer_configuration_basename`이 기본값
+  (`turtlebot3_lds_2d_risk_safe.lua`, `map->base_footprint`만 직접 발행하고
+  `odom`은 건너뜀)일 때만 `turtlebot3_lds_2d_risk_safe_no_odom.lua`(정상적인
+  `map->odom->base_footprint` 전체 소유)로 자동으로 바꿔준다.
+
+이 조합 없이 그냥 켜면 `odom`과 `base_footprint`를 두 곳(휠 오도메트리,
+Cartographer)이 동시에 주장해서 TF 트리가 두 갈래로 쪼개지고
+(`Tf has two or more unconnected trees`), Nav2가 `map`으로 좌표 변환을
+못 해서 결과적으로 맵/코스트맵이 전혀 안 뜨는 것처럼 보인다 — 실기
+3대 테스트 중 실제로 겪은 문제. `cartographer_configuration_basename`을
+직접 다른 값으로 지정하면 이 자동 교체는 건너뛴다(사용자가 이미 알고
+하는 것으로 간주).
+
 - 정찰봇이 자기 SLAM으로 독자 맵을 가지면 `/member_pose`가 리더의 공유
   맵 좌표계와 달라져서 `fleet_path_coordinator`의 회피 계산이 어긋날 수
   있다 — 아직 해결 방법을 논의 중.

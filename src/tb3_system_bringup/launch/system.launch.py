@@ -90,6 +90,20 @@ def generate_launch_description():
         fleet_launch_path = os.path.join(
             fleet_share, 'launch', FLEET_LAUNCH_FILES[fleet_role_value]
         )
+
+        # Will this member end up owning its own SLAM (risk map's
+        # Cartographer, via start_cartographer:=true + enable_amcl:=false)?
+        # If so it needs the wheel odometry's own odom->base_footprint TF
+        # broadcast disabled, or Cartographer's map->odom(->base_footprint)
+        # fights it and TF splits into two disconnected trees.
+        member_owns_slam = (
+            role_value == 'scout'
+            and fleet_role_value == 'member'
+            and launch_bool(start_risk_map.perform(context))
+            and launch_bool(start_cartographer.perform(context))
+            and not launch_bool(enable_amcl.perform(context))
+        )
+
         fleet_launch_args = {
             'domain_id': str(domain),
             'start_robot_bringup': start_robot_bringup.perform(context),
@@ -107,6 +121,11 @@ def generate_launch_description():
             )
         if fleet_role_value in ('follower', 'member'):
             fleet_launch_args['main_domain_id'] = str(main_domain)
+        if member_owns_slam:
+            fleet_launch_args['hardware_param_file'] = os.path.join(
+                get_package_share_directory('tb3_bayesian_risk_map'),
+                'config', 'turtlebot3_burger_no_odom_tf.yaml',
+            )
         # Whether the fleet stack underneath already owns a map->odom TF
         # source, so start_cartographer below can refuse to also claim
         # that transform. member.launch.py and leader.launch.py can each
@@ -171,6 +190,14 @@ def generate_launch_description():
                     f"{fleet_role_value} fleet stack's own map->odom "
                     f'source for this robot. {hint}'
                 )
+            configured_lua = cartographer_configuration_basename.perform(context)
+            if member_owns_slam and configured_lua == 'turtlebot3_lds_2d_risk_safe.lua':
+                # Auto-upgrade to the variant that properly owns the full
+                # map->odom->base_footprint chain -- paired with the
+                # no-odom-TF hardware param file set above, since the
+                # plain default only publishes map->base_footprint
+                # directly and leaves odom disconnected.
+                configured_lua = 'turtlebot3_lds_2d_risk_safe_no_odom.lua'
             actions.append(IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(risk_launch_path),
                 launch_arguments={
@@ -184,9 +211,7 @@ def generate_launch_description():
                     'start_cartographer': (
                         'true' if cartographer_on else 'false'
                     ),
-                    'cartographer_configuration_basename': (
-                        cartographer_configuration_basename.perform(context)
-                    ),
+                    'cartographer_configuration_basename': configured_lua,
                     'start_camera': start_camera.perform(context),
                     'model_path': risk_model_path.perform(context),
                     'detection_source': detection_source.perform(context),

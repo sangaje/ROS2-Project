@@ -43,6 +43,7 @@ def generate_launch_description():
     domain_id = LaunchConfiguration('domain_id')
     main_domain_id = LaunchConfiguration('main_domain_id')
     start_robot_bringup = LaunchConfiguration('start_robot_bringup')
+    hardware_param_file = LaunchConfiguration('hardware_param_file')
     initial_x = LaunchConfiguration('member_initial_x')
     initial_y = LaunchConfiguration('member_initial_y')
     initial_yaw = LaunchConfiguration('member_initial_yaw')
@@ -200,6 +201,7 @@ def generate_launch_description():
             launch_arguments={
                 'domain_id': str(member_domain),
                 'start_robot_bringup': start_robot_bringup.perform(context),
+                'hardware_param_file': hardware_param_file.perform(context),
                 'nav2_params_file': nav2_params,
                 'goal_pose_topic': '/member_goal_pose',
                 'goal_proxy_name': 'member_coord_goal',
@@ -243,6 +245,17 @@ def generate_launch_description():
             default_value='true',
             choices=['true', 'false'],
             description='Start TurtleBot3 hardware drivers.',
+        ),
+        DeclareLaunchArgument(
+            'hardware_param_file', default_value='',
+            description=(
+                'Optional override for turtlebot3_bringup\'s own hardware '
+                'parameter YAML, passed through to base.launch.py. Needed '
+                'when this member owns its own SLAM (enable_amcl:=false + '
+                'a Cartographer elsewhere) so the wheel odometry\'s own '
+                'odom->base_footprint TF broadcast can be disabled -- '
+                'otherwise it conflicts with Cartographer\'s own TF.'
+            ),
         ),
         DeclareLaunchArgument('member_initial_x', default_value='0.0'),
         DeclareLaunchArgument('member_initial_y', default_value='0.0'),
