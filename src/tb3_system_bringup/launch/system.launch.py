@@ -57,6 +57,9 @@ def generate_launch_description():
     )
     start_camera = LaunchConfiguration('start_camera')
     risk_model_path = LaunchConfiguration('risk_model_path')
+    detection_source = LaunchConfiguration('detection_source')
+    enable_yolo = LaunchConfiguration('enable_yolo')
+    external_detection_topic = LaunchConfiguration('external_detection_topic')
     start_rl_policy = LaunchConfiguration('start_rl_policy')
     rl_model_path = LaunchConfiguration('rl_model_path')
     rl_disable_slam_map = LaunchConfiguration('rl_disable_slam_map')
@@ -179,6 +182,11 @@ def generate_launch_description():
                     ),
                     'start_camera': start_camera.perform(context),
                     'model_path': risk_model_path.perform(context),
+                    'detection_source': detection_source.perform(context),
+                    'enable_yolo': enable_yolo.perform(context),
+                    'external_detection_topic': (
+                        external_detection_topic.perform(context)
+                    ),
                     'start_rviz': 'false',
                 }.items(),
             ))
@@ -308,6 +316,36 @@ def generate_launch_description():
             description='Scout only: start the USB camera feeding the risk map YOLO detector.',
         ),
         DeclareLaunchArgument('risk_model_path', default_value='yolo11n.pt'),
+        DeclareLaunchArgument(
+            'detection_source', default_value='local_yolo',
+            description=(
+                'Scout only, passed through to real_robot_risk_slam.'
+                'launch.py. Default local_yolo runs YOLO on this robot. '
+                "Set flask_topic to consume detections published by "
+                'tb3_flask_yolo_bridge/opencv_camera_to_flask_yolo.'
+                'launch.py instead (offload YOLO to a PC running '
+                'flask_yolo_server.launch.py) -- also set '
+                'enable_yolo:=false and start_camera:=false in that case, '
+                'since the sender node owns the camera instead.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'enable_yolo', default_value='true',
+            choices=['true', 'false'],
+            description=(
+                'Scout only: run YOLO inference inside the risk map node '
+                'itself. Set false when detection_source:=flask_topic '
+                '(a PC-side flask_yolo_server does the inference instead).'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'external_detection_topic', default_value='/risk/yolo_detections',
+            description=(
+                'Scout only: topic the risk map node reads external '
+                'detections from when detection_source is not local_yolo '
+                '-- must match opencv_camera_to_flask_yolo\'s output_topic.'
+            ),
+        ),
         DeclareLaunchArgument(
             'start_rl_policy', default_value='true',
             choices=['true', 'false'],
