@@ -87,13 +87,14 @@ start_robot_bringup:=false
 전부 스킵된다.
 
 `enable_amcl:=false`로 이 로봇이 Cartographer 등 자기 SLAM을 갖게 할
-때는, `base.launch.py`/`member.launch.py`의 **`hardware_param_file`**도
-같이 넘겨서 `turtlebot3_bringup`의 하드웨어 파라미터 파일을 바꿔야 한다
-(`tb3_bayesian_risk_map`의 `turtlebot3_burger_no_odom_tf.yaml` 등) —
-안 그러면 휠 오도메트리가 여전히 `odom->base_footprint`를 자기가
-따로 방송해서, Cartographer가 갖는 TF와 충돌해 트리가 두 갈래로
-쪼개진다(`tb3_system_bringup` README의 "하드웨어 odom TF 자동 교체"
-참고 — `system.launch.py`의 SLAM 조합 launch에서는 이걸 자동으로
+때는, `base.launch.py`/`member.launch.py`/`follower.launch.py` 모두가
+받는 **`hardware_param_file`**도 같이 넘겨서 `turtlebot3_bringup`의
+하드웨어 파라미터 파일을 바꿔야 한다(`tb3_bayesian_risk_map`의
+`turtlebot3_burger_no_odom_tf.yaml` 등) — 안 그러면 휠 오도메트리가
+여전히 `odom->base_footprint`를 자기가 따로 방송해서, Cartographer가
+갖는 TF와 충돌해 트리가 두 갈래로 쪼개진다(`tb3_system_bringup`
+README의 "하드웨어 odom TF 자동 교체" 참고 — `system.launch.py`의 SLAM
+조합 launch(`fleet_role:=member`/`follower` 둘 다)에서는 이걸 자동으로
 넣어준다).
 
 ## 리더가 SLAM을 포기하고 멤버의 맵을 받는 옵션 (`enable_cartographer`)

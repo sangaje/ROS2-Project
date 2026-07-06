@@ -61,6 +61,9 @@ def generate_launch_description():
     detection_source = LaunchConfiguration('detection_source')
     enable_yolo = LaunchConfiguration('enable_yolo')
     external_detection_topic = LaunchConfiguration('external_detection_topic')
+    start_camera_sender = LaunchConfiguration('start_camera_sender')
+    camera_sender_device = LaunchConfiguration('camera_sender_device')
+    flask_server_url = LaunchConfiguration('flask_server_url')
     start_rl_policy = LaunchConfiguration('start_rl_policy')
     rl_model_path = LaunchConfiguration('rl_model_path')
     rl_disable_slam_map = LaunchConfiguration('rl_disable_slam_map')
@@ -91,14 +94,18 @@ def generate_launch_description():
             fleet_share, 'launch', FLEET_LAUNCH_FILES[fleet_role_value]
         )
 
-        # Will this member end up owning its own SLAM (risk map's
+        # Will this scout end up owning its own SLAM (risk map's
         # Cartographer, via start_cartographer:=true + enable_amcl:=false)?
-        # If so it needs the wheel odometry's own odom->base_footprint TF
-        # broadcast disabled, or Cartographer's map->odom(->base_footprint)
-        # fights it and TF splits into two disconnected trees.
-        member_owns_slam = (
+        # Applies whether the scout is currently in member or follower
+        # fleet_role -- a follower is just a scout temporarily tailing the
+        # leader instead of exploring (RL suspended above), and its risk
+        # map/camera/Cartographer keep running regardless. If so it needs
+        # the wheel odometry's own odom->base_footprint TF broadcast
+        # disabled, or Cartographer's map->odom(->base_footprint) fights
+        # it and TF splits into two disconnected trees.
+        scout_owns_slam = (
             role_value == 'scout'
-            and fleet_role_value == 'member'
+            and fleet_role_value in ('member', 'follower')
             and launch_bool(start_risk_map.perform(context))
             and launch_bool(start_cartographer.perform(context))
             and not launch_bool(enable_amcl.perform(context))
@@ -121,21 +128,19 @@ def generate_launch_description():
             )
         if fleet_role_value in ('follower', 'member'):
             fleet_launch_args['main_domain_id'] = str(main_domain)
-        if member_owns_slam:
+        if scout_owns_slam:
             fleet_launch_args['hardware_param_file'] = os.path.join(
                 get_package_share_directory('tb3_bayesian_risk_map'),
                 'config', 'turtlebot3_burger_no_odom_tf.yaml',
             )
         # Whether the fleet stack underneath already owns a map->odom TF
         # source, so start_cartographer below can refuse to also claim
-        # that transform. member.launch.py and leader.launch.py can each
-        # give SLAM up (enable_amcl:=false / enable_cartographer:=false);
-        # follower.launch.py always runs AMCL with no off switch yet.
-        if fleet_role_value == 'member':
+        # that transform. member.launch.py, follower.launch.py and
+        # leader.launch.py can each give SLAM up (enable_amcl:=false /
+        # enable_cartographer:=false).
+        if fleet_role_value in ('member', 'follower'):
             fleet_launch_args['enable_amcl'] = enable_amcl.perform(context)
             fleet_stack_owns_slam = launch_bool(enable_amcl.perform(context))
-        elif fleet_role_value == 'follower':
-            fleet_stack_owns_slam = True
         else:  # leader
             fleet_stack_owns_slam = launch_bool(
                 enable_cartographer.perform(context)
@@ -162,6 +167,8 @@ def generate_launch_description():
                 ]))
             return actions
 
+        camera_sender_on = launch_bool(start_camera_sender.perform(context))
+
         if launch_bool(start_risk_map.perform(context)):
             risk_share = get_package_share_directory('tb3_bayesian_risk_map')
             risk_launch_path = os.path.join(
@@ -169,15 +176,8 @@ def generate_launch_description():
             )
             cartographer_on = launch_bool(start_cartographer.perform(context))
             if cartographer_on and fleet_stack_owns_slam:
-                if fleet_role_value == 'member':
+                if fleet_role_value in ('member', 'follower'):
                     hint = 'Set enable_amcl:=false when turning start_cartographer on.'
-                elif fleet_role_value == 'follower':
-                    hint = (
-                        'follower.launch.py always runs AMCL with no off '
-                        'switch, so start_cartographer:=true cannot be used '
-                        "with fleet_role:=follower yet -- use fleet_role:="
-                        "member enable_amcl:=false instead."
-                    )
                 else:
                     hint = (
                         'Set enable_cartographer:=false (leader.launch.py '
@@ -191,13 +191,26 @@ def generate_launch_description():
                     f'source for this robot. {hint}'
                 )
             configured_lua = cartographer_configuration_basename.perform(context)
-            if member_owns_slam and configured_lua == 'turtlebot3_lds_2d_risk_safe.lua':
+            if scout_owns_slam and configured_lua == 'turtlebot3_lds_2d_risk_safe.lua':
                 # Auto-upgrade to the variant that properly owns the full
                 # map->odom->base_footprint chain -- paired with the
                 # no-odom-TF hardware param file set above, since the
                 # plain default only publishes map->base_footprint
                 # directly and leaves odom disconnected.
                 configured_lua = 'turtlebot3_lds_2d_risk_safe_no_odom.lua'
+
+            # start_camera_sender:=true means opencv_camera_to_flask_yolo
+            # (started below) owns the camera and forwards frames to a
+            # PC-side flask_yolo_server instead -- force the matching
+            # detection_source wiring so the two never drift apart.
+            risk_start_camera = start_camera.perform(context)
+            risk_enable_yolo = enable_yolo.perform(context)
+            risk_detection_source = detection_source.perform(context)
+            if camera_sender_on:
+                risk_start_camera = 'false'
+                risk_enable_yolo = 'false'
+                risk_detection_source = 'flask_topic'
+
             actions.append(IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(risk_launch_path),
                 launch_arguments={
@@ -212,10 +225,10 @@ def generate_launch_description():
                         'true' if cartographer_on else 'false'
                     ),
                     'cartographer_configuration_basename': configured_lua,
-                    'start_camera': start_camera.perform(context),
+                    'start_camera': risk_start_camera,
                     'model_path': risk_model_path.perform(context),
-                    'detection_source': detection_source.perform(context),
-                    'enable_yolo': enable_yolo.perform(context),
+                    'detection_source': risk_detection_source,
+                    'enable_yolo': risk_enable_yolo,
                     'external_detection_topic': (
                         external_detection_topic.perform(context)
                     ),
@@ -223,7 +236,35 @@ def generate_launch_description():
                 }.items(),
             ))
 
-        if launch_bool(start_rl_policy.perform(context)):
+        if camera_sender_on:
+            sender_share = get_package_share_directory('tb3_flask_yolo_bridge')
+            sender_launch_path = os.path.join(
+                sender_share, 'launch', 'opencv_camera_to_flask_yolo.launch.py'
+            )
+            actions.append(IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(sender_launch_path),
+                launch_arguments={
+                    'device': camera_sender_device.perform(context),
+                    'server_url': flask_server_url.perform(context),
+                    'output_topic': external_detection_topic.perform(context),
+                }.items(),
+            ))
+
+        if fleet_role_value == 'follower':
+            # A follower is a scout that is temporarily suspending its own
+            # recon duty to tail the leader instead -- follower.launch.py's
+            # Nav2 stack already drives cmd_vel to chase the leader, so the
+            # RL policy (which also drives cmd_vel directly) must not run
+            # at the same time or the two fight over the motors. The risk
+            # map/camera/YOLO stay on above: they only accumulate risk data
+            # passively and never command movement themselves.
+            if launch_bool(start_rl_policy.perform(context)):
+                actions.append(LogInfo(msg=[
+                    'SYSTEM_BRINGUP | fleet_role=follower: suspending the '
+                    'RL policy (follower.launch.py\'s own Nav2 pursuit '
+                    'drives cmd_vel instead). Risk map/camera stay on.'
+                ]))
+        elif launch_bool(start_rl_policy.perform(context)):
             process_env = clean_process_environment(str(domain))
             rl_command = [
                 'ros2', 'run', 'turtlebot3_rl_training', 'eval_policy',
@@ -328,9 +369,10 @@ def generate_launch_description():
             'enable_amcl', default_value='true',
             choices=['true', 'false'],
             description=(
-                'member fleet_role only: run AMCL as the map->odom TF '
-                'source (fleet bringup\'s own default). Set false only '
-                'when start_cartographer below will own SLAM/TF instead.'
+                'member/follower fleet_role only: run AMCL as the '
+                'map->odom TF source (fleet bringup\'s own default). Set '
+                'false only when start_cartographer below will own '
+                'SLAM/TF instead.'
             ),
         ),
         DeclareLaunchArgument(
@@ -391,6 +433,33 @@ def generate_launch_description():
                 'Scout only: topic the risk map node reads external '
                 'detections from when detection_source is not local_yolo '
                 '-- must match opencv_camera_to_flask_yolo\'s output_topic.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'start_camera_sender', default_value='false',
+            choices=['true', 'false'],
+            description=(
+                'Scout only: run tb3_flask_yolo_bridge/'
+                'opencv_camera_to_flask_yolo.launch.py on this robot to '
+                'offload YOLO inference to a PC running '
+                'flask_yolo_server.launch.py, instead of running YOLO '
+                'locally. When true, this auto-forces start_camera:=false, '
+                "enable_yolo:=false and detection_source:=flask_topic so "
+                "the risk map reads detections from the sender's "
+                'output_topic (kept in sync with external_detection_topic) '
+                'instead of running its own camera/YOLO.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'camera_sender_device', default_value='/dev/video1',
+            description='Scout only, start_camera_sender:=true: camera device for opencv_camera_to_flask_yolo.',
+        ),
+        DeclareLaunchArgument(
+            'flask_server_url', default_value='http://seil:5005/detect',
+            description=(
+                'Scout only, start_camera_sender:=true: PC-side '
+                'flask_yolo_server URL. Defaults to the PC\'s Tailscale '
+                'hostname.'
             ),
         ),
         DeclareLaunchArgument(

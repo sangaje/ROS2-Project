@@ -39,6 +39,7 @@ def generate_launch_description():
     domain_id = LaunchConfiguration('domain_id')
     main_domain_id = LaunchConfiguration('main_domain_id')
     start_robot_bringup = LaunchConfiguration('start_robot_bringup')
+    hardware_param_file = LaunchConfiguration('hardware_param_file')
     follow_distance = LaunchConfiguration('follow_distance')
     initial_x = LaunchConfiguration('follower_initial_x')
     initial_y = LaunchConfiguration('follower_initial_y')
@@ -329,12 +330,13 @@ def generate_launch_description():
         if robot_state_publisher is not None:
             actions.append(robot_state_publisher)
         elif launch_bool(start_robot_bringup.perform(context)):
+            robot_launch_args = {'use_sim_time': 'false', 'namespace': ''}
+            param_file = hardware_param_file.perform(context)
+            if param_file:
+                robot_launch_args['tb3_param_dir'] = param_file
             actions.append(IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(robot_launch),
-                launch_arguments={
-                    'use_sim_time': 'false',
-                    'namespace': '',
-                }.items(),
+                launch_arguments=robot_launch_args.items(),
             ))
 
         timing = (
@@ -387,6 +389,17 @@ def generate_launch_description():
             default_value='true',
             choices=['true', 'false'],
             description='Start TurtleBot3 hardware drivers in real mode.',
+        ),
+        DeclareLaunchArgument(
+            'hardware_param_file', default_value='',
+            description=(
+                'Optional override for turtlebot3_bringup\'s own hardware '
+                'parameter YAML (real mode only). Needed when this '
+                'follower owns its own SLAM (enable_amcl:=false + a '
+                'Cartographer elsewhere) so the wheel odometry\'s own '
+                'odom->base_footprint TF broadcast can be disabled -- '
+                'otherwise it conflicts with Cartographer\'s own TF.'
+            ),
         ),
         DeclareLaunchArgument(
             'follow_distance',

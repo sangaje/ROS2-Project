@@ -61,6 +61,17 @@ RL 정책이 직접 `/cmd_vel`을 몰아 정찰하고, 코디네이터가 다른
 `waffle`은 아직 정찰봇 behavior와 합쳐지지 않은 베타 자리표시자다.
 지금은 `tb3_fleet_bringup/leader.launch.py`만 실행한다.
 
+### follower는 결국 정찰봇이다
+
+`role:=scout fleet_role:=follower`로 쓰면(정찰봇 하드웨어가 잠깐 리더를
+그냥 쫓아만 다니는 모드) `system.launch.py`가 자동으로 **RL 정책만**
+꺼준다 — `follower.launch.py`의 Nav2 추종 로직이 이미 `/cmd_vel`을 몰고
+있는데 RL도 같이 몰면 둘이 로봇을 두고 싸우게 되기 때문. 리스크맵/카메라/YOLO는
+follower 중에도 계속 켜져 있다 — 위험도만 수동적으로 계속 쌓을 뿐 이동
+명령은 절대 안 내리므로 follower의 Nav2 추종과 부딪히지 않는다. 정찰
+임무(RL 탐사)를 다시 켜려면 `fleet_role`을 다시 `member`(또는 비워서
+기본값)로 바꾸면 된다.
+
 ## 주요 옵션
 
 공통: `domain_id`, `main_domain_id`, `fleet_role`, `start_robot_bringup`,
@@ -70,6 +81,32 @@ RL 정책이 직접 `/cmd_vel`을 몰아 정찰하고, 코디네이터가 다른
 `risk_model_path`(YOLO 가중치), `start_cartographer`(기본 false),
 `cartographer_configuration_basename`(기본
 `turtlebot3_lds_2d_risk_safe.lua`).
+
+### YOLO를 PC로 오프로드 (`start_camera_sender`)
+
+`start_camera_sender:=true`를 주면 `system.launch.py`가 직접
+`tb3_flask_yolo_bridge/opencv_camera_to_flask_yolo.launch.py`를 이
+로봇에서 같이 띄운다 — 카메라를 잡아서 PC의 `flask_yolo_server`로 HTTP로
+프레임을 보내고, 리스크맵은 로컬 YOLO 대신 그 결과(`external_detection_topic`)를
+읽는다. 켜면 `start_camera:=false`, `enable_yolo:=false`,
+`detection_source:=flask_topic`이 자동으로 강제되므로 따로 안 챙겨도 된다.
+별도로 `opencv_camera_to_flask_yolo.launch.py`를 수동으로 또 띄울 필요 없음.
+
+```bash
+# 정찰봇: YOLO는 PC(flask_yolo_server)에서 돌리고 여기선 카메라만 전송
+ros2 launch tb3_system_bringup system.launch.py \
+  role:=scout start_camera_sender:=true
+
+# PC: flask_yolo_server (YOLO 추론 서버)
+ros2 launch tb3_flask_yolo_bridge flask_yolo_server.launch.py
+```
+
+- `camera_sender_device`(기본 `/dev/video1`): 이 로봇에서 잡을 카메라 장치.
+- `flask_server_url`(기본 `http://seil:5005/detect`): PC의 flask_yolo_server
+  주소. Tailscale 호스트명 `seil`을 기본값으로 쓴다(IP 대신).
+- 리스크맵이 읽는 `external_detection_topic`과 센더의 `output_topic`이
+  같은 값으로 자동으로 맞춰진다(둘 다 `external_detection_topic` 인자를
+  공유).
 
 ### TF 소유권: AMCL vs 리스크맵 Cartographer
 
@@ -86,10 +123,12 @@ ros2 launch tb3_system_bringup system.launch.py \
   role:=scout enable_amcl:=false start_cartographer:=true
 ```
 
-이 안전장치는 `fleet_role`이 `member`(AMCL, `enable_amcl`로 끌 수 있음)나
-`leader`(Cartographer, `enable_cartographer`로 끌 수 있음)일 때 적용된다.
-`follower`는 아직 AMCL을 끌 방법이 없어서 `fleet_role:=follower`로는
-`start_cartographer:=true`를 쓸 수 없다.
+이 안전장치는 `fleet_role`이 `member`/`follower`(AMCL, `enable_amcl`로
+끌 수 있음)나 `leader`(Cartographer, `enable_cartographer`로 끌 수 있음)일
+때 적용된다. `fleet_role:=follower`도 `enable_amcl:=false`와 같이 쓰면
+`start_cartographer:=true`를 그대로 쓸 수 있다 (2026-07-06 배선 완료 —
+follower는 결국 정찰봇이므로 follower 중에도 리스크맵 Cartographer가
+SLAM을 계속 소유해야 한다, 위 "follower는 결국 정찰봇이다" 참고).
 
 `/map` 이중 발행 문제는 `map_relay`가 `count_publishers()`로 Cartographer
 같은 다른 발행자가 있는지 감지해서 있으면 조용히 대기하도록 바뀌어서
@@ -122,10 +161,12 @@ domain_bridge 프로세스를 띄울 필요는 없다(정찰봇이 양방향 다
 ### 하드웨어 odom TF 자동 교체 (해결됨, 2026-07-06)
 
 `role:=scout enable_amcl:=false start_cartographer:=true` 조합을 쓰면
-(정찰봇이 SLAM 소유), `system.launch.py`가 자동으로:
-- `member.launch.py`의 하드웨어 bringup에 `tb3_bayesian_risk_map`의
-  `turtlebot3_burger_no_odom_tf.yaml`을 `hardware_param_file`로 넘겨서
-  휠 오도메트리의 `odom->base_footprint` 자체 방송을 끈다.
+(정찰봇이 SLAM 소유, `fleet_role:=member`든 `fleet_role:=follower`든 둘 다
+적용됨), `system.launch.py`가 자동으로:
+- `member.launch.py`/`follower.launch.py`의 하드웨어 bringup에
+  `tb3_bayesian_risk_map`의 `turtlebot3_burger_no_odom_tf.yaml`을
+  `hardware_param_file`로 넘겨서 휠 오도메트리의 `odom->base_footprint`
+  자체 방송을 끈다.
 - 리스크맵의 `cartographer_configuration_basename`이 기본값
   (`turtlebot3_lds_2d_risk_safe.lua`, `map->base_footprint`만 직접 발행하고
   `odom`은 건너뜀)일 때만 `turtlebot3_lds_2d_risk_safe_no_odom.lua`(정상적인
@@ -147,6 +188,10 @@ Cartographer)이 동시에 주장해서 TF 트리가 두 갈래로 쪼개지고
   잠깐 넘겨받을 수 있다. `start_cartographer:=true` 조합에서는
   `takeover_grace_sec` 기본값(2초)이 너무 짧을 수 있으니 실기 테스트 때
   Cartographer 기동 시간에 맞춰 늘리는 걸 권장.
+- SLAM 소유권 자동 배선(`enable_amcl` 전달, `hardware_param_file` 자동
+  주입)은 `fleet_role:=member`와 `fleet_role:=follower` 둘 다 지원한다
+  (2026-07-06 배선 완료). `fleet_role:=leader`는 대신 `enable_cartographer`로
+  같은 역할을 한다.
 
 RL 정책(scout, `start_rl_policy:=true`가 기본): `rl_model_path`(SB3
 `.zip`), `rl_extra_args`(`eval_policy`에 그대로 넘길 추가 CLI 플래그
