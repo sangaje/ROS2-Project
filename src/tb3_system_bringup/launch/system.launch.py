@@ -137,7 +137,7 @@ def generate_launch_description():
             )
         if fleet_role_value in ('follower', 'member'):
             fleet_launch_args['main_domain_id'] = str(main_domain)
-        if fleet_role_value == 'member':
+        if fleet_role_value in ('leader', 'member'):
             fleet_launch_args['start_nav2'] = start_nav2.perform(context)
         if scout_owns_slam:
             fleet_launch_args['hardware_param_file'] = os.path.join(

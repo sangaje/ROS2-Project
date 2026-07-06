@@ -46,6 +46,7 @@ def generate_launch_description():
     use_sim_time = LaunchConfiguration('use_sim_time')
     domain_id = LaunchConfiguration('domain_id')
     start_robot_bringup = LaunchConfiguration('start_robot_bringup')
+    start_nav2 = LaunchConfiguration('start_nav2')
     require_follower_pose = LaunchConfiguration('require_follower_pose')
     enable_cartographer = LaunchConfiguration('enable_cartographer')
     auto_localize = LaunchConfiguration('auto_localize')
@@ -155,6 +156,8 @@ def generate_launch_description():
                 output='screen',
                 parameters=[nav2_params],
                 env=process_env,
+                respawn=True,
+                respawn_delay=3.0,
             )
             if auto:
                 kickstart_node = Node(
@@ -278,17 +281,32 @@ def generate_launch_description():
                 ),
             ]
         else:
+            if cartographer_owned:
+                nav_delay_sec = '12.0'
+                lifecycle_delay_sec = '16.0'
+                goal_delay_sec = '18.0'
+            else:
+                # External-map mode has one more startup dependency than
+                # normal leader SLAM: /map must cross the member/scout
+                # bridge, then AMCL must configure against that map and the
+                # local /scan. Give localization a clear head start before
+                # Nav2 starts asking for map->odom transforms.
+                nav_delay_sec = '18.0'
+                lifecycle_delay_sec = '22.0'
+                goal_delay_sec = '24.0'
+
             base_include = IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(base_launch),
                 launch_arguments={
                     'domain_id': domain,
                     'start_robot_bringup': start_robot_bringup.perform(context),
+                    'start_nav2': start_nav2.perform(context),
                     'nav2_params_file': nav2_params,
                     'goal_pose_topic': '/fleet/leader_coord_goal',
                     'goal_proxy_name': 'leader_goal_arbiter_output',
-                    'nav_delay_sec': '12.0',
-                    'lifecycle_delay_sec': '16.0',
-                    'goal_delay_sec': '18.0',
+                    'nav_delay_sec': nav_delay_sec,
+                    'lifecycle_delay_sec': lifecycle_delay_sec,
+                    'goal_delay_sec': goal_delay_sec,
                 }.items(),
             )
 
@@ -352,8 +370,9 @@ def generate_launch_description():
             ])
         else:
             # nav/lifecycle/goal timing for real mode lives inside
-            # base.launch.py (nav_delay_sec=12.0, lifecycle_delay_sec=16.0,
-            # goal_delay_sec=18.0 above), measured from this same t=0.
+            # base.launch.py, measured from this same t=0. External-map
+            # leader mode deliberately starts Nav2 later than normal SLAM
+            # leader mode so AMCL is active before navigation needs TF.
             pose_t, coordinator_t = 8.0, 20.0
             actions.extend([
                 TimerAction(
@@ -370,13 +389,13 @@ def generate_launch_description():
                 actions.append(
                     TimerAction(period=1.0, actions=[map_relay])
                 )
-                actions.append(TimerAction(period=5.0, actions=[amcl]))
+                actions.append(TimerAction(period=8.0, actions=[amcl]))
                 actions.append(TimerAction(
-                    period=5.5, actions=[localization_lifecycle],
+                    period=12.0, actions=[localization_lifecycle],
                 ))
                 if kickstart_node is not None:
                     actions.append(
-                        TimerAction(period=6.5, actions=[kickstart_node])
+                        TimerAction(period=15.0, actions=[kickstart_node])
                     )
         return actions
 
@@ -397,6 +416,15 @@ def generate_launch_description():
             default_value='true',
             choices=['true', 'false'],
             description='Start TurtleBot3 hardware drivers in real mode.',
+        ),
+        DeclareLaunchArgument(
+            'start_nav2',
+            default_value='true',
+            choices=['true', 'false'],
+            description=(
+                'Start the leader Nav2 navigation core and goal proxy in '
+                'real mode. Hardware bringup is controlled separately.'
+            ),
         ),
         DeclareLaunchArgument(
             'require_follower_pose',
