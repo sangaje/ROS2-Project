@@ -3,14 +3,13 @@ from launch.actions import (
     DeclareLaunchArgument,
     ExecuteProcess,
     IncludeLaunchDescription,
-    SetEnvironmentVariable,
     TimerAction,
-    UnsetEnvironmentVariable,
 )
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.substitutions import FindPackageShare
+from tb3_fleet_bringup.launch_utils import dds_launch_environment
 
 
 def generate_launch_description():
@@ -45,8 +44,8 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        DeclareLaunchArgument('central_domain_id', default_value='25'),
-        DeclareLaunchArgument('robot_domain_id', default_value='24'),
+        DeclareLaunchArgument('central_domain_id', default_value=EnvironmentVariable('ROS_DOMAIN_ID')),
+        DeclareLaunchArgument('robot_domain_id', default_value=EnvironmentVariable('ROBOT_DOMAIN_ID')),
         DeclareLaunchArgument('use_sim_time', default_value='false'),
 
         DeclareLaunchArgument('start_flask_server', default_value='true'),
@@ -74,14 +73,7 @@ def generate_launch_description():
         DeclareLaunchArgument('external_detection_topic', default_value='/risk/yolo_detections'),
         DeclareLaunchArgument('risk_publish_rate_hz', default_value='5.0'),
 
-        UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),
-        UnsetEnvironmentVariable('RMW_FASTRTPS_DEFAULT_PROFILES_FILE'),
-        UnsetEnvironmentVariable('FASTDDS_DEFAULT_PROFILES_FILE'),
-        UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
-        UnsetEnvironmentVariable('ROS_STATIC_PEERS'),
-        SetEnvironmentVariable('ROS_DOMAIN_ID', LaunchConfiguration('central_domain_id')),
-        SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp'),
-        SetEnvironmentVariable('ROS_LOCALHOST_ONLY', '0'),
+        *dds_launch_environment(LaunchConfiguration('central_domain_id')),
 
         clean_flask_port,
         TimerAction(

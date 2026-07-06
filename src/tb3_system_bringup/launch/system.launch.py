@@ -47,6 +47,7 @@ def generate_launch_description():
     main_domain_id = LaunchConfiguration('main_domain_id')
     fleet_role = LaunchConfiguration('fleet_role')
     start_robot_bringup = LaunchConfiguration('start_robot_bringup')
+    ros_static_peers = LaunchConfiguration('ros_static_peers')
     require_follower_pose = LaunchConfiguration('require_follower_pose')
     enable_cartographer = LaunchConfiguration('enable_cartographer')
     auto_localize = LaunchConfiguration('auto_localize')
@@ -111,9 +112,11 @@ def generate_launch_description():
             and not launch_bool(enable_amcl.perform(context))
         )
 
+        peers = ros_static_peers.perform(context)
         fleet_launch_args = {
             'domain_id': str(domain),
             'start_robot_bringup': start_robot_bringup.perform(context),
+            'ros_static_peers': peers,
         }
         if fleet_role_value == 'leader':
             fleet_launch_args['require_follower_pose'] = (
@@ -265,7 +268,7 @@ def generate_launch_description():
                     'drives cmd_vel instead). Risk map/camera stay on.'
                 ]))
         elif launch_bool(start_rl_policy.perform(context)):
-            process_env = clean_process_environment(str(domain))
+            process_env = clean_process_environment(str(domain), peers)
             rl_command = [
                 'ros2', 'run', 'turtlebot3_rl_training', 'eval_policy',
                 '--model', rl_model_path.perform(context),
@@ -296,7 +299,10 @@ def generate_launch_description():
             )
             actions.append(IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(viewer_launch_path),
-                launch_arguments={'domain_id': str(main_domain)}.items(),
+                launch_arguments={
+                    'domain_id': str(main_domain),
+                    'ros_static_peers': peers,
+                }.items(),
             ))
 
         return actions
@@ -314,12 +320,12 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'domain_id',
-            default_value=EnvironmentVariable('ROS_DOMAIN_ID', default_value='26'),
+            default_value=EnvironmentVariable('ROS_DOMAIN_ID'),
             description='This robot\'s DDS domain.',
         ),
         DeclareLaunchArgument(
             'main_domain_id',
-            default_value='24',
+            default_value=EnvironmentVariable('MAIN_DOMAIN_ID'),
             description='Leader/PC DDS domain used by domain_bridge.',
         ),
         DeclareLaunchArgument(
@@ -334,6 +340,22 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'start_robot_bringup', default_value='true',
             choices=['true', 'false'],
+        ),
+        DeclareLaunchArgument(
+            'ros_static_peers',
+            default_value=EnvironmentVariable('ROS_STATIC_PEERS', default_value=''),
+            description=(
+                'Optional ROS_STATIC_PEERS value (semicolon-separated '
+                'addresses) forcing unicast DDS discovery to specific '
+                'peers in addition to SUBNET multicast discovery. Needed '
+                'when this fleet spans machines that are not on the same '
+                'physical LAN and only reachable over a link that does '
+                'not carry multicast, e.g. a Tailscale/VPN hop -- without '
+                'this, cross-machine topics (like a member-owned /map '
+                'reaching the leader, or the PC viewer) can silently show '
+                'up in `ros2 topic list` (discovery) but never actually '
+                'deliver any messages (`ros2 topic echo`/`hz` hang).'
+            ),
         ),
         DeclareLaunchArgument(
             'require_follower_pose', default_value='true',
@@ -489,6 +511,6 @@ def generate_launch_description():
             choices=['true', 'false'],
             description='Also bring up the unified fleet+risk RViz view (see viewer.launch.py).',
         ),
-        *dds_launch_environment(domain_id),
+        *dds_launch_environment(domain_id, LaunchConfiguration('ros_static_peers')),
         OpaqueFunction(function=make_stack),
     ])

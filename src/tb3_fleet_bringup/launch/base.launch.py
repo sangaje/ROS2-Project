@@ -21,7 +21,7 @@ from launch.actions import (
     TimerAction,
 )
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import Node
 
 from tb3_fleet_bringup.launch_utils import clean_process_environment, launch_bool
@@ -43,9 +43,12 @@ def generate_launch_description():
     nav_delay_sec = LaunchConfiguration('nav_delay_sec')
     lifecycle_delay_sec = LaunchConfiguration('lifecycle_delay_sec')
     goal_delay_sec = LaunchConfiguration('goal_delay_sec')
+    ros_static_peers = LaunchConfiguration('ros_static_peers')
 
     def make_stack(context):
-        process_env = clean_process_environment(domain_id.perform(context))
+        process_env = clean_process_environment(
+            domain_id.perform(context), ros_static_peers.perform(context),
+        )
         params_file = nav2_params_file.perform(context)
         if not params_file:
             raise ValueError(
@@ -160,6 +163,18 @@ def generate_launch_description():
                 'Optional path to override turtlebot3_bringup\'s own '
                 'hardware parameter YAML (its tb3_param_dir). Empty '
                 'means use turtlebot3_bringup\'s own default.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'ros_static_peers',
+            default_value=EnvironmentVariable('ROS_STATIC_PEERS', default_value=''),
+            description=(
+                'Optional ROS_STATIC_PEERS value (semicolon-separated '
+                'addresses) forcing unicast DDS discovery to specific '
+                'peers in addition to SUBNET multicast discovery -- needed '
+                'when a peer (e.g. the PC) is only reachable over a link '
+                'that does not carry multicast, such as a Tailscale/VPN '
+                'hop between machines on different physical LANs.'
             ),
         ),
         DeclareLaunchArgument(

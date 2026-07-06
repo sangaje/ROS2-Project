@@ -14,16 +14,12 @@ def main() -> None:
         'command',
         choices=['follow', 'resume', 'pause', 'stop', 'toggle'],
     )
-    parser.add_argument('--domain', default=os.environ.get('ROS_DOMAIN_ID', '24'))
+    parser.add_argument('--domain', default=None)
     args = parser.parse_args(sys.argv[1:])
 
-    os.environ['ROS_DOMAIN_ID'] = str(args.domain)
-    os.environ.pop('ROS_DISCOVERY_SERVER', None)
-    os.environ.pop('FASTRTPS_DEFAULT_PROFILES_FILE', None)
-    os.environ.pop('FASTDDS_DEFAULT_PROFILES_FILE', None)
-    os.environ['ROS_LOCALHOST_ONLY'] = '0'
-    os.environ['ROS_AUTOMATIC_DISCOVERY_RANGE'] = 'SUBNET'
-    os.environ['RMW_IMPLEMENTATION'] = 'rmw_fastrtps_cpp'
+    from tb3_fleet_bringup.launch_utils import validate_shell_environment
+    validate_shell_environment(args.domain)
+    domain = os.environ['ROS_DOMAIN_ID']
 
     import rclpy
     from rclpy.node import Node
@@ -51,7 +47,7 @@ def main() -> None:
 
     matched = pub.get_subscription_count()
     print(
-        f'follow_command={msg.data} domain={args.domain} '
+        f'follow_command={msg.data} domain={domain} '
         f'matched_subscriptions={matched}'
     )
     node.destroy_node()

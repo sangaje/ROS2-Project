@@ -28,6 +28,26 @@ def topic(message_type: str, *, remap: Optional[str] = None, profile=None) -> Di
     return config
 
 
+def risk_topics() -> Dict[str, Dict]:
+    """Core Bayesian risk outputs a scout should forward to the main domain."""
+    grid_profile = qos(durability='transient_local', depth=1)
+    marker_profile = qos(durability='transient_local', depth=1)
+    return {
+        '/risk/risk_map': topic(
+            'nav_msgs/msg/OccupancyGrid',
+            profile=grid_profile,
+        ),
+        '/risk/person_probability_map': topic(
+            'nav_msgs/msg/OccupancyGrid',
+            profile=grid_profile,
+        ),
+        '/risk/evidence_markers': topic(
+            'visualization_msgs/msg/MarkerArray',
+            profile=marker_profile,
+        ),
+    }
+
+
 def write_fleet_bridge_configs(
     main_domain: int,
     follower_domain: int,
@@ -134,6 +154,7 @@ def write_fleet_bridge_configs(
             remap=f'/follower{int(follower_domain)}/scan',
             profile=qos('best_effort'),
         ),
+        **risk_topics(),
     }
     if simulation:
         follower_topics['/cmd_vel'] = topic(
@@ -205,6 +226,7 @@ def write_member_bridge_configs(
             remap='/map_from_member',
             profile=qos(depth=5),
         ),
+        **risk_topics(),
     }
 
     main_to_member.write_text(yaml.safe_dump({

@@ -19,7 +19,7 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument(
             'domain_id',
-            default_value=EnvironmentVariable('ROS_DOMAIN_ID', default_value='24'),
+            default_value=EnvironmentVariable('ROS_DOMAIN_ID'),
             description='Leader/PC DDS domain.',
         ),
         *dds_launch_environment(domain_id),

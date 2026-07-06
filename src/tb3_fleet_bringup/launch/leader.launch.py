@@ -52,11 +52,13 @@ def generate_launch_description():
     initial_x = LaunchConfiguration('leader_initial_x')
     initial_y = LaunchConfiguration('leader_initial_y')
     initial_yaw = LaunchConfiguration('leader_initial_yaw')
+    ros_static_peers = LaunchConfiguration('ros_static_peers')
 
     def make_stack(context):
         simulation = launch_bool(use_sim_time.perform(context))
         domain = domain_id.perform(context)
-        process_env = clean_process_environment(domain)
+        peers = ros_static_peers.perform(context)
+        process_env = clean_process_environment(domain, peers)
         # Simulation has no bridged-map infrastructure set up, so it always
         # owns Cartographer regardless of enable_cartographer.
         cartographer_owned = simulation or launch_bool(
@@ -283,6 +285,7 @@ def generate_launch_description():
                 launch_arguments={
                     'domain_id': domain,
                     'start_robot_bringup': start_robot_bringup.perform(context),
+                    'ros_static_peers': peers,
                     'nav2_params_file': nav2_params,
                     'goal_pose_topic': '/fleet/leader_coord_goal',
                     'goal_proxy_name': 'leader_goal_arbiter_output',
@@ -389,7 +392,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'domain_id',
-            default_value=EnvironmentVariable('ROS_DOMAIN_ID', default_value='24'),
+            default_value=EnvironmentVariable('ROS_DOMAIN_ID'),
             description='Leader DDS domain.',
         ),
         DeclareLaunchArgument(
@@ -439,6 +442,19 @@ def generate_launch_description():
         DeclareLaunchArgument('leader_initial_x', default_value='0.0'),
         DeclareLaunchArgument('leader_initial_y', default_value='0.0'),
         DeclareLaunchArgument('leader_initial_yaw', default_value='0.0'),
-        *dds_launch_environment(domain_id),
+        DeclareLaunchArgument(
+            'ros_static_peers',
+            default_value=EnvironmentVariable('ROS_STATIC_PEERS', default_value=''),
+            description=(
+                'Optional ROS_STATIC_PEERS value (semicolon-separated '
+                'addresses) forcing unicast DDS discovery to specific '
+                'peers in addition to SUBNET multicast discovery -- needed '
+                'when a peer (e.g. a member robot bridging in a map) is '
+                'only reachable over a link that does not carry '
+                'multicast, such as a Tailscale/VPN hop between machines '
+                'on different physical LANs.'
+            ),
+        ),
+        *dds_launch_environment(domain_id, LaunchConfiguration('ros_static_peers')),
         OpaqueFunction(function=make_stack),
     ])

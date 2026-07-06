@@ -6,6 +6,7 @@ from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 from ament_index_python.packages import get_package_share_directory
+from tb3_fleet_bringup.launch_utils import dds_launch_environment
 import os
 
 
@@ -94,6 +95,7 @@ def generate_launch_description():
         DeclareLaunchArgument('image_topic', default_value='/camera/image_raw'),
         DeclareLaunchArgument('map_frame', default_value='map'),
         DeclareLaunchArgument('base_frame', default_value='base_footprint'),
+        *dds_launch_environment(None),
 
         DeclareLaunchArgument('detection_source', default_value='local_yolo'),
         DeclareLaunchArgument('external_detection_topic', default_value='/risk/yolo_detections'),

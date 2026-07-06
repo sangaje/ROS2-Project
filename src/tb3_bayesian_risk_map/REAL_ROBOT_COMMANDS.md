@@ -4,11 +4,8 @@
 
 ```bash
 cd ~/ROS2-Project
-source /opt/ros/jazzy/setup.bash
+source ~/.bashrc
 source install/setup.bash
-export ROS_DOMAIN_ID=25
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-export TURTLEBOT3_MODEL=burger
 ros2 launch turtlebot3_bringup robot.launch.py
 ```
 
@@ -16,32 +13,26 @@ ros2 launch turtlebot3_bringup robot.launch.py
 
 ```bash
 cd ~/ROS2-Project
-source /opt/ros/jazzy/setup.bash
+source ~/.bashrc
 source install/setup.bash
-export ROS_DOMAIN_ID=25
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-export TURTLEBOT3_MODEL=burger
-ros2 launch tb3_bayesian_risk_map robot_camera_yolo_inference.launch.py \
+ros2 launch tb3_bayesian_risk_map robot_risk_source_stack.launch.py \
   use_sim_time:=false \
+  start_robot_bringup:=false \
+  start_camera_sender:=false \
+  start_risk_map:=true \
   model_path:=$PWD/yolo11n.pt \
   camera_device:=/dev/video0 \
   camera_width:=640 \
   camera_height:=480 \
-  camera_fps:=15 \
-  yolo_imgsz:=320 \
-  yolo_max_rate_hz:=1.0 \
-  conf_threshold:=0.25
+  camera_fps:=15.0
 ```
 
 ## PC terminal 1: teleop
 
 ```bash
 cd ~/ROS2-Project
-source /opt/ros/jazzy/setup.bash
+source ~/.bashrc
 source install/setup.bash
-export ROS_DOMAIN_ID=25
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-export TURTLEBOT3_MODEL=burger
 ros2 run turtlebot3_teleop teleop_keyboard
 ```
 
@@ -49,10 +40,8 @@ ros2 run turtlebot3_teleop teleop_keyboard
 
 ```bash
 cd ~/ROS2-Project
-source /opt/ros/jazzy/setup.bash
+source ~/.bashrc
 source install/setup.bash
-export ROS_DOMAIN_ID=25
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ros2 launch tb3_bayesian_risk_map pc_risk_debug_monitor.launch.py \
   start_rviz:=true \
   start_opencv_debug_view:=true \

@@ -24,6 +24,7 @@
   <exec_depend>cartographer_ros</exec_depend>
   <exec_depend>turtlebot3_cartographer</exec_depend>
   <exec_depend>turtlebot3_bringup</exec_depend>
+  <exec_depend>tb3_fleet_bringup</exec_depend>
 
   <test_depend>python3-pytest</test_depend>
 

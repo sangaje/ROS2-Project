@@ -1,25 +1,15 @@
-# tb3_bayesian_risk_map v4
+# tb3_bayesian_risk_map
 
-## Fixes
+## Launch Files
 
-- RViz config now includes interactive tools: Interact, MoveCamera, Select, FocusCamera, Measure.
-- RViz LaserScan queue increased to reduce message filter queue-full spam.
-- OpenCV YOLO viewer node added: `opencv_yolo_viewer_node`.
-- All-in-one launch starts OpenCV YOLO viewer by default.
-- TF buffer increased to 120 seconds.
-- Risk node uses latest TF and falls back between `base_link` and `base_footprint`.
+- `robot_risk_source_stack.launch.py`: robot-side bringup, Cartographer map, camera sender, and pose publisher.
+- `central_risk_map_bridge.launch.py`: central risk-map node plus domain bridges.
+- `pc_robot_risk_stack.launch.py`: PC-side Flask server, central bridge/risk stack, and monitor.
+- `pc_risk_debug_monitor.launch.py`: RViz/debug image monitor.
+- `real_robot_risk_slam.launch.py`: lower-level real robot SLAM/risk launch used by the system bringup.
 
-## Main launch
-
-```zsh
-ros2 launch tb3_bayesian_risk_map cartographer_risk_rviz.launch.py \
-  use_sim_time:=false \
-  start_opencv_yolo_view:=true
-```
-
-## OpenCV viewer only
+All DDS/domain/RMW settings are inherited from the shell environment.
 
 ```zsh
-ros2 launch tb3_bayesian_risk_map opencv_yolo_view.launch.py \
-  image_topic:=/risk/debug_yolo_image
+ros2 launch tb3_bayesian_risk_map robot_risk_source_stack.launch.py
 ```

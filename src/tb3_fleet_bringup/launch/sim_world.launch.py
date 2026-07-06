@@ -25,7 +25,7 @@ from launch.actions import (
 )
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import Node
 
 from tb3_fleet_bringup.launch_utils import dds_launch_environment
@@ -160,7 +160,7 @@ def generate_launch_description():
 
     return LaunchDescription([
         DeclareLaunchArgument('world',        default_value=default_world),
-        DeclareLaunchArgument('domain_id',    default_value='24'),
+        DeclareLaunchArgument('domain_id',    default_value=EnvironmentVariable('ROS_DOMAIN_ID')),
         DeclareLaunchArgument('start_gz_client', default_value='false',
                               description='Start the Gazebo GUI client. False keeps the headless server running.'),
         *dds_launch_environment(domain_id),

@@ -49,11 +49,13 @@ def generate_launch_description():
     initial_yaw = LaunchConfiguration('member_initial_yaw')
     auto_localize = LaunchConfiguration('auto_localize')
     enable_amcl = LaunchConfiguration('enable_amcl')
+    ros_static_peers = LaunchConfiguration('ros_static_peers')
 
     def make_stack(context):
         member_domain = int(domain_id.perform(context))
         main_domain = int(main_domain_id.perform(context))
-        process_env = clean_process_environment(str(member_domain))
+        peers = ros_static_peers.perform(context)
+        process_env = clean_process_environment(str(member_domain), peers)
 
         # Reuses the follower's Burger Nav2/AMCL tuning; a plain member is
         # the same robot class localizing against the same shared map.
@@ -202,6 +204,7 @@ def generate_launch_description():
                 'domain_id': str(member_domain),
                 'start_robot_bringup': start_robot_bringup.perform(context),
                 'hardware_param_file': hardware_param_file.perform(context),
+                'ros_static_peers': peers,
                 'nav2_params_file': nav2_params,
                 'goal_pose_topic': '/member_goal_pose',
                 'goal_proxy_name': 'member_coord_goal',
@@ -232,12 +235,12 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument(
             'domain_id',
-            default_value=EnvironmentVariable('ROS_DOMAIN_ID', default_value='26'),
+            default_value=EnvironmentVariable('ROS_DOMAIN_ID'),
             description='Member DDS domain.',
         ),
         DeclareLaunchArgument(
             'main_domain_id',
-            default_value='24',
+            default_value=EnvironmentVariable('MAIN_DOMAIN_ID'),
             description='Leader/PC DDS domain used by domain_bridge.',
         ),
         DeclareLaunchArgument(
@@ -282,6 +285,18 @@ def generate_launch_description():
                 'fixed seed.'
             ),
         ),
-        *dds_launch_environment(domain_id),
+        DeclareLaunchArgument(
+            'ros_static_peers',
+            default_value=EnvironmentVariable('ROS_STATIC_PEERS', default_value=''),
+            description=(
+                'Optional ROS_STATIC_PEERS value (semicolon-separated '
+                'addresses) forcing unicast DDS discovery to specific '
+                'peers in addition to SUBNET multicast discovery -- needed '
+                'when the main/PC domain is only reachable over a link '
+                'that does not carry multicast, such as a Tailscale/VPN '
+                'hop between machines on different physical LANs.'
+            ),
+        ),
+        *dds_launch_environment(domain_id, LaunchConfiguration('ros_static_peers')),
         OpaqueFunction(function=make_stack),
     ])

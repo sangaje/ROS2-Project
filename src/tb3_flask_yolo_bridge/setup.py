@@ -15,6 +15,7 @@ setup(
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
     ],
     install_requires=['setuptools'],
+    tests_require=['pytest'],
     zip_safe=True,
     maintainer='bomin',
     maintainer_email='qhals8380@gmail.com',
@@ -24,9 +25,6 @@ setup(
         'console_scripts': [
             'flask_yolo_server = tb3_flask_yolo_bridge.flask_yolo_server:main',
             'opencv_camera_to_flask_yolo = tb3_flask_yolo_bridge.opencv_camera_to_flask_yolo:main',
-            'opencv_camera_publisher = tb3_flask_yolo_bridge.opencv_camera_publisher:main',
-            'ros_image_to_flask_yolo = tb3_flask_yolo_bridge.ros_image_to_flask_yolo:main',
-            'random_world_detection_test = tb3_flask_yolo_bridge.random_world_detection_test:main',
         ],
     },
 )

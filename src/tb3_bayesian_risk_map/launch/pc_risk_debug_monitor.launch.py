@@ -1,10 +1,11 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, SetEnvironmentVariable
+from launch.actions import DeclareLaunchArgument, ExecuteProcess
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 from ament_index_python.packages import get_package_share_directory
+from tb3_fleet_bringup.launch_utils import dds_launch_environment
 import os
 
 
@@ -21,7 +22,7 @@ def generate_launch_description():
         DeclareLaunchArgument('start_rviz', default_value='true'),
         DeclareLaunchArgument('start_opencv_debug_view', default_value='false'),
         DeclareLaunchArgument('start_rqt_debug_view', default_value='false'),
-        DeclareLaunchArgument('domain_id', default_value='25'),
+        DeclareLaunchArgument('domain_id', default_value=EnvironmentVariable('ROS_DOMAIN_ID')),
         DeclareLaunchArgument('use_sim_time', default_value='false'),
         DeclareLaunchArgument('rviz_config', default_value=rviz_config),
         DeclareLaunchArgument('debug_image_topic', default_value='/risk/debug_yolo_image/compressed'),
@@ -29,8 +30,7 @@ def generate_launch_description():
         DeclareLaunchArgument('resize_width', default_value='960'),
         DeclareLaunchArgument('grid_topics', default_value=''),
 
-        SetEnvironmentVariable('ROS_DOMAIN_ID', LaunchConfiguration('domain_id')),
-        SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp'),
+        *dds_launch_environment(LaunchConfiguration('domain_id')),
 
         ExecuteProcess(
             condition=IfCondition(LaunchConfiguration('start_rviz')),

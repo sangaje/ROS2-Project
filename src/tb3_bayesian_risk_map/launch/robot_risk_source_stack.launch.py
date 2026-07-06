@@ -3,15 +3,14 @@ from launch.actions import (
     DeclareLaunchArgument,
     ExecuteProcess,
     IncludeLaunchDescription,
-    SetEnvironmentVariable,
     TimerAction,
-    UnsetEnvironmentVariable,
 )
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
+from tb3_fleet_bringup.launch_utils import dds_launch_environment
 
 
 def generate_launch_description():
@@ -46,10 +45,8 @@ def generate_launch_description():
     ])
 
     return LaunchDescription([
-        DeclareLaunchArgument('domain_id', default_value='24'),
+        DeclareLaunchArgument('domain_id', default_value=EnvironmentVariable('ROS_DOMAIN_ID')),
         DeclareLaunchArgument('use_sim_time', default_value='false'),
-        DeclareLaunchArgument('turtlebot3_model', default_value='burger'),
-        DeclareLaunchArgument('lds_model', default_value='LDS-02'),
         DeclareLaunchArgument('tb3_param_dir', default_value=default_tb3_param_dir),
 
         DeclareLaunchArgument('start_robot_bringup', default_value='true'),
@@ -93,16 +90,7 @@ def generate_launch_description():
         DeclareLaunchArgument('cartographer_resolution', default_value='0.05'),
         DeclareLaunchArgument('cartographer_publish_period_sec', default_value='1.0'),
 
-        UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),
-        UnsetEnvironmentVariable('RMW_FASTRTPS_DEFAULT_PROFILES_FILE'),
-        UnsetEnvironmentVariable('FASTDDS_DEFAULT_PROFILES_FILE'),
-        UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
-        UnsetEnvironmentVariable('ROS_STATIC_PEERS'),
-        SetEnvironmentVariable('ROS_DOMAIN_ID', LaunchConfiguration('domain_id')),
-        SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp'),
-        SetEnvironmentVariable('ROS_LOCALHOST_ONLY', '0'),
-        SetEnvironmentVariable('TURTLEBOT3_MODEL', LaunchConfiguration('turtlebot3_model')),
-        SetEnvironmentVariable('LDS_MODEL', LaunchConfiguration('lds_model')),
+        *dds_launch_environment(LaunchConfiguration('domain_id')),
 
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(robot_launch),

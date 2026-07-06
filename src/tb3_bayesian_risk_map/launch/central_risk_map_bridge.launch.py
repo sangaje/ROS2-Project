@@ -10,13 +10,12 @@ from launch.actions import (
     DeclareLaunchArgument,
     ExecuteProcess,
     OpaqueFunction,
-    SetEnvironmentVariable,
     TimerAction,
-    UnsetEnvironmentVariable,
 )
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import Node
+from tb3_fleet_bringup.launch_utils import dds_launch_environment
 
 
 def _topic_block(topic: str, msg_type: str, reliability='reliable', durability='volatile', depth=10) -> str:
@@ -158,9 +157,9 @@ topics:
     )
 
     return LaunchDescription([
-        DeclareLaunchArgument('central_domain_id', default_value='25'),
-        DeclareLaunchArgument('source_domain_id', default_value='24'),
-        DeclareLaunchArgument('risk_sink_domain_ids', default_value='24', description='Comma-separated domains that should receive central /risk maps.'),
+        DeclareLaunchArgument('central_domain_id', default_value=EnvironmentVariable('ROS_DOMAIN_ID')),
+        DeclareLaunchArgument('source_domain_id', default_value=EnvironmentVariable('SOURCE_DOMAIN_ID')),
+        DeclareLaunchArgument('risk_sink_domain_ids', default_value=EnvironmentVariable('RISK_SINK_DOMAIN_IDS'), description='Comma-separated domains that should receive central /risk maps.'),
         DeclareLaunchArgument('use_sim_time', default_value='false'),
         DeclareLaunchArgument('start_domain_bridges', default_value='true'),
         DeclareLaunchArgument('start_risk_map', default_value='true'),
@@ -178,14 +177,7 @@ topics:
         DeclareLaunchArgument('enable_room_probability', default_value='false'),
         DeclareLaunchArgument('enable_region_segmentation', default_value='false'),
         DeclareLaunchArgument('enable_visibility_tracking', default_value='true'),
-        UnsetEnvironmentVariable('FASTRTPS_DEFAULT_PROFILES_FILE'),
-        UnsetEnvironmentVariable('RMW_FASTRTPS_DEFAULT_PROFILES_FILE'),
-        UnsetEnvironmentVariable('FASTDDS_DEFAULT_PROFILES_FILE'),
-        UnsetEnvironmentVariable('ROS_DISCOVERY_SERVER'),
-        UnsetEnvironmentVariable('ROS_STATIC_PEERS'),
-        SetEnvironmentVariable('ROS_DOMAIN_ID', central_domain_id),
-        SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp'),
-        SetEnvironmentVariable('ROS_LOCALHOST_ONLY', '0'),
+        *dds_launch_environment(central_domain_id),
         TimerAction(
             period=0.5,
             actions=[map_frame_anchor, OpaqueFunction(function=_write_bridge_configs)],

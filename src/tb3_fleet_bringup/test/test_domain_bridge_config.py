@@ -1,6 +1,9 @@
 import yaml
 
-from tb3_fleet_bringup.domain_bridge_config import write_fleet_bridge_configs
+from tb3_fleet_bringup.domain_bridge_config import (
+    write_fleet_bridge_configs,
+    write_member_bridge_configs,
+)
 
 
 def test_real_bridge_directions_and_control_qos(tmp_path):
@@ -30,6 +33,19 @@ def test_real_bridge_directions_and_control_qos(tmp_path):
     )
     assert follower['topics']['/burger_scan_relay']['remap'] == (
         '/follower25/scan'
+    )
+    assert follower['topics']['/risk/risk_map']['type'] == (
+        'nav_msgs/msg/OccupancyGrid'
+    )
+    assert follower['topics']['/risk/risk_map']['qos']['durability'] == (
+        'transient_local'
+    )
+    assert follower['topics']['/risk/risk_map']['qos']['depth'] == 1
+    assert follower['topics']['/risk/person_probability_map']['type'] == (
+        'nav_msgs/msg/OccupancyGrid'
+    )
+    assert follower['topics']['/risk/evidence_markers']['type'] == (
+        'visualization_msgs/msg/MarkerArray'
     )
     assert '/clock' not in main['topics']
     assert '/cmd_vel' not in follower['topics']
@@ -61,4 +77,25 @@ def test_follower_scan_topic_uses_its_domain_id(tmp_path):
 
     assert follower['topics']['/burger_scan_relay']['remap'] == (
         '/follower31/scan'
+    )
+
+
+def test_member_bridge_forwards_core_risk_topics_to_main(tmp_path):
+    _, member_path = write_member_bridge_configs(
+        24,
+        26,
+        output_directory=tmp_path,
+    )
+    member = yaml.safe_load(member_path.read_text())
+
+    assert (member['from_domain'], member['to_domain']) == (26, 24)
+    assert member['topics']['/risk/risk_map']['type'] == (
+        'nav_msgs/msg/OccupancyGrid'
+    )
+    assert member['topics']['/risk/risk_map']['qos']['durability'] == (
+        'transient_local'
+    )
+    assert member['topics']['/risk/person_probability_map']['qos']['depth'] == 1
+    assert member['topics']['/risk/evidence_markers']['type'] == (
+        'visualization_msgs/msg/MarkerArray'
     )
