@@ -53,34 +53,44 @@ def _cyclonedds_uri_to_path(uri: str) -> Path | None:
     return Path(uri)
 
 
-def _bytes_from_cyclonedds_size(value: str) -> int | None:
-    raw = value.strip().replace(' ', '')
+def _bytes_from_cyclonedds_size(value: str) -> tuple[int | None, str | None]:
+    raw = value.strip()
     if not raw:
-        return None
-    units = (
-        ('kib', 1024),
-        ('kb', 1024),
-        ('k', 1024),
-        ('mib', 1024 * 1024),
-        ('mb', 1024 * 1024),
-        ('m', 1024 * 1024),
-        ('gib', 1024 * 1024 * 1024),
-        ('gb', 1024 * 1024 * 1024),
-        ('g', 1024 * 1024 * 1024),
-        ('b', 1),
-    )
-    lowered = raw.lower()
-    for suffix, multiplier in units:
-        if lowered.endswith(suffix):
-            number = lowered[:-len(suffix)]
-            try:
-                return int(float(number) * multiplier)
-            except ValueError:
-                return None
+        return None, None
+
+    parts = raw.split()
+    if len(parts) == 1:
+        compact = parts[0]
+        idx = 0
+        while idx < len(compact) and (
+            compact[idx].isdigit() or compact[idx] in ('.', '+', '-')
+        ):
+            idx += 1
+        number = compact[:idx]
+        unit = compact[idx:]
+    elif len(parts) == 2:
+        number, unit = parts
+    else:
+        return None, raw
+
+    # CycloneDDS units are case-sensitive; "KB" is not accepted. Prefer
+    # explicit bytes ("131072 B") in robot-local XML files.
+    multipliers = {
+        '': 1,
+        'B': 1,
+        'kB': 1000,
+        'KiB': 1024,
+        'MB': 1000 * 1000,
+        'MiB': 1024 * 1024,
+        'GB': 1000 * 1000 * 1000,
+        'GiB': 1024 * 1024 * 1024,
+    }
+    if unit not in multipliers:
+        return None, unit
     try:
-        return int(float(lowered))
+        return int(float(number) * multipliers[unit]), None
     except ValueError:
-        return None
+        return None, raw
 
 
 def _read_kernel_limit(name: str) -> int | None:
@@ -115,16 +125,33 @@ def _validate_cyclonedds_socket_buffers() -> None:
         ('SocketSendBufferSize', 'wmem_max'),
     )
     problems = []
+    invalid = []
     for tag, sysctl_name in checks:
         elem = root.find(f'.//c:{tag}', ns)
         if elem is None:
             continue
-        requested = _bytes_from_cyclonedds_size(elem.get('min', ''))
+        raw_min = elem.get('min', '')
+        requested, invalid_unit = _bytes_from_cyclonedds_size(raw_min)
+        if invalid_unit is not None:
+            invalid.append((tag, raw_min, invalid_unit))
+            continue
         limit = _read_kernel_limit(sysctl_name)
         if requested is not None and limit is not None and requested > limit:
-            problems.append((tag, elem.get('min', ''), sysctl_name, limit))
-    if not problems:
+            problems.append((tag, raw_min, sysctl_name, limit))
+    if not problems and not invalid:
         return
+
+    if invalid:
+        details = '; '.join(
+            f'{tag} min={raw_min!r} has invalid unit {unit!r}'
+            for tag, raw_min, unit in invalid
+        )
+        raise RuntimeError(
+            'CycloneDDS socket buffer config has invalid units: '
+            f'{details}. Code did not change your network settings. Use a '
+            'CycloneDDS-supported size such as "131072 B", "128 KiB", or '
+            '"128 kB" in the XML.'
+        )
 
     details = '; '.join(
         f'{tag} min={requested} exceeds net.core.{sysctl_name}={limit}'
