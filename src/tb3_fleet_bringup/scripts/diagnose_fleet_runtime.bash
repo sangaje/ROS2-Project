@@ -90,6 +90,7 @@ echo "main_domain=${main_domain} follower_domain=${follower_domain}"
 echo "RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION}"
 echo "ROS_AUTOMATIC_DISCOVERY_RANGE=${ROS_AUTOMATIC_DISCOVERY_RANGE:-}"
 echo "ROS_LOCALHOST_ONLY=${ROS_LOCALHOST_ONLY:-}"
+echo "CYCLONEDDS_URI=${CYCLONEDDS_URI:-}"
 
 echo
 echo "===== local matching processes ====="

@@ -43,6 +43,7 @@ def generate_launch_description():
     domain_id = LaunchConfiguration('domain_id')
     main_domain_id = LaunchConfiguration('main_domain_id')
     start_robot_bringup = LaunchConfiguration('start_robot_bringup')
+    start_nav2 = LaunchConfiguration('start_nav2')
     hardware_param_file = LaunchConfiguration('hardware_param_file')
     initial_x = LaunchConfiguration('member_initial_x')
     initial_y = LaunchConfiguration('member_initial_y')
@@ -209,6 +210,7 @@ def generate_launch_description():
                 'start_robot_bringup': start_robot_bringup.perform(context),
                 'hardware_param_file': hardware_param_file.perform(context),
                 'nav2_params_file': nav2_params,
+                'start_nav2': start_nav2.perform(context),
                 'goal_pose_topic': '/member_goal_pose',
                 'goal_proxy_name': 'member_coord_goal',
                 'nav_delay_sec': '8.0',
@@ -254,6 +256,15 @@ def generate_launch_description():
             default_value='true',
             choices=['true', 'false'],
             description='Start TurtleBot3 hardware drivers.',
+        ),
+        DeclareLaunchArgument(
+            'start_nav2',
+            default_value='true',
+            choices=['true', 'false'],
+            description=(
+                'Start this member robot Nav2 stack. Set false for a '
+                'mapping-only scout where RL/manual control owns cmd_vel.'
+            ),
         ),
         DeclareLaunchArgument(
             'hardware_param_file', default_value='',

@@ -45,6 +45,7 @@ def generate_launch_description():
     main_domain_id = LaunchConfiguration('main_domain_id')
     fleet_role = LaunchConfiguration('fleet_role')
     start_robot_bringup = LaunchConfiguration('start_robot_bringup')
+    start_nav2 = LaunchConfiguration('start_nav2')
     require_follower_pose = LaunchConfiguration('require_follower_pose')
     enable_cartographer = LaunchConfiguration('enable_cartographer')
     auto_localize = LaunchConfiguration('auto_localize')
@@ -136,6 +137,8 @@ def generate_launch_description():
             )
         if fleet_role_value in ('follower', 'member'):
             fleet_launch_args['main_domain_id'] = str(main_domain)
+        if fleet_role_value == 'member':
+            fleet_launch_args['start_nav2'] = start_nav2.perform(context)
         if scout_owns_slam:
             fleet_launch_args['hardware_param_file'] = os.path.join(
                 get_package_share_directory('tb3_bayesian_risk_map'),
@@ -341,6 +344,15 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'start_robot_bringup', default_value='true',
             choices=['true', 'false'],
+        ),
+        DeclareLaunchArgument(
+            'start_nav2', default_value='true',
+            choices=['true', 'false'],
+            description=(
+                'member fleet_role only: start Nav2. Set false for a '
+                'mapping-only scout where Cartographer/risk map run but '
+                'Nav2 should not create planner/controller nodes.'
+            ),
         ),
         DeclareLaunchArgument(
             'require_follower_pose', default_value='true',

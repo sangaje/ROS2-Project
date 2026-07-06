@@ -38,6 +38,7 @@ def generate_launch_description():
     start_robot_bringup = LaunchConfiguration('start_robot_bringup')
     hardware_param_file = LaunchConfiguration('hardware_param_file')
     nav2_params_file = LaunchConfiguration('nav2_params_file')
+    start_nav2 = LaunchConfiguration('start_nav2')
     goal_pose_topic = LaunchConfiguration('goal_pose_topic')
     goal_proxy_name = LaunchConfiguration('goal_proxy_name')
     nav_delay_sec = LaunchConfiguration('nav_delay_sec')
@@ -128,20 +129,21 @@ def generate_launch_description():
                 launch_arguments=robot_launch_args.items(),
             ))
 
-        actions.extend([
-            TimerAction(
-                period=float(nav_delay_sec.perform(context)),
-                actions=navigation,
-            ),
-            TimerAction(
-                period=float(lifecycle_delay_sec.perform(context)),
-                actions=[navigation_lifecycle],
-            ),
-            TimerAction(
-                period=float(goal_delay_sec.perform(context)),
-                actions=[goal_proxy],
-            ),
-        ])
+        if launch_bool(start_nav2.perform(context)):
+            actions.extend([
+                TimerAction(
+                    period=float(nav_delay_sec.perform(context)),
+                    actions=navigation,
+                ),
+                TimerAction(
+                    period=float(lifecycle_delay_sec.perform(context)),
+                    actions=[navigation_lifecycle],
+                ),
+                TimerAction(
+                    period=float(goal_delay_sec.perform(context)),
+                    actions=[goal_proxy],
+                ),
+            ])
         return actions
 
     return LaunchDescription([
@@ -169,6 +171,16 @@ def generate_launch_description():
                 'caller owns localization, so this file should not '
                 'declare its own SLAM/AMCL choice beyond what Nav2 itself '
                 'needs (global_frame, costmaps, controller tuning).'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'start_nav2',
+            default_value='true',
+            choices=['true', 'false'],
+            description=(
+                'Start the Nav2 controller/planner/behavior/bt_navigator '
+                'and goal proxy. Hardware bringup is controlled separately '
+                'by start_robot_bringup.'
             ),
         ),
         DeclareLaunchArgument('goal_pose_topic', default_value='/goal_pose'),

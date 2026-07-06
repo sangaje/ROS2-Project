@@ -1,5 +1,8 @@
 import os
 from typing import Dict, List
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+from xml.etree import ElementTree as ET
 
 from launch.actions import OpaqueFunction
 
@@ -11,6 +14,7 @@ REQUIRED_DDS_ENVIRONMENT = (
 CYCLONEDDS_REQUIRED_ENVIRONMENT = (
     'CYCLONEDDS_URI',
 )
+_CYCLONEDDS_CONFIG_NS = 'https://cdds.io/config'
 
 
 def _perform_if_needed(value, context):
@@ -32,6 +36,108 @@ def _missing_required_environment() -> List[str]:
     return missing
 
 
+def _env_bool(name: str, default: bool = True) -> bool:
+    raw = os.environ.get(name, '1' if default else '0').strip().lower()
+    return raw not in ('0', 'false', 'no', 'off', 'disable', 'disabled')
+
+
+def _cyclonedds_uri_to_path(uri: str) -> Path | None:
+    uri = uri.strip()
+    if not uri:
+        return None
+    parsed = urlparse(uri)
+    if parsed.scheme == 'file':
+        return Path(unquote(parsed.path))
+    if parsed.scheme:
+        return None
+    return Path(uri)
+
+
+def _bytes_from_cyclonedds_size(value: str) -> int | None:
+    raw = value.strip().replace(' ', '')
+    if not raw:
+        return None
+    units = (
+        ('kib', 1024),
+        ('kb', 1024),
+        ('k', 1024),
+        ('mib', 1024 * 1024),
+        ('mb', 1024 * 1024),
+        ('m', 1024 * 1024),
+        ('gib', 1024 * 1024 * 1024),
+        ('gb', 1024 * 1024 * 1024),
+        ('g', 1024 * 1024 * 1024),
+        ('b', 1),
+    )
+    lowered = raw.lower()
+    for suffix, multiplier in units:
+        if lowered.endswith(suffix):
+            number = lowered[:-len(suffix)]
+            try:
+                return int(float(number) * multiplier)
+            except ValueError:
+                return None
+    try:
+        return int(float(lowered))
+    except ValueError:
+        return None
+
+
+def _read_kernel_limit(name: str) -> int | None:
+    try:
+        return int(Path('/proc/sys/net/core', name).read_text().strip())
+    except Exception:
+        return None
+
+
+def _validate_cyclonedds_socket_buffers() -> None:
+    """Fail early for Cyclone configs that the current kernel cannot satisfy.
+
+    This intentionally does not modify CYCLONEDDS_URI or sysctl values.  It only
+    replaces the later rmw_create_node crash storm with one actionable message.
+    """
+    if os.environ.get('RMW_IMPLEMENTATION', '').strip() != 'rmw_cyclonedds_cpp':
+        return
+    if not _env_bool('TB3_FLEET_VALIDATE_CYCLONEDDS_BUFFERS', True):
+        return
+
+    path = _cyclonedds_uri_to_path(os.environ.get('CYCLONEDDS_URI', ''))
+    if path is None or not path.exists():
+        return
+
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError:
+        return
+    ns = {'c': _CYCLONEDDS_CONFIG_NS}
+    checks = (
+        ('SocketReceiveBufferSize', 'rmem_max'),
+        ('SocketSendBufferSize', 'wmem_max'),
+    )
+    problems = []
+    for tag, sysctl_name in checks:
+        elem = root.find(f'.//c:{tag}', ns)
+        if elem is None:
+            continue
+        requested = _bytes_from_cyclonedds_size(elem.get('min', ''))
+        limit = _read_kernel_limit(sysctl_name)
+        if requested is not None and limit is not None and requested > limit:
+            problems.append((tag, elem.get('min', ''), sysctl_name, limit))
+    if not problems:
+        return
+
+    details = '; '.join(
+        f'{tag} min={requested} exceeds net.core.{sysctl_name}={limit}'
+        for tag, requested, sysctl_name, limit in problems
+    )
+    raise RuntimeError(
+        'CycloneDDS socket buffer config is too large for this machine: '
+        f'{details}. Code did not change your network settings. Fix bashrc/'
+        'CYCLONEDDS_URI or sysctl, e.g. lower the Socket*BufferSize min values '
+        'in the XML or raise net.core.rmem_max/net.core.wmem_max.'
+    )
+
+
 def validate_shell_environment(expected_domain_id: str | None = None) -> None:
     """Fail fast when launch-time DDS values are missing or conflicting.
 
@@ -45,6 +151,7 @@ def validate_shell_environment(expected_domain_id: str | None = None) -> None:
             + ', '.join(missing)
             + '. Source your bashrc/setup before launching.'
         )
+    _validate_cyclonedds_socket_buffers()
 
     actual_domain = os.environ.get('ROS_DOMAIN_ID', '').strip()
     if expected_domain_id is not None and str(expected_domain_id).strip() != actual_domain:
