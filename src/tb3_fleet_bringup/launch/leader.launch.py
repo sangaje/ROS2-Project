@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
-"""Leader stack: TurtleBot3 bringup, Cartographer, Nav2 and fleet coordination."""
+"""Leader stack: TurtleBot3 bringup, Nav2 and fleet coordination.
+
+By default the leader owns SLAM itself (Cartographer). Set
+enable_cartographer:=false (real mode only) to instead receive a map built
+by a member robot that owns its own SLAM (member.launch.py with
+enable_amcl:=false start_cartographer:=true) -- the leader then runs
+AMCL against that bridged map and republishes it as its own /map, the same
+way member.launch.py already does for a shared map from a leader.
+"""
 
 import os
+import tempfile
+from pathlib import Path
 
+import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (
@@ -36,15 +47,31 @@ def generate_launch_description():
     domain_id = LaunchConfiguration('domain_id')
     start_robot_bringup = LaunchConfiguration('start_robot_bringup')
     require_follower_pose = LaunchConfiguration('require_follower_pose')
+    enable_cartographer = LaunchConfiguration('enable_cartographer')
+    auto_localize = LaunchConfiguration('auto_localize')
+    initial_x = LaunchConfiguration('leader_initial_x')
+    initial_y = LaunchConfiguration('leader_initial_y')
+    initial_yaw = LaunchConfiguration('leader_initial_yaw')
 
     def make_stack(context):
         simulation = launch_bool(use_sim_time.perform(context))
         domain = domain_id.perform(context)
         process_env = clean_process_environment(domain)
+        # Simulation has no bridged-map infrastructure set up, so it always
+        # owns Cartographer regardless of enable_cartographer.
+        cartographer_owned = simulation or launch_bool(
+            enable_cartographer.perform(context)
+        )
 
         nav2_params = RewrittenYaml(
             source_file=os.path.join(
-                package_share, 'config', 'leader_nav2.yaml'
+                package_share,
+                'config',
+                (
+                    'leader_nav2.yaml'
+                    if cartographer_owned
+                    else 'follower_nav2_amcl.yaml'
+                ),
             ),
             param_rewrites={
                 'use_sim_time': str(simulation).lower(),
@@ -56,15 +83,94 @@ def generate_launch_description():
             convert_types=True,
         )
 
-        cartographer = IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(cartographer_launch),
-            launch_arguments={
-                'cartographer_config_dir': os.path.join(package_share, 'config'),
-                'configuration_basename': 'leader_cartographer.lua',
-                'use_sim_time': str(simulation).lower(),
-                'use_rviz': 'false',
-            }.items(),
-        )
+        cartographer = None
+        amcl = None
+        localization_lifecycle = None
+        map_relay = None
+        kickstart_node = None
+        if cartographer_owned:
+            cartographer = IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(cartographer_launch),
+                launch_arguments={
+                    'cartographer_config_dir': os.path.join(package_share, 'config'),
+                    'configuration_basename': 'leader_cartographer.lua',
+                    'use_sim_time': str(simulation).lower(),
+                    'use_rviz': 'false',
+                }.items(),
+            )
+        else:
+            # Receive the map from a member that owns its own SLAM instead
+            # (bridged in by that member's own domain_bridge as
+            # /map_from_member) and republish it as this domain's /map,
+            # the same failover-aware relay member.launch.py already uses.
+            map_relay = Node(
+                package='tb3_fleet_bringup',
+                executable='map_relay',
+                name='leader_map_relay',
+                output='screen',
+                parameters=[{
+                    'use_sim_time': False,
+                    'input_topic': '/map_from_member',
+                    'output_topic': '/map',
+                }],
+                env=process_env,
+                respawn=True,
+                respawn_delay=3.0,
+            )
+
+            auto = launch_bool(auto_localize.perform(context))
+            pose_override = Path(tempfile.gettempdir()) / (
+                f'tb3_leader_{domain}_initial_pose.yaml'
+            )
+            if auto:
+                amcl_overrides = {'set_initial_pose': False}
+            else:
+                amcl_overrides = {
+                    'set_initial_pose': True,
+                    'initial_pose': {
+                        'x': float(initial_x.perform(context)),
+                        'y': float(initial_y.perform(context)),
+                        'z': 0.0,
+                        'yaw': float(initial_yaw.perform(context)),
+                    },
+                }
+            pose_override.write_text(yaml.safe_dump({
+                'amcl': {'ros__parameters': amcl_overrides},
+            }), encoding='utf-8')
+
+            amcl = Node(
+                package='nav2_amcl',
+                executable='amcl',
+                name='amcl',
+                output='screen',
+                parameters=[nav2_params, str(pose_override)],
+                env=process_env,
+                respawn=True,
+                respawn_delay=3.0,
+            )
+            localization_lifecycle = Node(
+                package='nav2_lifecycle_manager',
+                executable='lifecycle_manager',
+                name='lifecycle_manager_localization',
+                output='screen',
+                parameters=[nav2_params],
+                env=process_env,
+            )
+            if auto:
+                kickstart_node = Node(
+                    package='tb3_fleet_bringup',
+                    executable='global_localize_kickstart',
+                    name='leader_global_localize',
+                    output='screen',
+                    parameters=[{
+                        'spin_enabled': True,
+                        'spin_duration_sec': 8.0,
+                        'spin_speed_rad_s': 0.6,
+                        'cmd_vel_topic': '/cmd_vel',
+                        'use_stamped_cmd_vel': True,
+                    }],
+                    env=process_env,
+                )
 
         leader_pose = Node(
             package='tb3_fleet_bringup',
@@ -248,15 +354,30 @@ def generate_launch_description():
             # nav/lifecycle/goal timing for real mode lives inside
             # base.launch.py (nav_delay_sec=12.0, lifecycle_delay_sec=16.0,
             # goal_delay_sec=18.0 above), measured from this same t=0.
-            cartographer_t, pose_t, coordinator_t = 5.0, 8.0, 20.0
+            pose_t, coordinator_t = 8.0, 20.0
             actions.extend([
-                TimerAction(period=cartographer_t, actions=[cartographer]),
                 TimerAction(
                     period=pose_t,
                     actions=[leader_pose, follower_tf, leader_scan],
                 ),
                 TimerAction(period=coordinator_t, actions=[coordinator]),
             ])
+            if cartographer_owned:
+                actions.append(
+                    TimerAction(period=5.0, actions=[cartographer])
+                )
+            else:
+                actions.append(
+                    TimerAction(period=1.0, actions=[map_relay])
+                )
+                actions.append(TimerAction(period=5.0, actions=[amcl]))
+                actions.append(TimerAction(
+                    period=5.5, actions=[localization_lifecycle],
+                ))
+                if kickstart_node is not None:
+                    actions.append(
+                        TimerAction(period=6.5, actions=[kickstart_node])
+                    )
         return actions
 
     return LaunchDescription([
@@ -291,6 +412,33 @@ def generate_launch_description():
                 'leader+member fleet with no follower robot.'
             ),
         ),
+        DeclareLaunchArgument(
+            'enable_cartographer',
+            default_value='true',
+            choices=['true', 'false'],
+            description=(
+                'Real mode only (ignored in simulation): run Cartographer '
+                'and own SLAM here. Set false to instead receive a map '
+                'from a member robot that owns its own SLAM '
+                '(enable_amcl:=false start_cartographer:=true on that '
+                'member) over /map_from_member, and run AMCL against it '
+                'here instead.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'auto_localize',
+            default_value='true',
+            choices=['true', 'false'],
+            description=(
+                'Only used when enable_cartographer:=false. Let AMCL '
+                'search the whole received map via '
+                'reinitialize_global_localization instead of trusting '
+                'leader_initial_x/y/yaw.'
+            ),
+        ),
+        DeclareLaunchArgument('leader_initial_x', default_value='0.0'),
+        DeclareLaunchArgument('leader_initial_y', default_value='0.0'),
+        DeclareLaunchArgument('leader_initial_yaw', default_value='0.0'),
         *dds_launch_environment(domain_id),
         OpaqueFunction(function=make_stack),
     ])

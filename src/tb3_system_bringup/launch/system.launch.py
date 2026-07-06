@@ -48,6 +48,7 @@ def generate_launch_description():
     fleet_role = LaunchConfiguration('fleet_role')
     start_robot_bringup = LaunchConfiguration('start_robot_bringup')
     require_follower_pose = LaunchConfiguration('require_follower_pose')
+    enable_cartographer = LaunchConfiguration('enable_cartographer')
     auto_localize = LaunchConfiguration('auto_localize')
     enable_amcl = LaunchConfiguration('enable_amcl')
     start_risk_map = LaunchConfiguration('start_risk_map')
@@ -97,24 +98,29 @@ def generate_launch_description():
             fleet_launch_args['require_follower_pose'] = (
                 require_follower_pose.perform(context)
             )
-        if fleet_role_value in ('follower', 'member'):
-            fleet_launch_args['main_domain_id'] = str(main_domain)
+            fleet_launch_args['enable_cartographer'] = (
+                enable_cartographer.perform(context)
+            )
+        if fleet_role_value in ('follower', 'member', 'leader'):
             fleet_launch_args['auto_localize'] = (
                 auto_localize.perform(context)
             )
+        if fleet_role_value in ('follower', 'member'):
+            fleet_launch_args['main_domain_id'] = str(main_domain)
         # Whether the fleet stack underneath already owns a map->odom TF
         # source, so start_cartographer below can refuse to also claim
-        # that transform. member.launch.py is the only fleet role with an
-        # enable_amcl switch; follower.launch.py always runs AMCL with no
-        # off switch; leader.launch.py always runs its own Cartographer
-        # with no off switch either -- all three are conflicts.
+        # that transform. member.launch.py and leader.launch.py can each
+        # give SLAM up (enable_amcl:=false / enable_cartographer:=false);
+        # follower.launch.py always runs AMCL with no off switch yet.
         if fleet_role_value == 'member':
             fleet_launch_args['enable_amcl'] = enable_amcl.perform(context)
             fleet_stack_owns_slam = launch_bool(enable_amcl.perform(context))
         elif fleet_role_value == 'follower':
             fleet_stack_owns_slam = True
-        else:  # leader: always runs its own Cartographer, no toggle exists
-            fleet_stack_owns_slam = True
+        else:  # leader
+            fleet_stack_owns_slam = launch_bool(
+                enable_cartographer.perform(context)
+            )
 
         actions = [
             LogInfo(msg=[
@@ -155,9 +161,10 @@ def generate_launch_description():
                     )
                 else:
                     hint = (
-                        'leader.launch.py always runs its own Cartographer '
-                        'with no off switch, so start_cartographer:=true '
-                        "cannot be used with fleet_role:=leader."
+                        'Set enable_cartographer:=false (leader.launch.py '
+                        'will then run AMCL against a map bridged in from '
+                        'a member instead) when turning start_cartographer '
+                        'on for fleet_role:=leader.'
                     )
                 raise ValueError(
                     'start_cartographer:=true would fight with the '
@@ -273,9 +280,24 @@ def generate_launch_description():
             ),
         ),
         DeclareLaunchArgument(
+            'enable_cartographer', default_value='true',
+            choices=['true', 'false'],
+            description=(
+                'leader fleet_role only (role:=waffle), real mode only: '
+                'run Cartographer here (default). Set false to instead '
+                'run AMCL against a map received from a member robot '
+                'that owns its own SLAM (that member needs '
+                'enable_amcl:=false start_cartographer:=true).'
+            ),
+        ),
+        DeclareLaunchArgument(
             'auto_localize', default_value='true',
             choices=['true', 'false'],
-            description='Passed through to follower/member AMCL global localization.',
+            description=(
+                'Passed through to follower/member AMCL global '
+                'localization, and to leader AMCL when '
+                'enable_cartographer:=false.'
+            ),
         ),
         DeclareLaunchArgument(
             'enable_amcl', default_value='true',

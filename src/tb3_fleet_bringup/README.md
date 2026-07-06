@@ -86,6 +86,26 @@ start_robot_bringup:=false
 `global_localize_kickstart`(AMCL 전용 서비스라 AMCL 없이는 의미가 없다)가
 전부 스킵된다.
 
+## 리더가 SLAM을 포기하고 멤버의 맵을 받는 옵션 (`enable_cartographer`)
+
+`leader.launch.py`도 (실물 모드에서) `enable_cartographer`(기본 true)를
+받는다. `false`로 주면 자체 Cartographer 대신 `map_relay`(`input_topic`을
+`/map_from_member`로) + AMCL 조합으로 바뀐다 — 정찰봇처럼 자기 SLAM을 가진
+멤버(`enable_amcl:=false start_cartographer:=true`)가 있을 때, 그 멤버가
+만든 맵을 리더가 받아서 AMCL로 로컬라이즈하고 자기 도메인의 `/map`으로
+재발행하게 하는 옵션이다. `auto_localize`/`leader_initial_x/y/yaw`도
+멤버 쪽과 동일한 패턴으로 지원한다.
+
+```bash
+ros2 launch tb3_fleet_bringup leader.launch.py enable_cartographer:=false
+```
+
+`/map_from_member` 브릿지는 멤버 쪽 `write_member_bridge_configs`가 매
+실행마다 그 시점의 `domain_id`/`main_domain_id` 값으로 `/tmp/`에 새로
+써서 만든다(캐싱 없음) — 와플의 도메인이 바뀌어도 다음 실행에 그대로
+반영된다. 리더 쪽에 별도 domain_bridge 프로세스를 새로 띄울 필요는 없다
+(멤버가 양방향 브릿지를 이미 다 실행한다).
+
 ## 시뮬레이션
 
 리더 도메인의 터미널 1:
@@ -171,6 +191,11 @@ Waffle이 우선이다. follow 모드에서도 Waffle이 우선이며 Burger만 
 자리로 그대로 복귀한다. 멤버가 없거나 `/member_pose`가 들어오지 않으면 이
 로직은 완전히 비활성 상태이며 기존 leader/follower 동작에는 아무 영향도
 주지 않는다.
+
+멤버가 `enable_amcl:=false`로 자기 SLAM(예: 리스크맵 Cartographer)을 갖는
+경우, 그 로컬 `/map`은 `/map_from_member`로 리맵되어 main 도메인으로도
+브릿지된다 — 리더 쪽에서 `enable_cartographer:=false`로 그 맵을 받아 쓸
+수 있다(위 "리더가 SLAM을 포기하고 멤버의 맵을 받는 옵션" 참고).
 
 ## `/map` 페일오버 (`map_relay`)
 

@@ -195,6 +195,16 @@ def write_member_bridge_configs(
     }
     member_topics = {
         '/member_pose': topic('geometry_msgs/msg/PoseStamped'),
+        # Only actually publishes if this member owns its own SLAM
+        # (enable_amcl:=false + start_cartographer:=true) -- otherwise
+        # nothing ever appears here and the bridge just idles. Lets a
+        # leader with enable_cartographer:=false receive this member's
+        # map instead of building its own.
+        '/map': topic(
+            'nav_msgs/msg/OccupancyGrid',
+            remap='/map_from_member',
+            profile=qos(depth=5),
+        ),
     }
 
     main_to_member.write_text(yaml.safe_dump({

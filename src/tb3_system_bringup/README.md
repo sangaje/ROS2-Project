@@ -86,15 +86,38 @@ ros2 launch tb3_system_bringup system.launch.py \
   role:=scout enable_amcl:=false start_cartographer:=true
 ```
 
-이 안전장치는 `fleet_role`이 `member`(AMCL, `enable_amcl`로 끌 수 있음)일
-때뿐 아니라 `follower`(AMCL, 끌 방법 없음)와 `leader`(자체 Cartographer,
-끌 방법 없음)일 때도 적용된다 — 즉 `fleet_role:=follower`나
-`fleet_role:=leader`로는 `start_cartographer:=true`를 아예 쓸 수 없고,
-지금은 `fleet_role:=member enable_amcl:=false` 조합만 유효하다.
+이 안전장치는 `fleet_role`이 `member`(AMCL, `enable_amcl`로 끌 수 있음)나
+`leader`(Cartographer, `enable_cartographer`로 끌 수 있음)일 때 적용된다.
+`follower`는 아직 AMCL을 끌 방법이 없어서 `fleet_role:=follower`로는
+`start_cartographer:=true`를 쓸 수 없다.
 
 `/map` 이중 발행 문제는 `map_relay`가 `count_publishers()`로 Cartographer
 같은 다른 발행자가 있는지 감지해서 있으면 조용히 대기하도록 바뀌어서
 해결됐다 (`tb3_fleet_bringup` README의 "`/map` 페일오버" 참고).
+
+### 정찰봇이 SLAM을 갖고, 와플이 그 맵을 받아서 재발행
+
+`role:=waffle`에 `enable_cartographer:=false`를 주면 와플(`leader.launch.py`)이
+자체 Cartographer 대신, `/map_from_member`로 브릿지되어 들어오는 맵을
+받아 AMCL로 로컬라이즈하고 그걸 자기 도메인의 `/map`으로 재발행한다.
+정찰봇 쪽에서 `enable_amcl:=false start_cartographer:=true`로 SLAM을
+갖고 있어야 짝이 맞는다.
+
+```bash
+# 와플: 정찰봇이 만든 맵을 받아서 AMCL + 재발행
+ros2 launch tb3_system_bringup system.launch.py \
+  role:=waffle enable_cartographer:=false
+
+# 정찰봇: 직접 SLAM 소유
+ros2 launch tb3_system_bringup system.launch.py \
+  role:=scout enable_amcl:=false start_cartographer:=true start_rl_policy:=false
+```
+
+`/map_from_member` 브릿지는 정찰봇(member)의 `write_member_bridge_configs`가
+매 실행마다 `main_domain_id`/`domain_id` 실행값으로 동적으로
+`/tmp/tb3_fleet_domain_bridge/`에 다시 써서 만든다 — 와플 쪽 도메인이
+바뀌어도 캐싱 없이 항상 최신 값으로 반영된다. 별도로 와플 쪽에 새
+domain_bridge 프로세스를 띄울 필요는 없다(정찰봇이 양방향 다 실행).
 
 **아직 안 풀린 부분(고치지 않고 남겨둠):**
 - 이 스위치는 AMCL↔Cartographer 사이의 TF 소유권만 정리한 것이고, 로봇
