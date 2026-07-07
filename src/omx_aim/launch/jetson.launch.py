@@ -5,6 +5,8 @@
     ros2 launch omx_aim jetson.launch.py debug_stream:=true
     ros2 launch omx_aim jetson.launch.py debug_stream:=true debug_port:=8090 dashboard_port:=8091
 
+start_yolo_server:=true 이면 정찰/팔로워 로봇이 HTTP로 프레임을 보낼
+flask_yolo_server 도 이 Jetson에서 같이 실행한다.
 debug_stream:=true 이면 yolo_node 가 기존 in-process Flask MJPEG 스트림을 띄우고,
 leader_unified_dashboard 도 별도 Flask 서버로 같이 실행한다.
     브라우저에서 http://<jetson-ip>:<debug_port>/ 로 확인
@@ -32,6 +34,9 @@ def launch_setup(context, *args, **kwargs):
     )
     start_fleet_leader = _is_true(
         LaunchConfiguration('start_fleet_leader').perform(context)
+    )
+    start_yolo_server = _is_true(
+        LaunchConfiguration('start_yolo_server').perform(context)
     )
     debug_port = LaunchConfiguration('debug_port').perform(context)
     dashboard_port = LaunchConfiguration('dashboard_port').perform(context)
@@ -64,6 +69,23 @@ def launch_setup(context, *args, **kwargs):
                 'auto_localize': LaunchConfiguration('auto_localize').perform(context),
                 'start_robot_bringup': LaunchConfiguration('start_robot_bringup').perform(context),
                 'start_nav2': LaunchConfiguration('start_nav2').perform(context),
+            }.items(),
+        ))
+
+    if start_yolo_server:
+        yolo_server_launch = os.path.join(
+            get_package_share_directory('flask_yolo_bridge'),
+            'launch',
+            'flask_yolo_server.launch.py',
+        )
+        actions.append(IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(yolo_server_launch),
+            launch_arguments={
+                'host': LaunchConfiguration('yolo_server_host').perform(context),
+                'port': LaunchConfiguration('yolo_server_port').perform(context),
+                'model_path': LaunchConfiguration('yolo_server_model_path').perform(context),
+                'device': LaunchConfiguration('yolo_server_device').perform(context),
+                'half': LaunchConfiguration('yolo_server_half').perform(context),
             }.items(),
         ))
 
@@ -162,6 +184,26 @@ def generate_launch_description():
             'start_nav2', default_value='true',
             choices=['true', 'false'],
             description='Start Nav2 through the fleet leader stack.'),
+        DeclareLaunchArgument(
+            'start_yolo_server', default_value='true',
+            choices=['true', 'false'],
+            description='Run flask_yolo_server on this Jetson for scout/follower camera offload.'),
+        DeclareLaunchArgument(
+            'yolo_server_host', default_value='0.0.0.0',
+            description='flask_yolo_server bind address.'),
+        DeclareLaunchArgument(
+            'yolo_server_port', default_value='5005',
+            description='flask_yolo_server HTTP port.'),
+        DeclareLaunchArgument(
+            'yolo_server_model_path', default_value='yolo11n.pt',
+            description='YOLO model path for flask_yolo_server.'),
+        DeclareLaunchArgument(
+            'yolo_server_device', default_value='0',
+            description='YOLO device for flask_yolo_server.'),
+        DeclareLaunchArgument(
+            'yolo_server_half', default_value='true',
+            choices=['true', 'false'],
+            description='Use half precision in flask_yolo_server when supported.'),
         DeclareLaunchArgument(
             'debug_stream', default_value='false',
             description='yolo_node 의 Flask MJPEG 디버그 스트림 켜기'),

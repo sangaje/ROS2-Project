@@ -30,7 +30,7 @@ def generate_launch_description():
     ])
 
     return LaunchDescription([
-        DeclareLaunchArgument('start_yolo_server', default_value='true'),
+        DeclareLaunchArgument('start_yolo_server', default_value='false'),
         DeclareLaunchArgument('start_viewer', default_value='true'),
         DeclareLaunchArgument(
             'domain_id',
