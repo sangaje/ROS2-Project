@@ -263,7 +263,7 @@ def generate_launch_description():
                     ]))
 
             actions.append(TimerAction(
-                period=21.0,
+                period=3.0,
                 actions=[Node(
                     package='fleet_bringup',
                     executable='fleet_debug_marker',
@@ -839,8 +839,8 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'patrol_planner_delay_sec',
-            default_value='24.0',
-            description='Leader role only: delay patrol planner until risk/map bridge has time to publish.',
+            default_value='6.0',
+            description='Leader role only: small grace before starting patrol planner.',
         ),
         DeclareLaunchArgument(
             'debug_stream',

@@ -100,12 +100,19 @@ class WaffleNavNode(Node):
         # Action client
         action_name = self.cfg.waffle.nav_action_name
         self.action_client = ActionClient(self, NavigateToPose, action_name)
+        self.action_name = action_name
+        self._nav_server_ready_logged = False
+        self._nav_server_timer = None
 
         if dry_run:
             self.get_logger().info(
                 "[dry-run] Nav2 액션 서버 대기 생략 - 시뮬레이션 모드")
         else:
-            self._wait_for_action_server(action_name)
+            self.get_logger().info(
+                f"Nav2 액션 서버 '{action_name}' 비동기 확인 시작")
+            self._nav_server_timer = self.create_timer(
+                1.0, self._check_action_server_ready
+            )
 
         # Subscribers
         self.create_subscription(PoseStamped, '/omx/nav_goal',
@@ -140,17 +147,22 @@ class WaffleNavNode(Node):
 
     # ----- Action server 대기 -----
 
-    def _wait_for_action_server(self, action_name: str,
-                                 timeout_sec: float = 5.0):
-        """무한 대기 안 함. timeout 안에 못 찾으면 경고만."""
-        self.get_logger().info(
-            f"Nav2 액션 서버 '{action_name}' 대기 중 ({timeout_sec}s)...")
-        if self.action_client.wait_for_server(timeout_sec=timeout_sec):
-            self.get_logger().info("Nav2 액션 서버 연결 확인")
-        else:
-            self.get_logger().warn(
-                f"Nav2 액션 서버 '{action_name}' 못 찾음. "
-                f"nav_goal 수신 시 다시 시도.")
+    def _check_action_server_ready(self):
+        """Constructor/startup path를 막지 않고 Nav2 action 서버를 확인."""
+        if self.action_client.server_is_ready():
+            if not self._nav_server_ready_logged:
+                self.get_logger().info("Nav2 액션 서버 연결 확인")
+                self._nav_server_ready_logged = True
+            if self._nav_server_timer is not None:
+                self._nav_server_timer.cancel()
+                self._nav_server_timer = None
+            return
+
+        self.get_logger().warn(
+            f"Nav2 액션 서버 '{self.action_name}' 아직 준비 안 됨. "
+            f"nav_goal 수신 시 다시 시도.",
+            throttle_duration_sec=5.0,
+        )
 
     # ----- State -----
 

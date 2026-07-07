@@ -310,9 +310,9 @@ def generate_launch_description():
                 # External-map mode waits for /map to cross the risk->leader
                 # bridge, then gives AMCL a clear head start before Nav2
                 # starts asking for map->odom transforms.
-                nav_delay_sec = '8.0'
-                lifecycle_delay_sec = '10.0'
-                goal_delay_sec = '11.0'
+                nav_delay_sec = '6.0'
+                lifecycle_delay_sec = '7.0'
+                goal_delay_sec = '8.0'
 
             base_include = IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(base_launch),
@@ -354,7 +354,7 @@ def generate_launch_description():
 
         if not simulation:
             actions.append(TimerAction(
-                period=1.0,
+                period=0.2,
                 actions=[
                     LogInfo(msg=[
                         'LEADER_STAGE | starting follower scan static TF',
@@ -397,7 +397,7 @@ def generate_launch_description():
             # base.launch.py, measured from this same t=0. External-map
             # leader mode deliberately starts Nav2 later than normal SLAM
             # leader mode so AMCL is active before navigation needs TF.
-            pose_t, coordinator_t = 2.0, 10.0
+            pose_t, coordinator_t = 1.0, 6.0
             actions.extend([
                 TimerAction(
                     period=pose_t,
@@ -436,7 +436,7 @@ def generate_launch_description():
             else:
                 actions.append(
                     TimerAction(
-                        period=0.5,
+                        period=0.2,
                         actions=[
                             LogInfo(msg=[
                                 'LEADER_STAGE | starting bridged-map relay',
@@ -447,7 +447,7 @@ def generate_launch_description():
                 )
                 actions.append(
                     TimerAction(
-                        period=3.0,
+                        period=2.0,
                         actions=[
                             localization_config_log,
                             LogInfo(msg=[
@@ -458,7 +458,7 @@ def generate_launch_description():
                     )
                 )
                 actions.append(TimerAction(
-                    period=4.0,
+                    period=3.0,
                     actions=[
                         LogInfo(msg=[
                             'LEADER_STAGE | starting AMCL lifecycle manager',
@@ -469,7 +469,7 @@ def generate_launch_description():
                 if kickstart_node is not None:
                     actions.append(
                         TimerAction(
-                            period=5.0,
+                            period=4.0,
                             actions=[
                                 LogInfo(msg=[
                                     'LEADER_STAGE | starting AMCL global ',

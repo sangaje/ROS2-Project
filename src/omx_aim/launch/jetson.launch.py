@@ -145,8 +145,8 @@ def generate_launch_description():
             choices=['true', 'false'],
             description='Start patrol_planner on the leader after the risk bridge grace period.'),
         DeclareLaunchArgument(
-            'patrol_planner_delay_sec', default_value='24.0',
-            description='Delay patrol_planner until /risk/risk_map has time to bridge in.'),
+            'patrol_planner_delay_sec', default_value='6.0',
+            description='Small grace before starting patrol_planner.'),
         DeclareLaunchArgument(
             'debug_stream', default_value='false',
             description='yolo_node 의 Flask MJPEG 디버그 스트림 켜기'),
