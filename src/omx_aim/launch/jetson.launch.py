@@ -15,7 +15,13 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
+from launch.actions import (
+    DeclareLaunchArgument,
+    IncludeLaunchDescription,
+    LogInfo,
+    OpaqueFunction,
+    TimerAction,
+)
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -30,7 +36,13 @@ def launch_setup(context, *args, **kwargs):
     start_yolo_server = _is_true(
         LaunchConfiguration('start_yolo_server').perform(context)
     )
+    start_patrol_planner = _is_true(
+        LaunchConfiguration('start_patrol_planner').perform(context)
+    )
     debug_port = LaunchConfiguration('debug_port').perform(context)
+    patrol_delay = float(
+        LaunchConfiguration('patrol_planner_delay_sec').perform(context)
+    )
 
     # yolo_node CLI 인자 조립
     yolo_args = ['--no-display']
@@ -81,11 +93,27 @@ def launch_setup(context, *args, **kwargs):
             package='omx_aim', executable='scan_processor', name='scan_processor',
             output='screen',
         ),
-        Node(
-            package='omx_aim', executable='patrol_planner', name='patrol_planner',
-            output='screen',
-        ),
     ])
+
+    patrol_planner = Node(
+        package='omx_aim', executable='patrol_planner', name='patrol_planner',
+        output='screen',
+    )
+    if start_patrol_planner:
+        if patrol_delay > 0.0:
+            actions.append(TimerAction(
+                period=patrol_delay,
+                actions=[
+                    LogInfo(msg=[
+                        'OMX_AIM | starting patrol_planner after ',
+                        str(patrol_delay),
+                        's risk-map bridge grace period',
+                    ]),
+                    patrol_planner,
+                ],
+            ))
+        else:
+            actions.append(patrol_planner)
 
     return actions
 
@@ -112,6 +140,13 @@ def generate_launch_description():
             'yolo_server_half', default_value='true',
             choices=['true', 'false'],
             description='Use half precision in flask_yolo_server when supported.'),
+        DeclareLaunchArgument(
+            'start_patrol_planner', default_value='true',
+            choices=['true', 'false'],
+            description='Start patrol_planner on the leader after the risk bridge grace period.'),
+        DeclareLaunchArgument(
+            'patrol_planner_delay_sec', default_value='24.0',
+            description='Delay patrol_planner until /risk/risk_map has time to bridge in.'),
         DeclareLaunchArgument(
             'debug_stream', default_value='false',
             description='yolo_node 의 Flask MJPEG 디버그 스트림 켜기'),

@@ -753,11 +753,23 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
     def on_map(self, msg: OccupancyGrid):
         h = int(msg.info.height)
         w = int(msg.info.width)
-        if h <= 0 or w <= 0:
+        resolution = float(msg.info.resolution)
+        if (
+            h <= 0
+            or w <= 0
+            or resolution <= 0.0
+            or len(msg.data) != h * w
+        ):
+            self.get_logger().warn(
+                'RISK_MAP_INPUT_INVALID_DROP | '
+                f'topic={self.map_topic} width={w} height={h} '
+                f'resolution={resolution:.6f} data_len={len(msg.data)}',
+                throttle_duration_sec=5.0,
+            )
             return
 
         data = np.array(msg.data, dtype=np.int16).reshape((h, w))
-        res = float(msg.info.resolution)
+        res = resolution
         ox = float(msg.info.origin.position.x)
         oy = float(msg.info.origin.position.y)
         oyaw = yaw_from_quaternion(msg.info.origin.orientation)

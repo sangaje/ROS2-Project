@@ -27,6 +27,7 @@ class MapRelay(Node):
         self.declare_parameter('output_topic', '/map')
         self.declare_parameter('check_period_sec', 1.0)
         self.declare_parameter('takeover_grace_sec', 2.0)
+        self.declare_parameter('republish_period_sec', 2.0)
 
         self.input_topic = str(self.get_parameter('input_topic').value)
         self.output_topic = str(self.get_parameter('output_topic').value)
@@ -35,6 +36,9 @@ class MapRelay(Node):
         )
         self.takeover_grace = max(
             0.0, float(self.get_parameter('takeover_grace_sec').value)
+        )
+        self.republish_period = max(
+            0.0, float(self.get_parameter('republish_period_sec').value)
         )
 
         pub_qos = QoSProfile(
@@ -50,9 +54,11 @@ class MapRelay(Node):
             history=HistoryPolicy.KEEP_LAST,
         )
         self._latest_bridged = None
+        self._latest_bridged_key = None
         self._last_seen_output = None
         self._relaying = False
         self._primary_missing_since = None
+        self._last_republish_sec = 0.0
         self._first_bridged_logged = False
         self._first_output_logged = False
 
@@ -61,6 +67,18 @@ class MapRelay(Node):
         )
         self._sub = self.create_subscription(
             OccupancyGrid, self.input_topic, self._on_bridged_map, sub_qos
+        )
+        transient_sub_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+        self._transient_sub = self.create_subscription(
+            OccupancyGrid,
+            self.input_topic,
+            self._on_bridged_map,
+            transient_sub_qos,
         )
         # Also watch the output topic itself so a takeover can continue from
         # whatever the primary (e.g. Cartographer) last published there,
@@ -74,7 +92,8 @@ class MapRelay(Node):
         self.get_logger().info(
             f'map relay standing by: {self.input_topic} (volatile-compatible) -> '
             f'{self.output_topic} (transient_local), only if no other '
-            f'publisher is active on {self.output_topic}'
+            f'publisher is active on {self.output_topic}; '
+            f'republish_period={self.republish_period:.1f}s'
         )
 
     def _on_bridged_map(self, msg: OccupancyGrid):
@@ -92,9 +111,13 @@ class MapRelay(Node):
                 f'topic={self.input_topic} width={msg.info.width} '
                 f'height={msg.info.height} resolution={msg.info.resolution:.3f}'
             )
+        key = self._grid_key(msg)
+        if key == self._latest_bridged_key:
+            return
+        self._latest_bridged_key = key
         self._latest_bridged = msg
         if self._relaying:
-            self._publish(msg)
+            self._publish(msg, source='bridge')
 
     def _on_output_seen(self, msg: OccupancyGrid):
         if not self._is_valid_map(msg):
@@ -117,6 +140,26 @@ class MapRelay(Node):
             and height > 0
             and float(msg.info.resolution) > 0.0
             and len(msg.data) == width * height
+        )
+
+    @staticmethod
+    def _grid_key(msg: OccupancyGrid):
+        origin = msg.info.origin
+        return (
+            msg.header.stamp.sec,
+            msg.header.stamp.nanosec,
+            msg.header.frame_id,
+            int(msg.info.width),
+            int(msg.info.height),
+            round(float(msg.info.resolution), 9),
+            round(float(origin.position.x), 6),
+            round(float(origin.position.y), 6),
+            round(float(origin.position.z), 6),
+            round(float(origin.orientation.x), 6),
+            round(float(origin.orientation.y), 6),
+            round(float(origin.orientation.z), 6),
+            round(float(origin.orientation.w), 6),
+            len(msg.data),
         )
 
     def _now_sec(self) -> float:
@@ -158,6 +201,11 @@ class MapRelay(Node):
                 f'Map relay active (no primary for {missing_sec:.1f}s)',
                 throttle_duration_sec=10.0,
             )
+            if (
+                self.republish_period > 0.0
+                and now - self._last_republish_sec >= self.republish_period
+            ):
+                self._publish_latest()
 
     def _publish_latest(self):
         # Prefer continuing from whatever the primary itself last
@@ -171,13 +219,18 @@ class MapRelay(Node):
                 throttle_duration_sec=5.0,
             )
             return
-        self._publish(source)
+        self._publish(
+            source,
+            source='output_cache' if self._last_seen_output is not None
+            else 'bridge',
+        )
 
-    def _publish(self, source: OccupancyGrid):
-        self._pub.publish(source)
+    def _publish(self, msg: OccupancyGrid, *, source='unknown'):
+        self._pub.publish(msg)
+        self._last_republish_sec = self._now_sec()
         self.get_logger().info(
-            f'Map relayed: {source.info.width}x{source.info.height} @ '
-            f'{source.info.resolution:.3f}m/cell',
+            f'Map relayed: {msg.info.width}x{msg.info.height} @ '
+            f'{msg.info.resolution:.3f}m/cell source={source}',
             throttle_duration_sec=10.0,
         )
 

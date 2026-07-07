@@ -5,6 +5,8 @@ OpenCV VideoCapture + Ultralytics YOLO. ROS 의존성 없음.
 
 from __future__ import annotations
 
+import os
+
 import cv2
 from ultralytics import YOLO
 
@@ -32,12 +34,21 @@ class YoloDetector:
             raise RuntimeError(f"카메라 {cam_idx} 열기 실패")
         self._log(f"카메라 {cam_idx} 열림")
 
+        self.device = str(os.environ.get(
+            "OMX_YOLO_DEVICE",
+            getattr(cfg.yolo, "device", "0"),
+        )).strip()
+        self.use_half = bool(getattr(cfg.yolo, "half", True))
+        if self.device.lower() in ("cpu", "none", ""):
+            self.use_half = False
+
         self.model = YOLO(cfg.yolo.model_path)
         self.target_class = cfg.yolo.target_class
         self.class_name = self.model.names.get(
             self.target_class, f"cls_{self.target_class}")
         self._log(f"YOLO 로드: {cfg.yolo.model_path}, "
-                  f"클래스 {self.target_class} ({self.class_name})")
+                  f"클래스 {self.target_class} ({self.class_name}), "
+                  f"device={self.device}, half={self.use_half}")
 
     def _log(self, msg):
         if self.logger:
@@ -67,7 +78,10 @@ class YoloDetector:
         results = self.model.predict(
             frame, imgsz=self.cfg.yolo.imgsz,
             conf=self.cfg.yolo.conf_threshold,
-            classes=[self.target_class], verbose=False)
+            classes=[self.target_class],
+            device=self.device,
+            half=self.use_half,
+            verbose=False)
         boxes = results[0].boxes
 
         if boxes is None or len(boxes) == 0:

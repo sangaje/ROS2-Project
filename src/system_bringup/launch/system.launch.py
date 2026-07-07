@@ -92,6 +92,8 @@ def generate_launch_description():
     yolo_server_model_path = LaunchConfiguration('yolo_server_model_path')
     yolo_server_device = LaunchConfiguration('yolo_server_device')
     yolo_server_half = LaunchConfiguration('yolo_server_half')
+    start_patrol_planner = LaunchConfiguration('start_patrol_planner')
+    patrol_planner_delay_sec = LaunchConfiguration('patrol_planner_delay_sec')
     debug_stream = LaunchConfiguration('debug_stream')
     debug_port = LaunchConfiguration('debug_port')
     unified_dashboard = LaunchConfiguration('unified_dashboard')
@@ -316,6 +318,12 @@ def generate_launch_description():
                         ),
                         'yolo_server_device': yolo_server_device.perform(context),
                         'yolo_server_half': yolo_server_half.perform(context),
+                        'start_patrol_planner': (
+                            start_patrol_planner.perform(context)
+                        ),
+                        'patrol_planner_delay_sec': (
+                            patrol_planner_delay_sec.perform(context)
+                        ),
                         'debug_stream': debug_stream.perform(context),
                         'debug_port': debug_port.perform(context),
                     }.items(),
@@ -769,6 +777,17 @@ def generate_launch_description():
             default_value='true',
             choices=['true', 'false'],
             description='Leader role only: use half precision when supported.',
+        ),
+        DeclareLaunchArgument(
+            'start_patrol_planner',
+            default_value='true',
+            choices=['true', 'false'],
+            description='Leader role only: start OMX patrol planner from bridged risk map.',
+        ),
+        DeclareLaunchArgument(
+            'patrol_planner_delay_sec',
+            default_value='24.0',
+            description='Leader role only: delay patrol planner until risk/map bridge has time to publish.',
         ),
         DeclareLaunchArgument(
             'debug_stream',

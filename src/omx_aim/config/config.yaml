@@ -99,8 +99,10 @@ ibvs:
   derivative_reset_gap_sec: 0.5
 
 yolo:
-  model_path: ../models/best.pt    # 학습 모델 쓸 때는 ./models/best.pt 같은 경로로 교체
-  target_class: 1           # 67=cell phone, 39=bottle, 41=cup, 0=person, 47=apple
+  model_path: yolo11n.pt    # custom best.pt가 있으면 OMX_YOLO_MODEL_PATH=/abs/path/best.pt 로 override
+  device: 0                 # Jetson CUDA device. cpu로 강제하려면 "cpu"
+  half: true                # CUDA에서 FP16 사용
+  target_class: 0           # COCO: 0=person. custom best.pt 사용 시 class id에 맞게 변경
   conf_threshold: 0.5        # 0.0~1.0. 낮을수록 더 많이 검출 (오검출 늘어남)
   imgsz: 640                 # 추론 해상도. 320 = 빠름, 640 = 기본, 1280 = 정확
 

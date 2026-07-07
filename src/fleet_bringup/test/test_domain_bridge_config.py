@@ -32,6 +32,7 @@ def test_real_bridge_directions_and_control_qos(tmp_path):
     assert main['topics']['/leader_pose']['type'] == (
         'geometry_msgs/msg/PoseStamped'
     )
+    assert main['topics']['/map']['qos']['durability'] == 'transient_local'
     assert '/fleet/hazard_pose' in main['topics']
     assert follower['topics']['/fleet/follow_enabled']['qos']['durability'] == (
         'transient_local'
@@ -96,6 +97,7 @@ def test_member_bridge_forwards_core_risk_topics_to_main(tmp_path):
 
     assert (main['from_domain'], main['to_domain']) == (24, 26)
     assert main['topics']['/map']['remap'] == '/map_bridge'
+    assert main['topics']['/map']['qos']['durability'] == 'transient_local'
     assert main['topics']['/leader_pose']['type'] == (
         'geometry_msgs/msg/PoseStamped'
     )
@@ -145,8 +147,9 @@ def test_leader_to_pc_bridge_is_visualization_only(tmp_path):
     config = yaml.safe_load(path.read_text())
 
     assert (config['from_domain'], config['to_domain']) == (24, 30)
-    assert 'reliability' not in config['topics']['/map']['qos']
-    assert 'durability' not in config['topics']['/map']['qos']
+    assert config['topics']['/map']['qos']['reliability'] == 'reliable'
+    assert config['topics']['/map']['qos']['durability'] == 'transient_local'
+    assert config['topics']['/map']['qos']['depth'] == 1
     assert '/fleet_debug_markers' in config['topics']
     assert '/risk/risk_map' in config['topics']
     assert '/tf' not in config['topics']

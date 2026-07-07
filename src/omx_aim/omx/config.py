@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -78,6 +79,8 @@ class YoloConfig:
     target_class: int
     conf_threshold: float
     imgsz: int
+    device: str = "0"
+    half: bool = True
 
 
 @dataclass
@@ -244,9 +247,44 @@ def load_config(path=None):
             f"Config 파일 형식 오류 ({config_path}): {e}"
         ) from e
 
-    # model_path 는 config.yaml 기준 상대경로 (share/config/../models/best.pt).
-    # ros2 run 은 cwd 가 정해져 있지 않으므로 cwd 기준 상대경로로 두면 안 됨.
-    if yolo_cfg is not None and yolo_cfg.model_path and not Path(yolo_cfg.model_path).is_absolute():
-        yolo_cfg.model_path = str((config_path.parent / yolo_cfg.model_path).resolve())
+    if yolo_cfg is not None and yolo_cfg.model_path:
+        override_model_path = os.environ.get("OMX_YOLO_MODEL_PATH", "").strip()
+        if override_model_path:
+            yolo_cfg.model_path = override_model_path
+
+        model_path = Path(str(yolo_cfg.model_path)).expanduser()
+        if not model_path.is_absolute():
+            # Installed config lives in share/omx_aim/config. Prefer package
+            # data models, then the launch cwd used by the robot commands.
+            candidates = [
+                config_path.parent / model_path,
+                config_path.parent.parent / "models" / model_path.name,
+                Path.cwd() / model_path,
+                Path.cwd() / model_path.name,
+            ]
+            for candidate in candidates:
+                if candidate.is_file():
+                    yolo_cfg.model_path = str(candidate.resolve())
+                    break
+            else:
+                # Keep known Ultralytics model names unresolved so the library
+                # can use its normal cache/download path. Custom models should
+                # fail early with a useful path list instead of dying later.
+                known_ultralytics = {
+                    "yolo11n.pt", "yolo11s.pt", "yolo11m.pt",
+                    "yolo11l.pt", "yolo11x.pt",
+                    "yolov8n.pt", "yolov8s.pt", "yolov8m.pt",
+                    "yolov8l.pt", "yolov8x.pt",
+                }
+                if model_path.name not in known_ultralytics:
+                    searched = "\n".join(f"  - {c}" for c in candidates)
+                    raise FileNotFoundError(
+                        "YOLO model file not found. Set OMX_YOLO_MODEL_PATH "
+                        f"to an absolute .pt path, or place {model_path.name} "
+                        f"in one of:\n{searched}"
+                    )
+                yolo_cfg.model_path = model_path.name
+        else:
+            yolo_cfg.model_path = str(model_path)
 
     return cfg
