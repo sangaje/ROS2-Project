@@ -1,563 +1,518 @@
 Panels:
-- Class: rviz_common/Displays
-  Help Height: 85
-  Name: Displays
-  Property Tree Widget:
+  - Class: rviz_common/Displays
+    Help Height: 85
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+        - /Status1
+        - /Map1
+        - /TF1
+        - /Leader Pose1
+        - /Burger Pose1
+        - /Leader Nav2 Plan1
+        - /Burger Nav2 Plan1
+        - /Fleet Debug Markers1
+        - /Risk Map Positive Halo1
+      Splitter Ratio: 0.5
+    Tree Height: 375
+  - Class: rviz_common/Views
     Expanded:
-    - /Global Options1
-    - /Status1
-    - /Map1
-    - /TF1
-    - /Leader Pose1
-    - /Burger Pose1
-    - /Leader Nav2 Plan1
-    - /Burger Nav2 Plan1
-    - /Fleet Debug Markers1
-    - /Risk Map Positive Halo1
-    - /LaserScan1
+      - /Current View1
+    Name: Views
     Splitter Ratio: 0.5
-  Tree Height: 375
-- Class: rviz_common/Views
-  Expanded:
-  - /Current View1
-  Name: Views
-  Splitter Ratio: 0.5
 Visualization Manager:
-  Class: ''
+  Class: ""
   Displays:
-  - Alpha: 0.44999998807907104
-    Cell Size: 1
-    Class: rviz_default_plugins/Grid
-    Color: 160; 160; 164
-    Enabled: true
-    Line Style:
-      Line Width: 0.029999999329447746
-      Value: Lines
-    Name: Grid
-    Normal Cell Count: 0
-    Offset:
-      X: 0
-      Y: 0
-      Z: 0
-    Plane: XY
-    Plane Cell Count: 20
-    Reference Frame: <Fixed Frame>
-    Value: true
-  - Alpha: 0.75
-    Binary representation: false
-    Binary threshold: 100
-    Class: rviz_default_plugins/Map
-    Color Scheme: map
-    Draw Behind: true
-    Enabled: true
-    Name: Map
-    Topic:
-      Depth: 1
-      Durability Policy: Transient Local
-      Filter size: 10
-      History Policy: Keep Last
-      Reliability Policy: Reliable
-      Value: /map
-    Update Topic:
-      Depth: 5
-      Durability Policy: Volatile
-      History Policy: Keep Last
-      Reliability Policy: Reliable
-      Value: /map_updates
-    Use Timestamp: false
-    Value: true
-  - Class: rviz_default_plugins/TF
-    Enabled: true
-    Filter (blacklist): ''
-    Filter (whitelist): ''
-    Frame Timeout: 15
-    Frames:
-      All Enabled: true
-      base_footprint:
-        Value: true
-      base_link:
-        Value: true
-      base_scan:
-        Value: true
-      burger/base_footprint:
-        Value: true
-      burger/base_scan:
-        Value: true
-      caster_back_link:
-        Value: true
-      imu_link:
-        Value: true
-      map:
-        Value: true
-      odom:
-        Value: true
-      wheel_left_link:
-        Value: true
-      wheel_right_link:
-        Value: true
-    Marker Scale: 1.5
-    Name: TF
-    Show Arrows: true
-    Show Axes: true
-    Show Names: true
-    Tree:
-      map:
-        odom:
-          base_footprint:
-            base_link:
-              base_scan: {}
-              caster_back_link: {}
-              imu_link: {}
-              wheel_left_link: {}
-              wheel_right_link: {}
-    Update Interval: 0
-    Value: true
-  - Alpha: 1
-    Autocompute Intensity Bounds: true
-    Autocompute Value Bounds:
-      Max Value: 10
-      Min Value: -10
+    - Alpha: 0.44999998807907104
+      Cell Size: 1
+      Class: rviz_default_plugins/Grid
+      Color: 160; 160; 164
+      Enabled: true
+      Line Style:
+        Line Width: 0.029999999329447746
+        Value: Lines
+      Name: Grid
+      Normal Cell Count: 0
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Plane: XY
+      Plane Cell Count: 20
+      Reference Frame: <Fixed Frame>
       Value: true
-    Axis: Z
-    Channel Name: intensity
-    Class: rviz_default_plugins/LaserScan
-    Color: 25; 120; 255
-    Color Transformer: FlatColor
-    Decay Time: 0
-    Enabled: true
-    Invert Rainbow: false
-    Max Color: 255; 255; 255
-    Max Intensity: 4096
-    Min Color: 0; 0; 0
-    Min Intensity: 0
-    Name: Leader Scan
-    Position Transformer: XYZ
-    Selectable: true
-    Size (Pixels): 3
-    Size (m): 0.03999999910593033
-    Style: Points
-    Topic:
-      Depth: 10
-      Durability Policy: Volatile
-      Filter size: 10
-      History Policy: Keep Last
-      Reliability Policy: Best Effort
-      Value: /leader/scan
-    Use Fixed Frame: true
-    Use rainbow: true
-    Value: true
-  - Alpha: 1
-    Autocompute Intensity Bounds: true
-    Autocompute Value Bounds:
-      Max Value: 10
-      Min Value: -10
+    - Alpha: 0.75
+      Binary representation: false
+      Binary threshold: 100
+      Class: rviz_default_plugins/Map
+      Color Scheme: map
+      Draw Behind: true
+      Enabled: true
+      Name: Map
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /map
+      Update Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /map_updates
+      Use Timestamp: false
       Value: true
-    Axis: Z
-    Channel Name: intensity
-    Class: rviz_default_plugins/LaserScan
-    Color: 255; 120; 30
-    Color Transformer: FlatColor
-    Decay Time: 0
-    Enabled: true
-    Invert Rainbow: false
-    Max Color: 255; 255; 255
-    Max Intensity: 4096
-    Min Color: 0; 0; 0
-    Min Intensity: 0
-    Name: Follower22 Scan
-    Position Transformer: XYZ
-    Selectable: true
-    Size (Pixels): 3
-    Size (m): 0.03999999910593033
-    Style: Points
-    Topic:
-      Depth: 10
-      Durability Policy: Volatile
-      Filter size: 10
-      History Policy: Keep Last
-      Reliability Policy: Best Effort
-      Value: /follower22/scan
-    Use Fixed Frame: true
-    Use rainbow: true
-    Value: true
-  - Alpha: 1
-    Axes Length: 0.3499999940395355
-    Axes Radius: 0.029999999329447746
-    Class: rviz_default_plugins/Pose
-    Color: 25; 80; 255
-    Enabled: true
-    Head Length: 0.25
-    Head Radius: 0.07999999821186066
-    Name: Leader Pose
-    Shaft Length: 0.44999998807907104
-    Shaft Radius: 0.029999999329447746
-    Shape: Arrow
-    Topic:
-      Depth: 10
-      Durability Policy: Volatile
-      Filter size: 10
-      History Policy: Keep Last
-      Reliability Policy: Reliable
-      Value: /leader_pose
-    Value: true
-  - Alpha: 1
-    Axes Length: 0.30000001192092896
-    Axes Radius: 0.029999999329447746
-    Class: rviz_default_plugins/Pose
-    Color: 255; 90; 20
-    Enabled: true
-    Head Length: 0.2199999988079071
-    Head Radius: 0.07000000029802322
-    Name: Burger Pose
-    Shaft Length: 0.4000000059604645
-    Shaft Radius: 0.029999999329447746
-    Shape: Arrow
-    Topic:
-      Depth: 10
-      Durability Policy: Volatile
-      Filter size: 10
-      History Policy: Keep Last
-      Reliability Policy: Reliable
-      Value: /burger_pose
-    Value: true
-  - Alpha: 1
-    Axes Length: 0.30000001192092896
-    Axes Radius: 0.029999999329447746
-    Class: rviz_default_plugins/Pose
-    Color: 0; 220; 90
-    Enabled: true
-    Head Length: 0.2199999988079071
-    Head Radius: 0.07000000029802322
-    Name: Member Pose
-    Shaft Length: 0.4000000059604645
-    Shaft Radius: 0.029999999329447746
-    Shape: Arrow
-    Topic:
-      Depth: 10
-      Durability Policy: Volatile
-      Filter size: 10
-      History Policy: Keep Last
-      Reliability Policy: Reliable
-      Value: /member_pose
-    Value: true
-  - Alpha: 1
-    Buffer Length: 1
-    Class: rviz_default_plugins/Path
-    Color: 25; 80; 255
-    Enabled: true
-    Head Diameter: 0.30000001192092896
-    Head Length: 0.20000000298023224
-    Length: 0.30000001192092896
-    Line Style: Lines
-    Line Width: 0.03999999910593033
-    Name: Leader Nav2 Plan
-    Offset:
-      X: 0
-      Y: 0
-      Z: 0
-    Pose Color: 25; 80; 255
-    Pose Style: None
-    Radius: 0.029999999329447746
-    Shaft Diameter: 0.10000000149011612
-    Shaft Length: 0.10000000149011612
-    Topic:
-      Depth: 10
-      Durability Policy: Volatile
-      Filter size: 10
-      History Policy: Keep Last
-      Reliability Policy: Reliable
-      Value: /plan
-    Value: true
-  - Alpha: 1
-    Buffer Length: 1
-    Class: rviz_default_plugins/Path
-    Color: 255; 90; 20
-    Enabled: true
-    Head Diameter: 0.30000001192092896
-    Head Length: 0.20000000298023224
-    Length: 0.30000001192092896
-    Line Style: Lines
-    Line Width: 0.03999999910593033
-    Name: Burger Nav2 Plan
-    Offset:
-      X: 0
-      Y: 0
-      Z: 0
-    Pose Color: 255; 90; 20
-    Pose Style: None
-    Radius: 0.029999999329447746
-    Shaft Diameter: 0.10000000149011612
-    Shaft Length: 0.10000000149011612
-    Topic:
-      Depth: 10
-      Durability Policy: Volatile
-      Filter size: 10
-      History Policy: Keep Last
-      Reliability Policy: Reliable
-      Value: /burger_plan
-    Value: true
-  - Class: rviz_default_plugins/MarkerArray
-    Enabled: true
-    Name: Fleet Debug Markers
-    Namespaces:
-      burger: true
-      burger_heading: true
-      burger_label: true
-      burger_goal: true
-      burger_goal_label: true
-      leader: true
-      leader_heading: true
-      leader_label: true
-      leader_coord_goal: true
-      leader_coord_goal_label: true
-      leader_user_goal: true
-      leader_user_goal_label: true
-      member: true
-      member_heading: true
-      member_label: true
-      member_goal: true
-      member_goal_label: true
-    Topic:
-      Depth: 10
-      Durability Policy: Volatile
-      History Policy: Keep Last
-      Reliability Policy: Reliable
-      Value: /fleet_debug_markers
-    Value: true
-  - Class: rviz_default_plugins/MarkerArray
-    Enabled: true
-    Name: Coordination Markers
-    Namespaces: {}
-    Topic:
-      Depth: 10
-      Durability Policy: Volatile
-      History Policy: Keep Last
-      Reliability Policy: Reliable
-      Value: /fleet/coordination_markers
-    Value: true
-  - Alpha: 1
-    Axes Length: 0.30000001192092896
-    Axes Radius: 0.029999999329447746
-    Class: rviz_default_plugins/Pose
-    Color: 255; 230; 25
-    Enabled: true
-    Head Length: 0.2199999988079071
-    Head Radius: 0.07000000029802322
-    Name: Clicked Goal Pose
-    Shaft Length: 0.4000000059604645
-    Shaft Radius: 0.029999999329447746
-    Shape: Arrow
-    Topic:
-      Depth: 10
-      Durability Policy: Volatile
-      Filter size: 10
-      History Policy: Keep Last
-      Reliability Policy: Reliable
-      Value: /goal_pose
-    Value: true
-  - Alpha: 1
-    Axes Length: 0.30000001192092896
-    Axes Radius: 0.029999999329447746
-    Class: rviz_default_plugins/Pose
-    Color: 0; 220; 90
-    Enabled: true
-    Head Length: 0.2199999988079071
-    Head Radius: 0.07000000029802322
-    Name: Member Goal Pose
-    Shaft Length: 0.4000000059604645
-    Shaft Radius: 0.029999999329447746
-    Shape: Arrow
-    Topic:
-      Depth: 10
-      Durability Policy: Volatile
-      Filter size: 10
-      History Policy: Keep Last
-      Reliability Policy: Reliable
-      Value: /member_goal_pose
-    Value: true
-  - Alpha: 0.800000011920929
-    Binary representation: false
-    Binary threshold: 100
-    Class: rviz_default_plugins/Map
-    Color Scheme: costmap
-    Draw Behind: false
-    Enabled: true
-    Name: Risk Map Positive Halo
-    Topic:
-      Depth: 5
-      Durability Policy: Transient Local
-      Filter size: 10
-      History Policy: Keep Last
-      Reliability Policy: Reliable
-      Value: /risk/risk_map
-    Update Topic:
-      Depth: 5
-      Durability Policy: Volatile
-      History Policy: Keep Last
-      Reliability Policy: Reliable
-      Value: /risk/risk_map_updates
-    Use Timestamp: false
-    Value: true
-  - Alpha: 0.75
-    Binary representation: false
-    Binary threshold: 100
-    Class: rviz_default_plugins/Map
-    Color Scheme: costmap
-    Draw Behind: false
-    Enabled: true
-    Name: Bayesian Person Probability
-    Topic:
-      Depth: 5
-      Durability Policy: Transient Local
-      Filter size: 10
-      History Policy: Keep Last
-      Reliability Policy: Reliable
-      Value: /risk/person_probability_map
-    Update Topic:
-      Depth: 5
-      Durability Policy: Volatile
-      History Policy: Keep Last
-      Reliability Policy: Reliable
-      Value: /risk/person_probability_map_updates
-    Use Timestamp: false
-    Value: true
-  - Alpha: 0.550000011920929
-    Binary representation: false
-    Binary threshold: 100
-    Class: rviz_default_plugins/Map
-    Color Scheme: map
-    Draw Behind: false
-    Enabled: false
-    Name: Positive Memory
-    Topic:
-      Depth: 5
-      Durability Policy: Transient Local
-      Filter size: 10
-      History Policy: Keep Last
-      Reliability Policy: Reliable
-      Value: /risk/positive_memory_map
-    Update Topic:
-      Depth: 5
-      Durability Policy: Volatile
-      History Policy: Keep Last
-      Reliability Policy: Reliable
+    - Class: rviz_default_plugins/TF
+      Enabled: true
+      Filter (blacklist): ""
+      Filter (whitelist): ""
+      Frame Timeout: 15
+      Frames:
+        All Enabled: true
+      Marker Scale: 1.5
+      Name: TF
+      Show Arrows: true
+      Show Axes: true
+      Show Names: true
+      Tree:
+        {}
+      Update Interval: 0
       Value: true
-    Use Timestamp: false
-    Value: false
-  - Alpha: 0.550000011920929
-    Binary representation: false
-    Binary threshold: 100
-    Class: rviz_default_plugins/Map
-    Color Scheme: map
-    Draw Behind: false
-    Enabled: false
-    Name: Detection Candidate
-    Topic:
-      Depth: 5
-      Durability Policy: Transient Local
-      Filter size: 10
-      History Policy: Keep Last
-      Reliability Policy: Reliable
-      Value: /risk/detection_candidate_map
-    Update Topic:
-      Depth: 5
-      Durability Policy: Volatile
-      History Policy: Keep Last
-      Reliability Policy: Reliable
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz_default_plugins/LaserScan
+      Color: 25; 120; 255
+      Color Transformer: FlatColor
+      Decay Time: 0
+      Enabled: true
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Max Intensity: 4096
+      Min Color: 0; 0; 0
+      Min Intensity: 0
+      Name: Leader Scan
+      Position Transformer: XYZ
+      Selectable: true
+      Size (Pixels): 3
+      Size (m): 0.03999999910593033
+      Style: Points
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /leader/scan
+      Use Fixed Frame: true
+      Use rainbow: true
       Value: true
-    Use Timestamp: false
-    Value: false
-  - Alpha: 0.3499999940395355
-    Binary representation: false
-    Binary threshold: 100
-    Class: rviz_default_plugins/Map
-    Color Scheme: map
-    Draw Behind: false
-    Enabled: false
-    Name: Observed Empty Not Risk
-    Topic:
-      Depth: 5
-      Durability Policy: Transient Local
-      Filter size: 10
-      History Policy: Keep Last
-      Reliability Policy: Reliable
-      Value: /risk/observed_empty_map
-    Update Topic:
-      Depth: 5
-      Durability Policy: Volatile
-      History Policy: Keep Last
-      Reliability Policy: Reliable
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz_default_plugins/LaserScan
+      Color: 255; 120; 30
+      Color Transformer: FlatColor
+      Decay Time: 0
+      Enabled: true
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Max Intensity: 4096
+      Min Color: 0; 0; 0
+      Min Intensity: 0
+      Name: Follower22 Scan
+      Position Transformer: XYZ
+      Selectable: true
+      Size (Pixels): 3
+      Size (m): 0.03999999910593033
+      Style: Points
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /follower22/scan
+      Use Fixed Frame: true
+      Use rainbow: true
       Value: true
-    Use Timestamp: false
-    Value: false
-  - Alpha: 0.30000001192092896
-    Binary representation: false
-    Binary threshold: 100
-    Class: rviz_default_plugins/Map
-    Color Scheme: map
-    Draw Behind: false
-    Enabled: false
-    Name: Room Probability Diagnostic
-    Topic:
-      Depth: 5
-      Durability Policy: Transient Local
-      Filter size: 10
-      History Policy: Keep Last
-      Reliability Policy: Reliable
-      Value: /risk/room_probability_map
-    Update Topic:
-      Depth: 5
-      Durability Policy: Volatile
-      History Policy: Keep Last
-      Reliability Policy: Reliable
+    - Alpha: 1
+      Axes Length: 0.3499999940395355
+      Axes Radius: 0.029999999329447746
+      Class: rviz_default_plugins/Pose
+      Color: 25; 80; 255
+      Enabled: true
+      Head Length: 0.25
+      Head Radius: 0.07999999821186066
+      Name: Leader Pose
+      Shaft Length: 0.44999998807907104
+      Shaft Radius: 0.029999999329447746
+      Shape: Arrow
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /leader_pose
       Value: true
-    Use Timestamp: false
-    Value: false
-  - Class: rviz_default_plugins/MarkerArray
-    Enabled: true
-    Name: Evidence Markers
-    Namespaces: {}
-    Topic:
-      Depth: 10
-      Durability Policy: Transient Local
-      History Policy: Keep Last
-      Reliability Policy: Reliable
-      Value: /risk/evidence_markers
-    Value: true
-  - Alpha: 1
-    Autocompute Intensity Bounds: true
-    Autocompute Value Bounds:
-      Max Value: 10
-      Min Value: -10
+    - Alpha: 1
+      Axes Length: 0.30000001192092896
+      Axes Radius: 0.029999999329447746
+      Class: rviz_default_plugins/Pose
+      Color: 255; 90; 20
+      Enabled: true
+      Head Length: 0.2199999988079071
+      Head Radius: 0.07000000029802322
+      Name: Follower21 Pose
+      Shaft Length: 0.4000000059604645
+      Shaft Radius: 0.029999999329447746
+      Shape: Arrow
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /burger_pose
       Value: true
-    Axis: Z
-    Channel Name: intensity
-    Class: rviz_default_plugins/LaserScan
-    Color: 255; 0; 0
-    Color Transformer: ''
-    Decay Time: 0
-    Enabled: true
-    Invert Rainbow: false
-    Max Color: 255; 255; 255
-    Max Intensity: 4096
-    Min Color: 0; 0; 0
-    Min Intensity: 0
-    Name: Scout Scan
-    Position Transformer: ''
-    Selectable: true
-    Size (Pixels): 3
-    Size (m): 0.029999999329447746
-    Style: Points
-    Topic:
-      Depth: 100
-      Durability Policy: Volatile
-      Filter size: 10
-      History Policy: Keep Last
-      Reliability Policy: Best Effort
-      Value: /scan
-    Use Fixed Frame: true
-    Use rainbow: true
-    Value: true
+    - Alpha: 1
+      Axes Length: 0.30000001192092896
+      Axes Radius: 0.029999999329447746
+      Class: rviz_default_plugins/Pose
+      Color: 0; 220; 90
+      Enabled: true
+      Head Length: 0.2199999988079071
+      Head Radius: 0.07000000029802322
+      Name: Follower22 Pose
+      Shaft Length: 0.4000000059604645
+      Shaft Radius: 0.029999999329447746
+      Shape: Arrow
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /member_pose
+      Value: true
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz_default_plugins/Path
+      Color: 25; 80; 255
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.03999999910593033
+      Name: Leader Nav2 Plan
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 25; 80; 255
+      Pose Style: None
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /plan
+      Value: true
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz_default_plugins/Path
+      Color: 255; 90; 20
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.03999999910593033
+      Name: Follower21 Nav2 Plan
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 90; 20
+      Pose Style: None
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /burger_plan
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Fleet Debug Markers
+      Namespaces:
+        {}
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /fleet_debug_markers
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Coordination Markers
+      Namespaces:
+        {}
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /fleet/coordination_markers
+      Value: true
+    - Alpha: 1
+      Axes Length: 0.30000001192092896
+      Axes Radius: 0.029999999329447746
+      Class: rviz_default_plugins/Pose
+      Color: 255; 230; 25
+      Enabled: true
+      Head Length: 0.2199999988079071
+      Head Radius: 0.07000000029802322
+      Name: Clicked Goal Pose
+      Shaft Length: 0.4000000059604645
+      Shaft Radius: 0.029999999329447746
+      Shape: Arrow
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /goal_pose
+      Value: true
+    - Alpha: 1
+      Axes Length: 0.30000001192092896
+      Axes Radius: 0.029999999329447746
+      Class: rviz_default_plugins/Pose
+      Color: 0; 220; 90
+      Enabled: true
+      Head Length: 0.2199999988079071
+      Head Radius: 0.07000000029802322
+      Name: Follower22 Goal Pose
+      Shaft Length: 0.4000000059604645
+      Shaft Radius: 0.029999999329447746
+      Shape: Arrow
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /member_goal_pose
+      Value: true
+    - Alpha: 0.800000011920929
+      Binary representation: false
+      Binary threshold: 100
+      Class: rviz_default_plugins/Map
+      Color Scheme: costmap
+      Draw Behind: false
+      Enabled: true
+      Name: Risk Map Positive Halo
+      Topic:
+        Depth: 5
+        Durability Policy: Transient Local
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /risk/risk_map
+      Update Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /risk/risk_map_updates
+      Use Timestamp: false
+      Value: true
+    - Alpha: 0.75
+      Binary representation: false
+      Binary threshold: 100
+      Class: rviz_default_plugins/Map
+      Color Scheme: costmap
+      Draw Behind: false
+      Enabled: true
+      Name: Bayesian Person Probability
+      Topic:
+        Depth: 5
+        Durability Policy: Transient Local
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /risk/person_probability_map
+      Update Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /risk/person_probability_map_updates
+      Use Timestamp: false
+      Value: true
+    - Alpha: 0.550000011920929
+      Binary representation: false
+      Binary threshold: 100
+      Class: rviz_default_plugins/Map
+      Color Scheme: map
+      Draw Behind: false
+      Enabled: false
+      Name: Positive Memory
+      Topic:
+        Depth: 5
+        Durability Policy: Transient Local
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /risk/positive_memory_map
+      Update Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: true
+      Use Timestamp: false
+      Value: false
+    - Alpha: 0.550000011920929
+      Binary representation: false
+      Binary threshold: 100
+      Class: rviz_default_plugins/Map
+      Color Scheme: map
+      Draw Behind: false
+      Enabled: false
+      Name: Detection Candidate
+      Topic:
+        Depth: 5
+        Durability Policy: Transient Local
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /risk/detection_candidate_map
+      Update Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: true
+      Use Timestamp: false
+      Value: false
+    - Alpha: 0.3499999940395355
+      Binary representation: false
+      Binary threshold: 100
+      Class: rviz_default_plugins/Map
+      Color Scheme: map
+      Draw Behind: false
+      Enabled: false
+      Name: Observed Empty Not Risk
+      Topic:
+        Depth: 5
+        Durability Policy: Transient Local
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /risk/observed_empty_map
+      Update Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: true
+      Use Timestamp: false
+      Value: false
+    - Alpha: 0.30000001192092896
+      Binary representation: false
+      Binary threshold: 100
+      Class: rviz_default_plugins/Map
+      Color Scheme: map
+      Draw Behind: false
+      Enabled: false
+      Name: Room Probability Diagnostic
+      Topic:
+        Depth: 5
+        Durability Policy: Transient Local
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /risk/room_probability_map
+      Update Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: true
+      Use Timestamp: false
+      Value: false
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Evidence Markers
+      Namespaces:
+        {}
+      Topic:
+        Depth: 10
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /risk/evidence_markers
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz_default_plugins/LaserScan
+      Color: 255; 0; 0
+      Color Transformer: ""
+      Decay Time: 0
+      Enabled: true
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Max Intensity: 4096
+      Min Color: 0; 0; 0
+      Min Intensity: 0
+      Name: Scout Scan
+      Position Transformer: ""
+      Selectable: true
+      Size (Pixels): 3
+      Size (m): 0.029999999329447746
+      Style: Points
+      Topic:
+        Depth: 100
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /scan
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
@@ -565,30 +520,30 @@ Visualization Manager:
     Frame Rate: 30
   Name: root
   Tools:
-  - Class: rviz_default_plugins/Interact
-    Hide Inactive Objects: true
-  - Class: rviz_default_plugins/MoveCamera
-  - Class: rviz_default_plugins/Select
-  - Class: rviz_default_plugins/FocusCamera
-  - Class: rviz_default_plugins/Measure
-    Line color: 128; 128; 0
-  - Class: rviz_default_plugins/SetInitialPose
-    Covariance x: 0.25
-    Covariance y: 0.25
-    Covariance yaw: 0.06853891909122467
-    Topic:
-      Depth: 10
-      Durability Policy: Volatile
-      History Policy: Keep Last
-      Reliability Policy: Reliable
-      Value: /initialpose
-  - Class: rviz_default_plugins/SetGoal
-    Topic:
-      Depth: 10
-      Durability Policy: Volatile
-      History Policy: Keep Last
-      Reliability Policy: Reliable
-      Value: /goal_pose
+    - Class: rviz_default_plugins/Interact
+      Hide Inactive Objects: true
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+      Line color: 128; 128; 0
+    - Class: rviz_default_plugins/SetInitialPose
+      Covariance x: 0.25
+      Covariance y: 0.25
+      Covariance yaw: 0.06853891909122467
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /initialpose
+    - Class: rviz_default_plugins/SetGoal
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /goal_pose
   Transformation:
     Current:
       Class: rviz_default_plugins/TF
@@ -596,7 +551,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 18.32250213623047
+      Distance: 54.189388275146484
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -615,7 +570,7 @@ Visualization Manager:
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz)
       Yaw: 0
-    Saved: null
+    Saved: ~
 Window Geometry:
   Displays:
     collapsed: false

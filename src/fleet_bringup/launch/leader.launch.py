@@ -44,6 +44,7 @@ def generate_launch_description():
     require_follower_pose = LaunchConfiguration('require_follower_pose')
     enable_cartographer = LaunchConfiguration('enable_cartographer')
     auto_localize = LaunchConfiguration('auto_localize')
+    localization_scan_topic = LaunchConfiguration('localization_scan_topic')
     initial_x = LaunchConfiguration('leader_initial_x')
     initial_y = LaunchConfiguration('leader_initial_y')
     initial_yaw = LaunchConfiguration('leader_initial_yaw')
@@ -56,6 +57,11 @@ def generate_launch_description():
         # owns Cartographer regardless of enable_cartographer.
         cartographer_owned = simulation or launch_bool(
             enable_cartographer.perform(context)
+        )
+        scan_topic_value = (
+            '/scan'
+            if simulation
+            else localization_scan_topic.perform(context).strip() or '/scan'
         )
 
         nav2_params = RewrittenYaml(
@@ -71,8 +77,9 @@ def generate_launch_description():
             param_rewrites={
                 'use_sim_time': str(simulation).lower(),
                 'odom_topic': '/odom',
-                'scan_topic': '/scan',
-                'topic': '/scan',
+                'scan_topic': scan_topic_value,
+                'map_topic': '/map',
+                'topic': scan_topic_value,
                 'enable_stamped_cmd_vel': 'true',
             },
             convert_types=True,
@@ -147,6 +154,16 @@ def generate_launch_description():
                 respawn=True,
                 respawn_delay=3.0,
             )
+            localization_config_log = LogInfo(msg=[
+                'LEADER_LOCALIZATION_CONFIG | global_frame=map',
+                ' | odom_frame=odom',
+                ' | base_frame=base_footprint',
+                ' | map_topic=/map',
+                ' | scan_topic=', scan_topic_value,
+                ' | tf_broadcast=true',
+                ' | initial_pose_mode=',
+                'global_localize' if auto else 'fixed_seed',
+            ])
             localization_lifecycle = Node(
                 package='nav2_lifecycle_manager',
                 executable='lifecycle_manager',
@@ -181,6 +198,9 @@ def generate_launch_description():
             parameters=[{
                 'use_sim_time': simulation,
                 'output_topic': '/leader_pose',
+                'target_frame': 'map',
+                'source_frame': 'base_footprint',
+                'source_frame_candidates': ['base_footprint', 'base_link'],
                 'publish_rate_hz': 10.0,
                 'log_every_n': 100,
             }],
@@ -204,7 +224,7 @@ def generate_launch_description():
             name='leader_fleet_scan_relay',
             output='screen',
             parameters=[{
-                'input_topic': '/scan',
+                'input_topic': scan_topic_value,
                 'output_topic': '/leader/scan',
                 'output_frame': 'base_scan',
                 'input_reliability': 'best_effort',
@@ -426,6 +446,7 @@ def generate_launch_description():
                     TimerAction(
                         period=8.0,
                         actions=[
+                            localization_config_log,
                             LogInfo(msg=[
                                 'LEADER_STAGE | starting AMCL',
                             ]),
@@ -518,6 +539,15 @@ def generate_launch_description():
                 'search the whole received map via '
                 'reinitialize_global_localization instead of trusting '
                 'leader_initial_x/y/yaw.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'localization_scan_topic',
+            default_value='/scan_filtered',
+            description=(
+                'Real external-map leader mode: LaserScan topic consumed by '
+                'AMCL/Nav2. The Waffle OMX stack starts scan_processor, '
+                'which masks self-obstacles and republishes /scan_filtered.'
             ),
         ),
         DeclareLaunchArgument('leader_initial_x', default_value='0.0'),

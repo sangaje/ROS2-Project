@@ -83,7 +83,14 @@ class LeaderUnifiedDashboard(Node):
         self.risk_topic = str(_declare(self, 'risk_topic', '/risk/risk_map'))
         self.leader_pose_topic = str(_declare(self, 'leader_pose_topic', '/leader_pose'))
         self.follower_pose_topic = str(_declare(self, 'follower_pose_topic', '/burger_pose'))
+        self.follower_name = str(_declare(self, 'follower_name', 'follower21'))
         self.member_pose_topic = str(_declare(self, 'member_pose_topic', '/member_pose'))
+        self.second_follower_pose_topic = str(
+            _declare(self, 'second_follower_pose_topic', self.member_pose_topic)
+        )
+        self.second_follower_name = str(
+            _declare(self, 'second_follower_name', 'follower22')
+        )
         self.fleet_poses_topic = str(_declare(self, 'fleet_poses_topic', '/fleet/robot_poses'))
         self.fleet_status_topic = str(_declare(self, 'fleet_status_topic', '/fleet/coordination_status'))
         self.collision_warning_topic = str(_declare(self, 'collision_warning_topic', '/fleet/collision_warning'))
@@ -101,9 +108,20 @@ class LeaderUnifiedDashboard(Node):
         }
         self._robots: Dict[str, Dict[str, Any]] = {
             'leader': self._empty_robot('leader', 'leader', self.leader_pose_topic),
-            'burger': self._empty_robot('burger', 'follower', self.follower_pose_topic),
-            'member': self._empty_robot('member', 'member', self.member_pose_topic),
+            self.follower_name: self._empty_robot(
+                self.follower_name, 'follower', self.follower_pose_topic
+            ),
+            self.second_follower_name: self._empty_robot(
+                self.second_follower_name,
+                'follower',
+                self.second_follower_pose_topic,
+            ),
         }
+        self._robot_order = (
+            'leader',
+            self.follower_name,
+            self.second_follower_name,
+        )
         self._topic_state: Dict[str, Dict[str, Any]] = {}
         self._omx_state: Dict[str, Any] = {
             'state': None,
@@ -123,8 +141,8 @@ class LeaderUnifiedDashboard(Node):
         self.create_subscription(OccupancyGrid, self.map_topic, lambda msg: self._on_grid('map', msg), grid_qos)
         self.create_subscription(OccupancyGrid, self.risk_topic, lambda msg: self._on_grid('risk', msg), grid_qos)
         self.create_subscription(PoseStamped, self.leader_pose_topic, lambda msg: self._on_pose('leader', msg, self.leader_pose_topic), 10)
-        self.create_subscription(PoseStamped, self.follower_pose_topic, lambda msg: self._on_pose('burger', msg, self.follower_pose_topic), 10)
-        self.create_subscription(PoseStamped, self.member_pose_topic, lambda msg: self._on_pose('member', msg, self.member_pose_topic), 10)
+        self.create_subscription(PoseStamped, self.follower_pose_topic, lambda msg: self._on_pose(self.follower_name, msg, self.follower_pose_topic), 10)
+        self.create_subscription(PoseStamped, self.second_follower_pose_topic, lambda msg: self._on_pose(self.second_follower_name, msg, self.second_follower_pose_topic), 10)
         self.create_subscription(PoseArray, self.fleet_poses_topic, self._on_fleet_poses, 10)
         self.create_subscription(String, self.fleet_status_topic, self._on_fleet_status, 10)
         self.create_subscription(Bool, self.collision_warning_topic, self._on_collision_warning, 10)
@@ -258,14 +276,26 @@ class LeaderUnifiedDashboard(Node):
         now = time.time()
         with self._lock:
             robot = self._robots[name]
+            first_sample = robot['received_wall_sec'] is None
+            role = robot['role']
             robot['pose'] = msg
             robot['received_wall_sec'] = now
             robot['source'] = source
             self._touch_topic(source, now, 'geometry_msgs/msg/PoseStamped')
+        if first_sample:
+            tag = (
+                'LEADER_DASHBOARD_POSE_FIRST_RX'
+                if name == 'leader'
+                else 'DASHBOARD_ROBOT_POSE_FIRST_RX'
+            )
+            self.get_logger().info(
+                f'{tag} | robot={name} role={role} '
+                f'topic={source} frame_id={msg.header.frame_id}'
+            )
 
     def _on_fleet_poses(self, msg: PoseArray) -> None:
         now = time.time()
-        names = ('leader', 'burger')
+        names = ('leader', self.follower_name)
         with self._lock:
             for index, pose in enumerate(msg.poses[: len(names)]):
                 robot = self._robots[names[index]]
@@ -327,7 +357,10 @@ class LeaderUnifiedDashboard(Node):
                     **self._grid_summary('risk', now, self.risk_stale_timeout_sec),
                     'metadata_matches_map': _metadata_match(map_meta, risk_meta),
                 },
-                'robots': [self._robot_summary(name, now) for name in ('leader', 'burger', 'member')],
+                'robots': [
+                    self._robot_summary(name, now)
+                    for name in self._robot_order
+                ],
                 'fleet': {
                     'coordination_status': self._topic_value(self.fleet_status_topic, now),
                     'collision_warning': self._topic_value(self.collision_warning_topic, now),

@@ -8,7 +8,7 @@ let mapReady = false;
 let riskReady = false;
 const canvas = document.getElementById('mapCanvas');
 const ctx = canvas.getContext('2d');
-const roleColors = {leader: '#58a6ff', follower: '#63d297', member: '#f2cc60'};
+const roleColors = {leader: '#58a6ff', follower: '#63d297'};
 
 function statusClass(status) {
   return String(status || 'NO DATA').toLowerCase().replaceAll(' ', '-');

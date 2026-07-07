@@ -139,6 +139,13 @@ class OmxYoloNode(Node):
         # TF
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.declare_parameter(
+            'waffle_frame_candidates',
+            ['base_link', 'base_footprint'],
+        )
+        self.waffle_frame_candidates = self._frame_candidates(
+            self.get_parameter('waffle_frame_candidates').value
+        )
 
         # Arm base offset
         self.declare_parameter('arm_base_x', 0.10)
@@ -272,11 +279,52 @@ class OmxYoloNode(Node):
 
     # ----- TF helpers -----
 
+    @staticmethod
+    def _frame_candidates(raw) -> list[str]:
+        if isinstance(raw, str):
+            values = raw.split(',')
+        else:
+            values = raw or []
+        frames = []
+        for value in values:
+            frame = str(value).strip().strip('/')
+            if frame and frame not in frames:
+                frames.append(frame)
+        return frames or ['base_link']
+
+    def _lookup_with_candidate_source(self, target_frame: str):
+        last_error = None
+        for source_frame in self.waffle_frame_candidates:
+            try:
+                transform = self.tf_buffer.lookup_transform(
+                    target_frame,
+                    source_frame,
+                    rclpy.time.Time(),
+                    timeout=Duration(seconds=0.1),
+                )
+                return source_frame, transform
+            except TransformException as exc:
+                last_error = exc
+        raise last_error or TransformException('no waffle frame candidates')
+
+    def _lookup_with_candidate_target(self, source_frame: str):
+        last_error = None
+        for target_frame in self.waffle_frame_candidates:
+            try:
+                transform = self.tf_buffer.lookup_transform(
+                    target_frame=target_frame,
+                    source_frame=source_frame,
+                    time=rclpy.time.Time(),
+                    timeout=Duration(seconds=0.1),
+                )
+                return target_frame, transform
+            except TransformException as exc:
+                last_error = exc
+        raise last_error or TransformException('no waffle frame candidates')
+
     def get_waffle_xy(self):
         try:
-            tr = self.tf_buffer.lookup_transform(
-                'map', 'base_link', rclpy.time.Time(),
-                timeout=Duration(seconds=0.1))
+            _, tr = self._lookup_with_candidate_source('map')
             return tr.transform.translation.x, tr.transform.translation.y
         except TransformException:
             return None
@@ -284,9 +332,7 @@ class OmxYoloNode(Node):
     def get_waffle_xy_yaw(self):
         """H2: 와플 (x, y, yaw) in map frame. H4 BOUNDARY 자동 생성에 사용."""
         try:
-            tr = self.tf_buffer.lookup_transform(
-                'map', 'base_link', rclpy.time.Time(),
-                timeout=Duration(seconds=0.1))
+            _, tr = self._lookup_with_candidate_source('map')
             q = tr.transform.rotation
             # quaternion -> yaw
             yaw = math.atan2(
@@ -525,12 +571,7 @@ class OmxYoloNode(Node):
         ps.point.x, ps.point.y, ps.point.z = coord_map
 
         try:
-            transform = self.tf_buffer.lookup_transform(
-                target_frame='base_link',
-                source_frame='map',
-                time=rclpy.time.Time(),
-                timeout=Duration(seconds=0.1),
-            )
+            _, transform = self._lookup_with_candidate_target('map')
         except TransformException as e:
             self.get_logger().warn(f"TF lookup 실패: {e}")
             return None

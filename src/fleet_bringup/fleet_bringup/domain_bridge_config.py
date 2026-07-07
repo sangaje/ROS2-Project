@@ -241,7 +241,24 @@ def write_member_bridge_configs(
             remap='/map_bridge',
             profile=map_qos(depth=5),
         ),
+        '/leader_pose': topic('geometry_msgs/msg/PoseStamped'),
         '/member_goal_pose': topic('geometry_msgs/msg/PoseStamped'),
+        '/fleet/coordination_status': topic(
+            'std_msgs/msg/String',
+            profile=qos(durability='transient_local', depth=1),
+        ),
+        '/fleet/robot_poses': topic(
+            'geometry_msgs/msg/PoseArray',
+            profile=qos(depth=5),
+        ),
+        '/fleet/collision_warning': topic(
+            'std_msgs/msg/Bool',
+            profile=qos(durability='transient_local', depth=1),
+        ),
+        '/fleet/hazard_pose': topic(
+            'geometry_msgs/msg/PoseStamped',
+            profile=qos(depth=5),
+        ),
         '/initialpose': topic(
             'geometry_msgs/msg/PoseWithCovarianceStamped',
             profile=qos(depth=1),

@@ -357,12 +357,12 @@ def generate_launch_description():
         ) = timing
         actions.extend([
             LogInfo(msg=[
-                'MAP_BRIDGE_STAGE_B | source_domain=', str(main_domain),
+                'LEADER_EGRESS_BRIDGE | source_domain=', str(main_domain),
                 ' | destination_domain=', str(follower_domain),
-                ' | source_topic=/map',
+                ' | topics=/map,/leader_pose',
                 ' | bridge_topic=/map_bridge',
-                ' | final_topic=/map',
-                ' | type=nav_msgs/msg/OccupancyGrid',
+                ' | map_type=nav_msgs/msg/OccupancyGrid',
+                ' | pose_type=geometry_msgs/msg/PoseStamped',
             ]),
             TimerAction(period=bridge_t, actions=bridges),
             TimerAction(period=relay_t, actions=relay_nodes + [follower_pose]),

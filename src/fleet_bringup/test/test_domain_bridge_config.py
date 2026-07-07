@@ -29,6 +29,9 @@ def test_real_bridge_directions_and_control_qos(tmp_path):
     assert main['topics']['/fleet/robot_poses']['type'] == (
         'geometry_msgs/msg/PoseArray'
     )
+    assert main['topics']['/leader_pose']['type'] == (
+        'geometry_msgs/msg/PoseStamped'
+    )
     assert '/fleet/hazard_pose' in main['topics']
     assert follower['topics']['/fleet/follow_enabled']['qos']['durability'] == (
         'transient_local'
@@ -83,13 +86,25 @@ def test_follower_scan_topic_uses_its_domain_id(tmp_path):
 
 
 def test_member_bridge_forwards_core_risk_topics_to_main(tmp_path):
-    _, member_path = write_member_bridge_configs(
+    main_path, member_path = write_member_bridge_configs(
         24,
         26,
         output_directory=tmp_path,
     )
+    main = yaml.safe_load(main_path.read_text())
     member = yaml.safe_load(member_path.read_text())
 
+    assert (main['from_domain'], main['to_domain']) == (24, 26)
+    assert main['topics']['/map']['remap'] == '/map_bridge'
+    assert main['topics']['/leader_pose']['type'] == (
+        'geometry_msgs/msg/PoseStamped'
+    )
+    assert main['topics']['/fleet/coordination_status']['qos']['durability'] == (
+        'transient_local'
+    )
+    assert main['topics']['/fleet/robot_poses']['type'] == (
+        'geometry_msgs/msg/PoseArray'
+    )
     assert (member['from_domain'], member['to_domain']) == (26, 24)
     assert member['topics']['/risk/risk_map']['type'] == (
         'nav_msgs/msg/OccupancyGrid'

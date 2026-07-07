@@ -65,6 +65,9 @@ def launch_setup(context, *args, **kwargs):
             package='omx_aim', executable='yolo_node', name='omx_yolo_node',
             output='screen',
             arguments=yolo_args,
+            parameters=[{
+                'waffle_frame_candidates': ['base_link', 'base_footprint'],
+            }],
         ),
         Node(
             package='omx_aim', executable='fire_node', name='fire_node',
