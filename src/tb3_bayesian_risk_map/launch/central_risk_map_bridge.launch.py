@@ -29,6 +29,19 @@ def _topic_block(topic: str, msg_type: str, reliability='reliable', durability='
 """
 
 
+def _write_runtime_yaml(prefix: str, text: str, output_dir: Path) -> Path:
+    with tempfile.NamedTemporaryFile(
+        mode='w',
+        suffix='.yaml',
+        prefix=prefix,
+        dir=output_dir,
+        delete=False,
+        encoding='utf-8',
+    ) as handle:
+        handle.write(text)
+        return Path(handle.name)
+
+
 def generate_launch_description():
     pkg_share = get_package_share_directory('tb3_bayesian_risk_map')
     default_config = os.path.join(pkg_share, 'config', 'bayesian_risk_map.yaml')
@@ -58,7 +71,6 @@ def generate_launch_description():
         out_dir = Path(tempfile.gettempdir()) / 'tb3_central_risk_domain_bridge'
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        source_to_central = out_dir / f'risk_source_{source_domain}_to_central_{central_domain}.yaml'
         source_yaml = f"""name: risk_source_{source_domain}_to_central_{central_domain}
 from_domain: {source_domain}
 to_domain: {central_domain}
@@ -66,17 +78,17 @@ to_domain: {central_domain}
 topics:
 """
         source_yaml += _topic_block('/clock', 'rosgraph_msgs/msg/Clock', reliability='best_effort', depth=1)
-        source_yaml += _topic_block('/map', 'nav_msgs/msg/OccupancyGrid', depth=1)
+        source_yaml += _topic_block('/map', 'nav_msgs/msg/OccupancyGrid', durability='transient_local', depth=1)
         if include_rviz_topics:
-            # Robot TF publishers are reliable, and RViz/tf2 reliable subscribers reject
-            # a best-effort bridge endpoint. Preserve reliable QoS across the bridge.
-            source_yaml += _topic_block('/tf', 'tf2_msgs/msg/TFMessage', reliability='reliable', depth=50)
-            source_yaml += _topic_block('/tf_static', 'tf2_msgs/msg/TFMessage', durability='transient_local', depth=1)
             source_yaml += _topic_block('/scan', 'sensor_msgs/msg/LaserScan', reliability='best_effort', depth=3)
             source_yaml += _topic_block('/odom', 'nav_msgs/msg/Odometry', depth=3)
         source_yaml += _topic_block('/leader_pose', 'geometry_msgs/msg/PoseStamped', depth=1)
         source_yaml += _topic_block('/risk/yolo_detections', 'std_msgs/msg/String', reliability='best_effort', depth=1)
-        source_to_central.write_text(source_yaml, encoding='utf-8')
+        source_to_central = _write_runtime_yaml(
+            f'risk_source_{source_domain}_to_central_{central_domain}_',
+            source_yaml,
+            out_dir,
+        )
 
         actions = [
             ExecuteProcess(
@@ -94,7 +106,6 @@ topics:
         for sink_domain in sink_domains:
             if sink_domain == central_domain:
                 continue
-            central_to_sink = out_dir / f'risk_maps_{central_domain}_to_{sink_domain}.yaml'
             sink_yaml = f"""name: risk_maps_{central_domain}_to_{sink_domain}
 from_domain: {central_domain}
 to_domain: {sink_domain}
@@ -103,7 +114,11 @@ topics:
 """
             for topic, msg_type in risk_topics:
                 sink_yaml += _topic_block(topic, msg_type, durability='transient_local', depth=1)
-            central_to_sink.write_text(sink_yaml, encoding='utf-8')
+            central_to_sink = _write_runtime_yaml(
+                f'risk_maps_{central_domain}_to_{sink_domain}_',
+                sink_yaml,
+                out_dir,
+            )
             actions.append(
                 ExecuteProcess(
                     cmd=['ros2', 'run', 'domain_bridge', 'domain_bridge', str(central_to_sink)],

@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""Leader stack: TurtleBot3 bringup, Nav2 and fleet coordination.
+"""Leader stack: TurtleBot3 bringup, AMCL/Nav2 and fleet coordination.
 
-By default the leader owns SLAM itself (Cartographer). Set
-enable_cartographer:=false (real mode only) to instead receive a map built
-by a member robot that owns its own SLAM (member.launch.py with
-enable_amcl:=false start_cartographer:=true) -- the leader then runs
-AMCL against that bridged map and republishes it as its own /map, the same
-way member.launch.py already does for a shared map from a leader.
+In real mode the leader defaults to receiving the risk/scout domain's SLAM
+map through domain_bridge on /map_bridge, republishing it as this domain's
+/map, and running AMCL against that shared map. enable_cartographer:=true is
+kept as an explicit compatibility escape hatch.
 """
 
 import os
@@ -100,10 +98,9 @@ def generate_launch_description():
                 }.items(),
             )
         else:
-            # Receive the map from a member that owns its own SLAM instead
-            # (bridged in by that member's own domain_bridge as
-            # /map_from_member) and republish it as this domain's /map,
-            # the same failover-aware relay member.launch.py already uses.
+            # Receive the map from the risk/scout SLAM domain as
+            # /map_bridge, then republish it as this domain's /map for
+            # AMCL/Nav2 and downstream fan-out bridges.
             map_relay = Node(
                 package='tb3_fleet_bringup',
                 executable='map_relay',
@@ -111,7 +108,7 @@ def generate_launch_description():
                 output='screen',
                 parameters=[{
                     'use_sim_time': False,
-                    'input_topic': '/map_from_member',
+                    'input_topic': '/map_bridge',
                     'output_topic': '/map',
                 }],
                 env=process_env,
@@ -286,11 +283,9 @@ def generate_launch_description():
                 lifecycle_delay_sec = '16.0'
                 goal_delay_sec = '18.0'
             else:
-                # External-map mode has one more startup dependency than
-                # normal leader SLAM: /map must cross the member/scout
-                # bridge, then AMCL must configure against that map and the
-                # local /scan. Give localization a clear head start before
-                # Nav2 starts asking for map->odom transforms.
+                # External-map mode waits for /map to cross the risk->leader
+                # bridge, then gives AMCL a clear head start before Nav2
+                # starts asking for map->odom transforms.
                 nav_delay_sec = '18.0'
                 lifecycle_delay_sec = '22.0'
                 goal_delay_sec = '24.0'
@@ -442,15 +437,13 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'enable_cartographer',
-            default_value='true',
+            default_value='false',
             choices=['true', 'false'],
             description=(
-                'Real mode only (ignored in simulation): run Cartographer '
-                'and own SLAM here. Set false to instead receive a map '
-                'from a member robot that owns its own SLAM '
-                '(enable_amcl:=false start_cartographer:=true on that '
-                'member) over /map_from_member, and run AMCL against it '
-                'here instead.'
+                'Real mode only (ignored in simulation): default false '
+                'receives the risk/scout SLAM map on /map_bridge and runs '
+                'AMCL against the shared /map. Set true only for legacy '
+                'single-leader SLAM operation.'
             ),
         ),
         DeclareLaunchArgument(

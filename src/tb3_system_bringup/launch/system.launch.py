@@ -17,10 +17,16 @@ from launch.actions import (
     IncludeLaunchDescription,
     LogInfo,
     OpaqueFunction,
+    TimerAction,
 )
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration
+from launch_ros.actions import Node
 
+from tb3_fleet_bringup.domain_bridge_config import (
+    write_leader_to_pc_bridge_config,
+    write_risk_to_leader_bridge_config,
+)
 from tb3_fleet_bringup.launch_utils import (
     clean_process_environment,
     dds_launch_environment,
@@ -68,6 +74,16 @@ def generate_launch_description():
     rl_disable_slam_map = LaunchConfiguration('rl_disable_slam_map')
     rl_extra_args = LaunchConfiguration('rl_extra_args')
     start_rviz = LaunchConfiguration('start_rviz')
+    risk_domain_id = LaunchConfiguration('risk_domain_id')
+    pc_domain_id = LaunchConfiguration('pc_domain_id')
+    enable_risk_to_leader_bridge = LaunchConfiguration(
+        'enable_risk_to_leader_bridge'
+    )
+    enable_pc_visualization_bridge = LaunchConfiguration(
+        'enable_pc_visualization_bridge'
+    )
+    member_domain_id = LaunchConfiguration('member_domain_id')
+    follower_domain_id = LaunchConfiguration('follower_domain_id')
 
     def make_stack(context):
         role_value = role.perform(context).strip().lower()
@@ -89,11 +105,11 @@ def generate_launch_description():
 
         main_domain_value = main_domain_id.perform(context).strip()
         main_domain = domain
-        if fleet_role_value in ('follower', 'member') or launch_bool(start_rviz.perform(context)):
+        if fleet_role_value in ('follower', 'member'):
             if not main_domain_value:
                 raise ValueError(
                     'main_domain_id is required for scout/member/follower '
-                    'bridging or start_rviz:=true. Pass the launch option '
+                    'bridging. Pass the launch option '
                     'main_domain_id:=<leader_domain>.'
                 )
             main_domain = int(main_domain_value)
@@ -169,7 +185,105 @@ def generate_launch_description():
             ),
         ]
 
+        if role_value == 'leader':
+            process_env = clean_process_environment(str(domain))
+            risk_domain_value = risk_domain_id.perform(context).strip()
+            if (
+                launch_bool(enable_risk_to_leader_bridge.perform(context))
+                and risk_domain_value
+            ):
+                risk_domain = int(risk_domain_value)
+                if risk_domain != domain:
+                    risk_bridge_config = write_risk_to_leader_bridge_config(
+                        risk_domain, domain,
+                    )
+                    actions.append(TimerAction(
+                        period=0.5,
+                        actions=[Node(
+                            package='domain_bridge',
+                            executable='domain_bridge',
+                            name='bridge_risk_to_leader',
+                            output='screen',
+                            arguments=[
+                                str(risk_bridge_config),
+                                '--wait-for-publisher',
+                                'false',
+                            ],
+                            env=process_env,
+                            respawn=True,
+                            respawn_delay=3.0,
+                        )],
+                    ))
+                else:
+                    actions.append(LogInfo(msg=[
+                        'SYSTEM_BRINGUP | risk_domain_id equals leader '
+                        'domain; risk->leader bridge skipped.'
+                    ]))
+
+            actions.append(TimerAction(
+                period=21.0,
+                actions=[Node(
+                    package='tb3_fleet_bringup',
+                    executable='fleet_debug_marker',
+                    name='fleet_debug_marker',
+                    output='screen',
+                    parameters=[{
+                        'use_sim_time': False,
+                        'leader_pose_topic': '/leader_pose',
+                        'burger_pose_topic': '/burger_pose',
+                        'member_pose_topic': '/member_pose',
+                        'marker_topic': '/fleet_debug_markers',
+                        'frame_id': 'map',
+                        'leader_domain_id': str(domain),
+                        'member_domain_id': member_domain_id.perform(context),
+                        'burger_domain_id': follower_domain_id.perform(context),
+                    }],
+                    env=process_env,
+                    respawn=True,
+                    respawn_delay=3.0,
+                )],
+            ))
+
+            pc_domain_value = pc_domain_id.perform(context).strip()
+            if (
+                launch_bool(enable_pc_visualization_bridge.perform(context))
+                and pc_domain_value
+            ):
+                pc_domain = int(pc_domain_value)
+                if pc_domain != domain:
+                    pc_bridge_config = write_leader_to_pc_bridge_config(
+                        domain, pc_domain,
+                    )
+                    actions.append(TimerAction(
+                        period=2.0,
+                        actions=[Node(
+                            package='domain_bridge',
+                            executable='domain_bridge',
+                            name='bridge_leader_to_pc_debug',
+                            output='screen',
+                            arguments=[
+                                str(pc_bridge_config),
+                                '--wait-for-publisher',
+                                'false',
+                            ],
+                            env=process_env,
+                            respawn=True,
+                            respawn_delay=3.0,
+                        )],
+                    ))
+                else:
+                    actions.append(LogInfo(msg=[
+                        'SYSTEM_BRINGUP | pc_domain_id equals leader '
+                        'domain; leader->PC bridge skipped.'
+                    ]))
+
         if role_value != 'scout':
+            if launch_bool(start_rviz.perform(context)):
+                actions.append(LogInfo(msg=[
+                    'SYSTEM_BRINGUP | start_rviz is ignored on robot-side '
+                    'system.launch.py. Run tb3_system_bringup pc.launch.py '
+                    'on the PC domain instead.'
+                ]))
             return actions
 
         camera_sender_on = launch_bool(start_camera_sender.perform(context))
@@ -221,10 +335,9 @@ def generate_launch_description():
                 launch_arguments={
                     'use_sim_time': 'false',
                     # The fleet stack above already brings up hardware.
-                    # start_cartographer defaults to false because AMCL
-                    # (fleet bringup's own map->odom source) is on by
-                    # default; flip enable_amcl:=false first if you want
-                    # this Cartographer to own SLAM/TF instead.
+                    # In the target architecture this risk-map layer owns
+                    # SLAM by default; keep enable_amcl:=false underneath so
+                    # there is only one map->odom source in this domain.
                     'start_robot_bringup': 'false',
                     'start_cartographer': (
                         'true' if cartographer_on else 'false'
@@ -295,16 +408,11 @@ def generate_launch_description():
             ))
 
         if launch_bool(start_rviz.perform(context)):
-            system_share = get_package_share_directory('tb3_system_bringup')
-            viewer_launch_path = os.path.join(
-                system_share, 'launch', 'viewer.launch.py'
-            )
-            actions.append(IncludeLaunchDescription(
-                PythonLaunchDescriptionSource(viewer_launch_path),
-                launch_arguments={
-                    'domain_id': str(main_domain),
-                }.items(),
-            ))
+            actions.append(LogInfo(msg=[
+                'SYSTEM_BRINGUP | start_rviz is ignored on robot-side '
+                'system.launch.py. Run tb3_system_bringup pc.launch.py on '
+                'the PC domain instead.'
+            ]))
 
         return actions
 
@@ -327,8 +435,8 @@ def generate_launch_description():
             'main_domain_id',
             default_value='',
             description=(
-                'Leader/PC DDS domain used by domain_bridge. Required for '
-                'scout/member/follower bridging or start_rviz:=true; optional '
+                'Leader DDS domain used by domain_bridge. Required for '
+                'scout/member/follower bridging; optional '
                 'for role:=leader. Pass as main_domain_id:=<leader_domain>.'
             ),
         ),
@@ -365,14 +473,12 @@ def generate_launch_description():
             ),
         ),
         DeclareLaunchArgument(
-            'enable_cartographer', default_value='true',
+            'enable_cartographer', default_value='false',
             choices=['true', 'false'],
             description=(
                 'leader fleet_role only (role:=leader), real mode only: '
-                'run Cartographer here (default). Set false to instead '
-                'run AMCL against a map received from a member robot '
-                'that owns its own SLAM (that member needs '
-                'enable_amcl:=false start_cartographer:=true).'
+                'run Cartographer here. Default false in leader.launch.py '
+                'receives the risk/scout SLAM map and runs AMCL against it.'
             ),
         ),
         DeclareLaunchArgument(
@@ -385,7 +491,7 @@ def generate_launch_description():
             ),
         ),
         DeclareLaunchArgument(
-            'enable_amcl', default_value='true',
+            'enable_amcl', default_value='false',
             choices=['true', 'false'],
             description=(
                 'member/follower fleet_role only: run AMCL as the '
@@ -400,7 +506,7 @@ def generate_launch_description():
             description='Scout only: turn on the Bayesian risk map stack.',
         ),
         DeclareLaunchArgument(
-            'start_cartographer', default_value='false',
+            'start_cartographer', default_value='true',
             choices=['true', 'false'],
             description=(
                 'Scout only: let the risk map\'s own Cartographer own '
@@ -506,7 +612,49 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'start_rviz', default_value='false',
             choices=['true', 'false'],
-            description='Also bring up the unified fleet+risk RViz view (see viewer.launch.py).',
+            description=(
+                'Deprecated on robot-side system.launch.py. RViz now runs '
+                'only on the PC via pc.launch.py/viewer.launch.py.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'risk_domain_id',
+            default_value='',
+            description=(
+                'Leader role only: risk/scout DDS domain that owns SLAM and '
+                'publishes /map. When set, system bringup starts a one-way '
+                'risk->leader bridge.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'pc_domain_id',
+            default_value='',
+            description=(
+                'Leader role only: PC visualization DDS domain. When set, '
+                'system bringup starts a one-way leader->PC debug bridge.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'enable_risk_to_leader_bridge',
+            default_value='true',
+            choices=['true', 'false'],
+            description='Leader role only: bridge /map and risk debug topics from risk_domain_id to leader.',
+        ),
+        DeclareLaunchArgument(
+            'enable_pc_visualization_bridge',
+            default_value='true',
+            choices=['true', 'false'],
+            description='Leader role only: bridge selected visualization/debug topics to pc_domain_id.',
+        ),
+        DeclareLaunchArgument(
+            'member_domain_id',
+            default_value='',
+            description='Leader debug marker label for a member/scout domain.',
+        ),
+        DeclareLaunchArgument(
+            'follower_domain_id',
+            default_value='',
+            description='Leader debug marker label for a follower domain.',
         ),
         *dds_launch_environment(domain_id),
         OpaqueFunction(function=make_stack),

@@ -21,7 +21,8 @@ ros2 launch tb3_system_bringup system.launch.py \
 리더:
 
 ```bash
-ros2 launch tb3_system_bringup system.launch.py role:=leader
+ros2 launch tb3_system_bringup system.launch.py \
+  role:=leader risk_domain_id:=22 pc_domain_id:=30
 ```
 
 **follower.launch.py 로봇이 fleet에 없으면(예: 리더+정찰봇만 있는 구성)
@@ -54,7 +55,10 @@ RL 정책이 직접 `/cmd_vel`을 몰아 정찰하고, 코디네이터가 다른
 비켜줘야 할 때만 짧게 Nav2 목적지로 개입한다. `follower`처럼 리더를
 계속 쫓아가게 하고 싶으면 `fleet_role:=follower`로 바꾸면 된다.
 
-`leader`는 `tb3_fleet_bringup/leader.launch.py`만 실행한다.
+`leader`는 `tb3_fleet_bringup/leader.launch.py`를 실행하고, 선택적으로
+`risk_domain_id`가 있으면 risk/scout→leader 맵/리스크 브리지를, `pc_domain_id`가
+있으면 leader→PC 시각화 브리지를 단방향으로 실행한다. RViz 프로세스는
+리더에서 실행하지 않는다.
 
 ### follower는 결국 정찰봇이다
 
@@ -73,7 +77,7 @@ follower 중에도 계속 켜져 있다 — 위험도만 수동적으로 계속 
 `auto_localize` — 전부 `tb3_fleet_bringup`의 동명 인자와 그대로 대응된다.
 
 리스크맵(scout, `start_risk_map:=true`가 기본): `start_camera`,
-`risk_model_path`(YOLO 가중치), `start_cartographer`(기본 false),
+`risk_model_path`(YOLO 가중치), `start_cartographer`(기본 true),
 `cartographer_configuration_basename`(기본
 `turtlebot3_lds_2d_risk_safe.lua`).
 
@@ -109,9 +113,11 @@ ros2 launch tb3_system_bringup pc.launch.py
 
 ### TF 소유권: AMCL vs 리스크맵 Cartographer
 
-`member.launch.py`의 AMCL이 이 스택에서 기본으로 `map->odom` TF를 갖는
-쪽이다(`enable_amcl`, 기본 true). 리스크맵의 Cartographer가 대신 SLAM을
-가지려면 반드시 `enable_amcl:=false`와 같이 써야 한다 — 그렇지 않으면
+system bringup의 scout 기본값은 리스크맵 Cartographer가 `map->odom` TF와
+SLAM을 갖는 쪽이다(`start_cartographer:=true`, `enable_amcl:=false`).
+AMCL 기반 member/follower로 운용하려면 `start_cartographer:=false
+enable_amcl:=true`를 명시한다. 리스크맵의 Cartographer와 AMCL을 동시에
+켜려 하면
 `system.launch.py`가 `start_cartographer:=true` + `enable_amcl:=true`
 조합을 아예 에러로 막는다(둘 다 켜지면 `map->odom`을 동시에 방송하게
 되므로).
@@ -135,27 +141,27 @@ SLAM을 계속 소유해야 한다, 위 "follower는 결국 정찰봇이다" 참
 
 ### 정찰봇이 SLAM을 갖고, 리더가 그 맵을 받아서 재발행
 
-`role:=leader`에 `enable_cartographer:=false`를 주면 리더(`leader.launch.py`)가
-자체 Cartographer 대신, `/map_from_member`로 브릿지되어 들어오는 맵을
-받아 AMCL로 로컬라이즈하고 그걸 자기 도메인의 `/map`으로 재발행한다.
-정찰봇 쪽에서 `enable_amcl:=false start_cartographer:=true`로 SLAM을
-갖고 있어야 짝이 맞는다.
+`role:=leader`는 기본적으로 자체 Cartographer를 띄우지 않는다
+(`enable_cartographer:=false`). 대신 `risk_domain_id`로 지정한
+risk/scout 도메인의 `/map`을 단방향 domain_bridge로 받아 `/map_bridge`에
+넣고, 리더의 `map_relay`가 자기 도메인의 `/map`으로 재발행한다. 리더는 이
+공유 맵으로 AMCL/Nav2를 실행하고, follower/member에는 leader→robot
+브리지로 같은 `/map`을 fan-out한다.
 
 ```bash
-# 리더: 정찰봇이 만든 맵을 받아서 AMCL + 재발행
+# 리더: 정찰봇이 만든 맵을 받아서 AMCL + 재발행, PC로 debug 전달
 ros2 launch tb3_system_bringup system.launch.py \
-  role:=leader enable_cartographer:=false
+  role:=leader risk_domain_id:=22 pc_domain_id:=30 \
+  member_domain_id:=22 follower_domain_id:=25
 
 # 정찰봇: 직접 SLAM 소유
 ros2 launch tb3_system_bringup system.launch.py \
-  role:=scout enable_amcl:=false start_cartographer:=true start_rl_policy:=false
+  role:=scout domain_id:=22 main_domain_id:=24 start_rl_policy:=false
 ```
 
-`/map_from_member` 브릿지는 정찰봇(member)의 `write_member_bridge_configs`가
-매 실행마다 `main_domain_id`/`domain_id` 실행값으로 동적으로
-`/tmp/tb3_fleet_domain_bridge/`에 다시 써서 만든다 — 리더 쪽 도메인이
-바뀌어도 캐싱 없이 항상 최신 값으로 반영된다. 별도로 리더 쪽에 새
-domain_bridge 프로세스를 띄울 필요는 없다(정찰봇이 양방향 다 실행).
+bridge YAML은 실행 시점에 `/tmp` 아래 unique 파일로 동적 생성된다. 맵
+경로는 risk/scout→leader→follower/member/PC 모두 단방향이며, PC에서
+leader로 되돌아가는 bridge는 만들지 않는다.
 
 ### 하드웨어 odom TF 자동 교체 (해결됨, 2026-07-06)
 

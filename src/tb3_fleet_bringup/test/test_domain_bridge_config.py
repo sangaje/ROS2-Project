@@ -1,8 +1,10 @@
 import yaml
 
 from tb3_fleet_bringup.domain_bridge_config import (
+    write_leader_to_pc_bridge_config,
     write_fleet_bridge_configs,
     write_member_bridge_configs,
+    write_risk_to_leader_bridge_config,
 )
 
 
@@ -99,3 +101,36 @@ def test_member_bridge_forwards_core_risk_topics_to_main(tmp_path):
     assert member['topics']['/risk/evidence_markers']['type'] == (
         'visualization_msgs/msg/MarkerArray'
     )
+    assert '/map' not in member['topics']
+
+
+def test_risk_to_leader_bridge_is_one_way_map_source(tmp_path):
+    path = write_risk_to_leader_bridge_config(
+        22,
+        24,
+        output_directory=tmp_path,
+    )
+    config = yaml.safe_load(path.read_text())
+
+    assert (config['from_domain'], config['to_domain']) == (22, 24)
+    assert config['topics']['/map']['remap'] == '/map_bridge'
+    assert config['topics']['/map']['qos']['durability'] == 'transient_local'
+    assert '/tf' not in config['topics']
+    assert '/tf_static' not in config['topics']
+
+
+def test_leader_to_pc_bridge_is_visualization_only(tmp_path):
+    path = write_leader_to_pc_bridge_config(
+        24,
+        30,
+        output_directory=tmp_path,
+    )
+    config = yaml.safe_load(path.read_text())
+
+    assert (config['from_domain'], config['to_domain']) == (24, 30)
+    assert config['topics']['/map']['qos']['durability'] == 'transient_local'
+    assert '/fleet_debug_markers' in config['topics']
+    assert '/risk/risk_map' in config['topics']
+    assert '/tf' not in config['topics']
+    assert '/tf_static' not in config['topics']
+    assert '/cmd_vel' not in config['topics']

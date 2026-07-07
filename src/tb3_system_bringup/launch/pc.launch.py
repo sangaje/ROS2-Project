@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""PC-side tools for the two-robot system test.
+"""PC-side tools for the fleet system.
 
-The scout owns the Bayesian risk map. This launch only starts the PC-side YOLO
-HTTP server and the unified RViz/debug viewer on the current ROS domain.
+The PC only starts visualization/client tools on its own DDS domain. Leader
+system bringup owns debug aggregation and bridges selected topics here.
 """
 
 from launch import LaunchDescription
@@ -35,17 +35,7 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'domain_id',
             default_value=EnvironmentVariable('ROS_DOMAIN_ID'),
-            description='PC DDS domain. Usually the same shell ROS_DOMAIN_ID as the leader domain.',
-        ),
-        DeclareLaunchArgument(
-            'scout_domain_id',
-            default_value='22',
-            description='Scout/member DDS domain shown in RViz marker labels.',
-        ),
-        DeclareLaunchArgument(
-            'follower_domain_id',
-            default_value=LaunchConfiguration('scout_domain_id'),
-            description='Follower/Burger DDS domain shown in RViz marker labels.',
+            description='PC DDS domain. Set this shell to pc_domain_id.',
         ),
 
         IncludeLaunchDescription(
@@ -57,8 +47,6 @@ def generate_launch_description():
             condition=IfCondition(LaunchConfiguration('start_viewer')),
             launch_arguments={
                 'domain_id': LaunchConfiguration('domain_id'),
-                'member_domain_id': LaunchConfiguration('scout_domain_id'),
-                'burger_domain_id': LaunchConfiguration('follower_domain_id'),
             }.items(),
         ),
     ])

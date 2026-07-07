@@ -11,7 +11,10 @@ from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.exceptions import ParameterAlreadyDeclaredException
 from geometry_msgs.msg import PoseStamped
+from lifecycle_msgs.msg import State
+from lifecycle_msgs.srv import GetState
 from nav2_msgs.action import NavigateToPose
+from nav2_msgs.srv import ManageLifecycleNodes
 
 
 def _safe_declare(node: Node, name: str, default):
@@ -52,9 +55,38 @@ class PoseToNav2Action(Node):
         self.log_feedback = bool(
             _safe_declare(self, 'log_feedback', False)
         )
+        self.wait_for_lifecycle_active = bool(
+            _safe_declare(self, 'wait_for_lifecycle_active', True)
+        )
+        self.bt_state_service_name = self._abs(str(
+            _safe_declare(
+                self,
+                'bt_navigator_state_service',
+                '/bt_navigator/get_state',
+            )
+        ))
+        self.navigation_lifecycle_service_name = self._abs(str(
+            _safe_declare(
+                self,
+                'navigation_lifecycle_service',
+                '/lifecycle_manager_navigation/manage_nodes',
+            )
+        ))
+        self.auto_start_navigation_lifecycle = bool(
+            _safe_declare(self, 'auto_start_navigation_lifecycle', True)
+        )
+        self.lifecycle_retry_sec = max(
+            0.5, float(_safe_declare(self, 'lifecycle_retry_sec', 2.0))
+        )
 
         self.client: ActionClient = ActionClient(
             self, NavigateToPose, self.navigate_action
+        )
+        self.state_client = self.create_client(
+            GetState, self.bt_state_service_name
+        )
+        self.lifecycle_client = self.create_client(
+            ManageLifecycleNodes, self.navigation_lifecycle_service_name
         )
         self.sub = self.create_subscription(
             PoseStamped,
@@ -68,13 +100,19 @@ class PoseToNav2Action(Node):
         self.goal_count = 0
         self.last_wait_log_time = -1.0e9
         self.retry_not_before = -1.0e9
+        self.navigation_active: Optional[bool] = None
+        self.lifecycle_state_known = False
+        self.state_future = None
+        self.startup_future = None
+        self.last_lifecycle_start_time = -1.0e9
         self.retry_timer = self.create_timer(0.25, self._try_send_pending)
 
         self.get_logger().info(
             'POSE_TO_NAV2_ACTION_READY | '
             f'in={self.goal_pose_topic} action={self.navigate_action} '
             f'frame={self.default_frame_id} '
-            f'cancel_previous={self.cancel_previous_goal}'
+            f'cancel_previous={self.cancel_previous_goal} '
+            f'wait_lifecycle={self.wait_for_lifecycle_active}'
         )
 
     @staticmethod
@@ -99,6 +137,8 @@ class PoseToNav2Action(Node):
             return
         now = self.get_clock().now().nanoseconds * 1.0e-9
         if now < self.retry_not_before:
+            return
+        if self._nav2_lifecycle_blocks_send(now):
             return
         if not self.client.server_is_ready():
             if now - self.last_wait_log_time >= 5.0:
@@ -150,6 +190,91 @@ class PoseToNav2Action(Node):
             )
         )
 
+    def _nav2_lifecycle_blocks_send(self, now: float) -> bool:
+        if not self.wait_for_lifecycle_active:
+            return False
+
+        self._poll_navigation_state()
+        if self.navigation_active:
+            return False
+
+        # Unit tests and non-Nav2 action bridges may not expose lifecycle
+        # services. In that case, keep the old action-server-only behavior.
+        state_ready = self.state_client.service_is_ready()
+        lifecycle_ready = self.lifecycle_client.service_is_ready()
+        if not state_ready and not lifecycle_ready and not self.lifecycle_state_known:
+            return False
+
+        if self.auto_start_navigation_lifecycle:
+            self._request_navigation_startup(now)
+
+        if now - self.last_wait_log_time >= 5.0:
+            state = 'unknown'
+            if self.navigation_active is False:
+                state = 'inactive'
+            self.get_logger().warn(
+                'NAV2_LIFECYCLE_NOT_ACTIVE | '
+                f'bt_state={state} '
+                f'state_service={self.bt_state_service_name} '
+                f'lifecycle_service={self.navigation_lifecycle_service_name} '
+                '| latest goal retained'
+            )
+            self.last_wait_log_time = now
+        return True
+
+    def _poll_navigation_state(self) -> None:
+        if not self.state_client.service_is_ready():
+            return
+        if self.state_future is not None and not self.state_future.done():
+            return
+        future = self.state_client.call_async(GetState.Request())
+        self.state_future = future
+        future.add_done_callback(self._on_navigation_state)
+
+    def _on_navigation_state(self, future) -> None:
+        try:
+            response = future.result()
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f'NAV2_STATE_QUERY_FAILED | {exc}')
+            return
+        state_id = int(response.current_state.id)
+        state_label = str(response.current_state.label)
+        self.lifecycle_state_known = True
+        self.navigation_active = state_id == State.PRIMARY_STATE_ACTIVE
+        if self.navigation_active:
+            self.get_logger().info(
+                f'NAV2_LIFECYCLE_ACTIVE | bt_navigator={state_label}'
+            )
+            self.retry_not_before = -1.0e9
+
+    def _request_navigation_startup(self, now: float) -> None:
+        if not self.lifecycle_client.service_is_ready():
+            return
+        if self.startup_future is not None and not self.startup_future.done():
+            return
+        if now - self.last_lifecycle_start_time < self.lifecycle_retry_sec:
+            return
+        request = ManageLifecycleNodes.Request()
+        request.command = ManageLifecycleNodes.Request.STARTUP
+        self.startup_future = self.lifecycle_client.call_async(request)
+        self.startup_future.add_done_callback(self._on_navigation_startup)
+        self.last_lifecycle_start_time = now
+        self.get_logger().warn(
+            'NAV2_LIFECYCLE_STARTUP_REQUESTED | '
+            f'service={self.navigation_lifecycle_service_name}'
+        )
+
+    def _on_navigation_startup(self, future) -> None:
+        try:
+            response = future.result()
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f'NAV2_LIFECYCLE_STARTUP_FAILED | {exc}')
+            return
+        if getattr(response, 'success', False):
+            self.get_logger().info('NAV2_LIFECYCLE_STARTUP_OK')
+        else:
+            self.get_logger().warn('NAV2_LIFECYCLE_STARTUP_NOT_READY')
+
     def _goal_response_cb(
         self,
         future,
@@ -171,8 +296,14 @@ class PoseToNav2Action(Node):
             if goal_id == self.goal_count and self.pending_goal is None:
                 self.pending_goal = sent_goal
                 self.retry_not_before = (
-                    self.get_clock().now().nanoseconds * 1.0e-9 + 1.0
+                    self.get_clock().now().nanoseconds * 1.0e-9
+                    + self.lifecycle_retry_sec
                 )
+                self.navigation_active = False
+                if self.auto_start_navigation_lifecycle:
+                    self._request_navigation_startup(
+                        self.get_clock().now().nanoseconds * 1.0e-9
+                    )
             return
 
         # Action responses may arrive out of order. Never let an older response

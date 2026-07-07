@@ -389,7 +389,7 @@ def generate_launch_description():
             'main_domain_id',
             default_value='',
             description=(
-                'Leader/PC DDS domain used by domain_bridge. Required; pass '
+                'Leader DDS domain used by domain_bridge. Required; pass '
                 'main_domain_id:=<leader_domain>.'
             ),
         ),

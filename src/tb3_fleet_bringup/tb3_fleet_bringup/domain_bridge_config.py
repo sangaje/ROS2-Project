@@ -1,5 +1,5 @@
-from pathlib import Path
 import tempfile
+from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import yaml
@@ -45,7 +45,47 @@ def risk_topics() -> Dict[str, Dict]:
             'visualization_msgs/msg/MarkerArray',
             profile=marker_profile,
         ),
+        '/risk/positive_memory_map': topic(
+            'nav_msgs/msg/OccupancyGrid',
+            profile=grid_profile,
+        ),
+        '/risk/visibility_map': topic(
+            'nav_msgs/msg/OccupancyGrid',
+            profile=grid_profile,
+        ),
+        '/risk/observed_empty_map': topic(
+            'nav_msgs/msg/OccupancyGrid',
+            profile=grid_profile,
+        ),
+        '/risk/bearing_consensus_map': topic(
+            'nav_msgs/msg/OccupancyGrid',
+            profile=grid_profile,
+        ),
     }
+
+
+def _runtime_output_directory(output_directory: Optional[Path]) -> Path:
+    output = output_directory or Path(tempfile.gettempdir())
+    output.mkdir(parents=True, exist_ok=True)
+    return output
+
+
+def _write_runtime_config(
+    prefix: str,
+    config: Dict,
+    output_directory: Optional[Path] = None,
+) -> Path:
+    output = _runtime_output_directory(output_directory)
+    with tempfile.NamedTemporaryFile(
+        mode='w',
+        suffix='.yaml',
+        prefix=prefix,
+        dir=output,
+        delete=False,
+        encoding='utf-8',
+    ) as handle:
+        yaml.safe_dump(config, handle, sort_keys=False)
+        return Path(handle.name)
 
 
 def write_fleet_bridge_configs(
@@ -60,18 +100,7 @@ def write_fleet_bridge_configs(
     Control and acknowledgement topics use transient-local durability so a
     briefly restarting bridge or follower cannot miss the latest fleet state.
     """
-    output = output_directory or (
-        Path(tempfile.gettempdir()) / 'tb3_fleet_domain_bridge'
-    )
-    output.mkdir(parents=True, exist_ok=True)
-
     prefix = 'sim_' if simulation else ''
-    main_to_follower = output / (
-        f'{prefix}main_{main_domain}_to_follower_{follower_domain}.yaml'
-    )
-    follower_to_main = output / (
-        f'{prefix}follower_{follower_domain}_to_main_{main_domain}.yaml'
-    )
 
     main_topics = {}
     if simulation:
@@ -162,18 +191,26 @@ def write_fleet_bridge_configs(
             remap='/burger/cmd_vel',
         )
 
-    main_to_follower.write_text(yaml.safe_dump({
+    main_to_follower = _write_runtime_config(
+        f'{prefix}main_{main_domain}_to_follower_{follower_domain}_',
+        {
         'name': f'{prefix}main_{main_domain}_to_follower_{follower_domain}',
         'from_domain': int(main_domain),
         'to_domain': int(follower_domain),
         'topics': main_topics,
-    }, sort_keys=False), encoding='utf-8')
-    follower_to_main.write_text(yaml.safe_dump({
+        },
+        output_directory,
+    )
+    follower_to_main = _write_runtime_config(
+        f'{prefix}follower_{follower_domain}_to_main_{main_domain}_',
+        {
         'name': f'{prefix}follower_{follower_domain}_to_main_{main_domain}',
         'from_domain': int(follower_domain),
         'to_domain': int(main_domain),
         'topics': follower_topics,
-    }, sort_keys=False), encoding='utf-8')
+        },
+        output_directory,
+    )
 
     return main_to_follower, follower_to_main
 
@@ -190,18 +227,6 @@ def write_member_bridge_configs(
     needs to pass. Map and initial-pose flow mirror the follower's bridge
     so the same PC RViz can localize it.
     """
-    output = output_directory or (
-        Path(tempfile.gettempdir()) / 'tb3_fleet_domain_bridge'
-    )
-    output.mkdir(parents=True, exist_ok=True)
-
-    main_to_member = output / (
-        f'main_{main_domain}_to_member_{member_domain}.yaml'
-    )
-    member_to_main = output / (
-        f'member_{member_domain}_to_main_{main_domain}.yaml'
-    )
-
     main_topics = {
         '/map': topic(
             'nav_msgs/msg/OccupancyGrid',
@@ -216,30 +241,120 @@ def write_member_bridge_configs(
     }
     member_topics = {
         '/member_pose': topic('geometry_msgs/msg/PoseStamped'),
-        # Only actually publishes if this member owns its own SLAM
-        # (enable_amcl:=false + start_cartographer:=true) -- otherwise
-        # nothing ever appears here and the bridge just idles. Lets a
-        # leader with enable_cartographer:=false receive this member's
-        # map instead of building its own.
-        '/map': topic(
-            'nav_msgs/msg/OccupancyGrid',
-            remap='/map_from_member',
-            profile=qos(durability='transient_local', depth=5),
-        ),
         **risk_topics(),
     }
 
-    main_to_member.write_text(yaml.safe_dump({
+    main_to_member = _write_runtime_config(
+        f'main_{main_domain}_to_member_{member_domain}_',
+        {
         'name': f'main_{main_domain}_to_member_{member_domain}',
         'from_domain': int(main_domain),
         'to_domain': int(member_domain),
         'topics': main_topics,
-    }, sort_keys=False), encoding='utf-8')
-    member_to_main.write_text(yaml.safe_dump({
+        },
+        output_directory,
+    )
+    member_to_main = _write_runtime_config(
+        f'member_{member_domain}_to_main_{main_domain}_',
+        {
         'name': f'member_{member_domain}_to_main_{main_domain}',
         'from_domain': int(member_domain),
         'to_domain': int(main_domain),
         'topics': member_topics,
-    }, sort_keys=False), encoding='utf-8')
+        },
+        output_directory,
+    )
 
     return main_to_member, member_to_main
+
+
+def write_risk_to_leader_bridge_config(
+    risk_domain: int,
+    leader_domain: int,
+    *,
+    output_directory: Optional[Path] = None,
+) -> Path:
+    """Create the one-way SLAM/risk bridge into the leader domain."""
+    topics = {
+        '/map': topic(
+            'nav_msgs/msg/OccupancyGrid',
+            remap='/map_bridge',
+            profile=qos(durability='transient_local', depth=5),
+        ),
+        **risk_topics(),
+    }
+    return _write_runtime_config(
+        f'risk_{risk_domain}_to_leader_{leader_domain}_',
+        {
+            'name': f'risk_{risk_domain}_to_leader_{leader_domain}',
+            'from_domain': int(risk_domain),
+            'to_domain': int(leader_domain),
+            'topics': topics,
+        },
+        output_directory,
+    )
+
+
+def write_leader_to_pc_bridge_config(
+    leader_domain: int,
+    pc_domain: int,
+    *,
+    output_directory: Optional[Path] = None,
+) -> Path:
+    """Create the one-way visualization/debug bridge from leader to PC."""
+    topics = {
+        '/map': topic(
+            'nav_msgs/msg/OccupancyGrid',
+            profile=qos(durability='transient_local', depth=5),
+        ),
+        **risk_topics(),
+        '/leader_pose': topic('geometry_msgs/msg/PoseStamped'),
+        '/burger_pose': topic('geometry_msgs/msg/PoseStamped'),
+        '/member_pose': topic('geometry_msgs/msg/PoseStamped'),
+        '/leader_plan': topic(
+            'nav_msgs/msg/Path',
+            profile=qos(depth=3),
+        ),
+        '/burger_plan': topic(
+            'nav_msgs/msg/Path',
+            profile=qos(depth=3),
+        ),
+        '/goal_pose': topic('geometry_msgs/msg/PoseStamped'),
+        '/fleet/leader_coord_goal': topic('geometry_msgs/msg/PoseStamped'),
+        '/burger_goal_pose': topic('geometry_msgs/msg/PoseStamped'),
+        '/member_goal_pose': topic('geometry_msgs/msg/PoseStamped'),
+        '/fleet/coordination_status': topic(
+            'std_msgs/msg/String',
+            profile=qos(durability='transient_local', depth=1),
+        ),
+        '/fleet/robot_poses': topic(
+            'geometry_msgs/msg/PoseArray',
+            profile=qos(depth=5),
+        ),
+        '/fleet/collision_warning': topic(
+            'std_msgs/msg/Bool',
+            profile=qos(durability='transient_local', depth=1),
+        ),
+        '/fleet/hazard_pose': topic(
+            'geometry_msgs/msg/PoseStamped',
+            profile=qos(depth=5),
+        ),
+        '/fleet/coordination_markers': topic(
+            'visualization_msgs/msg/MarkerArray',
+            profile=qos(durability='transient_local', depth=1),
+        ),
+        '/fleet_debug_markers': topic(
+            'visualization_msgs/msg/MarkerArray',
+            profile=qos(durability='transient_local', depth=1),
+        ),
+    }
+    return _write_runtime_config(
+        f'leader_{leader_domain}_to_pc_{pc_domain}_',
+        {
+            'name': f'leader_{leader_domain}_to_pc_{pc_domain}',
+            'from_domain': int(leader_domain),
+            'to_domain': int(pc_domain),
+            'topics': topics,
+        },
+        output_directory,
+    )

@@ -8,6 +8,7 @@ from typing import Dict, Optional, Tuple
 import rclpy
 from rclpy.node import Node
 from rclpy.exceptions import ParameterAlreadyDeclaredException
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import PoseStamped, Point
 from visualization_msgs.msg import Marker, MarkerArray
 
@@ -80,7 +81,15 @@ class FleetDebugMarker(Node):
         self.sub_goal_leader_coord = self.create_subscription(PoseStamped, self.leader_coord_goal_topic, lambda m: self._on_goal('leader_coord_goal', m), 10)
         self.sub_goal_burger = self.create_subscription(PoseStamped, self.burger_goal_topic, lambda m: self._on_goal('burger_goal', m), 10)
         self.sub_goal_member = self.create_subscription(PoseStamped, self.member_goal_topic, lambda m: self._on_goal('member_goal', m), 10)
-        self.pub = self.create_publisher(MarkerArray, self.marker_topic, 10)
+        marker_qos = QoSProfile(
+            depth=1,
+            history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.pub = self.create_publisher(
+            MarkerArray, self.marker_topic, marker_qos
+        )
         self.create_timer(1.0 / self.publish_rate_hz, self._tick)
 
         self.get_logger().info(

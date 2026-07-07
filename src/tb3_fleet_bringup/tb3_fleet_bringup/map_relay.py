@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Receives /map_bridge (volatile, from domain_bridge) and stands by to
+Receives /map_bridge (transient-local, from domain_bridge) and stands by to
 republish it on /map (transient_local) only when nothing else is currently
 publishing there.
 
@@ -46,7 +46,7 @@ class MapRelay(Node):
         sub_qos = QoSProfile(
             depth=5,
             reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.VOLATILE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
         )
         self._latest_bridged = None
@@ -70,7 +70,7 @@ class MapRelay(Node):
             self.check_period, self._check_primary
         )
         self.get_logger().info(
-            f'map relay standing by: {self.input_topic} (volatile) -> '
+            f'map relay standing by: {self.input_topic} (transient_local) -> '
             f'{self.output_topic} (transient_local), only if no other '
             f'publisher is active on {self.output_topic}'
         )
