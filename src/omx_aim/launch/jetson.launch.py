@@ -8,11 +8,8 @@ Standalone component debug only:
 
 start_yolo_server:=true 이면 정찰/팔로워 로봇이 HTTP로 프레임을 보낼
 flask_yolo_server 도 이 Jetson에서 같이 실행한다.
-debug_stream:=true 이면 yolo_node 가 기존 in-process Flask MJPEG 스트림을 띄우고,
-leader_unified_dashboard 도 별도 Flask 서버로 같이 실행한다.
+debug_stream:=true 이면 yolo_node 가 기존 in-process Flask MJPEG 스트림을 띄운다.
     브라우저에서 http://<jetson-ip>:<debug_port>/ 로 확인
-    통합 상황판은 http://<jetson-ip>:<dashboard_port>/ 로 확인
-    (예: http://orin-jetson:8091/)
 """
 import os
 
@@ -30,15 +27,10 @@ def _is_true(value):
 
 def launch_setup(context, *args, **kwargs):
     debug_stream = _is_true(LaunchConfiguration('debug_stream').perform(context))
-    unified_dashboard = _is_true(
-        LaunchConfiguration('unified_dashboard').perform(context)
-    )
     start_yolo_server = _is_true(
         LaunchConfiguration('start_yolo_server').perform(context)
     )
     debug_port = LaunchConfiguration('debug_port').perform(context)
-    dashboard_port = LaunchConfiguration('dashboard_port').perform(context)
-    dashboard_host = LaunchConfiguration('dashboard_host').perform(context)
 
     # yolo_node CLI 인자 조립
     yolo_args = ['--no-display']
@@ -92,29 +84,6 @@ def launch_setup(context, *args, **kwargs):
         ),
     ])
 
-    if debug_stream and unified_dashboard:
-        actions.append(Node(
-            package='omx_aim',
-            executable='unified_dashboard',
-            name='leader_unified_dashboard',
-            output='screen',
-            parameters=[{
-                'host': dashboard_host,
-                'port': int(dashboard_port),
-                'omx_debug_port': int(debug_port),
-                'omx_stream_path': '/stream.mjpg',
-                'omx_state_path': '/state.json',
-                'map_topic': '/map',
-                'risk_topic': '/risk/risk_map',
-                'leader_pose_topic': '/leader_pose',
-                'follower_pose_topic': '/burger_pose',
-                'member_pose_topic': '/member_pose',
-                'fleet_poses_topic': '/fleet/robot_poses',
-                'fleet_status_topic': '/fleet/coordination_status',
-                'collision_warning_topic': '/fleet/collision_warning',
-            }],
-        ))
-
     return actions
 
 
@@ -146,15 +115,5 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'debug_port', default_value='8080',
             description='디버그 스트림 포트'),
-        DeclareLaunchArgument(
-            'unified_dashboard', default_value='true',
-            choices=['true', 'false'],
-            description='debug_stream:=true 일 때 leader 통합 상황판 실행'),
-        DeclareLaunchArgument(
-            'dashboard_host', default_value='0.0.0.0',
-            description='통합 상황판 HTTP bind address'),
-        DeclareLaunchArgument(
-            'dashboard_port', default_value='8091',
-            description='통합 상황판 HTTP 포트'),
         OpaqueFunction(function=launch_setup),
     ])

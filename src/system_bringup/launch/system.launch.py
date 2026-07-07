@@ -309,10 +309,35 @@ def generate_launch_description():
                         'yolo_server_half': yolo_server_half.perform(context),
                         'debug_stream': debug_stream.perform(context),
                         'debug_port': debug_port.perform(context),
-                        'unified_dashboard': unified_dashboard.perform(context),
-                        'dashboard_host': dashboard_host.perform(context),
-                        'dashboard_port': dashboard_port.perform(context),
                     }.items(),
+                ))
+            if (
+                launch_bool(debug_stream.perform(context))
+                and launch_bool(unified_dashboard.perform(context))
+            ):
+                actions.append(Node(
+                    package='system_bringup',
+                    executable='leader_unified_dashboard',
+                    name='leader_unified_dashboard',
+                    output='screen',
+                    parameters=[{
+                        'host': dashboard_host.perform(context),
+                        'port': int(dashboard_port.perform(context)),
+                        'omx_debug_port': int(debug_port.perform(context)),
+                        'omx_stream_path': '/stream.mjpg',
+                        'omx_state_path': '/state.json',
+                        'map_topic': '/map',
+                        'risk_topic': '/risk/risk_map',
+                        'leader_pose_topic': '/leader_pose',
+                        'follower_pose_topic': '/burger_pose',
+                        'member_pose_topic': '/member_pose',
+                        'fleet_poses_topic': '/fleet/robot_poses',
+                        'fleet_status_topic': '/fleet/coordination_status',
+                        'collision_warning_topic': '/fleet/collision_warning',
+                    }],
+                    env=process_env,
+                    respawn=True,
+                    respawn_delay=3.0,
                 ))
 
         if role_value != 'scout':

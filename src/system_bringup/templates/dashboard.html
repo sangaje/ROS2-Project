@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Leader Unified Dashboard</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+</head>
+<body>
+  <header>
+    <div><h1>Leader Unified Dashboard</h1></div>
+    <div class="top-status">
+      <span id="leaderPill" class="pill no-data"><span class="dot"></span>Leader NO DATA</span>
+      <span id="mapPill" class="pill no-data"><span class="dot"></span>Map NO DATA</span>
+      <span id="riskPill" class="pill no-data"><span class="dot"></span>Risk NO DATA</span>
+      <span id="robotPill" class="pill no-data"><span class="dot"></span>Robots 0/3</span>
+    </div>
+  </header>
+  <main>
+    <section>
+      <h2>OMX AIM Debug Stream</h2>
+      <div class="stream-wrap"><img id="omxStream" alt="OMX MJPEG stream"></div>
+    </section>
+    <section class="map-panel">
+      <h2>Shared Map + Risk Overlay</h2>
+      <div class="map-tools">
+        <label><input id="layerMap" type="checkbox" checked> Map</label>
+        <label><input id="layerRisk" type="checkbox" checked> Risk</label>
+        <label><input id="layerRobots" type="checkbox" checked> Robots</label>
+        <label>Risk opacity <input id="riskOpacity" type="range" min="0" max="1" step="0.05" value="0.55"></label>
+        <span class="legend">
+          <span><span class="swatch leader"></span> leader</span>
+          <span><span class="swatch follower"></span> follower</span>
+          <span><span class="swatch member"></span> member</span>
+        </span>
+      </div>
+      <canvas id="mapCanvas"></canvas>
+      <div id="mapWarning" class="warning"></div>
+    </section>
+    <div class="lower">
+      <section>
+        <h2>Robot Status</h2>
+        <table>
+          <thead><tr><th>Robot</th><th>Role</th><th>Status</th><th>X</th><th>Y</th><th>Yaw</th><th>Age</th></tr></thead>
+          <tbody id="robotRows"></tbody>
+        </table>
+      </section>
+      <section>
+        <h2>Topic / Data Status</h2>
+        <div id="topicRows" class="topic-list"></div>
+      </section>
+    </div>
+  </main>
+  <script src="{{ url_for('static', filename='dashboard.js') }}"></script>
+</body>
+</html>

@@ -10,6 +10,8 @@ def only_files(pattern):
 
 
 launch_files = only_files('launch/*.launch.py')
+template_files = only_files('templates/*.html')
+static_files = only_files('static/*')
 
 
 setup(
@@ -21,6 +23,8 @@ setup(
         ('share/' + package_name, ['package.xml', 'README.md']),
         (os.path.join('share', package_name, 'launch'), launch_files),
         (os.path.join('share', package_name, 'rviz'), only_files('rviz/*.rviz')),
+        (os.path.join('share', package_name, 'templates'), template_files),
+        (os.path.join('share', package_name, 'static'), static_files),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -33,6 +37,8 @@ setup(
     ),
     license='Apache-2.0',
     entry_points={
-        'console_scripts': [],
+        'console_scripts': [
+            'leader_unified_dashboard = system_bringup.leader_unified_dashboard:main',
+        ],
     },
 )
