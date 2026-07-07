@@ -48,6 +48,10 @@ def launch_setup(context, *args, **kwargs):
             package='omx_aim', executable='scan_processor', name='scan_processor',
             output='screen',
         ),
+        Node(
+            package='omx_aim', executable='patrol_planner', name='patrol_planner',
+            output='screen',
+        ),
     ]
 
 
