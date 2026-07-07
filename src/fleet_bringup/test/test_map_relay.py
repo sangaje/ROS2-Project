@@ -137,6 +137,29 @@ def test_new_bridged_maps_are_republished_immediately_while_relaying():
         destroy_node(node)
 
 
+def test_relay_republishes_cached_map_while_active_for_volatile_subscribers():
+    node = make_node()
+    try:
+        published = []
+        node._pub.publish = lambda msg: published.append(msg)
+        now = [0.0]
+        node._now_sec = lambda: now[0]
+        node.count_publishers = lambda topic: 1
+        node._on_bridged_map(grid(10))
+
+        node._check_primary()  # primes _primary_missing_since
+        now[0] += node.takeover_grace + 0.1
+        node._check_primary()
+        assert len(published) == 1
+
+        now[0] += node.check_period
+        node._check_primary()
+        assert len(published) == 2
+        assert published[-1].info.width == 10
+    finally:
+        destroy_node(node)
+
+
 def test_invalid_bridged_map_is_not_treated_as_available():
     node = make_node()
     try:

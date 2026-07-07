@@ -2,7 +2,9 @@
 """
 Receives /map_bridge from domain_bridge with a transient-local
 subscription and stands by to republish it on /map (transient_local) only
-when nothing else is currently publishing there.
+when nothing else is currently publishing there. While relaying, it
+periodically republishes the cached map so volatile/default subscribers
+such as plain `ros2 topic echo /map --once` can receive a fresh sample too.
 
 /map is meant to have exactly one live source at a time -- normally a local
 SLAM node (e.g. Cartographer) when this robot owns its own mapping. This
@@ -103,6 +105,8 @@ class MapRelay(Node):
             self._publish(msg)
 
     def _on_output_seen(self, msg: OccupancyGrid):
+        if self._relaying:
+            return
         if not self._is_valid_map(msg):
             return
         if not self._first_output_logged:
@@ -160,6 +164,7 @@ class MapRelay(Node):
             )
             self._publish_latest()
         elif self._relaying:
+            self._publish_latest()
             self.get_logger().info(
                 f'Map relay active (no primary for {missing_sec:.1f}s)',
                 throttle_duration_sec=10.0,
