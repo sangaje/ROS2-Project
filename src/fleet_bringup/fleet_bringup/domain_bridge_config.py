@@ -26,11 +26,6 @@ def map_qos(depth: int = 5) -> Dict:
     return qos(reliability=None, durability=None, depth=depth)
 
 
-def latched_map_qos(depth: int = 1) -> Dict:
-    """QoS for downstream /map fan-out from the leader's stable map relay."""
-    return qos(reliability='reliable', durability='transient_local', depth=depth)
-
-
 def topic(message_type: str, *, remap: Optional[str] = None, profile=None) -> Dict:
     config = {
         'type': message_type,
@@ -125,7 +120,7 @@ def write_fleet_bridge_configs(
         '/map': topic(
             'nav_msgs/msg/OccupancyGrid',
             remap='/map_bridge',
-            profile=latched_map_qos(depth=1),
+            profile=map_qos(depth=5),
         ),
         '/leader_pose': topic('geometry_msgs/msg/PoseStamped'),
         '/plan': topic(
@@ -244,7 +239,7 @@ def write_member_bridge_configs(
         '/map': topic(
             'nav_msgs/msg/OccupancyGrid',
             remap='/map_bridge',
-            profile=latched_map_qos(depth=1),
+            profile=map_qos(depth=5),
         ),
         '/leader_pose': topic('geometry_msgs/msg/PoseStamped'),
         '/member_goal_pose': topic('geometry_msgs/msg/PoseStamped'),
@@ -335,7 +330,7 @@ def write_leader_to_pc_bridge_config(
     topics = {
         '/map': topic(
             'nav_msgs/msg/OccupancyGrid',
-            profile=latched_map_qos(depth=1),
+            profile=map_qos(depth=5),
         ),
         **risk_topics(),
         '/leader_pose': topic('geometry_msgs/msg/PoseStamped'),

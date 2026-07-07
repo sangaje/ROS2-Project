@@ -22,7 +22,9 @@ from launch.actions import (
 )
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration
+from launch.substitutions import PathJoinSubstitution
 from launch_ros.actions import Node
+from launch_ros.substitutions import FindPackagePrefix
 
 from fleet_bringup.domain_bridge_config import (
     write_leader_to_pc_bridge_config,
@@ -301,6 +303,36 @@ def generate_launch_description():
                         'domain; leader->PC bridge skipped.'
                     ]))
 
+            if launch_bool(start_yolo_server.perform(context)):
+                flask_yolo_exe = PathJoinSubstitution([
+                    FindPackagePrefix('flask_yolo_bridge'),
+                    'lib',
+                    'flask_yolo_bridge',
+                    'flask_yolo_server',
+                ])
+                actions.append(ExecuteProcess(
+                    cmd=[
+                        flask_yolo_exe,
+                        '--host', yolo_server_host.perform(context),
+                        '--port', yolo_server_port.perform(context),
+                        '--model-path', yolo_server_model_path.perform(context),
+                        '--device', yolo_server_device.perform(context),
+                        '--half', yolo_server_half.perform(context),
+                        '--fast-forward', 'true',
+                        '--conf', '0.20',
+                        '--iou', '0.45',
+                        '--max-det', '64',
+                        '--imgsz', '960',
+                        '--debug-jpeg-quality', '75',
+                        '--max-capture-age-sec', '1.5',
+                        '--max-queue-wait-sec', '0.05',
+                        '--person-only',
+                    ],
+                    output='screen',
+                    name='flask_yolo_server',
+                    env=process_env,
+                ))
+
             if launch_bool(start_omx_aim.perform(context)):
                 omx_launch_path = os.path.join(
                     get_package_share_directory('omx_aim'),
@@ -310,7 +342,10 @@ def generate_launch_description():
                 actions.append(IncludeLaunchDescription(
                     PythonLaunchDescriptionSource(omx_launch_path),
                     launch_arguments={
-                        'start_yolo_server': start_yolo_server.perform(context),
+                        # system_bringup owns the leader Flask YOLO server.
+                        # Keep the OMX component from starting a duplicate
+                        # process on the same port/camera/GPU.
+                        'start_yolo_server': 'false',
                         'yolo_server_host': yolo_server_host.perform(context),
                         'yolo_server_port': yolo_server_port.perform(context),
                         'yolo_server_model_path': (

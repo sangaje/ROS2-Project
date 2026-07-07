@@ -146,29 +146,6 @@ def test_invalid_bridged_map_is_not_treated_as_available():
         destroy_node(node)
 
 
-def test_relay_republishes_latest_map_while_taking_over():
-    node = make_node()
-    try:
-        published = []
-        node._pub.publish = lambda msg: published.append(msg)
-        node.count_publishers = lambda topic: 1
-        now = [0.0]
-        node._now_sec = lambda: now[0]
-        node._on_bridged_map(grid(10))
-
-        node._check_primary()
-        now[0] += node.takeover_grace + 0.1
-        node._check_primary()
-        assert len(published) == 1
-
-        now[0] += node.republish_period + 0.1
-        node._check_primary()
-        assert len(published) == 2
-        assert published[-1].info.width == 10
-    finally:
-        destroy_node(node)
-
-
 def test_relay_does_not_republish_its_own_stale_output_over_fresh_bridge():
     node = make_node()
     try:

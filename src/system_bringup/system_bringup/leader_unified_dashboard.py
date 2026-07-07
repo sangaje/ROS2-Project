@@ -249,6 +249,10 @@ class LeaderUnifiedDashboard(Node):
     def _run_flask(self) -> None:
         logging.getLogger('werkzeug').setLevel(logging.WARNING)
         try:
+            self.get_logger().info(
+                f'UNIFIED_DASHBOARD_FLASK_BIND | host={self.host} '
+                f'| port={self.port} | threaded=true | reloader=false'
+            )
             self._app.run(
                 host=self.host,
                 port=self.port,
