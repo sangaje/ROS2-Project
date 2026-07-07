@@ -877,37 +877,37 @@ class FleetPathCoordinator(Node):
                 other_velocity, other_sample
             )
             other_speed = math.hypot(*effective_velocity)
+            if other_speed < self.motion_speed_threshold:
+                continue
 
             closest_distance = current_distance
             closest_time = 0.0
-            if other_speed >= self.motion_speed_threshold:
-                relative_position = (
-                    other_now[0] - member_now[0],
-                    other_now[1] - member_now[1],
+            relative_position = (
+                other_now[0] - member_now[0],
+                other_now[1] - member_now[1],
+            )
+            speed_squared = (
+                effective_velocity[0] ** 2 + effective_velocity[1] ** 2
+            )
+            if speed_squared > 1.0e-6:
+                closest_time = max(0.0, min(
+                    self.motion_prediction_horizon,
+                    -(
+                        relative_position[0] * effective_velocity[0]
+                        + relative_position[1] * effective_velocity[1]
+                    ) / speed_squared,
+                ))
+                closest_vector = (
+                    relative_position[0]
+                    + closest_time * effective_velocity[0],
+                    relative_position[1]
+                    + closest_time * effective_velocity[1],
                 )
-                speed_squared = (
-                    effective_velocity[0] ** 2 + effective_velocity[1] ** 2
-                )
-                if speed_squared > 1.0e-6:
-                    closest_time = max(0.0, min(
-                        self.motion_prediction_horizon,
-                        -(
-                            relative_position[0] * effective_velocity[0]
-                            + relative_position[1] * effective_velocity[1]
-                        ) / speed_squared,
-                    ))
-                    closest_vector = (
-                        relative_position[0]
-                        + closest_time * effective_velocity[0],
-                        relative_position[1]
-                        + closest_time * effective_velocity[1],
-                    )
-                    closest_distance = math.hypot(*closest_vector)
+                closest_distance = math.hypot(*closest_vector)
 
             emergency = current_distance < self.minimum_separation + 0.08
             approaching = (
                 current_distance < self.motion_trigger_distance
-                and other_speed >= self.motion_speed_threshold
             )
             predicted = (
                 closest_time > 0.05

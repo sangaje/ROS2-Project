@@ -367,6 +367,24 @@ def test_member_yields_when_leader_approaches_and_returns_when_clear():
         destroy_node(node)
 
 
+def test_stationary_nearby_robot_does_not_make_member_yield():
+    node = make_node()
+    try:
+        node._leader_pose_cb(pose(0.0, 0.0))
+        node._follower_pose_cb(pose(5.0, 5.0))
+        node._member_pose_cb(pose(0.4, 0.0))
+        now = node._now()
+        node.leader_velocity = (0.0, 0.0)
+        node.leader_motion_sample = (now, (0.0, 0.0))
+
+        node._tick()
+        node._tick()
+        assert node.member_state == node.IDLE
+        assert node.member_evasion_goal is None
+    finally:
+        destroy_node(node)
+
+
 def test_member_without_a_pose_never_triggers_any_member_state():
     node = make_node()
     try:
