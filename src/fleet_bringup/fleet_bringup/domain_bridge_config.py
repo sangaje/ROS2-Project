@@ -6,16 +6,24 @@ import yaml
 
 
 def qos(
-    reliability: str = 'reliable',
-    durability: str = 'volatile',
+    reliability: Optional[str] = 'reliable',
+    durability: Optional[str] = 'volatile',
     depth: int = 10,
 ) -> Dict:
-    return {
-        'reliability': reliability,
-        'durability': durability,
+    profile = {
         'history': 'keep_last',
         'depth': depth,
     }
+    if reliability is not None:
+        profile['reliability'] = reliability
+    if durability is not None:
+        profile['durability'] = durability
+    return profile
+
+
+def map_qos(depth: int = 5) -> Dict:
+    """Let domain_bridge auto-match /map publisher reliability/durability."""
+    return qos(reliability=None, durability=None, depth=depth)
 
 
 def topic(message_type: str, *, remap: Optional[str] = None, profile=None) -> Dict:
@@ -112,7 +120,7 @@ def write_fleet_bridge_configs(
         '/map': topic(
             'nav_msgs/msg/OccupancyGrid',
             remap='/map_bridge',
-            profile=qos(durability='transient_local', depth=5),
+            profile=map_qos(depth=5),
         ),
         '/leader_pose': topic('geometry_msgs/msg/PoseStamped'),
         '/plan': topic(
@@ -231,7 +239,7 @@ def write_member_bridge_configs(
         '/map': topic(
             'nav_msgs/msg/OccupancyGrid',
             remap='/map_bridge',
-            profile=qos(durability='transient_local', depth=5),
+            profile=map_qos(depth=5),
         ),
         '/member_goal_pose': topic('geometry_msgs/msg/PoseStamped'),
         '/initialpose': topic(
@@ -279,7 +287,7 @@ def write_risk_to_leader_bridge_config(
         '/map': topic(
             'nav_msgs/msg/OccupancyGrid',
             remap='/map_bridge',
-            profile=qos(durability='transient_local', depth=5),
+            profile=map_qos(depth=5),
         ),
         **risk_topics(),
     }
@@ -305,7 +313,7 @@ def write_leader_to_pc_bridge_config(
     topics = {
         '/map': topic(
             'nav_msgs/msg/OccupancyGrid',
-            profile=qos(durability='transient_local', depth=5),
+            profile=map_qos(depth=5),
         ),
         **risk_topics(),
         '/leader_pose': topic('geometry_msgs/msg/PoseStamped'),

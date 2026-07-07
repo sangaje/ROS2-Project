@@ -46,13 +46,15 @@ class MapRelay(Node):
         sub_qos = QoSProfile(
             depth=5,
             reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            durability=DurabilityPolicy.VOLATILE,
             history=HistoryPolicy.KEEP_LAST,
         )
         self._latest_bridged = None
         self._last_seen_output = None
         self._relaying = False
         self._primary_missing_since = None
+        self._first_bridged_logged = False
+        self._first_output_logged = False
 
         self._pub = self.create_publisher(
             OccupancyGrid, self.output_topic, pub_qos
@@ -70,18 +72,52 @@ class MapRelay(Node):
             self.check_period, self._check_primary
         )
         self.get_logger().info(
-            f'map relay standing by: {self.input_topic} (transient_local) -> '
+            f'map relay standing by: {self.input_topic} (volatile-compatible) -> '
             f'{self.output_topic} (transient_local), only if no other '
             f'publisher is active on {self.output_topic}'
         )
 
     def _on_bridged_map(self, msg: OccupancyGrid):
+        if not self._is_valid_map(msg):
+            self.get_logger().warning(
+                'MAP_RELAY_INVALID_BRIDGE_MAP | ignoring invalid '
+                f'{self.input_topic} sample',
+                throttle_duration_sec=5.0,
+            )
+            return
+        if not self._first_bridged_logged:
+            self._first_bridged_logged = True
+            self.get_logger().info(
+                'MAP_BRIDGE_FIRST_RX | '
+                f'topic={self.input_topic} width={msg.info.width} '
+                f'height={msg.info.height} resolution={msg.info.resolution:.3f}'
+            )
         self._latest_bridged = msg
         if self._relaying:
             self._publish(msg)
 
     def _on_output_seen(self, msg: OccupancyGrid):
+        if not self._is_valid_map(msg):
+            return
+        if not self._first_output_logged:
+            self._first_output_logged = True
+            self.get_logger().info(
+                'MAP_OUTPUT_FIRST_RX | '
+                f'topic={self.output_topic} width={msg.info.width} '
+                f'height={msg.info.height} resolution={msg.info.resolution:.3f}'
+            )
         self._last_seen_output = msg
+
+    @staticmethod
+    def _is_valid_map(msg: OccupancyGrid) -> bool:
+        width = int(msg.info.width)
+        height = int(msg.info.height)
+        return (
+            width > 0
+            and height > 0
+            and float(msg.info.resolution) > 0.0
+            and len(msg.data) == width * height
+        )
 
     def _now_sec(self) -> float:
         return self.get_clock().now().nanoseconds * 1.0e-9

@@ -21,6 +21,16 @@ def grid(width: int) -> OccupancyGrid:
     msg.info.width = width
     msg.info.height = width
     msg.info.resolution = 0.05
+    msg.data = [0] * (width * width)
+    return msg
+
+
+def invalid_grid() -> OccupancyGrid:
+    msg = OccupancyGrid()
+    msg.info.width = 10
+    msg.info.height = 10
+    msg.info.resolution = 0.05
+    msg.data = []
     return msg
 
 
@@ -123,6 +133,15 @@ def test_new_bridged_maps_are_republished_immediately_while_relaying():
         node._on_bridged_map(grid(42))
         assert len(published) == 2
         assert published[-1].info.width == 42
+    finally:
+        destroy_node(node)
+
+
+def test_invalid_bridged_map_is_not_treated_as_available():
+    node = make_node()
+    try:
+        node._on_bridged_map(invalid_grid())
+        assert node._latest_bridged is None
     finally:
         destroy_node(node)
 

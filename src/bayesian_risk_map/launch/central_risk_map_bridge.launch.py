@@ -19,12 +19,15 @@ from fleet_bringup.launch_utils import dds_launch_environment
 
 
 def _topic_block(topic: str, msg_type: str, reliability='reliable', durability='volatile', depth=10) -> str:
+    qos_lines = ''
+    if reliability is not None:
+        qos_lines += f'      reliability: {reliability}\n'
+    if durability is not None:
+        qos_lines += f'      durability: {durability}\n'
     return f"""  {topic}:
     type: {msg_type}
     qos:
-      reliability: {reliability}
-      durability: {durability}
-      history: keep_last
+{qos_lines}      history: keep_last
       depth: {depth}
 """
 
@@ -78,7 +81,13 @@ to_domain: {central_domain}
 topics:
 """
         source_yaml += _topic_block('/clock', 'rosgraph_msgs/msg/Clock', reliability='best_effort', depth=1)
-        source_yaml += _topic_block('/map', 'nav_msgs/msg/OccupancyGrid', durability='transient_local', depth=1)
+        source_yaml += _topic_block(
+            '/map',
+            'nav_msgs/msg/OccupancyGrid',
+            reliability=None,
+            durability=None,
+            depth=5,
+        )
         if include_rviz_topics:
             source_yaml += _topic_block('/scan', 'sensor_msgs/msg/LaserScan', reliability='best_effort', depth=3)
             source_yaml += _topic_block('/odom', 'nav_msgs/msg/Odometry', depth=3)
