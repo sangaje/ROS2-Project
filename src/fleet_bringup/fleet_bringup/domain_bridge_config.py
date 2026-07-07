@@ -22,8 +22,8 @@ def qos(
 
 
 def map_qos(depth: int = 5) -> Dict:
-    """Let domain_bridge auto-match /map publisher reliability/durability."""
-    return qos(reliability=None, durability=None, depth=depth)
+    """Preserve map late-joiner semantics across domain_bridge."""
+    return qos(reliability='reliable', durability='transient_local', depth=depth)
 
 
 def topic(message_type: str, *, remap: Optional[str] = None, profile=None) -> Dict:

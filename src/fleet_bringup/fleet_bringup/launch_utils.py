@@ -9,7 +9,6 @@ from launch.actions import OpaqueFunction
 
 REQUIRED_DDS_ENVIRONMENT = (
     'ROS_DOMAIN_ID',
-    'RMW_IMPLEMENTATION',
 )
 CYCLONEDDS_REQUIRED_ENVIRONMENT = (
     'CYCLONEDDS_URI',
@@ -168,8 +167,9 @@ def _validate_cyclonedds_socket_buffers() -> None:
 def validate_shell_environment(expected_domain_id: str | None = None) -> None:
     """Fail fast when launch-time DDS values are missing or conflicting.
 
-    Launch files in this workspace intentionally inherit DDS settings from the
-    user's shell.  They should not patch, unset, or invent those values.
+    Launch files in this workspace intentionally inherit DDS/RMW settings from
+    the user's shell.  They should not patch, unset, invent, or require an RMW
+    override when the ROS installation default is intended.
     """
     missing = _missing_required_environment()
     if missing:

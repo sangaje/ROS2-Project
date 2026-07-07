@@ -89,7 +89,10 @@ class LeaderUnifiedDashboard(Node):
             _declare(self, 'second_follower_pose_topic', self.member_pose_topic)
         )
         self.second_follower_name = str(
-            _declare(self, 'second_follower_name', 'follower22')
+            _declare(self, 'second_follower_name', 'scout22')
+        )
+        self.second_follower_role = str(
+            _declare(self, 'second_follower_role', 'scout')
         )
         self.fleet_poses_topic = str(_declare(self, 'fleet_poses_topic', '/fleet/robot_poses'))
         self.fleet_status_topic = str(_declare(self, 'fleet_status_topic', '/fleet/coordination_status'))
@@ -113,7 +116,7 @@ class LeaderUnifiedDashboard(Node):
             ),
             self.second_follower_name: self._empty_robot(
                 self.second_follower_name,
-                'follower',
+                self.second_follower_role,
                 self.second_follower_pose_topic,
             ),
         }

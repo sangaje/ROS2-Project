@@ -129,8 +129,8 @@ def test_risk_to_leader_bridge_is_one_way_map_source(tmp_path):
 
     assert (config['from_domain'], config['to_domain']) == (22, 24)
     assert config['topics']['/map']['remap'] == '/map_bridge'
-    assert 'reliability' not in config['topics']['/map']['qos']
-    assert 'durability' not in config['topics']['/map']['qos']
+    assert config['topics']['/map']['qos']['reliability'] == 'reliable'
+    assert config['topics']['/map']['qos']['durability'] == 'transient_local'
     assert config['topics']['/map']['qos']['history'] == 'keep_last'
     assert '/tf' not in config['topics']
     assert '/tf_static' not in config['topics']
@@ -145,8 +145,8 @@ def test_leader_to_pc_bridge_is_visualization_only(tmp_path):
     config = yaml.safe_load(path.read_text())
 
     assert (config['from_domain'], config['to_domain']) == (24, 30)
-    assert 'reliability' not in config['topics']['/map']['qos']
-    assert 'durability' not in config['topics']['/map']['qos']
+    assert config['topics']['/map']['qos']['reliability'] == 'reliable'
+    assert config['topics']['/map']['qos']['durability'] == 'transient_local'
     assert '/fleet_debug_markers' in config['topics']
     assert '/risk/risk_map' in config['topics']
     assert '/tf' not in config['topics']

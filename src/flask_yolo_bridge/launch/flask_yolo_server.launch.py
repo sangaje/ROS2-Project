@@ -10,7 +10,7 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('host', default_value='0.0.0.0'),
         DeclareLaunchArgument('port', default_value='5005'),
-        DeclareLaunchArgument('model_path', default_value='yolo11n.pt'),
+        DeclareLaunchArgument('model_path', default_value='best.pt'),
         DeclareLaunchArgument('device', default_value='0'),
         DeclareLaunchArgument('half', default_value='true'),
         DeclareLaunchArgument('fast_forward', default_value='true'),

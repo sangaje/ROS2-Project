@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Receives /map_bridge from domain_bridge with a volatile-compatible
+Receives /map_bridge from domain_bridge with a transient-local
 subscription and stands by to republish it on /map (transient_local) only
 when nothing else is currently publishing there.
 
@@ -43,7 +43,13 @@ class MapRelay(Node):
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
         )
-        sub_qos = QoSProfile(
+        bridge_sub_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+        output_sub_qos = QoSProfile(
             depth=5,
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.VOLATILE,
@@ -60,19 +66,19 @@ class MapRelay(Node):
             OccupancyGrid, self.output_topic, pub_qos
         )
         self._sub = self.create_subscription(
-            OccupancyGrid, self.input_topic, self._on_bridged_map, sub_qos
+            OccupancyGrid, self.input_topic, self._on_bridged_map, bridge_sub_qos
         )
         # Also watch the output topic itself so a takeover can continue from
         # whatever the primary (e.g. Cartographer) last published there,
         # instead of always jumping straight to the bridged leader map.
         self._output_sub = self.create_subscription(
-            OccupancyGrid, self.output_topic, self._on_output_seen, sub_qos
+            OccupancyGrid, self.output_topic, self._on_output_seen, output_sub_qos
         )
         self._timer = self.create_timer(
             self.check_period, self._check_primary
         )
         self.get_logger().info(
-            f'map relay standing by: {self.input_topic} (volatile-compatible) -> '
+            f'map relay standing by: {self.input_topic} (transient_local) -> '
             f'{self.output_topic} (transient_local), only if no other '
             f'publisher is active on {self.output_topic}'
         )

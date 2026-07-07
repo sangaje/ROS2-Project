@@ -152,6 +152,11 @@ def generate_launch_description():
             and launch_bool(start_cartographer.perform(context))
             and not launch_bool(enable_amcl.perform(context))
         )
+        scout_rl_owns_cmd_vel = (
+            role_value == 'scout'
+            and fleet_role_value == 'member'
+            and launch_bool(start_rl_policy.perform(context))
+        )
 
         fleet_launch_args = {
             'domain_id': str(domain),
@@ -171,7 +176,10 @@ def generate_launch_description():
         if fleet_role_value in ('follower', 'member'):
             fleet_launch_args['main_domain_id'] = str(main_domain)
         if fleet_role_value in ('leader', 'member'):
-            fleet_launch_args['start_nav2'] = start_nav2.perform(context)
+            fleet_launch_args['start_nav2'] = (
+                'false' if scout_rl_owns_cmd_vel
+                else start_nav2.perform(context)
+            )
         if scout_owns_slam:
             fleet_launch_args['hardware_param_file'] = os.path.join(
                 get_package_share_directory('bayesian_risk_map'),
@@ -201,6 +209,11 @@ def generate_launch_description():
                 launch_arguments=fleet_launch_args.items(),
             ),
         ]
+        if scout_rl_owns_cmd_vel and launch_bool(start_nav2.perform(context)):
+            actions.append(LogInfo(msg=[
+                'SYSTEM_BRINGUP | scout member RL owns /cmd_vel; forcing ',
+                'fleet start_nav2:=false to avoid Nav2/RL command conflict.',
+            ]))
 
         if role_value == 'leader':
             process_env = clean_process_environment(str(domain))
@@ -363,10 +376,7 @@ def generate_launch_description():
                         'debug_port': debug_port.perform(context),
                     }.items(),
                 ))
-            if (
-                launch_bool(debug_stream.perform(context))
-                and launch_bool(unified_dashboard.perform(context))
-            ):
+            if launch_bool(unified_dashboard.perform(context)):
                 actions.append(Node(
                     package='system_bringup',
                     executable='leader_unified_dashboard',
@@ -385,7 +395,8 @@ def generate_launch_description():
                         'follower_name': 'follower21',
                         'member_pose_topic': '/member_pose',
                         'second_follower_pose_topic': '/member_pose',
-                        'second_follower_name': 'follower22',
+                        'second_follower_name': 'scout22',
+                        'second_follower_role': 'scout',
                         'fleet_poses_topic': '/fleet/robot_poses',
                         'fleet_status_topic': '/fleet/coordination_status',
                         'collision_warning_topic': '/fleet/collision_warning',
@@ -799,7 +810,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'yolo_server_model_path',
-            default_value='yolo11n.pt',
+            default_value='best.pt',
             description='Leader role only: YOLO model path for flask_yolo_server.',
         ),
         DeclareLaunchArgument(
