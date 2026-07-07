@@ -78,7 +78,7 @@ class MapRelay(Node):
     def _on_bridged_map(self, msg: OccupancyGrid):
         self._latest_bridged = msg
         if self._relaying:
-            self._publish_latest()
+            self._publish(msg)
 
     def _on_output_seen(self, msg: OccupancyGrid):
         self._last_seen_output = msg
@@ -135,6 +135,9 @@ class MapRelay(Node):
                 throttle_duration_sec=5.0,
             )
             return
+        self._publish(source)
+
+    def _publish(self, source: OccupancyGrid):
         self._pub.publish(source)
         self.get_logger().info(
             f'Map relayed: {source.info.width}x{source.info.height} @ '

@@ -125,3 +125,29 @@ def test_new_bridged_maps_are_republished_immediately_while_relaying():
         assert published[-1].info.width == 42
     finally:
         destroy_node(node)
+
+
+def test_relay_does_not_republish_its_own_stale_output_over_fresh_bridge():
+    node = make_node()
+    try:
+        published = []
+
+        def publish(msg):
+            published.append(msg)
+            node._on_output_seen(msg)
+
+        node._pub.publish = publish
+        now = [0.0]
+        node._now_sec = lambda: now[0]
+        node.count_publishers = lambda topic: 1
+        node._on_bridged_map(grid(10))
+
+        node._check_primary()
+        now[0] += node.takeover_grace + 0.1
+        node._check_primary()
+        assert published[-1].info.width == 10
+
+        node._on_bridged_map(grid(42))
+        assert published[-1].info.width == 42
+    finally:
+        destroy_node(node)
