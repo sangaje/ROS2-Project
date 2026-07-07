@@ -39,7 +39,10 @@ def test_relay_stays_silent_while_a_primary_publisher_is_active():
     try:
         published = []
         node._pub.publish = lambda msg: published.append(msg)
-        node.count_publishers = lambda topic: 2  # us + one real primary
+        node._volatile_pub.publish = lambda msg: None
+        node.count_publishers = (
+            lambda topic: node._own_output_publishers + 1
+        )
         node._on_bridged_map(grid(10))
 
         node._check_primary()
@@ -55,7 +58,8 @@ def test_relay_takes_over_after_grace_period_once_primary_disappears():
     try:
         published = []
         node._pub.publish = lambda msg: published.append(msg)
-        node.count_publishers = lambda topic: 1  # only ourselves
+        node._volatile_pub.publish = lambda msg: None
+        node.count_publishers = lambda topic: node._own_output_publishers
         now = [0.0]
         node._now_sec = lambda: now[0]
         node._on_bridged_map(grid(20))
@@ -79,7 +83,8 @@ def test_zero_grace_takes_over_on_first_missing_primary_check():
         published = []
         node.takeover_grace = 0.0
         node._pub.publish = lambda msg: published.append(msg)
-        node.count_publishers = lambda topic: 1  # only ourselves
+        node._volatile_pub.publish = lambda msg: None
+        node.count_publishers = lambda topic: node._own_output_publishers
         node._now_sec = lambda: 0.0
         node._on_bridged_map(grid(20))
 
@@ -96,7 +101,8 @@ def test_takeover_prefers_the_primarys_own_last_output_over_the_bridged_map():
     try:
         published = []
         node._pub.publish = lambda msg: published.append(msg)
-        node.count_publishers = lambda topic: 1
+        node._volatile_pub.publish = lambda msg: None
+        node.count_publishers = lambda topic: node._own_output_publishers
         now = [0.0]
         node._now_sec = lambda: now[0]
 
@@ -116,9 +122,10 @@ def test_relay_stands_down_the_moment_a_primary_reappears():
     try:
         published = []
         node._pub.publish = lambda msg: published.append(msg)
+        node._volatile_pub.publish = lambda msg: None
         now = [0.0]
         node._now_sec = lambda: now[0]
-        node.count_publishers = lambda topic: 1
+        node.count_publishers = lambda topic: node._own_output_publishers
         node._on_bridged_map(grid(10))
 
         node._check_primary()  # primes _primary_missing_since
@@ -126,7 +133,9 @@ def test_relay_stands_down_the_moment_a_primary_reappears():
         node._check_primary()
         assert node._relaying is True
 
-        node.count_publishers = lambda topic: 2
+        node.count_publishers = (
+            lambda topic: node._own_output_publishers + 1
+        )
         node._check_primary()
         assert node._relaying is False
     finally:
@@ -138,9 +147,10 @@ def test_new_bridged_maps_are_republished_immediately_while_relaying():
     try:
         published = []
         node._pub.publish = lambda msg: published.append(msg)
+        node._volatile_pub.publish = lambda msg: None
         now = [0.0]
         node._now_sec = lambda: now[0]
-        node.count_publishers = lambda topic: 1
+        node.count_publishers = lambda topic: node._own_output_publishers
         node._on_bridged_map(grid(10))
 
         node._check_primary()  # primes _primary_missing_since
@@ -160,9 +170,10 @@ def test_relay_republishes_cached_map_while_active_for_volatile_subscribers():
     try:
         published = []
         node._pub.publish = lambda msg: published.append(msg)
+        node._volatile_pub.publish = lambda msg: None
         now = [0.0]
         node._now_sec = lambda: now[0]
-        node.count_publishers = lambda topic: 1
+        node.count_publishers = lambda topic: node._own_output_publishers
         node._on_bridged_map(grid(10))
 
         node._check_primary()  # primes _primary_missing_since
@@ -197,9 +208,10 @@ def test_relay_does_not_republish_its_own_stale_output_over_fresh_bridge():
             node._on_output_seen(msg)
 
         node._pub.publish = publish
+        node._volatile_pub.publish = lambda msg: None
         now = [0.0]
         node._now_sec = lambda: now[0]
-        node.count_publishers = lambda topic: 1
+        node.count_publishers = lambda topic: node._own_output_publishers
         node._on_bridged_map(grid(10))
 
         node._check_primary()

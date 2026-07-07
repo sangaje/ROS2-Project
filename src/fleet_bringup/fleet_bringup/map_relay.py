@@ -3,8 +3,9 @@
 Receives /map_bridge from domain_bridge with a transient-local
 subscription and stands by to republish it on /map (transient_local) only
 when nothing else is currently publishing there. While relaying, it
-periodically republishes the cached map so volatile/default subscribers
-such as plain `ros2 topic echo /map --once` can receive a fresh sample too.
+periodically republishes the cached map through both transient-local and
+volatile publishers so AMCL/Nav2 can get a latched map and plain
+`ros2 topic echo /map --once` can receive a fresh sample too.
 
 /map is meant to have exactly one live source at a time -- normally a local
 SLAM node (e.g. Cartographer) when this robot owns its own mapping. This
@@ -67,6 +68,16 @@ class MapRelay(Node):
         self._pub = self.create_publisher(
             OccupancyGrid, self.output_topic, pub_qos
         )
+        volatile_pub_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+        self._volatile_pub = self.create_publisher(
+            OccupancyGrid, self.output_topic, volatile_pub_qos
+        )
+        self._own_output_publishers = 2
         self._sub = self.create_subscription(
             OccupancyGrid, self.input_topic, self._on_bridged_map, bridge_sub_qos
         )
@@ -133,9 +144,13 @@ class MapRelay(Node):
         return self.get_clock().now().nanoseconds * 1.0e-9
 
     def _external_publisher_count(self) -> int:
-        # count_publishers() always includes our own publisher on this
-        # topic, so subtract it to learn whether anyone else is active.
-        return max(0, self.count_publishers(self.output_topic) - 1)
+        # count_publishers() includes our own publishers on this topic, so
+        # subtract them to learn whether anyone else is active.
+        return max(
+            0,
+            self.count_publishers(self.output_topic)
+            - self._own_output_publishers,
+        )
 
     def _check_primary(self):
         now = self._now_sec()
@@ -185,6 +200,7 @@ class MapRelay(Node):
 
     def _publish(self, source: OccupancyGrid):
         self._pub.publish(source)
+        self._volatile_pub.publish(source)
         self.get_logger().info(
             f'Map relayed: {source.info.width}x{source.info.height} @ '
             f'{source.info.resolution:.3f}m/cell',
