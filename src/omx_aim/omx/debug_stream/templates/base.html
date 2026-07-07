@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <title>OMX Debug</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: #0e0e0e;
+      color: #ddd;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 14px;
+    }
+    nav {
+      background: #1a1a1a;
+      padding: 0.6em 1.2em;
+      border-bottom: 1px solid #2a2a2a;
+      display: flex;
+      align-items: center;
+    }
+    nav .title {
+      font-weight: 700;
+      margin-right: 2em;
+      color: #fff;
+    }
+    nav a {
+      color: #888;
+      margin-right: 1.2em;
+      text-decoration: none;
+      cursor: pointer;
+      padding: 0.3em 0;
+    }
+    nav a:hover { color: #ccc; }
+    nav a.active {
+      color: #fff;
+      border-bottom: 2px solid #4af;
+    }
+    nav .conn {
+      margin-left: auto;
+      font-size: 0.85em;
+      color: #666;
+    }
+    nav .conn.live { color: #6c4; }
+    #content { padding: 1.2em; }
+    .tab { display: none; }
+    .tab.active { display: block; }
+
+    /* Common badges/pills */
+    .badge {
+      display: inline-block;
+      padding: 0.25em 0.7em;
+      border-radius: 4px;
+      background: #2a2a2a;
+      font-weight: 600;
+      font-size: 0.85em;
+    }
+    .badge.armed { background: #5a4; color: #000; }
+    .badge.disarmed { background: #444; color: #aaa; }
+    .state-pill {
+      display: inline-block;
+      padding: 0.2em 0.7em;
+      border-radius: 3px;
+      background: #2a3a4a;
+      color: #fff;
+      font-weight: 600;
+      letter-spacing: 0.5px;
+    }
+
+    /* Live tab */
+    .live-meta {
+      display: flex;
+      gap: 1.2em;
+      margin-bottom: 1em;
+      align-items: center;
+    }
+    .live-meta .label { color: #888; }
+    img.stream {
+      max-width: 100%;
+      height: auto;
+      display: block;
+      border-radius: 4px;
+      background: #000;
+    }
+
+    /* Ops layout */
+    .ops-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      grid-template-rows: auto auto auto;
+      gap: 1em;
+    }
+    .ops-grid .full { grid-column: 1 / -1; }
+
+    .card {
+      background: #1a1a1a;
+      border: 1px solid #2a2a2a;
+      border-radius: 4px;
+      padding: 0.9em 1em;
+    }
+    .card h3 {
+      margin: 0 0 0.6em;
+      font-size: 0.85em;
+      font-weight: 600;
+      color: #888;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    /* Summary card */
+    .summary-row {
+      display: flex;
+      gap: 1.5em;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .summary-row .item { display: flex; flex-direction: column; gap: 0.2em; }
+    .summary-row .item .label {
+      font-size: 0.75em;
+      color: #666;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .summary-row .item .val {
+      font-family: "SF Mono", Consolas, monospace;
+      font-size: 0.95em;
+    }
+
+    /* Focus panel */
+    .focus-empty { color: #555; font-style: italic; font-size: 0.9em; }
+    .focus-row {
+      display: flex;
+      gap: 1.2em;
+      align-items: baseline;
+      font-family: "SF Mono", Consolas, monospace;
+      font-size: 0.9em;
+    }
+    .focus-row .tag {
+      display: inline-block;
+      padding: 0.1em 0.5em;
+      border-radius: 3px;
+      background: #38a;
+      color: #fff;
+      font-weight: 600;
+      font-size: 0.8em;
+    }
+    .focus-row .tag.parent { background: #666; }
+    .focus-row .tag.boundary { background: #a63; }
+    .focus-row .tag.target { background: #a33; }
+    .focus-row .tag.patrol { background: #383; }
+
+    /* Queue tables */
+    table.queue {
+      width: 100%;
+      border-collapse: collapse;
+      font-family: "SF Mono", Consolas, monospace;
+      font-size: 0.85em;
+    }
+    table.queue th {
+      text-align: left;
+      color: #666;
+      font-weight: 500;
+      padding: 0.3em 0.5em;
+      border-bottom: 1px solid #2a2a2a;
+      font-size: 0.75em;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    table.queue td {
+      padding: 0.35em 0.5em;
+      border-bottom: 1px solid #222;
+    }
+    table.queue tr:last-child td { border-bottom: none; }
+    table.queue .type-boundary { color: #d84; }
+    table.queue .type-target { color: #d55; }
+    table.queue .type-patrol { color: #6c4; }
+    .queue-empty {
+      color: #555;
+      font-style: italic;
+      font-size: 0.85em;
+      padding: 0.4em 0;
+    }
+
+    /* Chart */
+    #ibvs-chart {
+      display: block;
+      width: 100%;
+      height: 200px;
+      background: #0a0a0a;
+      border-radius: 3px;
+    }
+    .chart-legend {
+      display: flex;
+      gap: 1em;
+      margin-top: 0.5em;
+      font-size: 0.8em;
+      color: #888;
+    }
+    .chart-legend .swatch {
+      display: inline-block;
+      width: 12px;
+      height: 3px;
+      vertical-align: middle;
+      margin-right: 0.4em;
+    }
+  </style>
+</head>
+<body>
+  <nav>
+    <span class="title">OMX Debug</span>
+    <a id="tab-live" class="active" onclick="show('live')">Live</a>
+    <a id="tab-ops" onclick="show('ops')">Ops</a>
+    <span id="conn" class="conn">연결 안 됨</span>
+  </nav>
+
+  <div id="content">
+    <!-- Live -->
+    <div id="live" class="tab active">
+      <div class="live-meta">
+        <span class="state-pill" id="state-pill-live">—</span>
+        <span id="armed-badge-live" class="badge disarmed">—</span>
+        <span><span class="label">FPS:</span> <span id="fps-live">—</span></span>
+        <span><span class="label">Queue:</span>
+          m<span id="qm-live">0</span> / b<span id="qb-live">0</span></span>
+        <span id="confirm-info" style="display:none">
+          <span class="label">AIM:</span> <span id="confirm-pct">0</span>%
+        </span>
+      </div>
+      <img class="stream" src="/stream.mjpg" alt="MJPEG stream">
+    </div>
+
+    <!-- Ops -->
+    <div id="ops" class="tab">
+      <div class="ops-grid">
+        <!-- Summary (full width) -->
+        <div class="card full">
+          <div class="summary-row">
+            <span class="state-pill" id="state-pill-ops">—</span>
+            <span id="armed-badge-ops" class="badge disarmed">—</span>
+            <div class="item"><span class="label">FPS</span>
+              <span class="val" id="fps-ops">—</span></div>
+            <div class="item"><span class="label">Main Q</span>
+              <span class="val" id="qm-ops">0</span></div>
+            <div class="item"><span class="label">Boundary Q</span>
+              <span class="val" id="qb-ops">0</span></div>
+            <div class="item"><span class="label">IBVS err</span>
+              <span class="val" id="err-ops">—</span></div>
+            <div class="item"><span class="label">Confirm</span>
+              <span class="val" id="confirm-ops">—</span></div>
+          </div>
+        </div>
+
+        <!-- Current focus/parent (full width) -->
+        <div class="card full">
+          <h3>Processing Now</h3>
+          <div id="focus-panel">
+            <div class="focus-empty">focus 없음 (IDLE)</div>
+          </div>
+        </div>
+
+        <!-- Main Queue -->
+        <div class="card">
+          <h3>Main Queue</h3>
+          <div id="main-queue-wrap">
+            <div class="queue-empty">비어 있음</div>
+          </div>
+        </div>
+
+        <!-- Boundary Queue -->
+        <div class="card">
+          <h3>Boundary Queue</h3>
+          <div id="boundary-queue-wrap">
+            <div class="queue-empty">비어 있음</div>
+          </div>
+        </div>
+
+        <!-- IBVS chart -->
+        <div class="card full">
+          <h3>IBVS Error (last 10s)</h3>
+          <canvas id="ibvs-chart" width="1200" height="200"></canvas>
+          <div class="chart-legend">
+            <span><span class="swatch" style="background:#4af"></span>ex</span>
+            <span><span class="swatch" style="background:#fa4"></span>ey</span>
+            <span><span class="swatch" style="background:#333"></span>deadband</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ===== Tab switching =====
+    function show(name) {
+      document.querySelectorAll('.tab').forEach(el =>
+        el.classList.remove('active'));
+      document.getElementById(name).classList.add('active');
+      document.querySelectorAll('nav a').forEach(el =>
+        el.classList.remove('active'));
+      document.getElementById('tab-' + name).classList.add('active');
+    }
+
+    // ===== State color mapping (matches OpenCV visualize) =====
+    const stateColors = {
+      idle: '#444', aiming: '#a82', scanning: '#5a5',
+      tracking: '#4a4', confirming: '#c84', firing: '#c33',
+      cooldown: '#a4a', waiting_nav: '#48a',
+    };
+
+    // ===== IBVS chart (rolling buffer + canvas draw) =====
+    const CHART_WINDOW_SEC = 10.0;
+    const chart = {
+      canvas: null,
+      ctx: null,
+      buf: [],   // {t, ex, ey}
+      deadband: [0.1, 0.1],  // fallback default
+    };
+
+    function chartInit() {
+      chart.canvas = document.getElementById('ibvs-chart');
+      chart.ctx = chart.canvas.getContext('2d');
+      // DPI 대응
+      const dpr = window.devicePixelRatio || 1;
+      const rect = chart.canvas.getBoundingClientRect();
+      chart.canvas.width = rect.width * dpr;
+      chart.canvas.height = rect.height * dpr;
+      chart.ctx.scale(dpr, dpr);
+      chart.w = rect.width;
+      chart.h = rect.height;
+    }
+
+    function chartPush(t, ex, ey) {
+      chart.buf.push({ t, ex, ey });
+      const cutoff = t - CHART_WINDOW_SEC;
+      while (chart.buf.length && chart.buf[0].t < cutoff) {
+        chart.buf.shift();
+      }
+    }
+
+    function chartDraw() {
+      const c = chart.ctx;
+      const w = chart.w, h = chart.h;
+      c.clearRect(0, 0, w, h);
+
+      // Y range: -1.0 ~ 1.0
+      const yMax = 1.0;
+      const yToPx = v => h / 2 - (v / yMax) * (h / 2 - 8);
+
+      // Deadband band
+      const [dbx, dby] = chart.deadband;
+      const dbHalf = Math.max(dbx, dby);   // 두 축 중 큰 값으로 시각화
+      c.fillStyle = '#252525';
+      c.fillRect(0, yToPx(dbHalf), w, yToPx(-dbHalf) - yToPx(dbHalf));
+
+      // Zero line
+      c.strokeStyle = '#333';
+      c.lineWidth = 1;
+      c.beginPath();
+      c.moveTo(0, h / 2);
+      c.lineTo(w, h / 2);
+      c.stroke();
+
+      // Grid: -0.5, 0.5
+      c.strokeStyle = '#1e1e1e';
+      [-0.5, 0.5].forEach(v => {
+        c.beginPath();
+        c.moveTo(0, yToPx(v));
+        c.lineTo(w, yToPx(v));
+        c.stroke();
+      });
+
+      if (chart.buf.length < 2) return;
+
+      // X range: 최근 CHART_WINDOW_SEC 초
+      const tNow = chart.buf[chart.buf.length - 1].t;
+      const tStart = tNow - CHART_WINDOW_SEC;
+      const xToPx = t => ((t - tStart) / CHART_WINDOW_SEC) * w;
+
+      // ex line (blue)
+      c.strokeStyle = '#4af';
+      c.lineWidth = 1.5;
+      c.beginPath();
+      chart.buf.forEach((p, i) => {
+        const x = xToPx(p.t), y = yToPx(p.ex);
+        if (i === 0) c.moveTo(x, y); else c.lineTo(x, y);
+      });
+      c.stroke();
+
+      // ey line (orange)
+      c.strokeStyle = '#fa4';
+      c.lineWidth = 1.5;
+      c.beginPath();
+      chart.buf.forEach((p, i) => {
+        const x = xToPx(p.t), y = yToPx(p.ey);
+        if (i === 0) c.moveTo(x, y); else c.lineTo(x, y);
+      });
+      c.stroke();
+
+      // Y axis labels
+      c.fillStyle = '#555';
+      c.font = '10px sans-serif';
+      c.textAlign = 'left';
+      c.fillText('+1.0', 4, 12);
+      c.fillText('0', 4, h / 2 + 4);
+      c.fillText('-1.0', 4, h - 4);
+    }
+
+    // ===== Queue rendering =====
+    function renderQueue(entries, wrapId) {
+      const wrap = document.getElementById(wrapId);
+      if (!entries || entries.length === 0) {
+        wrap.innerHTML = '<div class="queue-empty">비어 있음</div>';
+        return;
+      }
+      const rows = entries.map(e => {
+        const cls = 'type-' + e.type.toLowerCase();
+        const coord = e.coord.map(v => v.toFixed(2)).join(', ');
+        return `<tr>
+          <td>${e.priority}</td>
+          <td class="${cls}">${e.type}</td>
+          <td>${coord}</td>
+          <td>${e.distance.toFixed(2)}</td>
+        </tr>`;
+      }).join('');
+      wrap.innerHTML = `
+        <table class="queue">
+          <thead><tr>
+            <th>Pri</th><th>Type</th><th>Coord (x,y,z)</th><th>Dist</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>`;
+    }
+
+    function renderFocus(state) {
+      const panel = document.getElementById('focus-panel');
+      const parts = [];
+      if (state.current_parent) {
+        const p = state.current_parent;
+        const cls = 'tag ' + p.type.toLowerCase();
+        parts.push(`<div class="focus-row">
+          <span class="${cls}">PARENT</span>
+          <span>${p.type}</span>
+          <span>coord (${p.coord.map(v=>v.toFixed(2)).join(', ')})</span>
+          <span>dist ${p.distance.toFixed(2)}m</span>
+        </div>`);
+      }
+      if (state.current_focus) {
+        const f = state.current_focus;
+        const cls = 'tag ' + f.type.toLowerCase();
+        parts.push(`<div class="focus-row">
+          <span class="${cls}">FOCUS</span>
+          <span>${f.type}</span>
+          <span>coord (${f.coord.map(v=>v.toFixed(2)).join(', ')})</span>
+          <span>dist ${f.distance.toFixed(2)}m</span>
+        </div>`);
+      }
+      if (parts.length === 0) {
+        panel.innerHTML = '<div class="focus-empty">focus 없음 (IDLE)</div>';
+      } else {
+        panel.innerHTML = parts.join('');
+      }
+    }
+
+    // ===== State application =====
+    function applyState(s) {
+      const st = (s.state || '').toLowerCase();
+      const armed = !!s.armed;
+      const armedTxt = armed ? 'ARMED' : 'DISARMED';
+      const armedCls = 'badge ' + (armed ? 'armed' : 'disarmed');
+      const stateColor = stateColors[st] || '#333';
+      const stateTxt = st.toUpperCase() || '—';
+      const fps = (s.fps ?? 0).toFixed(1);
+      const qm = s.main_queue_size ?? 0;
+      const qb = s.boundary_queue_size ?? 0;
+
+      // Live tab
+      const spL = document.getElementById('state-pill-live');
+      spL.textContent = stateTxt;
+      spL.style.background = stateColor;
+      const abL = document.getElementById('armed-badge-live');
+      abL.textContent = armedTxt;
+      abL.className = armedCls;
+      document.getElementById('fps-live').textContent = fps;
+      document.getElementById('qm-live').textContent = qm;
+      document.getElementById('qb-live').textContent = qb;
+      const ci = document.getElementById('confirm-info');
+      const cp = s.confirm_progress ?? 0;
+      if (cp > 0) {
+        ci.style.display = '';
+        document.getElementById('confirm-pct').textContent =
+          (cp * 100).toFixed(0);
+      } else {
+        ci.style.display = 'none';
+      }
+
+      // Ops tab summary
+      const spO = document.getElementById('state-pill-ops');
+      spO.textContent = stateTxt;
+      spO.style.background = stateColor;
+      const abO = document.getElementById('armed-badge-ops');
+      abO.textContent = armedTxt;
+      abO.className = armedCls;
+      document.getElementById('fps-ops').textContent = fps;
+      document.getElementById('qm-ops').textContent = qm;
+      document.getElementById('qb-ops').textContent = qb;
+      const err = s.ibvs_error;
+      document.getElementById('err-ops').textContent =
+        err ? `${err[0].toFixed(2)}, ${err[1].toFixed(2)}` : '—';
+      document.getElementById('confirm-ops').textContent =
+        cp > 0 ? (cp * 100).toFixed(0) + '%' : '—';
+
+      // Focus + queues
+      renderFocus(s);
+      renderQueue(s.main_queue, 'main-queue-wrap');
+      renderQueue(s.boundary_queue, 'boundary-queue-wrap');
+
+      // Chart
+      if (s.deadband) chart.deadband = s.deadband;
+      if (err) {
+        const t = s.ts || (Date.now() / 1000);
+        chartPush(t, err[0], err[1]);
+      } else if (chart.buf.length > 0) {
+        // 검출 끊긴 것도 시각적으로 보이게 마지막 시각으로 0 push
+        const t = s.ts || (Date.now() / 1000);
+        chartPush(t, 0, 0);
+      }
+      chartDraw();
+    }
+
+    // ===== SSE =====
+    const conn = document.getElementById('conn');
+    const es = new EventSource('/events');
+    es.onopen = () => {
+      conn.textContent = '● live';
+      conn.className = 'conn live';
+    };
+    es.onerror = () => {
+      conn.textContent = '재연결 중...';
+      conn.className = 'conn';
+    };
+    es.onmessage = (e) => {
+      try {
+        applyState(JSON.parse(e.data));
+      } catch (err) {
+        console.warn('SSE parse error:', err);
+      }
+    };
+
+    // ===== Init =====
+    window.addEventListener('load', () => {
+      chartInit();
+      chartDraw();
+    });
+    window.addEventListener('resize', () => {
+      chartInit();
+      chartDraw();
+    });
+  </script>
+</body>
+</html>

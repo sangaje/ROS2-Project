@@ -1,0 +1,31 @@
+name: scout_to_waffle_bridge
+
+# Burger 의 DOMAIN_ID (팀원에게 확인 필요!)
+from_domain: 22   # 예시. 팀원이 쓰는 값
+to_domain: 20     # 우리 시스템
+
+topics:
+  /scout/map:
+    type: nav_msgs/msg/OccupancyGrid
+    qos:
+      reliability: reliable
+      durability: transient_local   # ← 중요! map 은 latched
+
+  /scout/risk_map:
+    type: nav_msgs/msg/OccupancyGrid
+    qos:
+      reliability: reliable
+      durability: transient_local
+
+  # ----- Scout Watchdog 용 (신규) -----
+  /scout/heartbeat:
+    type: std_msgs/msg/Empty
+    qos:
+      reliability: best_effort      # heartbeat 는 빠지면 다음 거 받으면 됨
+      durability: volatile
+
+  /scout/pose:
+    type: geometry_msgs/msg/PoseStamped
+    qos:
+      reliability: reliable
+      durability: volatile          # 최신만 필요, latched X

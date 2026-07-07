@@ -1,0 +1,203 @@
+# OMX 통합 설정 파일
+#
+# 이 파일을 수정해서 캘리브레이션, 게인, 한계 등을 조정합니다.
+# 코드 수정 불필요.
+#
+# 환경별로 여러 파일 사용 가능:
+#   configs/desktop.yaml  (개발용)
+#   configs/raspi.yaml    (와플 통합용)
+
+# ===========================================================
+# 모터 통신 / 속도
+# ===========================================================
+motor:
+  port: /dev/omx_follower
+  profile_velocity: 100        # 0 = 최대속도(위험). 30 = 매우 천천히
+  profile_acceleration: 10
+
+  # elbow_flex PID (omx_follower 기본값)
+  elbow_p_gain: 1500
+  elbow_i_gain: 0
+  elbow_d_gain: 600
+
+
+# ===========================================================
+# 캘리브레이션 (실측 후 조정)
+# ===========================================================
+
+calibration:
+  # 각 joint 가 0 rad 일 때의 raw tick.
+  # `--measure-home` 모드로 측정한 값을 여기 박아넣으세요.
+  home:
+    shoulder_pan:  2048
+    shoulder_lift: 1055
+    elbow_flex:    3050
+    wrist_flex:    2048
+    # wrist_roll:    2024
+    # gripper:       3217
+
+  # 회전 방향 부호. 검증 후 반대로 돌면 -1 로 뒤집기.
+  sign:
+    shoulder_pan:  1
+    shoulder_lift: -1
+    elbow_flex:    1
+    wrist_flex:    1
+    # wrist_roll:    1
+
+
+# ===========================================================
+# 안전 한계
+# ===========================================================
+safety:
+  # 관절별 안전 각도 범위 (도 단위). IK 결과가 이 범위 밖이면 clamp.
+  angle_limits_deg:
+    shoulder_pan:  [-180,  180]
+    shoulder_lift: [-30,  30]
+    elbow_flex:    [-90,  90]
+    wrist_flex:    [-90,  90]
+    wrist_roll:    [-180, 180]
+
+  # IBVS 한 step 당 최대 변화 (도)
+  max_step_deg: 2.0
+
+  # 한 번에 이 tick 이상 움직이는 명령은 사용자 확인 요구
+  large_delta_threshold_tick: 500
+
+
+# ===========================================================
+# 키보드 teleop
+# ===========================================================
+keyboard:
+  arm_step: 13              # 키 한 번에 raw tick (joint 1~5)
+  gripper_step: 25          # 키 한 번에 raw tick (gripper)
+  command_interval: 0.02    # 명령 간 최소 간격 (초)
+
+
+# ===========================================================
+# IBVS (visual servoing)
+# ===========================================================
+ibvs:
+  camera_index: 0
+  kp_yaw:   0.05            # 비례 게인 (rad / normalized error)
+  kp_pitch: 0.03
+  sign_vs_x: -1             # 카메라 마운팅에 따른 부호
+  sign_vs_y: -1
+  deadband_x:  0.03        # 화면 폭의 3%
+  deadband_y:  0.09         # ← 신규 (위아래 3배 여유)
+  control_hz:  25.0         # 제어 주기
+  # ----- 움직이는 표적 추적 (Phase B) -----
+  # 0 = 순수 P (정적 표적, 기존 동작과 동일)
+  # 권장 시작값: kp * 0.1 정도부터 점진적으로
+  kd_yaw:   0.01
+  kd_pitch: 0.01
+
+  # EMA 필터 (de/dt 노이즈 완화)
+  # 1.0 = 필터 없음, 0.3~0.5 = 권장, 0.1 = 매우 부드러움
+  derivative_ema_alpha: 0.4
+
+  # 미분 상태 자동 reset 기준 (TRACKING 재진입 케이스)
+  derivative_reset_gap_sec: 0.5
+
+yolo:
+  model_path: ../models/best.pt    # 학습 모델 쓸 때는 ./models/best.pt 같은 경로로 교체
+  target_class: 1           # 67=cell phone, 39=bottle, 41=cup, 0=person, 47=apple
+  conf_threshold: 0.5        # 0.0~1.0. 낮을수록 더 많이 검출 (오검출 늘어남)
+  imgsz: 640                 # 추론 해상도. 320 = 빠름, 640 = 기본, 1280 = 정확
+
+# ===========================================================
+# 격발 & 상태 머신
+# ===========================================================
+fire:
+  # 격발 직전 확인 (CONFIRMING 상태)
+  hold_time_sec: 0.5            # deadband 안 유지 시간
+  confirm_deadband_scale: 1.0   # IBVS deadband 의 N배 (1.0 = 같음, 더 좁게 하려면 0.5)
+  aim_settle_sec: 0.7
+
+  # 격발 펄스 동안 조준 유지 시간 (fire_node 의 fire_duration_sec 와 일치 권장)
+  # 이 시간 동안 OMX 는 조준 자세를 유지하고, 끝나면 home 으로 복귀.
+  # cooldown_sec 보다 작아야 의미 있음.
+  fire_pulse_sec: 1.5
+
+  # 격발 동작 (gripper 시뮬레이션)
+  gripper_close_pos: 1000       # 격발 시 gripper raw tick
+  gripper_open_pos: 3217        # 격발 후 위치 (보통 home 값)
+  gripper_close_duration: 0.3   # 닫기 동작 시간
+  gripper_open_duration: 0.3    # 열기 동작 시간
+
+  # 격발 후 cooldown (FIRING 진입 후 총 휴지 시간)
+  # 흐름: fire_pulse_sec 동안 조준 유지 → home 이동 → 나머지 시간 휴지 → IDLE
+  cooldown_sec: 3.0
+  lost_timeout_sec: 1.5
+# ===========================================================
+# Auto-track (자율 검출)
+# ===========================================================
+autotrack:
+  # IDLE 상태에서 카메라가 표적 검출 시 자율 추적 시작?
+  # 안전: 기본 비활성, /omx/arm_enable 또는 'a' 키로 활성화
+  default_armed: false
+  
+  # 중복 표적 방지: 처리한 표적 좌표와 비교
+  duplicate_threshold_m: 0.5    # 이 거리 안 표적은 중복 간주
+
+# 기존 config.yaml 끝에 추가할 patrol 섹션
+ 
+# ===========================================================
+# 정찰 + 우선순위 큐
+# ===========================================================
+patrol:
+  scan_timeout_sec: 2.0
+  target_scan_timeout_sec: 5.0
+  boundary_scan_timeout_sec: 1.0
+  max_queue_size: 20
+  duplicate_threshold_m: 0.3
+  los_check_enabled: true
+  los_cost_threshold: 80
+  costmap_topic: "/global_costmap/costmap"
+  
+  publish_queue_markers: true
+  marker_lifetime_sec: 2.0
+
+# ===========================================================
+# 와플 (Nav2 클라이언트)
+# ===========================================================
+waffle:
+  frame: "map"
+  nav_action_name: "/navigate_to_pose"
+  # H2 부터 사용 예정 (지금은 빈자리)
+  # stand_off_distance: 1.0
+  # omx_timeout_sec: 30.0
+
+# ===========================================================
+# CHECK_VIEW 판정 + VIEW_POSE v1 계산 (H2)
+# ===========================================================
+view_pose:
+  omx_yaw_limit_deg: 180.0
+  min_distance_m: 0.3
+  max_distance_m: 3.0
+  stand_off_distance: 1.5
+  candidate_count: 12
+  yaw_next_weight: 0.0
+
+# ===========================================================
+# BOUNDARY 자동 생성 (H4 에서 활성화 예정)
+# ===========================================================
+boundary:
+  enable_during_target: false    # 런타임 토픽으로 토글 가능
+  enable_during_patrol: true
+  
+  fan_half_angle_deg: 45.0       # ± 이 각도 (좌우 합 90° fan)
+  angle_step_deg: 22.5
+  distance_m: 1.5
+  z: 0.00
+  period_sec: 2.0
+  max_queue_size: 10
+  ttl_sec: 10.0
+
+amcl:
+  ros__parameters:
+    set_initial_pose: true
+    initial_pose:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      yaw: 0.0

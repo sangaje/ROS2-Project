@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>omx_aim</name>
+  <version>0.1.0</version>
+  <description>OpenManipulator-X 기반 자동 조준 시스템. TurtleBot3 Burger(정찰) + Waffle(사격) + OMX 4-DOF 팔.</description>
+  <maintainer email="dladyddn133@gmail.com">dladyddn133-creator</maintainer>
+  <license>TODO: License declaration</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>action_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
+  <exec_depend>nav2_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>tf2_geometry_msgs</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+
+  <!--
+    pip 전용 의존성 (rosdep 키 없음, venv "system site packages" 옵션으로 설치):
+    ultralytics, dynamixel-sdk, lerobot, Jetson.GPIO, flask
+    자세한 설치 절차는 SETUP.md 참고.
+  -->
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
