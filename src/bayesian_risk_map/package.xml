@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>bayesian_risk_map</name>
+  <version>0.7.0</version>
+  <description>Room-aware Bayesian risk map for TurtleBot3 using YOLO, Cartographer map, TF, and camera visibility. No cv_bridge dependency.</description>
+  <maintainer email="qhals8380@gmail.com">bomin</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>rcl_interfaces</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>rosgraph_msgs</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>tf2_msgs</exec_depend>
+  <exec_depend>domain_bridge</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+  <exec_depend>rqt_image_view</exec_depend>
+  <exec_depend>turtlebot3_teleop</exec_depend>
+  <exec_depend>v4l2_camera</exec_depend>
+  <exec_depend>cartographer_ros</exec_depend>
+  <exec_depend>turtlebot3_cartographer</exec_depend>
+  <exec_depend>turtlebot3_bringup</exec_depend>
+  <exec_depend>fleet_bringup</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

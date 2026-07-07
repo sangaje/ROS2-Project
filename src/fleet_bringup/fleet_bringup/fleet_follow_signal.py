@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import sys
+import time
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description='Send a short Burger follow-state command on the selected fleet domain.'
+    )
+    parser.add_argument(
+        'command',
+        choices=['follow', 'resume', 'pause', 'stop', 'toggle'],
+    )
+    parser.add_argument('--domain', default=None)
+    args = parser.parse_args(sys.argv[1:])
+
+    from fleet_bringup.launch_utils import validate_shell_environment
+    validate_shell_environment(args.domain)
+    domain = os.environ['ROS_DOMAIN_ID']
+
+    import rclpy
+    from rclpy.node import Node
+    from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+    from std_msgs.msg import String
+
+    rclpy.init()
+    node = Node('fleet_follow_signal')
+    qos = QoSProfile(
+        depth=1,
+        reliability=ReliabilityPolicy.RELIABLE,
+        durability=DurabilityPolicy.TRANSIENT_LOCAL,
+    )
+    pub = node.create_publisher(String, '/fleet/follow_command', qos)
+
+    deadline = time.monotonic() + 3.0
+    while pub.get_subscription_count() == 0 and time.monotonic() < deadline:
+        rclpy.spin_once(node, timeout_sec=0.1)
+
+    msg = String()
+    msg.data = args.command.upper()
+    for _ in range(3):
+        pub.publish(msg)
+        rclpy.spin_once(node, timeout_sec=0.15)
+
+    matched = pub.get_subscription_count()
+    print(
+        f'follow_command={msg.data} domain={domain} '
+        f'matched_subscriptions={matched}'
+    )
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

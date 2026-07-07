@@ -41,6 +41,7 @@ setup(
             'fake_risk_map = omx_aim.fake_risk_map:main',
             'fake_static_map = omx_aim.fake_static_map:main',
             'ik_teleop = omx_aim.ik_teleop:main',
+            'unified_dashboard = omx_aim.unified_dashboard:main',
         ],
     },
 )

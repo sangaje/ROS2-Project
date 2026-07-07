@@ -19,10 +19,12 @@
   <exec_depend>tf2_geometry_msgs</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
   <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>python3-flask</exec_depend>
+  <exec_depend>system_bringup</exec_depend>
 
   <!--
     pip 전용 의존성 (rosdep 키 없음, venv "system site packages" 옵션으로 설치):
-    ultralytics, dynamixel-sdk, lerobot, Jetson.GPIO, flask
+    ultralytics, dynamixel-sdk, lerobot, Jetson.GPIO
     자세한 설치 절차는 SETUP.md 참고.
   -->
 

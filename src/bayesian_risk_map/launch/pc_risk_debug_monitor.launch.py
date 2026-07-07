@@ -1,0 +1,73 @@
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, ExecuteProcess
+from launch.conditions import IfCondition
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PathJoinSubstitution
+from launch_ros.actions import Node
+from launch_ros.substitutions import FindPackageShare
+from ament_index_python.packages import get_package_share_directory
+from fleet_bringup.launch_utils import dds_launch_environment
+import os
+
+
+def generate_launch_description():
+    pkg_share = get_package_share_directory('bayesian_risk_map')
+    rviz_config = os.path.join(pkg_share, 'rviz', 'slam_risk_live.rviz')
+    rviz_clean = PathJoinSubstitution([
+        FindPackageShare('bayesian_risk_map'),
+        'scripts',
+        'rviz2_clean_env.bash',
+    ])
+
+    return LaunchDescription([
+        DeclareLaunchArgument('start_rviz', default_value='true'),
+        DeclareLaunchArgument('start_opencv_debug_view', default_value='false'),
+        DeclareLaunchArgument('start_rqt_debug_view', default_value='false'),
+        DeclareLaunchArgument('domain_id', default_value=EnvironmentVariable('ROS_DOMAIN_ID')),
+        DeclareLaunchArgument('use_sim_time', default_value='false'),
+        DeclareLaunchArgument('rviz_config', default_value=rviz_config),
+        DeclareLaunchArgument('debug_image_topic', default_value='/risk/debug_yolo_image/compressed'),
+        DeclareLaunchArgument('image_type', default_value='auto'),
+        DeclareLaunchArgument('resize_width', default_value='960'),
+        DeclareLaunchArgument('grid_topics', default_value=''),
+
+        *dds_launch_environment(LaunchConfiguration('domain_id')),
+
+        ExecuteProcess(
+            condition=IfCondition(LaunchConfiguration('start_rviz')),
+            cmd=[
+                rviz_clean,
+                '-d',
+                LaunchConfiguration('rviz_config'),
+                '--ros-args',
+                '-r',
+                '__node:=rviz2_risk_map',
+                '-p',
+                ['use_sim_time:=', LaunchConfiguration('use_sim_time')],
+            ],
+            name='rviz2_risk_map_clean_env',
+            output='screen',
+        ),
+
+        Node(
+            condition=IfCondition(LaunchConfiguration('start_opencv_debug_view')),
+            package='bayesian_risk_map',
+            executable='opencv_yolo_viewer_node',
+            name='opencv_yolo_viewer_node',
+            output='screen',
+            parameters=[{
+                'image_topic': LaunchConfiguration('debug_image_topic'),
+                'image_type': LaunchConfiguration('image_type'),
+                'resize_width': LaunchConfiguration('resize_width'),
+                'grid_topics': LaunchConfiguration('grid_topics'),
+            }],
+        ),
+
+        Node(
+            condition=IfCondition(LaunchConfiguration('start_rqt_debug_view')),
+            package='rqt_image_view',
+            executable='rqt_image_view',
+            name='rqt_yolo_debug_view',
+            output='screen',
+            arguments=[LaunchConfiguration('debug_image_topic')],
+        ),
+    ])

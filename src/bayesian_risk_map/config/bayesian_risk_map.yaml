@@ -1,0 +1,148 @@
+bayesian_risk_map_node:
+  ros__parameters:
+    # Topics / frames
+    map_topic: "/map"
+    map_qos_durability: "volatile"
+    image_topic: "/camera/image_raw"
+    map_frame: "map"
+    base_frame: "base_link"
+    # tf: read map->base_frame from TF. topic: read PoseStamped from pose_topic.
+    pose_source: "tf"
+    pose_topic: "/leader_pose"
+    pose_topic_stale_sec: 2.5
+    use_sim_time: false
+    update_rate_hz: 2.0
+    tf_timeout_sec: 0.25
+    pose_history_duration_sec: 5.0
+    pose_history_max_error_sec: 0.75
+
+    # YOLO
+    # opencv_camera: open camera directly with cv2.VideoCapture; no ROS image traffic.
+    # local_yolo: subscribe ROS Image and run YOLO in this node.
+    # flask_topic: do not subscribe ROS Image; consume compact JSON detections from Flask bridge.
+    detection_source: "local_yolo"
+    external_detection_topic: "/risk/yolo_detections"
+    external_person_only: true
+    enable_yolo: true
+    model_path: "yolo11n.pt"
+    device: "cpu"
+    conf_threshold: 0.25
+    yolo_imgsz: 320
+    yolo_max_rate_hz: 1.0
+    detection_timeout_sec: 2.0
+    detection_reuse_max_distance_m: 0.50
+    external_detection_max_count: 64
+    opencv_camera_device: "/dev/video0"
+    opencv_camera_width: 640
+    opencv_camera_height: 480
+    opencv_camera_fps: 15.0
+    opencv_camera_fourcc: "MJPG"
+
+    # Fake detection debug
+    enable_fake_detection: false
+    fake_detection_interval_sec: 2.0
+    fake_bearing_deg: 0.0
+    fake_range_m: 2.0
+    fake_confidence: 0.9
+
+    # Camera prior
+    camera_hfov_deg: 62.0
+    camera_vfov_deg: 49.5
+    real_person_height_m: 1.70
+    min_range_m: 0.5
+    max_range_m: 5.0
+
+    # Positive detection candidate model
+    bearing_sigma_deg: 8.0
+    angular_sample_step_deg: 1.0
+    range_sigma_m: 0.75
+    use_bbox_range_prior: true
+    source_min_value: 0.03
+    positive_memory_alpha: 0.85
+
+    # Multi-view bearing consensus.
+    # Small/printed people make bbox-height distance unreliable, so range is ignored by
+    # default. A person direction is stored at each robot viewpoint, and risk appears
+    # where rays from at least two spatially distinct viewpoints agree.
+    positive_projection_mode: "bearing_consensus"
+    bearing_consensus_sigma_deg: 6.0
+    bearing_consensus_angle_step_deg: 1.0
+    bearing_viewpoint_min_baseline_m: 0.20
+    bearing_min_viewpoints: 2
+    bearing_support_threshold: 0.12
+    bearing_consensus_gain: 1.0
+    # A single view paints a low-confidence directional corridor immediately.
+    # Multi-view overlap still dominates and localizes the final high-risk area.
+    bearing_single_view_gain: 0.28
+    bearing_pair_min_vote: 0.02
+    # Printed/small detections can have confidence near 0.20. Keep the final
+    # directional seed above the geodesic halo cutoff in that case.
+    bearing_halo_seed_threshold: 0.03
+    bearing_additional_view_bonus: 0.15
+    bearing_use_bbox_range_prior: false
+    bearing_range_sigma_m: 2.0
+    bearing_observation_max_age_sec: 120.0
+    bearing_max_viewpoints: 24
+    bearing_max_observations_per_viewpoint: 8
+    bearing_same_view_angle_merge_deg: 2.0
+
+    # Real-time Bayesian person memory.
+    # Detection adds cell-wise log-odds. A missing detection reduces evidence only
+    # inside the current camera FOV, after the grace time; out-of-view cells persist.
+    enable_person_probability_map: true
+    bearing_consensus_accumulate: true
+    person_bayes_prior_probability: 0.01
+    person_bayes_hit_log_odds_gain: 8.0
+    person_bayes_candidate_power: 0.5
+    person_bayes_miss_log_odds_per_sec: 0.15
+    person_bayes_decay_grace_sec: 1.5
+    person_bayes_max_probability: 0.995
+    person_bayes_max_update_dt_sec: 1.0
+    person_prob_viz_threshold: 0.01
+    person_prob_marker_max_count: 1000
+    person_prob_estimate_min_views: 2
+
+    # Risk halo: bounded, wall-aware, not global diffusion
+    source_halo_radius_m: 0.75
+    source_halo_sigma_m: 0.35
+    source_halo_seed_threshold: 0.12
+    source_halo_top_k: 80
+    source_halo_seed_separation_m: 0.08
+    risk_source_mode: "evidence_points"
+    evidence_source_gain: 0.65
+    evidence_distribution_radius_m: 0.45
+    evidence_distribution_sigma_m: 0.22
+
+    # Room / region inference
+    enable_room_probability: true
+    room_top_k: 3
+    room_min_score: 0.02
+
+    # Empty observation is stored separately, not subtracted from risk
+    enable_empty_observation_map: true
+    enable_visibility_tracking: true
+    visibility_num_rays: 96
+    observed_empty_alpha: 0.20
+    diagnostic_publish_rate_hz: 1.0
+
+    # Occupancy policy
+    allow_unknown: false
+    free_threshold: 30
+    occupied_threshold: 65
+
+    # Clear
+    clear_radius_m: 0.6
+
+    # Debug images
+    publish_overlay: true
+    publish_debug_image: true
+    debug_show_opencv: false
+    debug_save_images: false
+    debug_image_dir: "/tmp/bayesian_risk_map_debug"
+    debug_image_rate_hz: 1.0
+    debug_log_image_status: true
+    publish_diagnostic_maps: false
+
+    # Persistence
+    preserve_risk_on_map_resize: true
+    publish_yolo_debug_even_without_detection: true
