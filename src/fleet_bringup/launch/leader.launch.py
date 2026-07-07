@@ -125,21 +125,19 @@ def generate_launch_description():
             )
 
             auto = launch_bool(auto_localize.perform(context))
+            initial_pose = {
+                'x': float(initial_x.perform(context)),
+                'y': float(initial_y.perform(context)),
+                'z': 0.0,
+                'yaw': float(initial_yaw.perform(context)),
+            }
             pose_override = Path(tempfile.gettempdir()) / (
                 f'leader_{domain}_initial_pose.yaml'
             )
-            if auto:
-                amcl_overrides = {'set_initial_pose': False}
-            else:
-                amcl_overrides = {
-                    'set_initial_pose': True,
-                    'initial_pose': {
-                        'x': float(initial_x.perform(context)),
-                        'y': float(initial_y.perform(context)),
-                        'z': 0.0,
-                        'yaw': float(initial_yaw.perform(context)),
-                    },
-                }
+            amcl_overrides = {
+                'set_initial_pose': True,
+                'initial_pose': initial_pose,
+            }
             pose_override.write_text(yaml.safe_dump({
                 'amcl': {'ros__parameters': amcl_overrides},
             }), encoding='utf-8')
@@ -162,7 +160,10 @@ def generate_launch_description():
                 ' | scan_topic=', scan_topic_value,
                 ' | tf_broadcast=true',
                 ' | initial_pose_mode=',
-                'global_localize' if auto else 'fixed_seed',
+                'seeded_global_localize' if auto else 'fixed_seed',
+                ' | x=', str(initial_pose['x']),
+                ' | y=', str(initial_pose['y']),
+                ' | yaw=', str(initial_pose['yaw']),
             ])
             localization_lifecycle = Node(
                 package='nav2_lifecycle_manager',
@@ -536,9 +537,8 @@ def generate_launch_description():
             choices=['true', 'false'],
             description=(
                 'Only used when enable_cartographer:=false. Let AMCL '
-                'search the whole received map via '
-                'reinitialize_global_localization instead of trusting '
-                'leader_initial_x/y/yaw.'
+                'start from leader_initial_x/y/yaw, then widen/refine via '
+                'reinitialize_global_localization.'
             ),
         ),
         DeclareLaunchArgument(

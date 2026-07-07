@@ -149,21 +149,16 @@ def generate_launch_description():
             pose_override = Path(tempfile.gettempdir()) / (
                 f'member_{member_domain}_initial_pose.yaml'
             )
-            if auto:
-                # Let AMCL search the whole map instead of trusting a fixed
-                # seed; global_localize_kickstart triggers the actual search
-                # once the localization stack is active.
-                amcl_overrides = {'set_initial_pose': False}
-            else:
-                amcl_overrides = {
-                    'set_initial_pose': True,
-                    'initial_pose': {
-                        'x': float(initial_x.perform(context)),
-                        'y': float(initial_y.perform(context)),
-                        'z': 0.0,
-                        'yaw': float(initial_yaw.perform(context)),
-                    },
-                }
+            initial_pose = {
+                'x': float(initial_x.perform(context)),
+                'y': float(initial_y.perform(context)),
+                'z': 0.0,
+                'yaw': float(initial_yaw.perform(context)),
+            }
+            amcl_overrides = {
+                'set_initial_pose': True,
+                'initial_pose': initial_pose,
+            }
             pose_override.write_text(yaml.safe_dump({
                 'amcl': {'ros__parameters': amcl_overrides},
             }), encoding='utf-8')
@@ -186,6 +181,20 @@ def generate_launch_description():
                 parameters=[nav2_params],
                 env=process_env,
             )
+            localization_config_log = LogInfo(msg=[
+                'AMCL_INITIAL_POSE_CONFIG | robot=member',
+                ' | role=member',
+                ' | global_frame=map',
+                ' | odom_frame=odom',
+                ' | base_frame=base_footprint',
+                ' | scan_topic=/scan',
+                ' | tf_broadcast=true',
+                ' | mode=',
+                'seeded_global_localize' if auto else 'fixed_seed',
+                ' | x=', str(initial_pose['x']),
+                ' | y=', str(initial_pose['y']),
+                ' | yaw=', str(initial_pose['yaw']),
+            ])
 
         kickstart_node = None
         if amcl_enabled and auto:
@@ -235,7 +244,9 @@ def generate_launch_description():
             TimerAction(period=relay_t, actions=[map_relay, member_pose]),
         ]
         if amcl is not None:
-            actions.append(TimerAction(period=amcl_t, actions=[amcl]))
+            actions.append(TimerAction(
+                period=amcl_t, actions=[localization_config_log, amcl],
+            ))
         if localization_lifecycle is not None:
             actions.append(TimerAction(
                 period=localization_t, actions=[localization_lifecycle],
@@ -306,9 +317,9 @@ def generate_launch_description():
             choices=['true', 'false'],
             description=(
                 'Let AMCL search the whole map via '
-                'reinitialize_global_localization instead of trusting '
-                'member_initial_x/y/yaw. Set false to fall back to the '
-                'fixed seed.'
+                'reinitialize_global_localization after seeding from '
+                'member_initial_x/y/yaw. Set false to use only the fixed '
+                'seed.'
             ),
         ),
         *dds_launch_environment(domain_id),
