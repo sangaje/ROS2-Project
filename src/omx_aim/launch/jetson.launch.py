@@ -40,6 +40,9 @@ def launch_setup(context, *args, **kwargs):
         LaunchConfiguration('start_patrol_planner').perform(context)
     )
     debug_port = LaunchConfiguration('debug_port').perform(context)
+    yolo_node_delay = float(
+        LaunchConfiguration('yolo_node_delay_sec').perform(context)
+    )
     patrol_delay = float(
         LaunchConfiguration('patrol_planner_delay_sec').perform(context)
     )
@@ -68,18 +71,19 @@ def launch_setup(context, *args, **kwargs):
             }.items(),
         ))
 
+    yolo_node = Node(
+        package='omx_aim', executable='yolo_node', name='omx_yolo_node',
+        output='screen',
+        arguments=yolo_args,
+        parameters=[{
+            'waffle_frame_candidates': ['base_link', 'base_footprint'],
+        }],
+    )
+
     actions.extend([
         Node(
             package='omx_aim', executable='waffle_node', name='waffle_node',
             output='screen',
-        ),
-        Node(
-            package='omx_aim', executable='yolo_node', name='omx_yolo_node',
-            output='screen',
-            arguments=yolo_args,
-            parameters=[{
-                'waffle_frame_candidates': ['base_link', 'base_footprint'],
-            }],
         ),
         Node(
             package='omx_aim', executable='fire_node', name='fire_node',
@@ -94,6 +98,20 @@ def launch_setup(context, *args, **kwargs):
             output='screen',
         ),
     ])
+    if yolo_node_delay > 0.0:
+        actions.append(TimerAction(
+            period=yolo_node_delay,
+            actions=[
+                LogInfo(msg=[
+                    'OMX_AIM | starting omx_yolo_node after ',
+                    str(yolo_node_delay),
+                    's stagger to avoid Jetson startup contention',
+                ]),
+                yolo_node,
+            ],
+        ))
+    else:
+        actions.append(yolo_node)
 
     patrol_planner = Node(
         package='omx_aim', executable='patrol_planner', name='patrol_planner',
@@ -144,6 +162,9 @@ def generate_launch_description():
             'start_patrol_planner', default_value='true',
             choices=['true', 'false'],
             description='Start patrol_planner on the leader after the risk bridge grace period.'),
+        DeclareLaunchArgument(
+            'yolo_node_delay_sec', default_value='14.0',
+            description='Delay heavy OMX YOLO/camera/model startup on constrained Jetson hardware.'),
         DeclareLaunchArgument(
             'patrol_planner_delay_sec', default_value='6.0',
             description='Small grace before starting patrol_planner.'),

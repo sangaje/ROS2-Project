@@ -89,11 +89,13 @@ def generate_launch_description():
     follower_domain_id = LaunchConfiguration('follower_domain_id')
     start_omx_aim = LaunchConfiguration('start_omx_aim')
     start_yolo_server = LaunchConfiguration('start_yolo_server')
+    yolo_server_delay_sec = LaunchConfiguration('yolo_server_delay_sec')
     yolo_server_host = LaunchConfiguration('yolo_server_host')
     yolo_server_port = LaunchConfiguration('yolo_server_port')
     yolo_server_model_path = LaunchConfiguration('yolo_server_model_path')
     yolo_server_device = LaunchConfiguration('yolo_server_device')
     yolo_server_half = LaunchConfiguration('yolo_server_half')
+    omx_yolo_node_delay_sec = LaunchConfiguration('omx_yolo_node_delay_sec')
     start_patrol_planner = LaunchConfiguration('start_patrol_planner')
     patrol_planner_delay_sec = LaunchConfiguration('patrol_planner_delay_sec')
     debug_stream = LaunchConfiguration('debug_stream')
@@ -326,7 +328,7 @@ def generate_launch_description():
                     'flask_yolo_bridge',
                     'flask_yolo_server',
                 ])
-                actions.append(ExecuteProcess(
+                flask_yolo_server = ExecuteProcess(
                     cmd=[
                         flask_yolo_exe,
                         '--host', yolo_server_host.perform(context),
@@ -347,7 +349,22 @@ def generate_launch_description():
                     output='screen',
                     name='flask_yolo_server',
                     env=process_env,
-                ))
+                )
+                yolo_delay = float(yolo_server_delay_sec.perform(context))
+                if yolo_delay > 0.0:
+                    actions.append(TimerAction(
+                        period=yolo_delay,
+                        actions=[
+                            LogInfo(msg=[
+                                'SYSTEM_BRINGUP | starting flask_yolo_server ',
+                                'after ', str(yolo_delay),
+                                's stagger to avoid Jetson startup contention',
+                            ]),
+                            flask_yolo_server,
+                        ],
+                    ))
+                else:
+                    actions.append(flask_yolo_server)
 
             if launch_bool(start_omx_aim.perform(context)):
                 omx_launch_path = os.path.join(
@@ -369,6 +386,9 @@ def generate_launch_description():
                         ),
                         'yolo_server_device': yolo_server_device.perform(context),
                         'yolo_server_half': yolo_server_half.perform(context),
+                        'yolo_node_delay_sec': (
+                            omx_yolo_node_delay_sec.perform(context)
+                        ),
                         'start_patrol_planner': (
                             start_patrol_planner.perform(context)
                         ),
@@ -806,6 +826,11 @@ def generate_launch_description():
             description='Leader role only: run flask_yolo_server on the Jetson.',
         ),
         DeclareLaunchArgument(
+            'yolo_server_delay_sec',
+            default_value='6.0',
+            description='Leader role only: delay heavy Flask YOLO model startup.',
+        ),
+        DeclareLaunchArgument(
             'yolo_server_host',
             default_value='0.0.0.0',
             description='Leader role only: flask_yolo_server bind address.',
@@ -830,6 +855,11 @@ def generate_launch_description():
             default_value='true',
             choices=['true', 'false'],
             description='Leader role only: use half precision when supported.',
+        ),
+        DeclareLaunchArgument(
+            'omx_yolo_node_delay_sec',
+            default_value='14.0',
+            description='Leader role only: delay heavy OMX YOLO/camera/model startup.',
         ),
         DeclareLaunchArgument(
             'start_patrol_planner',
