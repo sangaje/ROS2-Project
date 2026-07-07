@@ -153,7 +153,6 @@ class MapRelay(Node):
 
         if self._primary_missing_since is None:
             self._primary_missing_since = now
-            return
 
         missing_sec = now - self._primary_missing_since
         if not self._relaying and missing_sec >= self.takeover_grace:

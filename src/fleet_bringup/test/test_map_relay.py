@@ -73,6 +73,24 @@ def test_relay_takes_over_after_grace_period_once_primary_disappears():
         destroy_node(node)
 
 
+def test_zero_grace_takes_over_on_first_missing_primary_check():
+    node = make_node()
+    try:
+        published = []
+        node.takeover_grace = 0.0
+        node._pub.publish = lambda msg: published.append(msg)
+        node.count_publishers = lambda topic: 1  # only ourselves
+        node._now_sec = lambda: 0.0
+        node._on_bridged_map(grid(20))
+
+        node._check_primary()
+        assert node._relaying is True
+        assert len(published) == 1
+        assert published[0].info.width == 20
+    finally:
+        destroy_node(node)
+
+
 def test_takeover_prefers_the_primarys_own_last_output_over_the_bridged_map():
     node = make_node()
     try:
