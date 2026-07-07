@@ -13,6 +13,7 @@
   <exec_depend>fleet_bringup</exec_depend>
   <exec_depend>bayesian_risk_map</exec_depend>
   <exec_depend>flask_yolo_bridge</exec_depend>
+  <exec_depend>omx_aim</exec_depend>
   <exec_depend>turtlebot3_rl_training</exec_depend>
   <exec_depend>domain_bridge</exec_depend>
   <exec_depend>rviz2</exec_depend>

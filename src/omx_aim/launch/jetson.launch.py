@@ -1,9 +1,10 @@
-"""Leader Jetson bringup: fleet leader stack + OMX AIM + debug dashboards.
+"""Jetson/OMX AIM component launch for the system_bringup leader role.
 
 사용:
-    ros2 launch omx_aim jetson.launch.py
+    ros2 launch system_bringup system.launch.py role:=leader debug_stream:=true
+
+Standalone component debug only:
     ros2 launch omx_aim jetson.launch.py debug_stream:=true
-    ros2 launch omx_aim jetson.launch.py debug_stream:=true debug_port:=8090 dashboard_port:=8091
 
 start_yolo_server:=true 이면 정찰/팔로워 로봇이 HTTP로 프레임을 보낼
 flask_yolo_server 도 이 Jetson에서 같이 실행한다.
@@ -11,7 +12,7 @@ debug_stream:=true 이면 yolo_node 가 기존 in-process Flask MJPEG 스트림�
 leader_unified_dashboard 도 별도 Flask 서버로 같이 실행한다.
     브라우저에서 http://<jetson-ip>:<debug_port>/ 로 확인
     통합 상황판은 http://<jetson-ip>:<dashboard_port>/ 로 확인
-    (Tailscale 쓰면 http://100.79.57.117:8080/ 처럼 orin-jetson IP 로 접속)
+    (예: http://orin-jetson:8091/)
 """
 import os
 
@@ -19,7 +20,7 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import EnvironmentVariable, LaunchConfiguration
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
@@ -31,9 +32,6 @@ def launch_setup(context, *args, **kwargs):
     debug_stream = _is_true(LaunchConfiguration('debug_stream').perform(context))
     unified_dashboard = _is_true(
         LaunchConfiguration('unified_dashboard').perform(context)
-    )
-    start_fleet_leader = _is_true(
-        LaunchConfiguration('start_fleet_leader').perform(context)
     )
     start_yolo_server = _is_true(
         LaunchConfiguration('start_yolo_server').perform(context)
@@ -48,29 +46,6 @@ def launch_setup(context, *args, **kwargs):
         yolo_args += ['--debug-stream', '--debug-port', debug_port]
 
     actions = []
-
-    if start_fleet_leader:
-        system_launch = os.path.join(
-            get_package_share_directory('system_bringup'),
-            'launch',
-            'system.launch.py',
-        )
-        actions.append(IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(system_launch),
-            launch_arguments={
-                'role': 'leader',
-                'domain_id': LaunchConfiguration('domain_id').perform(context),
-                'risk_domain_id': LaunchConfiguration('risk_domain_id').perform(context),
-                'pc_domain_id': LaunchConfiguration('pc_domain_id').perform(context),
-                'member_domain_id': LaunchConfiguration('member_domain_id').perform(context),
-                'follower_domain_id': LaunchConfiguration('follower_domain_id').perform(context),
-                'require_follower_pose': LaunchConfiguration('require_follower_pose').perform(context),
-                'enable_cartographer': LaunchConfiguration('enable_cartographer').perform(context),
-                'auto_localize': LaunchConfiguration('auto_localize').perform(context),
-                'start_robot_bringup': LaunchConfiguration('start_robot_bringup').perform(context),
-                'start_nav2': LaunchConfiguration('start_nav2').perform(context),
-            }.items(),
-        ))
 
     if start_yolo_server:
         yolo_server_launch = os.path.join(
@@ -145,45 +120,6 @@ def launch_setup(context, *args, **kwargs):
 
 def generate_launch_description():
     return LaunchDescription([
-        DeclareLaunchArgument(
-            'domain_id', default_value=EnvironmentVariable('ROS_DOMAIN_ID'),
-            description='Leader DDS domain passed through to system_bringup.'),
-        DeclareLaunchArgument(
-            'start_fleet_leader', default_value='true',
-            choices=['true', 'false'],
-            description='system_bringup role:=leader 를 함께 실행'),
-        DeclareLaunchArgument(
-            'risk_domain_id', default_value='',
-            description='Risk/scout DDS domain to bridge /map and /risk topics into leader.'),
-        DeclareLaunchArgument(
-            'pc_domain_id', default_value='',
-            description='PC DDS domain for optional leader->PC visualization bridge.'),
-        DeclareLaunchArgument(
-            'member_domain_id', default_value='',
-            description='Member/scout domain label for leader debug markers.'),
-        DeclareLaunchArgument(
-            'follower_domain_id', default_value='',
-            description='Follower domain label for leader debug markers.'),
-        DeclareLaunchArgument(
-            'require_follower_pose', default_value='true',
-            choices=['true', 'false'],
-            description='Set false for leader-only or leader+member fleets without /burger_pose.'),
-        DeclareLaunchArgument(
-            'enable_cartographer', default_value='false',
-            choices=['true', 'false'],
-            description='Leader fleet stack: run local Cartographer instead of AMCL on bridged /map.'),
-        DeclareLaunchArgument(
-            'auto_localize', default_value='true',
-            choices=['true', 'false'],
-            description='Leader AMCL global localization when enable_cartographer:=false.'),
-        DeclareLaunchArgument(
-            'start_robot_bringup', default_value='true',
-            choices=['true', 'false'],
-            description='Start TurtleBot3 hardware bringup through the fleet leader stack.'),
-        DeclareLaunchArgument(
-            'start_nav2', default_value='true',
-            choices=['true', 'false'],
-            description='Start Nav2 through the fleet leader stack.'),
         DeclareLaunchArgument(
             'start_yolo_server', default_value='true',
             choices=['true', 'false'],

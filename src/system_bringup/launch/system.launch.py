@@ -3,7 +3,8 @@
 
 role:=scout  -> fleet bringup (default fleet_role=member) + Bayesian risk map
                 + the RL-trained exploration policy driving cmd_vel directly.
-role:=leader -> fleet bringup only (default fleet_role=leader).
+role:=leader -> fleet bringup (default fleet_role=leader) + leader-side
+                Jetson/OMX AIM integration.
 """
 
 import os
@@ -84,6 +85,18 @@ def generate_launch_description():
     )
     member_domain_id = LaunchConfiguration('member_domain_id')
     follower_domain_id = LaunchConfiguration('follower_domain_id')
+    start_omx_aim = LaunchConfiguration('start_omx_aim')
+    start_yolo_server = LaunchConfiguration('start_yolo_server')
+    yolo_server_host = LaunchConfiguration('yolo_server_host')
+    yolo_server_port = LaunchConfiguration('yolo_server_port')
+    yolo_server_model_path = LaunchConfiguration('yolo_server_model_path')
+    yolo_server_device = LaunchConfiguration('yolo_server_device')
+    yolo_server_half = LaunchConfiguration('yolo_server_half')
+    debug_stream = LaunchConfiguration('debug_stream')
+    debug_port = LaunchConfiguration('debug_port')
+    unified_dashboard = LaunchConfiguration('unified_dashboard')
+    dashboard_host = LaunchConfiguration('dashboard_host')
+    dashboard_port = LaunchConfiguration('dashboard_port')
 
     def make_stack(context):
         role_value = role.perform(context).strip().lower()
@@ -277,6 +290,31 @@ def generate_launch_description():
                         'domain; leader->PC bridge skipped.'
                     ]))
 
+            if launch_bool(start_omx_aim.perform(context)):
+                omx_launch_path = os.path.join(
+                    get_package_share_directory('omx_aim'),
+                    'launch',
+                    'jetson.launch.py',
+                )
+                actions.append(IncludeLaunchDescription(
+                    PythonLaunchDescriptionSource(omx_launch_path),
+                    launch_arguments={
+                        'start_yolo_server': start_yolo_server.perform(context),
+                        'yolo_server_host': yolo_server_host.perform(context),
+                        'yolo_server_port': yolo_server_port.perform(context),
+                        'yolo_server_model_path': (
+                            yolo_server_model_path.perform(context)
+                        ),
+                        'yolo_server_device': yolo_server_device.perform(context),
+                        'yolo_server_half': yolo_server_half.perform(context),
+                        'debug_stream': debug_stream.perform(context),
+                        'debug_port': debug_port.perform(context),
+                        'unified_dashboard': unified_dashboard.perform(context),
+                        'dashboard_host': dashboard_host.perform(context),
+                        'dashboard_port': dashboard_port.perform(context),
+                    }.items(),
+                ))
+
         if role_value != 'scout':
             if launch_bool(start_rviz.perform(context)):
                 actions.append(LogInfo(msg=[
@@ -320,7 +358,7 @@ def generate_launch_description():
 
             # start_camera_sender:=true means opencv_camera_to_flask_yolo
             # (started below) owns the camera and forwards frames to a
-            # PC-side flask_yolo_server instead -- force the matching
+            # remote flask_yolo_server -- force the matching
             # detection_source wiring so the two never drift apart.
             risk_start_camera = start_camera.perform(context)
             risk_enable_yolo = enable_yolo.perform(context)
@@ -537,8 +575,8 @@ def generate_launch_description():
                 'launch.py. Default local_yolo runs YOLO on this robot. '
                 "Set flask_topic to consume detections published by "
                 'flask_yolo_bridge/opencv_camera_to_flask_yolo.'
-                'launch.py instead (offload YOLO to a PC running '
-                'flask_yolo_server.launch.py) -- also set '
+                'launch.py instead (offload YOLO to a remote '
+                'flask_yolo_server, normally the leader Jetson) -- also set '
                 'enable_yolo:=false and start_camera:=false in that case, '
                 'since the sender node owns the camera instead.'
             ),
@@ -549,7 +587,8 @@ def generate_launch_description():
             description=(
                 'Scout only: run YOLO inference inside the risk map node '
                 'itself. Set false when detection_source:=flask_topic '
-                '(a PC-side flask_yolo_server does the inference instead).'
+                '(a remote flask_yolo_server, normally the leader Jetson, '
+                'does the inference instead).'
             ),
         ),
         DeclareLaunchArgument(
@@ -566,8 +605,8 @@ def generate_launch_description():
             description=(
                 'Scout only: run flask_yolo_bridge/'
                 'opencv_camera_to_flask_yolo.launch.py on this robot to '
-                'offload YOLO inference to a PC running '
-                'flask_yolo_server.launch.py, instead of running YOLO '
+                'offload YOLO inference to a remote '
+                'flask_yolo_server, normally the leader Jetson, instead of running YOLO '
                 'locally. When true, this auto-forces start_camera:=false, '
                 "enable_yolo:=false and detection_source:=flask_topic so "
                 "the risk map reads detections from the sender's "
@@ -580,10 +619,10 @@ def generate_launch_description():
             description='Scout only, start_camera_sender:=true: camera device for opencv_camera_to_flask_yolo.',
         ),
         DeclareLaunchArgument(
-            'flask_server_url', default_value='http://seil:5005/detect',
+            'flask_server_url', default_value='http://orin-jetson:5005/detect',
             description=(
-                'Scout only, start_camera_sender:=true: PC-side '
-                'flask_yolo_server URL. Defaults to the PC\'s Tailscale '
+                'Scout only, start_camera_sender:=true: remote '
+                'flask_yolo_server URL. Defaults to the leader Jetson '
                 'hostname.'
             ),
         ),
@@ -655,6 +694,71 @@ def generate_launch_description():
             'follower_domain_id',
             default_value='',
             description='Leader debug marker label for a follower domain.',
+        ),
+        DeclareLaunchArgument(
+            'start_omx_aim',
+            default_value='true',
+            choices=['true', 'false'],
+            description='Leader role only: include Jetson/OMX AIM component launch.',
+        ),
+        DeclareLaunchArgument(
+            'start_yolo_server',
+            default_value='true',
+            choices=['true', 'false'],
+            description='Leader role only: run flask_yolo_server on the Jetson.',
+        ),
+        DeclareLaunchArgument(
+            'yolo_server_host',
+            default_value='0.0.0.0',
+            description='Leader role only: flask_yolo_server bind address.',
+        ),
+        DeclareLaunchArgument(
+            'yolo_server_port',
+            default_value='5005',
+            description='Leader role only: flask_yolo_server HTTP port.',
+        ),
+        DeclareLaunchArgument(
+            'yolo_server_model_path',
+            default_value='yolo11n.pt',
+            description='Leader role only: YOLO model path for flask_yolo_server.',
+        ),
+        DeclareLaunchArgument(
+            'yolo_server_device',
+            default_value='0',
+            description='Leader role only: YOLO device for flask_yolo_server.',
+        ),
+        DeclareLaunchArgument(
+            'yolo_server_half',
+            default_value='true',
+            choices=['true', 'false'],
+            description='Leader role only: use half precision when supported.',
+        ),
+        DeclareLaunchArgument(
+            'debug_stream',
+            default_value='false',
+            choices=['true', 'false'],
+            description='Leader role only: enable the OMX MJPEG debug stream.',
+        ),
+        DeclareLaunchArgument(
+            'debug_port',
+            default_value='8080',
+            description='Leader role only: OMX MJPEG debug stream port.',
+        ),
+        DeclareLaunchArgument(
+            'unified_dashboard',
+            default_value='true',
+            choices=['true', 'false'],
+            description='Leader role only: run the integrated leader dashboard when debug_stream is true.',
+        ),
+        DeclareLaunchArgument(
+            'dashboard_host',
+            default_value='0.0.0.0',
+            description='Leader role only: integrated dashboard bind address.',
+        ),
+        DeclareLaunchArgument(
+            'dashboard_port',
+            default_value='8091',
+            description='Leader role only: integrated dashboard HTTP port.',
         ),
         *dds_launch_environment(domain_id),
         OpaqueFunction(function=make_stack),

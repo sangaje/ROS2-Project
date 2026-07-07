@@ -1,11 +1,12 @@
 # system_bringup
 
 로봇의 역할(정찰/리더)에 맞춰 `fleet_bringup` + 베이지안 리스크맵 +
-RL 정책까지 한 번에 켜는 오케스트레이터. 로봇마다 이 패키지의 런치 파일
-하나만 실행하면 된다.
+RL 정책 + 리더 Jetson/OMX AIM을 한 번에 켜는 오케스트레이터.
+로봇마다 이 패키지의 런치 파일 하나만 실행하면 된다.
 
 - `system.launch.py`: 역할별 전체 스택
-- `pc.launch.py`: PC에서 YOLO 서버 + 통합 RViz를 같이 실행
+- `pc.launch.py`: PC에서 디버그 RViz/뷰어 실행. YOLO 서버는 기본적으로
+  리더 Jetson에서 실행한다.
 - `viewer.launch.py`: PC에서 fleet 디버그 마커 + 리스크맵을 하나의 RViz로
   같이 보는 뷰어 (로봇을 켜지 않음)
 
@@ -22,7 +23,8 @@ ros2 launch system_bringup system.launch.py \
 
 ```bash
 ros2 launch system_bringup system.launch.py \
-  role:=leader risk_domain_id:=22 pc_domain_id:=30
+  role:=leader risk_domain_id:=22 pc_domain_id:=28 \
+  start_omx_aim:=true start_yolo_server:=true debug_stream:=true
 ```
 
 **follower.launch.py 로봇이 fleet에 없으면(예: 리더+정찰봇만 있는 구성)
@@ -35,20 +37,21 @@ ros2 launch system_bringup system.launch.py \
   role:=leader require_follower_pose:=false
 ```
 
-PC 통합 실행 (YOLO 서버 + fleet/risk RViz):
+PC 디버깅 실행 (fleet/risk RViz):
 
 ```bash
 ros2 launch system_bringup pc.launch.py
 ```
 
-PC에서 RViz만 켜려면 `start_yolo_server:=false`를 준다.
+PC에서 YOLO 서버는 기본으로 켜지지 않는다. 컴포넌트 디버깅용으로만
+PC에서 직접 돌릴 때 `start_yolo_server:=true`를 준다.
 
 ## `role`이 실제로 켜는 것
 
-| role     | fleet_role 기본값 | 리스크맵                   | RL 정책 |
-|----------|-------------------|----------------------------|---------|
-| `scout`  | `member`          | 켜짐                       | 켜짐    |
-| `leader` | `leader`          | 안 켜짐                    | 안 켜짐 |
+| role     | fleet_role 기본값 | 리스크맵                   | RL 정책 | Jetson/OMX |
+|----------|-------------------|----------------------------|---------|------------|
+| `scout`  | `member`          | 켜짐                       | 켜짐    | 안 켜짐    |
+| `leader` | `leader`          | 안 켜짐                    | 안 켜짐 | 켜짐       |
 
 `scout`는 리더를 따라가지도, 리더가 되지도 않는 `member.launch.py` 위에서
 RL 정책이 직접 `/cmd_vel`을 몰아 정찰하고, 코디네이터가 다른 로봇을
@@ -58,7 +61,9 @@ RL 정책이 직접 `/cmd_vel`을 몰아 정찰하고, 코디네이터가 다른
 `leader`는 `fleet_bringup/leader.launch.py`를 실행하고, 선택적으로
 `risk_domain_id`가 있으면 risk/scout→leader 맵/리스크 브리지를, `pc_domain_id`가
 있으면 leader→PC 시각화 브리지를 단방향으로 실행한다. RViz 프로세스는
-리더에서 실행하지 않는다.
+리더에서 실행하지 않는다. 리더 role은 `omx_aim/jetson.launch.py`를 하위
+component로 include해서 Jetson YOLO 서버, OMX AIM 파이프라인, debug stream,
+통합 웹 대시보드를 함께 실행한다.
 
 ### follower는 결국 정찰봇이다
 
@@ -81,32 +86,33 @@ follower 중에도 계속 켜져 있다 — 위험도만 수동적으로 계속 
 `cartographer_configuration_basename`(기본
 `turtlebot3_lds_2d_risk_safe.lua`).
 
-### YOLO를 PC로 오프로드 (`start_camera_sender`)
+### YOLO를 리더 Jetson으로 오프로드 (`start_camera_sender`)
 
 리스크맵은 정찰봇에서 실행된다. `start_camera_sender:=true`는 정찰봇의
-카메라 프레임만 PC의 Flask YOLO 서버로 보내고, YOLO 결과(`/risk/yolo_detections`)를
+카메라 프레임만 리더 Jetson의 Flask YOLO 서버로 보내고, YOLO 결과(`/risk/yolo_detections`)를
 다시 정찰봇에서 받아 로컬 리스크맵에 넣는다.
 
 `start_camera_sender:=true`를 주면 `system.launch.py`가 직접
 `flask_yolo_bridge/opencv_camera_to_flask_yolo.launch.py`를 이
-로봇에서 같이 띄운다 — 카메라를 잡아서 PC의 `flask_yolo_server`로 HTTP로
+로봇에서 같이 띄운다 — 카메라를 잡아서 리더 Jetson의 `flask_yolo_server`로 HTTP로
 프레임을 보내고, 리스크맵은 로컬 YOLO 대신 그 결과(`external_detection_topic`)를
 읽는다. 켜면 `start_camera:=false`, `enable_yolo:=false`,
 `detection_source:=flask_topic`이 자동으로 강제되므로 따로 안 챙겨도 된다.
 별도로 `opencv_camera_to_flask_yolo.launch.py`를 수동으로 또 띄울 필요 없음.
 
 ```bash
-# 정찰봇: YOLO는 PC(flask_yolo_server)에서 돌리고 여기선 카메라만 전송
+# 정찰봇: YOLO는 리더 Jetson(flask_yolo_server)에서 돌리고 여기선 카메라만 전송
 ros2 launch system_bringup system.launch.py \
-  role:=scout main_domain_id:=24 start_camera_sender:=true
+  role:=scout main_domain_id:=20 start_camera_sender:=true
 
-# PC: flask_yolo_server (YOLO 추론 서버)
-ros2 launch system_bringup pc.launch.py
+# 리더 Jetson: system_bringup leader가 flask_yolo_server를 함께 실행
+ros2 launch system_bringup system.launch.py \
+  role:=leader start_yolo_server:=true
 ```
 
 - `camera_sender_device`(기본 `/dev/video1`): 이 로봇에서 잡을 카메라 장치.
-- `flask_server_url`(기본 `http://seil:5005/detect`): PC의 flask_yolo_server
-  주소. Tailscale 호스트명 `seil`을 기본값으로 쓴다(IP 대신).
+- `flask_server_url`(기본 `http://orin-jetson:5005/detect`): 리더 Jetson의
+  flask_yolo_server 주소.
 - 리스크맵이 읽는 `external_detection_topic`과 센더의 `output_topic`이
   같은 값으로 자동으로 맞춰진다(둘 다 `external_detection_topic` 인자를
   공유).

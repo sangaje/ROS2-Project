@@ -21,7 +21,6 @@
   <exec_depend>python3-opencv</exec_depend>
   <exec_depend>python3-flask</exec_depend>
   <exec_depend>flask_yolo_bridge</exec_depend>
-  <exec_depend>system_bringup</exec_depend>
 
   <!--
     pip 전용 의존성 (rosdep 키 없음, venv "system site packages" 옵션으로 설치):

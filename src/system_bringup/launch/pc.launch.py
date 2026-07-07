@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""PC-side tools for the fleet system.
+"""PC-side debugging tools for the fleet system.
 
-The PC only starts visualization/client tools on its own DDS domain. Leader
-system bringup owns debug aggregation and bridges selected topics here.
+The PC normally starts visualization/client tools only. Leader system bringup
+owns Jetson/OMX integration and bridges selected debug topics here. A local
+flask_yolo_server can still be started manually for component debugging.
 """
 
 from launch import LaunchDescription

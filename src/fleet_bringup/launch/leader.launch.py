@@ -35,11 +35,6 @@ from fleet_bringup.launch_utils import (
 def generate_launch_description():
     package_share = get_package_share_directory('fleet_bringup')
     base_launch = os.path.join(package_share, 'launch', 'base.launch.py')
-    cartographer_launch = os.path.join(
-        get_package_share_directory('turtlebot3_cartographer'),
-        'launch',
-        'cartographer.launch.py',
-    )
 
     use_sim_time = LaunchConfiguration('use_sim_time')
     domain_id = LaunchConfiguration('domain_id')
@@ -88,6 +83,11 @@ def generate_launch_description():
         map_relay = None
         kickstart_node = None
         if cartographer_owned:
+            cartographer_launch = os.path.join(
+                get_package_share_directory('turtlebot3_cartographer'),
+                'launch',
+                'cartographer.launch.py',
+            )
             cartographer = IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(cartographer_launch),
                 launch_arguments={
