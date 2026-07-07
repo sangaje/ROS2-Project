@@ -17,6 +17,7 @@ from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     IncludeLaunchDescription,
+    LogInfo,
     OpaqueFunction,
     TimerAction,
 )
@@ -133,15 +134,32 @@ def generate_launch_description():
             actions.extend([
                 TimerAction(
                     period=float(nav_delay_sec.perform(context)),
-                    actions=navigation,
+                    actions=[
+                        LogInfo(msg=[
+                            'BASE_STAGE | starting Nav2 core nodes ',
+                            '(controller/planner/behavior/bt_navigator)',
+                        ]),
+                        *navigation,
+                    ],
                 ),
                 TimerAction(
                     period=float(lifecycle_delay_sec.perform(context)),
-                    actions=[navigation_lifecycle],
+                    actions=[
+                        LogInfo(msg=[
+                            'BASE_STAGE | starting Nav2 navigation lifecycle',
+                        ]),
+                        navigation_lifecycle,
+                    ],
                 ),
                 TimerAction(
                     period=float(goal_delay_sec.perform(context)),
-                    actions=[goal_proxy],
+                    actions=[
+                        LogInfo(msg=[
+                            'BASE_STAGE | starting Nav2 goal proxy ',
+                            goal_proxy_name.perform(context),
+                        ]),
+                        goal_proxy,
+                    ],
                 ),
             ])
         return actions

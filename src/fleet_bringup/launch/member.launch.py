@@ -20,6 +20,7 @@ from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     IncludeLaunchDescription,
+    LogInfo,
     OpaqueFunction,
     TimerAction,
 )
@@ -222,6 +223,14 @@ def generate_launch_description():
         bridge_t, relay_t, amcl_t, localization_t, kickstart_t = timing
         actions = [
             base,
+            LogInfo(msg=[
+                'MAP_BRIDGE_STAGE_B | source_domain=', str(main_domain),
+                ' | destination_domain=', str(member_domain),
+                ' | source_topic=/map',
+                ' | bridge_topic=/map_bridge',
+                ' | final_topic=/map',
+                ' | type=nav_msgs/msg/OccupancyGrid',
+            ]),
             TimerAction(period=bridge_t, actions=bridges),
             TimerAction(period=relay_t, actions=[map_relay, member_pose]),
         ]

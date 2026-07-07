@@ -210,6 +210,15 @@ def generate_launch_description():
                     risk_bridge_config = write_risk_to_leader_bridge_config(
                         risk_domain, domain,
                     )
+                    actions.append(LogInfo(msg=[
+                        'MAP_BRIDGE_STAGE_A | source_domain=',
+                        str(risk_domain),
+                        ' | destination_domain=', str(domain),
+                        ' | source_topic=/map',
+                        ' | bridge_topic=/map_bridge',
+                        ' | final_topic=/map',
+                        ' | type=nav_msgs/msg/OccupancyGrid',
+                    ]))
                     actions.append(TimerAction(
                         period=0.5,
                         actions=[Node(

@@ -17,6 +17,7 @@ from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     IncludeLaunchDescription,
+    LogInfo,
     OpaqueFunction,
     TimerAction,
 )
@@ -331,19 +332,24 @@ def generate_launch_description():
         if not simulation:
             actions.append(TimerAction(
                 period=1.0,
-                actions=[Node(
-                    package='tf2_ros',
-                    executable='static_transform_publisher',
-                    name='burger_scan_static_tf',
-                    output='screen',
-                    arguments=[
-                        '--x', '-0.032', '--y', '0.0', '--z', '0.182',
-                        '--roll', '0', '--pitch', '0', '--yaw', '0',
-                        '--frame-id', 'burger/base_footprint',
-                        '--child-frame-id', 'burger/base_scan',
-                    ],
-                    env=process_env,
-                )],
+                actions=[
+                    LogInfo(msg=[
+                        'LEADER_STAGE | starting follower scan static TF',
+                    ]),
+                    Node(
+                        package='tf2_ros',
+                        executable='static_transform_publisher',
+                        name='burger_scan_static_tf',
+                        output='screen',
+                        arguments=[
+                            '--x', '-0.032', '--y', '0.0', '--z', '0.182',
+                            '--roll', '0', '--pitch', '0', '--yaw', '0',
+                            '--frame-id', 'burger/base_footprint',
+                            '--child-frame-id', 'burger/base_scan',
+                        ],
+                        env=process_env,
+                    ),
+                ],
             ))
 
         if simulation:
@@ -372,25 +378,82 @@ def generate_launch_description():
             actions.extend([
                 TimerAction(
                     period=pose_t,
-                    actions=[leader_pose, follower_tf, leader_scan],
+                    actions=[
+                        LogInfo(msg=[
+                            'LEADER_STAGE | starting leader/follower pose ',
+                            'and scan relay nodes',
+                        ]),
+                        leader_pose,
+                        follower_tf,
+                        leader_scan,
+                    ],
                 ),
-                TimerAction(period=coordinator_t, actions=[coordinator]),
+                TimerAction(
+                    period=coordinator_t,
+                    actions=[
+                        LogInfo(msg=[
+                            'LEADER_STAGE | starting fleet coordinator',
+                        ]),
+                        coordinator,
+                    ],
+                ),
             ])
             if cartographer_owned:
                 actions.append(
-                    TimerAction(period=5.0, actions=[cartographer])
+                    TimerAction(
+                        period=5.0,
+                        actions=[
+                            LogInfo(msg=[
+                                'LEADER_STAGE | starting Cartographer',
+                            ]),
+                            cartographer,
+                        ],
+                    )
                 )
             else:
                 actions.append(
-                    TimerAction(period=1.0, actions=[map_relay])
+                    TimerAction(
+                        period=1.0,
+                        actions=[
+                            LogInfo(msg=[
+                                'LEADER_STAGE | starting bridged-map relay',
+                            ]),
+                            map_relay,
+                        ],
+                    )
                 )
-                actions.append(TimerAction(period=8.0, actions=[amcl]))
+                actions.append(
+                    TimerAction(
+                        period=8.0,
+                        actions=[
+                            LogInfo(msg=[
+                                'LEADER_STAGE | starting AMCL',
+                            ]),
+                            amcl,
+                        ],
+                    )
+                )
                 actions.append(TimerAction(
-                    period=12.0, actions=[localization_lifecycle],
+                    period=12.0,
+                    actions=[
+                        LogInfo(msg=[
+                            'LEADER_STAGE | starting AMCL lifecycle manager',
+                        ]),
+                        localization_lifecycle,
+                    ],
                 ))
                 if kickstart_node is not None:
                     actions.append(
-                        TimerAction(period=15.0, actions=[kickstart_node])
+                        TimerAction(
+                            period=15.0,
+                            actions=[
+                                LogInfo(msg=[
+                                    'LEADER_STAGE | starting AMCL global ',
+                                    'localize kickstart',
+                                ]),
+                                kickstart_node,
+                            ],
+                        )
                     )
         return actions
 

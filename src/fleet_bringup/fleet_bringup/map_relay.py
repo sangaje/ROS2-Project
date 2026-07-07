@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Receives /map_bridge (transient-local, from domain_bridge) and stands by to
-republish it on /map (transient_local) only when nothing else is currently
-publishing there.
+Receives /map_bridge from domain_bridge with a volatile-compatible
+subscription and stands by to republish it on /map (transient_local) only
+when nothing else is currently publishing there.
 
 /map is meant to have exactly one live source at a time -- normally a local
 SLAM node (e.g. Cartographer) when this robot owns its own mapping. This
