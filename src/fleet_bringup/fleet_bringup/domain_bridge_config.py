@@ -101,6 +101,7 @@ def write_fleet_bridge_configs(
     follower_domain: int,
     *,
     simulation: bool = False,
+    forward_map_to_main: bool = False,
     output_directory: Optional[Path] = None,
 ) -> Tuple[Path, Path]:
     """Create the two directional domain_bridge configurations.
@@ -193,6 +194,12 @@ def write_fleet_bridge_configs(
         ),
         **risk_topics(),
     }
+    if forward_map_to_main:
+        follower_topics['/map'] = topic(
+            'nav_msgs/msg/OccupancyGrid',
+            remap='/map_bridge',
+            profile=map_qos(depth=5),
+        )
     if simulation:
         follower_topics['/cmd_vel'] = topic(
             'geometry_msgs/msg/TwistStamped',
@@ -227,6 +234,7 @@ def write_member_bridge_configs(
     main_domain: int,
     member_domain: int,
     *,
+    forward_map_to_main: bool = False,
     output_directory: Optional[Path] = None,
 ) -> Tuple[Path, Path]:
     """Create the two directional domain_bridge configurations for a plain
@@ -268,6 +276,12 @@ def write_member_bridge_configs(
         '/member_pose': topic('geometry_msgs/msg/PoseStamped'),
         **risk_topics(),
     }
+    if forward_map_to_main:
+        member_topics['/map'] = topic(
+            'nav_msgs/msg/OccupancyGrid',
+            remap='/map_bridge',
+            profile=map_qos(depth=5),
+        )
 
     main_to_member = _write_runtime_config(
         f'main_{main_domain}_to_member_{member_domain}_',

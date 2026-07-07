@@ -175,6 +175,9 @@ def generate_launch_description():
             )
         if fleet_role_value in ('follower', 'member'):
             fleet_launch_args['main_domain_id'] = str(main_domain)
+            fleet_launch_args['forward_map_to_main'] = (
+                'true' if scout_owns_slam else 'false'
+            )
         if fleet_role_value in ('leader', 'member'):
             fleet_launch_args['start_nav2'] = (
                 'false' if scout_rl_owns_cmd_vel
@@ -766,9 +769,13 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'enable_risk_to_leader_bridge',
-            default_value='true',
+            default_value='false',
             choices=['true', 'false'],
-            description='Leader role only: bridge /map and risk debug topics from risk_domain_id to leader.',
+            description=(
+                'Leader role only: bridge /map and risk debug topics from '
+                'risk_domain_id to leader. Default false because a '
+                'Cartographer-owning scout now forwards its own /map upstream.'
+            ),
         ),
         DeclareLaunchArgument(
             'enable_pc_visualization_bridge',

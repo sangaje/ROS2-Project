@@ -46,6 +46,7 @@ def generate_launch_description():
     start_robot_bringup = LaunchConfiguration('start_robot_bringup')
     start_nav2 = LaunchConfiguration('start_nav2')
     hardware_param_file = LaunchConfiguration('hardware_param_file')
+    forward_map_to_main = LaunchConfiguration('forward_map_to_main')
     initial_x = LaunchConfiguration('member_initial_x')
     initial_y = LaunchConfiguration('member_initial_y')
     initial_yaw = LaunchConfiguration('member_initial_yaw')
@@ -80,7 +81,9 @@ def generate_launch_description():
         )
 
         main_to_member, member_to_main = write_member_bridge_configs(
-            main_domain, member_domain,
+            main_domain,
+            member_domain,
+            forward_map_to_main=launch_bool(forward_map_to_main.perform(context)),
         )
         bridges = [
             Node(
@@ -295,6 +298,15 @@ def generate_launch_description():
                 'a Cartographer elsewhere) so the wheel odometry\'s own '
                 'odom->base_footprint TF broadcast can be disabled -- '
                 'otherwise it conflicts with Cartographer\'s own TF.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'forward_map_to_main',
+            default_value='false',
+            choices=['true', 'false'],
+            description=(
+                'Bridge this robot-owned /map back to the leader domain as '
+                '/map_bridge. Enable only when this member/scout owns SLAM.'
             ),
         ),
         DeclareLaunchArgument('member_initial_x', default_value='0.0'),

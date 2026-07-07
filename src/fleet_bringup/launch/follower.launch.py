@@ -41,6 +41,7 @@ def generate_launch_description():
     main_domain_id = LaunchConfiguration('main_domain_id')
     start_robot_bringup = LaunchConfiguration('start_robot_bringup')
     hardware_param_file = LaunchConfiguration('hardware_param_file')
+    forward_map_to_main = LaunchConfiguration('forward_map_to_main')
     follow_distance = LaunchConfiguration('follow_distance')
     initial_x = LaunchConfiguration('follower_initial_x')
     initial_y = LaunchConfiguration('follower_initial_y')
@@ -85,6 +86,7 @@ def generate_launch_description():
             main_domain,
             follower_domain,
             simulation=simulation,
+            forward_map_to_main=launch_bool(forward_map_to_main.perform(context)),
         )
         bridges = [
             Node(
@@ -428,6 +430,15 @@ def generate_launch_description():
                 'Cartographer elsewhere) so the wheel odometry\'s own '
                 'odom->base_footprint TF broadcast can be disabled -- '
                 'otherwise it conflicts with Cartographer\'s own TF.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'forward_map_to_main',
+            default_value='false',
+            choices=['true', 'false'],
+            description=(
+                'Bridge this robot-owned /map back to the leader domain as '
+                '/map_bridge. Enable only when this follower/scout owns SLAM.'
             ),
         ),
         DeclareLaunchArgument(

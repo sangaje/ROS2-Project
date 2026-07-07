@@ -119,6 +119,38 @@ def test_member_bridge_forwards_core_risk_topics_to_main(tmp_path):
     assert '/map' not in member['topics']
 
 
+def test_member_bridge_can_forward_owned_map_to_main(tmp_path):
+    _, member_path = write_member_bridge_configs(
+        20,
+        22,
+        forward_map_to_main=True,
+        output_directory=tmp_path,
+    )
+    member = yaml.safe_load(member_path.read_text())
+
+    assert (member['from_domain'], member['to_domain']) == (22, 20)
+    assert member['topics']['/map']['type'] == 'nav_msgs/msg/OccupancyGrid'
+    assert member['topics']['/map']['remap'] == '/map_bridge'
+    assert member['topics']['/map']['qos']['reliability'] == 'reliable'
+    assert member['topics']['/map']['qos']['durability'] == 'transient_local'
+
+
+def test_follower_bridge_can_forward_owned_map_to_main(tmp_path):
+    _, follower_path = write_fleet_bridge_configs(
+        20,
+        21,
+        forward_map_to_main=True,
+        output_directory=tmp_path,
+    )
+    follower = yaml.safe_load(follower_path.read_text())
+
+    assert (follower['from_domain'], follower['to_domain']) == (21, 20)
+    assert follower['topics']['/map']['type'] == 'nav_msgs/msg/OccupancyGrid'
+    assert follower['topics']['/map']['remap'] == '/map_bridge'
+    assert follower['topics']['/map']['qos']['reliability'] == 'reliable'
+    assert follower['topics']['/map']['qos']['durability'] == 'transient_local'
+
+
 def test_risk_to_leader_bridge_is_one_way_map_source(tmp_path):
     path = write_risk_to_leader_bridge_config(
         22,
