@@ -112,8 +112,8 @@ class WaffleNavNode(Node):
         self.declare_parameter('require_amcl_ready', True)
         self.declare_parameter('amcl_pose_topic', '/amcl_pose')
         self.declare_parameter('max_amcl_pose_age_sec', 3.0)
-        self.declare_parameter('max_xy_covariance', 0.50)
-        self.declare_parameter('max_yaw_covariance', 0.50)
+        self.declare_parameter('max_xy_covariance', 2.00)
+        self.declare_parameter('max_yaw_covariance', 1.50)
         self.declare_parameter('pending_goal_retry_period_sec', 0.5)
         self.declare_parameter('max_pending_goal_age_sec', 60.0)
         self.require_amcl_ready = bool(
@@ -226,12 +226,16 @@ class WaffleNavNode(Node):
             xy_cov <= self.max_xy_covariance
             and yaw_cov <= self.max_yaw_covariance
         )
+        was_ready = self._amcl_ready
         self._last_amcl_pose_wall = time.time()
-        self._amcl_ready = ready
         self._amcl_cov_text = f"xy={xy_cov:.3f}, yaw={yaw_cov:.3f}"
-        if ready:
-            self.get_logger().debug(
-                f"AMCL ready ({self._amcl_cov_text})")
+        if ready and not was_ready:
+            self.get_logger().info(
+                f"AMCL pose accepted ({self._amcl_cov_text})")
+        elif not ready and was_ready:
+            self.get_logger().warn(
+                f"AMCL pose confidence dropped ({self._amcl_cov_text})")
+        self._amcl_ready = ready
 
     def _localization_ready(self) -> bool:
         if self.dry_run or not self.require_amcl_ready:
