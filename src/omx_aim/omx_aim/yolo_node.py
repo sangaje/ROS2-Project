@@ -254,6 +254,8 @@ class OmxYoloNode(Node):
         # H2 신규
         self.create_subscription(String, '/waffle/nav_result',
                                  self.on_nav_result, 10)
+        self.create_subscription(String, '/waffle/status',
+                                 self.on_waffle_status, 10)
         # H4 신규
         self.create_subscription(String, '/omx/boundary_enable',
                                  self.on_boundary_enable, 10)
@@ -276,6 +278,9 @@ class OmxYoloNode(Node):
         self._last_immediate_fire_t = 0.0
         self._immediate_fire_detection_active = False
         self._detection_nav_stop_active = False
+        self.waffle_status = "unknown"
+        self._last_nav_retry_t = 0.0
+        self._nav_retry_period_sec = 1.0
 
         self.get_logger().info(
             f"Timer: 메인 {self.cfg.ibvs.control_hz} Hz, 상태 1 Hz")
@@ -970,6 +975,9 @@ class OmxYoloNode(Node):
         """H2: waffle_node 가 발행한 Nav2 액션 결과."""
         self.sm.on_nav_result(msg.data)
 
+    def on_waffle_status(self, msg: String):
+        self.waffle_status = msg.data
+
     def on_boundary_enable(self, msg: String):
         """H4: BOUNDARY 자동 생성 런타임 토글.
         
@@ -1190,6 +1198,7 @@ class OmxYoloNode(Node):
         msg.pose.orientation.z = math.sin(yaw / 2.0)
         msg.pose.orientation.w = math.cos(yaw / 2.0)
         self.pub_nav_goal.publish(msg)
+        self._last_nav_retry_t = time.time()
         self.get_logger().info(
             f"[nav_goal] 발행: ({x:+.2f}, {y:+.2f}) "
             f"yaw={math.degrees(yaw):+.1f}°")
@@ -1227,6 +1236,27 @@ class OmxYoloNode(Node):
         """H3: TARGET preempt 시 진행 중 Nav2 cancel 요청."""
         self.pub_nav_cancel.publish(Empty())
         self.get_logger().info("[nav_cancel] 발행 (preempt)")
+
+    def maybe_retry_waiting_nav_goal(self, now: float):
+        """WAITING_NAV 인데 waffle 이 안 움직이면 현재 goal 을 다시 찌른다."""
+        if self.sm.state != State.WAITING_NAV:
+            return
+        if now - self._last_nav_retry_t < self._nav_retry_period_sec:
+            return
+
+        status = (self.waffle_status or "unknown").lower()
+        if "navigating" in status:
+            return
+
+        vp = self.sm._next_hop_pose()
+        if vp is None:
+            return
+
+        self._last_nav_retry_t = now
+        self.get_logger().warn(
+            f"[nav_retry] WAITING_NAV but waffle_status={self.waffle_status}; "
+            "nav_goal 재발행")
+        self.publish_nav_goal(vp)
 
     def publish_target_not_found(self, coord_map):
         """H3: TARGET 좌표에서 scan_timeout 안에 표적 못 찾음."""
@@ -1397,6 +1427,8 @@ class OmxYoloNode(Node):
                     self.cfg.patrol.scan_sweep_half_angle_deg,
                     self.cfg.patrol.scan_sweep_period_sec,
                 )
+
+        self.maybe_retry_waiting_nav_goal(now)
 
         if action.get('patrol_complete', False):
             self.publish_patrol_complete()
