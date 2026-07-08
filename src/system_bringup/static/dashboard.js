@@ -1,7 +1,9 @@
 const stateUrl = '/api/status';
+const yoloStatusUrl = '/api/yolo_status';
 const mapImg = new Image();
 const riskImg = new Image();
 let latest = null;
+let latestYolo = null;
 let mapSeq = -1;
 let riskSeq = -1;
 let mapReady = false;
@@ -20,6 +22,25 @@ function fmt(value, digits = 2) {
 
 function ageText(value) {
   return Number.isFinite(value) ? `${value.toFixed(1)}s` : '--';
+}
+
+function pctText(value) {
+  return Number.isFinite(value) ? `${Math.round(value * 100)}%` : '--';
+}
+
+function yesNo(value) {
+  if (value === true) return 'YES';
+  if (value === false) return 'NO';
+  return '--';
+}
+
+function escapeHtml(value) {
+  return String(value ?? '--')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
 }
 
 function yawDeg(rad) {
@@ -145,6 +166,103 @@ function drawRobot(meta, vp, robot) {
   ctx.restore();
 }
 
+function topicAge(s, key) {
+  const t = s.omx[`${key}_received_wall_sec`];
+  return t ? s.server_time_sec - t : null;
+}
+
+function metricCard(label, value, status = 'OK', sub = '') {
+  const cls = statusClass(status);
+  return `<div class="metric-card ${cls}">
+    <div class="metric-label">${escapeHtml(label)}</div>
+    <div class="metric-value">${escapeHtml(value)}</div>
+    ${sub ? `<div class="metric-sub">${escapeHtml(sub)}</div>` : ''}
+  </div>`;
+}
+
+function formatPoint(p) {
+  if (!p) return '--';
+  return `(${fmt(p.x)}, ${fmt(p.y)}, ${fmt(p.z)})`;
+}
+
+function updateOmxPanel(s) {
+  const err = s.omx.aim_error_norm || {};
+  const cmd = s.omx.leader_cmd_vel || {};
+  const detected = s.omx.target_detected === true;
+  const fireDisabled = s.omx.fire_disabled;
+  const cards = [
+    ['State', s.omx.state || '--', s.omx.state ? 'OK' : 'NO DATA', ageText(topicAge(s, 'state'))],
+    ['Status', s.omx.status || '--', s.omx.status ? 'OK' : 'NO DATA', ageText(topicAge(s, 'status'))],
+    ['Target', yesNo(s.omx.target_detected), detected ? 'OK' : 'NO DATA', ageText(topicAge(s, 'target_detected'))],
+    ['Aim', pctText(s.omx.aim_progress), s.omx.aim_progress ? 'OK' : 'NO DATA', `err ${fmt(err.magnitude, 3)}`],
+    ['Queue', s.omx.queue_size ?? '--', s.omx.queue_size ? 'OK' : 'NO DATA', ageText(topicAge(s, 'queue_size'))],
+    ['Fire', s.omx.fire_status || '--', s.omx.fire_status ? 'OK' : 'NO DATA', ageText(topicAge(s, 'fire_status'))],
+    ['Fire Lock', fireDisabled === true ? 'DISABLED' : fireDisabled === false ? 'ARMED' : '--', fireDisabled === false ? 'OK' : fireDisabled === true ? 'STALE' : 'NO DATA', ageText(topicAge(s, 'fire_disabled'))],
+    ['Nav Result', s.omx.waffle_nav_result || '--', s.omx.waffle_nav_result ? 'OK' : 'NO DATA', ageText(topicAge(s, 'waffle_nav_result'))],
+    ['Waffle', s.omx.waffle_status || '--', s.omx.waffle_status ? 'OK' : 'NO DATA', ageText(topicAge(s, 'waffle_status'))],
+    ['Cmd Vel', `x ${fmt(cmd.linear_x)} / z ${fmt(cmd.angular_z)}`, s.omx.leader_cmd_vel ? 'OK' : 'NO DATA', ageText(topicAge(s, 'leader_cmd_vel'))],
+  ];
+  document.getElementById('omxCards').innerHTML = cards
+    .map(([label, value, status, sub]) => metricCard(label, value, status, sub))
+    .join('');
+}
+
+function updateYoloPanel(y) {
+  const data = y && y.data ? y.data : {};
+  const detections = Array.isArray(data.detections) ? data.detections : [];
+  const cards = [
+    ['Server', y ? y.status : 'NO DATA', y ? y.status : 'NO DATA', y ? `${fmt(y.latency_ms, 0)} ms` : ''],
+    ['Raw FPS', fmt(data.raw_fps, 1), data.ok ? 'OK' : 'NO DATA', `${data.raw_frames ?? 0} frames`],
+    ['YOLO FPS', fmt(data.yolo_fps, 1), data.yolo_frames ? 'OK' : 'NO DATA', `${data.yolo_frames ?? 0} frames`],
+    ['People', data.people ?? '--', data.people > 0 ? 'OK' : 'NO DATA', `${detections.length} detections`],
+    ['Latency', `${fmt(data.latency_ms, 1)} ms`, data.yolo_frames ? 'OK' : 'NO DATA', `pred ${fmt(data.predict_ms, 1)} ms`],
+    ['Frame Age', `${fmt(data.raw_frame_age_sec, 2)} s`, data.raw_frame_age_sec < 2 ? 'OK' : 'STALE', `${data.image_width || '--'}x${data.image_height || '--'}`],
+  ];
+  document.getElementById('yoloCards').innerHTML = cards
+    .map(([label, value, status, sub]) => metricCard(label, value, status, sub))
+    .join('');
+}
+
+function updateEvents(s) {
+  const names = [
+    'fire',
+    'target_processed',
+    'target_lost',
+    'target_blocked',
+    'target_not_found',
+    'nav_goal',
+    'nav_cancel',
+    'patrol_complete',
+  ];
+  document.getElementById('eventRows').innerHTML = names.map(name => {
+    const e = s.events[name] || {};
+    const last = e.last ? formatPoint(e.last) : '';
+    const cls = statusClass(e.status);
+    return `<div class="topic-row event-row">
+      <span>${escapeHtml(e.topic || name)}<small>${escapeHtml(last)}</small></span>
+      <span class="status-${cls}">#${e.count || 0} ${escapeHtml(e.status || 'NO DATA')} ${ageText(e.age_sec)}</span>
+    </div>`;
+  }).join('');
+}
+
+function gridMetaText(grid) {
+  const m = grid.metadata;
+  if (!m) return '--';
+  return `${m.width}x${m.height} @ ${fmt(m.resolution, 3)}m frame=${m.frame_id}`;
+}
+
+function updateMapMeta(s) {
+  const rows = [
+    ['Map', s.map.status, s.map.age_sec, gridMetaText(s.map)],
+    ['Risk', s.risk.status, s.risk.age_sec, gridMetaText(s.risk)],
+    ['Risk Overlay', s.risk.metadata_matches_map ? 'OK' : 'STALE', null, s.risk.metadata_matches_map ? 'metadata match' : 'metadata mismatch'],
+  ];
+  document.getElementById('mapMetaRows').innerHTML = rows.map(row => {
+    const cls = statusClass(row[1]);
+    return `<div class="topic-row"><span>${escapeHtml(row[0])}<small>${escapeHtml(row[3])}</small></span><span class="status-${cls}">${escapeHtml(row[1])} ${ageText(row[2])}</span></div>`;
+  }).join('');
+}
+
 function draw() {
   resizeCanvas();
   ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -189,17 +307,26 @@ function updateTables(s) {
       <td>${ageText(r.age_sec)}</td>
     </tr>`;
   }).join('');
-  const rows = [
+  const fixedRows = [
     [s.map.topic, s.map.status, s.map.age_sec],
     [s.risk.topic, s.risk.status, s.risk.age_sec],
     [s.fleet.coordination_status.topic, s.fleet.coordination_status.status, s.fleet.coordination_status.age_sec],
     [s.fleet.collision_warning.topic, s.fleet.collision_warning.status, s.fleet.collision_warning.age_sec],
-    ['/omx/state', s.omx.state ? 'OK' : 'NO DATA', s.omx.state_received_wall_sec ? s.server_time_sec - s.omx.state_received_wall_sec : null],
-    ['/omx/status', s.omx.status ? 'OK' : 'NO DATA', s.omx.status_received_wall_sec ? s.server_time_sec - s.omx.status_received_wall_sec : null],
   ];
+  const seen = new Set(fixedRows.map(row => row[0]));
+  const dynamicRows = Object.entries(s.topics || {})
+    .filter(([topic]) => !seen.has(topic))
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([topic, info]) => [topic, info.status, info.age_sec, info.type, info.value]);
+  const rows = fixedRows.map(row => [...row, '', null]).concat(dynamicRows);
   document.getElementById('topicRows').innerHTML = rows.map(row => {
     const cls = statusClass(row[1]);
-    return `<div class="topic-row"><span>${row[0]}</span><span class="status-${cls}">${row[1]} ${ageText(row[2])}</span></div>`;
+    const value = row[4] === null || row[4] === undefined ? '' : JSON.stringify(row[4]);
+    const detail = [row[3], value].filter(Boolean).join(' | ');
+    return `<div class="topic-row">
+      <span>${escapeHtml(row[0])}${detail ? `<small>${escapeHtml(detail)}</small>` : ''}</span>
+      <span class="status-${cls}">${escapeHtml(row[1])} ${ageText(row[2])}</span>
+    </div>`;
   }).join('');
 }
 
@@ -209,6 +336,9 @@ function updateTop(s) {
   setPill('leaderPill', 'Leader', leader.status);
   setPill('mapPill', 'Map', s.map.status);
   setPill('riskPill', 'Risk', s.risk.status);
+  setPill('yoloPill', 'YOLO', latestYolo ? latestYolo.status : 'NO DATA');
+  const fireStatus = s.omx.fire_disabled === false ? 'ARMED' : s.omx.fire_status ? s.omx.fire_status : 'NO DATA';
+  setPill('firePill', 'Fire', fireStatus);
   const rp = document.getElementById('robotPill');
   rp.className = `pill ${online ? 'online' : 'no-data'}`;
   rp.innerHTML = `<span class="dot"></span>Robots ${online}/${s.robots.length}`;
@@ -219,12 +349,21 @@ function updateTop(s) {
 
 async function refresh() {
   try {
-    const s = await (await fetch(stateUrl, {cache: 'no-store'})).json();
+    const [stateResp, yoloResp] = await Promise.all([
+      fetch(stateUrl, {cache: 'no-store'}),
+      fetch(yoloStatusUrl, {cache: 'no-store'}),
+    ]);
+    const s = await stateResp.json();
+    latestYolo = await yoloResp.json();
     latest = s;
     configureStream(s);
     updateImages(s);
     updateTop(s);
     updateTables(s);
+    updateOmxPanel(s);
+    updateYoloPanel(latestYolo);
+    updateEvents(s);
+    updateMapMeta(s);
     draw();
   } catch (err) {
     console.warn('dashboard refresh failed', err);

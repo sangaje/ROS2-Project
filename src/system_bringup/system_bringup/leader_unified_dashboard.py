@@ -7,16 +7,19 @@ import logging
 import math
 import threading
 import time
+import json
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import rclpy
 from ament_index_python.packages import get_package_share_directory
-from geometry_msgs.msg import PoseArray, PoseStamped
+from geometry_msgs.msg import Point, PointStamped, PoseArray, PoseStamped, Twist
 from nav_msgs.msg import OccupancyGrid
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-from std_msgs.msg import Bool, Float32, Int32, String
+from std_msgs.msg import Bool, Empty, Float32, Int32, String
 
 
 def _declare(node: Node, name: str, default: Any) -> Any:
@@ -141,6 +144,33 @@ class LeaderUnifiedDashboard(Node):
             'aim_progress': None,
             'queue_size': None,
             'waffle_status': None,
+            'waffle_nav_result': None,
+            'fire_status': None,
+            'fire_disabled': None,
+            'aim_error_norm': None,
+            'leader_cmd_vel': None,
+        }
+        self._events: Dict[str, Dict[str, Any]] = {
+            'fire': self._empty_event('/omx/fire', 'std_msgs/msg/Empty'),
+            'target_processed': self._empty_event(
+                '/omx/target_processed', 'geometry_msgs/msg/PointStamped'
+            ),
+            'target_lost': self._empty_event(
+                '/omx/target_lost', 'geometry_msgs/msg/PointStamped'
+            ),
+            'target_blocked': self._empty_event(
+                '/omx/target_blocked', 'geometry_msgs/msg/PointStamped'
+            ),
+            'target_not_found': self._empty_event(
+                '/omx/target_not_found', 'geometry_msgs/msg/PointStamped'
+            ),
+            'nav_goal': self._empty_event(
+                '/omx/nav_goal', 'geometry_msgs/msg/PoseStamped'
+            ),
+            'nav_cancel': self._empty_event('/omx/nav_cancel', 'std_msgs/msg/Empty'),
+            'patrol_complete': self._empty_event(
+                '/omx/patrol_complete', 'std_msgs/msg/Empty'
+            ),
         }
 
         grid_qos = QoSProfile(
@@ -157,12 +187,25 @@ class LeaderUnifiedDashboard(Node):
         self.create_subscription(PoseArray, self.fleet_poses_topic, self._on_fleet_poses, 10)
         self.create_subscription(String, self.fleet_status_topic, self._on_fleet_status, 10)
         self.create_subscription(Bool, self.collision_warning_topic, self._on_collision_warning, 10)
-        self.create_subscription(String, '/omx/state', lambda msg: self._set_omx('state', msg.data), 10)
-        self.create_subscription(String, '/omx/status', lambda msg: self._set_omx('status', msg.data), 10)
-        self.create_subscription(Bool, '/omx/target_detected', lambda msg: self._set_omx('target_detected', bool(msg.data)), 10)
-        self.create_subscription(Float32, '/omx/aim_progress', lambda msg: self._set_omx('aim_progress', float(msg.data)), 10)
-        self.create_subscription(Int32, '/omx/queue_size', lambda msg: self._set_omx('queue_size', int(msg.data)), 10)
-        self.create_subscription(String, '/waffle/status', lambda msg: self._set_omx('waffle_status', msg.data), 10)
+        self.create_subscription(String, '/omx/state', lambda msg: self._set_omx('state', msg.data, '/omx/state', 'std_msgs/msg/String'), 10)
+        self.create_subscription(String, '/omx/status', lambda msg: self._set_omx('status', msg.data, '/omx/status', 'std_msgs/msg/String'), 10)
+        self.create_subscription(Bool, '/omx/target_detected', lambda msg: self._set_omx('target_detected', bool(msg.data), '/omx/target_detected', 'std_msgs/msg/Bool'), 10)
+        self.create_subscription(Float32, '/omx/aim_progress', lambda msg: self._set_omx('aim_progress', float(msg.data), '/omx/aim_progress', 'std_msgs/msg/Float32'), 10)
+        self.create_subscription(Int32, '/omx/queue_size', lambda msg: self._set_omx('queue_size', int(msg.data), '/omx/queue_size', 'std_msgs/msg/Int32'), 10)
+        self.create_subscription(String, '/waffle/status', lambda msg: self._set_omx('waffle_status', msg.data, '/waffle/status', 'std_msgs/msg/String'), 10)
+        self.create_subscription(String, '/waffle/nav_result', lambda msg: self._set_omx('waffle_nav_result', msg.data, '/waffle/nav_result', 'std_msgs/msg/String'), 10)
+        self.create_subscription(String, '/omx/fire_status', lambda msg: self._set_omx('fire_status', msg.data, '/omx/fire_status', 'std_msgs/msg/String'), 10)
+        self.create_subscription(Bool, '/omx/fire_disable', lambda msg: self._set_omx('fire_disabled', bool(msg.data), '/omx/fire_disable', 'std_msgs/msg/Bool'), 10)
+        self.create_subscription(Point, '/omx/error_norm', self._on_aim_error, 10)
+        self.create_subscription(Twist, '/cmd_vel', self._on_cmd_vel, 10)
+        self.create_subscription(Empty, '/omx/fire', lambda msg: self._on_empty_event('fire'), 10)
+        self.create_subscription(Empty, '/omx/nav_cancel', lambda msg: self._on_empty_event('nav_cancel'), 10)
+        self.create_subscription(Empty, '/omx/patrol_complete', lambda msg: self._on_empty_event('patrol_complete'), 10)
+        self.create_subscription(PointStamped, '/omx/target_processed', lambda msg: self._on_point_event('target_processed', msg), 10)
+        self.create_subscription(PointStamped, '/omx/target_lost', lambda msg: self._on_point_event('target_lost', msg), 10)
+        self.create_subscription(PointStamped, '/omx/target_blocked', lambda msg: self._on_point_event('target_blocked', msg), 10)
+        self.create_subscription(PointStamped, '/omx/target_not_found', lambda msg: self._on_point_event('target_not_found', msg), 10)
+        self.create_subscription(PoseStamped, '/omx/nav_goal', self._on_nav_goal, 10)
 
         self._app = self._build_app()
         self._server_thread = threading.Thread(target=self._run_flask, daemon=True)
@@ -189,6 +232,16 @@ class LeaderUnifiedDashboard(Node):
             'pose': None,
             'received_wall_sec': None,
             'source': None,
+        }
+
+    @staticmethod
+    def _empty_event(topic: str, msg_type: str) -> Dict[str, Any]:
+        return {
+            'topic': topic,
+            'type': msg_type,
+            'count': 0,
+            'received_wall_sec': None,
+            'last': None,
         }
 
     def _resource_paths(self) -> tuple[str, str]:
@@ -230,6 +283,12 @@ class LeaderUnifiedDashboard(Node):
         @app.get('/api/robots')
         def robots():
             response = jsonify({'robots': self.snapshot()['robots']})
+            response.headers['Cache-Control'] = 'no-store'
+            return response
+
+        @app.get('/api/yolo_status')
+        def yolo_status():
+            response = jsonify(self.yolo_status())
             response.headers['Cache-Control'] = 'no-store'
             return response
 
@@ -342,11 +401,95 @@ class LeaderUnifiedDashboard(Node):
                 'type': 'std_msgs/msg/Bool',
             }
 
-    def _set_omx(self, key: str, value: Any) -> None:
+    def _set_omx(
+        self,
+        key: str,
+        value: Any,
+        topic_name: Optional[str] = None,
+        msg_type: Optional[str] = None,
+    ) -> None:
         now = time.time()
         with self._lock:
             self._omx_state[key] = value
             self._omx_state[f'{key}_received_wall_sec'] = now
+            if topic_name and msg_type:
+                self._topic_state[topic_name] = {
+                    'value': value,
+                    'received_wall_sec': now,
+                    'type': msg_type,
+                }
+
+    def _on_aim_error(self, msg: Point) -> None:
+        value = {
+            'x': float(msg.x),
+            'y': float(msg.y),
+            'magnitude': math.hypot(float(msg.x), float(msg.y)),
+        }
+        self._set_omx(
+            'aim_error_norm',
+            value,
+            '/omx/error_norm',
+            'geometry_msgs/msg/Point',
+        )
+
+    def _on_cmd_vel(self, msg: Twist) -> None:
+        value = {
+            'linear_x': float(msg.linear.x),
+            'linear_y': float(msg.linear.y),
+            'angular_z': float(msg.angular.z),
+        }
+        self._set_omx('leader_cmd_vel', value, '/cmd_vel', 'geometry_msgs/msg/Twist')
+
+    def _on_empty_event(self, key: str) -> None:
+        now = time.time()
+        with self._lock:
+            event = self._events[key]
+            event['count'] += 1
+            event['received_wall_sec'] = now
+            self._touch_topic(event['topic'], now, event['type'])
+
+    def _on_point_event(self, key: str, msg: PointStamped) -> None:
+        now = time.time()
+        value = {
+            'frame_id': msg.header.frame_id,
+            'stamp_sec': _stamp_to_float(msg.header.stamp),
+            'x': float(msg.point.x),
+            'y': float(msg.point.y),
+            'z': float(msg.point.z),
+        }
+        with self._lock:
+            event = self._events[key]
+            event['count'] += 1
+            event['received_wall_sec'] = now
+            event['last'] = value
+            self._topic_state[event['topic']] = {
+                'value': value,
+                'received_wall_sec': now,
+                'type': event['type'],
+            }
+
+    def _on_nav_goal(self, msg: PoseStamped) -> None:
+        now = time.time()
+        yaw = _quaternion_to_yaw(msg.pose.orientation)
+        value = {
+            'frame_id': msg.header.frame_id,
+            'stamp_sec': _stamp_to_float(msg.header.stamp),
+            'x': float(msg.pose.position.x),
+            'y': float(msg.pose.position.y),
+            'z': float(msg.pose.position.z),
+            'yaw_rad': yaw,
+            'yaw_deg': math.degrees(yaw),
+        }
+        with self._lock:
+            event = self._events['nav_goal']
+            event['count'] += 1
+            event['received_wall_sec'] = now
+            event['last'] = value
+            self._topic_state[event['topic']] = {
+                'value': value,
+                'received_wall_sec': now,
+                'type': event['type'],
+            }
 
     def _touch_topic(self, topic_name: str, now: float, msg_type: str) -> None:
         self._topic_state[topic_name] = {
@@ -373,6 +516,7 @@ class LeaderUnifiedDashboard(Node):
                     'status_path': self.yolo_status_path,
                 },
                 'omx': dict(self._omx_state),
+                'events': self._events_summary(now),
                 'map': self._grid_summary('map', now, self.map_stale_timeout_sec),
                 'risk': {
                     **self._grid_summary('risk', now, self.risk_stale_timeout_sec),
@@ -387,6 +531,28 @@ class LeaderUnifiedDashboard(Node):
                     'collision_warning': self._topic_value(self.collision_warning_topic, now),
                 },
                 'topics': self._topics_summary(now),
+            }
+
+    def yolo_status(self) -> Dict[str, Any]:
+        url = f'http://127.0.0.1:{self.yolo_server_port}{self.yolo_status_path}'
+        started = time.time()
+        try:
+            with urllib.request.urlopen(url, timeout=0.35) as response:
+                raw = response.read(256 * 1024)
+            payload = json.loads(raw.decode('utf-8'))
+            return {
+                'status': 'OK',
+                'url': url,
+                'latency_ms': (time.time() - started) * 1000.0,
+                'data': payload,
+            }
+        except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+            return {
+                'status': 'NO DATA',
+                'url': url,
+                'latency_ms': (time.time() - started) * 1000.0,
+                'error': str(exc),
+                'data': None,
             }
 
     def _grid_summary(self, kind: str, now: float, stale_timeout: float) -> Dict[str, Any]:
@@ -449,6 +615,24 @@ class LeaderUnifiedDashboard(Node):
             'age_sec': age,
             'value': state.get('value'),
         }
+
+    def _events_summary(self, now: float) -> Dict[str, Dict[str, Any]]:
+        events = {}
+        for name, event in self._events.items():
+            age = None
+            status = 'NO DATA'
+            if event['received_wall_sec'] is not None:
+                age = max(0.0, now - event['received_wall_sec'])
+                status = 'STALE' if age > 10.0 else 'OK'
+            events[name] = {
+                'topic': event['topic'],
+                'type': event['type'],
+                'status': status,
+                'age_sec': age,
+                'count': int(event['count']),
+                'last': event['last'],
+            }
+        return events
 
     def _topics_summary(self, now: float) -> Dict[str, Dict[str, Any]]:
         topics = {}

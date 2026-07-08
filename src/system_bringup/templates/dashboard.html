@@ -13,6 +13,8 @@
       <span id="leaderPill" class="pill no-data"><span class="dot"></span>Leader NO DATA</span>
       <span id="mapPill" class="pill no-data"><span class="dot"></span>Map NO DATA</span>
       <span id="riskPill" class="pill no-data"><span class="dot"></span>Risk NO DATA</span>
+      <span id="yoloPill" class="pill no-data"><span class="dot"></span>YOLO NO DATA</span>
+      <span id="firePill" class="pill no-data"><span class="dot"></span>Fire NO DATA</span>
       <span id="robotPill" class="pill no-data"><span class="dot"></span>Robots 0/3</span>
     </div>
   </header>
@@ -53,6 +55,14 @@
     </section>
     <div class="lower">
       <section>
+        <h2>OMX / Fire / Nav</h2>
+        <div id="omxCards" class="metric-grid"></div>
+      </section>
+      <section>
+        <h2>YOLO Server</h2>
+        <div id="yoloCards" class="metric-grid"></div>
+      </section>
+      <section>
         <h2>Robot Status</h2>
         <table>
           <thead><tr><th>Robot</th><th>Role</th><th>Status</th><th>X</th><th>Y</th><th>Yaw</th><th>Age</th></tr></thead>
@@ -62,6 +72,14 @@
       <section>
         <h2>Topic / Data Status</h2>
         <div id="topicRows" class="topic-list"></div>
+      </section>
+      <section>
+        <h2>Target Events</h2>
+        <div id="eventRows" class="topic-list"></div>
+      </section>
+      <section>
+        <h2>Map / Risk Metadata</h2>
+        <div id="mapMetaRows" class="topic-list"></div>
       </section>
     </div>
   </main>
