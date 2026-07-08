@@ -16,7 +16,7 @@ from typing import Any, Dict, Optional
 import rclpy
 from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import Point, PointStamped, PoseArray, PoseStamped, Twist
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, Path as NavPath
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool, Empty, Float32, Int32, String
@@ -100,6 +100,12 @@ class LeaderUnifiedDashboard(Node):
         self.fleet_poses_topic = str(_declare(self, 'fleet_poses_topic', '/fleet/robot_poses'))
         self.fleet_status_topic = str(_declare(self, 'fleet_status_topic', '/fleet/coordination_status'))
         self.collision_warning_topic = str(_declare(self, 'collision_warning_topic', '/fleet/collision_warning'))
+        self.leader_nav_path_topic = str(_declare(self, 'leader_nav_path_topic', '/plan'))
+        self.leader_bridged_nav_path_topic = str(
+            _declare(self, 'leader_bridged_nav_path_topic', '/leader_plan')
+        )
+        self.follower_nav_path_topic = str(_declare(self, 'follower_nav_path_topic', '/burger_plan'))
+        self.member_nav_path_topic = str(_declare(self, 'member_nav_path_topic', '/member_plan'))
         self.omx_debug_port = int(_declare(self, 'omx_debug_port', 8080))
         self.omx_stream_path = str(_declare(self, 'omx_stream_path', '/stream.mjpg'))
         self.omx_state_path = str(_declare(self, 'omx_state_path', '/state.json'))
@@ -137,6 +143,14 @@ class LeaderUnifiedDashboard(Node):
             self.second_follower_name,
         )
         self._topic_state: Dict[str, Dict[str, Any]] = {}
+        self._nav_paths: Dict[str, Dict[str, Any]] = {
+            'leader': self._empty_path_state('leader', self.leader_nav_path_topic),
+            'leader_bridge': self._empty_path_state(
+                'leader_bridge', self.leader_bridged_nav_path_topic
+            ),
+            'follower': self._empty_path_state('follower', self.follower_nav_path_topic),
+            'member': self._empty_path_state('member', self.member_nav_path_topic),
+        }
         self._omx_state: Dict[str, Any] = {
             'state': None,
             'status': None,
@@ -187,6 +201,10 @@ class LeaderUnifiedDashboard(Node):
         self.create_subscription(PoseArray, self.fleet_poses_topic, self._on_fleet_poses, 10)
         self.create_subscription(String, self.fleet_status_topic, self._on_fleet_status, 10)
         self.create_subscription(Bool, self.collision_warning_topic, self._on_collision_warning, 10)
+        self.create_subscription(NavPath, self.leader_nav_path_topic, lambda msg: self._on_nav_path('leader', msg), 10)
+        self.create_subscription(NavPath, self.leader_bridged_nav_path_topic, lambda msg: self._on_nav_path('leader_bridge', msg), 10)
+        self.create_subscription(NavPath, self.follower_nav_path_topic, lambda msg: self._on_nav_path('follower', msg), 10)
+        self.create_subscription(NavPath, self.member_nav_path_topic, lambda msg: self._on_nav_path('member', msg), 10)
         self.create_subscription(String, '/risk/yolo_detections', lambda msg: self._set_topic_value('/risk/yolo_detections', msg.data, 'std_msgs/msg/String'), 10)
         self.create_subscription(String, '/omx/state', lambda msg: self._set_omx('state', msg.data, '/omx/state', 'std_msgs/msg/String'), 10)
         self.create_subscription(String, '/omx/status', lambda msg: self._set_omx('status', msg.data, '/omx/status', 'std_msgs/msg/String'), 10)
@@ -243,6 +261,16 @@ class LeaderUnifiedDashboard(Node):
             'count': 0,
             'received_wall_sec': None,
             'last': None,
+        }
+
+    @staticmethod
+    def _empty_path_state(name: str, topic: str) -> Dict[str, Any]:
+        return {
+            'name': name,
+            'topic': topic,
+            'msg': None,
+            'received_wall_sec': None,
+            'seq': 0,
         }
 
     def _resource_paths(self) -> tuple[str, str]:
@@ -435,6 +463,22 @@ class LeaderUnifiedDashboard(Node):
                 'type': 'std_msgs/msg/Bool',
             }
 
+    def _on_nav_path(self, name: str, msg: NavPath) -> None:
+        now = time.time()
+        with self._lock:
+            path = self._nav_paths[name]
+            first_sample = path['received_wall_sec'] is None
+            path['msg'] = msg
+            path['received_wall_sec'] = now
+            path['seq'] += 1
+            self._touch_topic(path['topic'], now, 'nav_msgs/msg/Path')
+        if first_sample:
+            self.get_logger().info(
+                'DASHBOARD_NAV_PATH_FIRST_RX | '
+                f'name={name} topic={self._nav_paths[name]["topic"]} '
+                f'frame_id={msg.header.frame_id} poses={len(msg.poses)}'
+            )
+
     def _set_omx(
         self,
         key: str,
@@ -575,6 +619,10 @@ class LeaderUnifiedDashboard(Node):
                     'coordination_status': self._topic_value(self.fleet_status_topic, now),
                     'collision_warning': self._topic_value(self.collision_warning_topic, now),
                 },
+                'nav2_paths': [
+                    self._nav_path_summary(name, now)
+                    for name in ('leader', 'leader_bridge', 'follower', 'member')
+                ],
                 'topics': self._topics_summary(now),
             }
 
@@ -659,6 +707,51 @@ class LeaderUnifiedDashboard(Node):
             'status': 'STALE' if age > self.robot_stale_timeout_sec else 'OK',
             'age_sec': age,
             'value': state.get('value'),
+        }
+
+    def _nav_path_summary(self, name: str, now: float) -> Dict[str, Any]:
+        path = self._nav_paths[name]
+        msg = path['msg']
+        age = None
+        status = 'NO DATA'
+        if path['received_wall_sec'] is not None:
+            age = max(0.0, now - path['received_wall_sec'])
+            status = 'STALE' if age > 5.0 else 'OK'
+        points = []
+        frame_id = None
+        stamp_sec = None
+        if msg is not None:
+            frame_id = msg.header.frame_id
+            stamp_sec = _stamp_to_float(msg.header.stamp)
+            stride = max(1, len(msg.poses) // 240)
+            for pose in msg.poses[::stride]:
+                points.append({
+                    'x': float(pose.pose.position.x),
+                    'y': float(pose.pose.position.y),
+                    'z': float(pose.pose.position.z),
+                })
+            if msg.poses and points[-1] != {
+                'x': float(msg.poses[-1].pose.position.x),
+                'y': float(msg.poses[-1].pose.position.y),
+                'z': float(msg.poses[-1].pose.position.z),
+            }:
+                points.append({
+                    'x': float(msg.poses[-1].pose.position.x),
+                    'y': float(msg.poses[-1].pose.position.y),
+                    'z': float(msg.poses[-1].pose.position.z),
+                })
+        return {
+            'name': path['name'],
+            'topic': path['topic'],
+            'status': status,
+            'age_sec': age,
+            'seq': int(path['seq']),
+            'frame_id': frame_id,
+            'stamp_sec': stamp_sec,
+            'pose_count': len(msg.poses) if msg is not None else 0,
+            'points': points,
+            'start': points[0] if points else None,
+            'end': points[-1] if points else None,
         }
 
     def _events_summary(self, now: float) -> Dict[str, Dict[str, Any]]:

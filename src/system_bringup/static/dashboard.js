@@ -12,6 +12,12 @@ let streamSources = {};
 const canvas = document.getElementById('mapCanvas');
 const ctx = canvas.getContext('2d');
 const roleColors = {leader: '#58a6ff', follower: '#63d297'};
+const pathColors = {
+  leader: '#f4c95d',
+  leader_bridge: '#ffdf7e',
+  follower: '#d2a8ff',
+  member: '#ffa657',
+};
 
 function statusClass(status) {
   return String(status || 'NO DATA').toLowerCase().replaceAll(' ', '-');
@@ -168,6 +174,38 @@ function drawRobot(meta, vp, robot) {
   ctx.restore();
 }
 
+function drawNavPath(meta, vp, path) {
+  if (!path || path.status === 'NO DATA' || !Array.isArray(path.points) || path.points.length < 2) return;
+  const canvasPoints = [];
+  path.points.forEach(point => {
+    const cell = worldToCell(meta, point.x, point.y);
+    if (cell.x < -1 || cell.x > meta.width + 1 || cell.y < -1 || cell.y > meta.height + 1) return;
+    canvasPoints.push(cellToCanvas(meta, vp, cell));
+  });
+  if (canvasPoints.length < 2) return;
+
+  const color = pathColors[path.name] || '#f4c95d';
+  ctx.save();
+  ctx.globalAlpha = path.status === 'OK' ? 0.96 : 0.38;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = Math.max(2, Math.min(4, vp.scale * 0.08));
+  ctx.setLineDash(path.name === 'leader_bridge' ? [7, 5] : []);
+  ctx.beginPath();
+  canvasPoints.forEach((p, index) => {
+    if (index === 0) ctx.moveTo(p.x, p.y);
+    else ctx.lineTo(p.x, p.y);
+  });
+  ctx.stroke();
+
+  const end = canvasPoints[canvasPoints.length - 1];
+  ctx.setLineDash([]);
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.arc(end.x, end.y, Math.max(4, Math.min(7, vp.scale * 0.12)), 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
 function topicAge(s, key) {
   const t = s.omx[`${key}_received_wall_sec`];
   return t ? s.server_time_sec - t : null;
@@ -265,6 +303,28 @@ function updateMapMeta(s) {
   }).join('');
 }
 
+function pathEndpointText(point) {
+  if (!point) return '--';
+  return `(${fmt(point.x)}, ${fmt(point.y)})`;
+}
+
+function updateNavPaths(s) {
+  const paths = Array.isArray(s.nav2_paths) ? s.nav2_paths : [];
+  document.getElementById('navPathRows').innerHTML = paths.map(path => {
+    const cls = statusClass(path.status);
+    const detail = [
+      `frame=${path.frame_id || '--'}`,
+      `poses=${path.pose_count || 0}`,
+      `start=${pathEndpointText(path.start)}`,
+      `end=${pathEndpointText(path.end)}`,
+    ].join(' | ');
+    return `<div class="topic-row">
+      <span>${escapeHtml(path.topic || path.name)}<small>${escapeHtml(detail)}</small></span>
+      <span class="status-${cls}">${escapeHtml(path.status || 'NO DATA')} ${ageText(path.age_sec)}</span>
+    </div>`;
+  }).join('');
+}
+
 function draw() {
   resizeCanvas();
   ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -286,6 +346,9 @@ function draw() {
     ctx.globalAlpha = Number(document.getElementById('riskOpacity').value);
     ctx.drawImage(riskImg, vp.x, vp.y, vp.w, vp.h);
     ctx.restore();
+  }
+  if (document.getElementById('layerNavPaths').checked) {
+    (latest.nav2_paths || []).forEach(path => drawNavPath(meta, vp, path));
   }
   if (document.getElementById('layerRobots').checked) {
     latest.robots.forEach(robot => drawRobot(meta, vp, robot));
@@ -366,13 +429,14 @@ async function refresh() {
     updateYoloPanel(latestYolo);
     updateEvents(s);
     updateMapMeta(s);
+    updateNavPaths(s);
     draw();
   } catch (err) {
     console.warn('dashboard refresh failed', err);
   }
 }
 
-['layerMap', 'layerRisk', 'layerRobots', 'riskOpacity'].forEach(id => {
+['layerMap', 'layerRisk', 'layerRobots', 'layerNavPaths', 'riskOpacity'].forEach(id => {
   document.getElementById(id).addEventListener('input', draw);
   document.getElementById(id).addEventListener('change', draw);
 });

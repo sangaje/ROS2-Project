@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Leader stack: TurtleBot3 bringup, AMCL/Nav2 and fleet coordination.
 
-In real mode the leader defaults to receiving the risk/scout domain's SLAM
+In real mode the leader defaults to receiving the scout/risk domain's SLAM
 map through domain_bridge on /map_bridge, republishing it as this domain's
 /map, and running AMCL against that shared map. enable_cartographer:=true is
-kept as an explicit compatibility escape hatch.
+kept as an explicit compatibility escape hatch for single-leader SLAM mode.
 """
 
 import os
@@ -120,6 +120,7 @@ def generate_launch_description():
                     'output_topic': '/map',
                     'check_period_sec': 0.2,
                     'takeover_grace_sec': 0.0,
+                    'relay_without_primary': True,
                 }],
                 env=process_env,
                 respawn=True,
@@ -536,9 +537,9 @@ def generate_launch_description():
             choices=['true', 'false'],
             description=(
                 'Real mode only (ignored in simulation): default false '
-                'receives the risk/scout SLAM map on /map_bridge and runs '
-                'AMCL against the shared /map. Set true only for legacy '
-                'single-leader SLAM operation.'
+                'receives the scout/risk SLAM map on /map_bridge and runs '
+                'AMCL against the shared /map. Set true only for '
+                'single-leader SLAM compatibility.'
             ),
         ),
         DeclareLaunchArgument(

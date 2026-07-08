@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
 Receives /map_bridge from domain_bridge with a transient-local
-subscription and stands by to republish it on /map (transient_local) only
-when nothing else is currently publishing there. While relaying, it
-periodically republishes the cached map through both transient-local and
-volatile publishers so AMCL/Nav2 can get a latched map and plain
-`ros2 topic echo /map --once` can receive a fresh sample too.
+subscription and republishes it on /map (transient_local). By default it
+stands by until no other /map publisher is alive. In external-map mode it
+relays each bridged update directly and avoids periodic full-map
+republishing.
 
 /map is meant to have exactly one live source at a time -- normally a local
 SLAM node (e.g. Cartographer) when this robot owns its own mapping. This
@@ -30,6 +29,7 @@ class MapRelay(Node):
         self.declare_parameter('output_topic', '/map')
         self.declare_parameter('check_period_sec', 1.0)
         self.declare_parameter('takeover_grace_sec', 2.0)
+        self.declare_parameter('relay_without_primary', False)
 
         self.input_topic = str(self.get_parameter('input_topic').value)
         self.output_topic = str(self.get_parameter('output_topic').value)
@@ -38,6 +38,9 @@ class MapRelay(Node):
         )
         self.takeover_grace = max(
             0.0, float(self.get_parameter('takeover_grace_sec').value)
+        )
+        self.relay_without_primary = bool(
+            self.get_parameter('relay_without_primary').value
         )
 
         pub_qos = QoSProfile(
@@ -93,7 +96,8 @@ class MapRelay(Node):
         self.get_logger().info(
             f'map relay standing by: {self.input_topic} (transient_local) -> '
             f'{self.output_topic} (transient_local), only if no other '
-            f'publisher is active on {self.output_topic}'
+            f'publisher is active on {self.output_topic}; '
+            f'relay_without_primary={self.relay_without_primary}'
         )
 
     def _on_bridged_map(self, msg: OccupancyGrid):
@@ -153,6 +157,16 @@ class MapRelay(Node):
         )
 
     def _check_primary(self):
+        if self.relay_without_primary:
+            if not self._relaying:
+                self._relaying = True
+                self.get_logger().info(
+                    'MAP_RELAY_EXTERNAL_MODE | relaying bridged map updates '
+                    f'{self.input_topic} -> {self.output_topic}'
+                )
+                self._publish_latest()
+            return
+
         now = self._now_sec()
         external = self._external_publisher_count()
 
@@ -188,7 +202,11 @@ class MapRelay(Node):
         # Prefer continuing from whatever the primary itself last
         # published (e.g. Cartographer's own last map before it died);
         # only fall back to the bridged leader map if we never saw one.
-        source = self._last_seen_output or self._latest_bridged
+        source = (
+            self._latest_bridged
+            if self.relay_without_primary
+            else self._last_seen_output or self._latest_bridged
+        )
         if source is None:
             self.get_logger().warning(
                 'MAP_RELAY_NO_CACHED_MAP | taking over but no map has '

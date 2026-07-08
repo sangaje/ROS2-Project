@@ -315,17 +315,23 @@ def write_risk_to_leader_bridge_config(
     risk_domain: int,
     leader_domain: int,
     *,
+    include_map: bool = True,
     output_directory: Optional[Path] = None,
 ) -> Path:
-    """Create the one-way SLAM/risk bridge into the leader domain."""
-    topics = {
-        '/map': topic(
+    """Create the one-way scout/risk bridge into the leader domain.
+
+    include_map=True is the target fleet mode: the scout/risk domain owns
+    Cartographer and publishes the authoritative /map. The explicit
+    leader-SLAM compatibility mode sets this false so domain 20's local
+    Cartographer remains the only /map source in that mode.
+    """
+    topics = risk_topics()
+    if include_map:
+        topics['/map'] = topic(
             'nav_msgs/msg/OccupancyGrid',
             remap='/map_bridge',
             profile=map_qos(depth=5),
-        ),
-        **risk_topics(),
-    }
+        )
     return _write_runtime_config(
         f'risk_{risk_domain}_to_leader_{leader_domain}_',
         {

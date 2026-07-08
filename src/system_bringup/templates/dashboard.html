@@ -44,10 +44,13 @@
         <label><input id="layerMap" type="checkbox" checked> Map</label>
         <label><input id="layerRisk" type="checkbox" checked> Risk</label>
         <label><input id="layerRobots" type="checkbox" checked> Robots</label>
+        <label><input id="layerNavPaths" type="checkbox" checked> Nav2 paths</label>
         <label>Risk opacity <input id="riskOpacity" type="range" min="0" max="1" step="0.05" value="0.55"></label>
         <span class="legend">
           <span><span class="swatch leader"></span> leader</span>
           <span><span class="swatch follower"></span> follower x2</span>
+          <span><span class="swatch nav-leader"></span> /plan</span>
+          <span><span class="swatch nav-follower"></span> /burger_plan</span>
         </span>
       </div>
       <canvas id="mapCanvas"></canvas>
@@ -68,6 +71,10 @@
           <thead><tr><th>Robot</th><th>Role</th><th>Status</th><th>X</th><th>Y</th><th>Yaw</th><th>Age</th></tr></thead>
           <tbody id="robotRows"></tbody>
         </table>
+      </section>
+      <section>
+        <h2>Nav2 Paths</h2>
+        <div id="navPathRows" class="topic-list"></div>
       </section>
       <section>
         <h2>Topic / Data Status</h2>

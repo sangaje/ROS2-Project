@@ -196,6 +196,8 @@ td { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .swatch { width: 10px; height: 10px; display: inline-block; border-radius: 2px; }
 .swatch.leader { background: var(--leader); }
 .swatch.follower { background: var(--follower); }
+.swatch.nav-leader { background: #f4c95d; }
+.swatch.nav-follower { background: #d2a8ff; }
 @media (max-width: 980px) {
   header, main, .lower, .scout-stream-grid { grid-template-columns: 1fr; }
   .top-status { justify-content: flex-start; }

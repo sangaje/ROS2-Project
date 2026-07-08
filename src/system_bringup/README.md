@@ -1,7 +1,10 @@
 # system_bringup
 
-로봇의 역할(정찰/리더)에 맞춰 `fleet_bringup` + 베이지안 리스크맵 +
-RL 정책 + 리더 Jetson/OMX AIM을 한 번에 켜는 오케스트레이터.
+로봇의 역할(정찰/리더)에 맞춰 `fleet_bringup` + Scout Cartographer/risk
+map + 경량 정찰 카메라 송신 + 리더 Jetson/OMX AIM을 한 번에 켜는
+오케스트레이터. 기본 구조는 Scout Pi/Domain 22가 Cartographer SLAM과
+authoritative `/map`을 소유하고, Leader Waffle/Jetson은 그 shared map을
+받아 자기 AMCL/Nav2로 주행한다.
 로봇마다 이 패키지의 런치 파일 하나만 실행하면 된다.
 
 - `system.launch.py`: 역할별 전체 스택
@@ -50,20 +53,38 @@ PC에서 직접 돌릴 때 `start_yolo_server:=true`를 준다.
 
 | role     | fleet_role 기본값 | 리스크맵                   | RL 정책 | Jetson/OMX |
 |----------|-------------------|----------------------------|---------|------------|
-| `scout`  | `member`          | 켜짐                       | 켜짐    | 안 켜짐    |
+| `scout`  | `member`          | 켜짐                       | 기본 꺼짐 | 안 켜짐  |
 | `leader` | `leader`          | 안 켜짐                    | 안 켜짐 | 켜짐       |
 
-`scout`는 리더를 따라가지도, 리더가 되지도 않는 `member.launch.py` 위에서
-RL 정책이 직접 `/cmd_vel`을 몰아 정찰하고, 코디네이터가 다른 로봇을
-비켜줘야 할 때만 짧게 Nav2 목적지로 개입한다. `follower`처럼 리더를
-계속 쫓아가게 하고 싶으면 `fleet_role:=follower`로 바꾸면 된다.
+`scout`는 기본적으로 로봇 base, Cartographer, Bayesian risk map, camera
+sender를 켠다. 카메라 프레임은 리더 Jetson의 `flask_yolo_server`로 보내고,
+Scout-local YOLO와 risk-map 내부 camera capture는 자동으로 꺼진다.
+Cartographer가 `/map`을 소유하는 동안 Scout 하위 Nav2는 기본으로 세우지
+않아 Pi의 CPU와 `/cmd_vel` 경합을 줄인다. `follower`처럼 리더를 계속
+쫓아가게 하고 싶으면 `fleet_role:=follower`로 바꾸면 된다.
 
-`leader`는 `fleet_bringup/leader.launch.py`를 실행하고, 선택적으로
-`risk_domain_id`가 있으면 risk/scout→leader 맵/리스크 브리지를, `pc_domain_id`가
-있으면 leader→PC 시각화 브리지를 단방향으로 실행한다. RViz 프로세스는
-리더에서 실행하지 않는다. 리더 role은 `omx_aim/jetson.launch.py`를 하위
-component로 include해서 Jetson YOLO 서버, OMX AIM 파이프라인, debug stream,
-통합 웹 대시보드를 함께 실행한다.
+`leader`는 `fleet_bringup/leader.launch.py`를 실행하고, 기본적으로 자체
+Cartographer를 띄우지 않는다. `risk_domain_id`로 지정한 Scout/risk domain의
+`/map`을 `/map_bridge`로 받아 leader domain의 `/map`으로 relay한 뒤, Leader
+자기 LiDAR/odom으로 AMCL/Nav2를 실행한다. RViz 프로세스는 리더에서 실행하지 않는다.
+리더 role은 `omx_aim/jetson.launch.py`를 하위 component로 include해서 Jetson
+YOLO 서버, OMX AIM 파이프라인, debug stream, 통합 웹 대시보드를 함께 실행한다.
+
+### 통합 대시보드의 Nav2 경로 표시
+
+통합 대시보드는 map/risk/robot marker 위에 Nav2 `nav_msgs/Path`도 함께
+그린다. 기본 구독 토픽은 다음과 같다.
+
+| label | topic | 의미 |
+|-------|-------|------|
+| leader | `/plan` | Leader domain에서 Nav2 planner가 직접 발행하는 현재 경로 |
+| leader_bridge | `/leader_plan` | bridge/PC 표시용 leader plan remap 경로 |
+| follower | `/burger_plan` | follower domain의 `/plan`이 leader domain으로 들어온 경로 |
+| member | `/member_plan` | member/scout Nav2 plan을 별도 bridge할 때 쓸 예약 경로 |
+
+화면의 `Nav2 paths` 체크박스로 지도 위 경로 레이어를 켜고 끌 수 있고, 아래
+`Nav2 Paths` 패널에는 각 topic의 frame, pose count, start/end 좌표, age가
+표시된다.
 
 ### follower는 결국 정찰봇이다
 
@@ -88,9 +109,10 @@ follower 중에도 계속 켜져 있다 — 위험도만 수동적으로 계속 
 
 ### YOLO를 리더 Jetson으로 오프로드 (`start_camera_sender`)
 
-리스크맵은 정찰봇에서 실행된다. `start_camera_sender:=true`는 정찰봇의
-카메라 프레임만 리더 Jetson의 Flask YOLO 서버로 보내고, YOLO 결과(`/risk/yolo_detections`)를
-다시 정찰봇에서 받아 로컬 리스크맵에 넣는다.
+`start_camera_sender:=true`가 Scout 기본값이다. 정찰봇의 카메라 프레임만
+리더 Jetson의 Flask YOLO 서버로 보내고, YOLO 결과(`/risk/yolo_detections`)를
+정찰봇 domain에 발행한다. 로컬 risk map은 이 detection topic을 읽고,
+Cartographer가 만든 authoritative `/map` 좌표계 위에 risk layer를 유지한다.
 
 `start_camera_sender:=true`를 주면 `system.launch.py`가 직접
 `flask_yolo_bridge/opencv_camera_to_flask_yolo.launch.py`를 이

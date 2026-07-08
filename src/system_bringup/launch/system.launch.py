@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Single entry point that turns on everything a robot's fleet role needs.
 
-role:=scout  -> fleet bringup (default fleet_role=member) + Bayesian risk map
-                + the RL-trained exploration policy driving cmd_vel directly.
-role:=leader -> fleet bringup (default fleet_role=leader) + leader-side
-                Jetson/OMX AIM integration.
+role:=scout  -> fleet bringup (default fleet_role=member) + Scout-owned
+                Cartographer/risk map + Jetson-offloaded camera sender.
+role:=leader -> fleet bringup (default fleet_role=leader) + shared-map
+                AMCL/Nav2 and Jetson/OMX AIM integration.
 """
 
 import os
@@ -65,6 +65,7 @@ def generate_launch_description():
         'cartographer_configuration_basename'
     )
     start_camera = LaunchConfiguration('start_camera')
+    start_teleop = LaunchConfiguration('start_teleop')
     risk_model_path = LaunchConfiguration('risk_model_path')
     detection_source = LaunchConfiguration('detection_source')
     enable_yolo = LaunchConfiguration('enable_yolo')
@@ -187,9 +188,13 @@ def generate_launch_description():
                 'true' if scout_owns_slam else 'false'
             )
         if fleet_role_value in ('leader', 'member'):
+            nav2_value = start_nav2.perform(context)
+            if scout_owns_slam:
+                nav2_value = 'false'
+            elif scout_rl_owns_cmd_vel:
+                nav2_value = 'false'
             fleet_launch_args['start_nav2'] = (
-                'false' if scout_rl_owns_cmd_vel
-                else start_nav2.perform(context)
+                nav2_value
             )
         if scout_owns_slam:
             fleet_launch_args['hardware_param_file'] = os.path.join(
@@ -225,6 +230,12 @@ def generate_launch_description():
                 'SYSTEM_BRINGUP | scout member RL owns /cmd_vel; forcing ',
                 'fleet start_nav2:=false to avoid Nav2/RL command conflict.',
             ]))
+        if scout_owns_slam and launch_bool(start_nav2.perform(context)):
+            actions.append(LogInfo(msg=[
+                'SYSTEM_BRINGUP | scout owns Cartographer /map; forcing ',
+                'fleet start_nav2:=false for lightweight Scout operation. ',
+                'Leader/member AMCL/Nav2 remains available in their own roles.',
+            ]))
 
         if role_value == 'leader':
             process_env = clean_process_environment(str(domain))
@@ -235,18 +246,30 @@ def generate_launch_description():
             ):
                 risk_domain = int(risk_domain_value)
                 if risk_domain != domain:
-                    risk_bridge_config = write_risk_to_leader_bridge_config(
-                        risk_domain, domain,
+                    leader_owns_map = launch_bool(
+                        enable_cartographer.perform(context)
                     )
-                    actions.append(LogInfo(msg=[
-                        'MAP_BRIDGE_STAGE_A | source_domain=',
-                        str(risk_domain),
-                        ' | destination_domain=', str(domain),
-                        ' | source_topic=/map',
-                        ' | bridge_topic=/map_bridge',
-                        ' | final_topic=/map',
-                        ' | type=nav_msgs/msg/OccupancyGrid',
-                    ]))
+                    risk_bridge_config = write_risk_to_leader_bridge_config(
+                        risk_domain,
+                        domain,
+                        include_map=not leader_owns_map,
+                    )
+                    if leader_owns_map:
+                        actions.append(LogInfo(msg=[
+                            'SYSTEM_BRINGUP | leader Cartographer owns /map; ',
+                            'risk->leader bridge excludes /map and only carries ',
+                            'risk/debug topics.',
+                        ]))
+                    else:
+                        actions.append(LogInfo(msg=[
+                            'MAP_BRIDGE_STAGE_A | source_domain=',
+                            str(risk_domain),
+                            ' | destination_domain=', str(domain),
+                            ' | source_topic=/map',
+                            ' | bridge_topic=/map_bridge',
+                            ' | final_topic=/map',
+                            ' | type=nav_msgs/msg/OccupancyGrid',
+                        ]))
                     actions.append(TimerAction(
                         period=0.5,
                         actions=[Node(
@@ -443,6 +466,10 @@ def generate_launch_description():
                         'fleet_poses_topic': '/fleet/robot_poses',
                         'fleet_status_topic': '/fleet/coordination_status',
                         'collision_warning_topic': '/fleet/collision_warning',
+                        'leader_nav_path_topic': '/plan',
+                        'leader_bridged_nav_path_topic': '/leader_plan',
+                        'follower_nav_path_topic': '/burger_plan',
+                        'member_nav_path_topic': '/member_plan',
                     }],
                     env=process_env,
                     respawn=True,
@@ -473,8 +500,8 @@ def generate_launch_description():
                     hint = (
                         'Set enable_cartographer:=false (leader.launch.py '
                         'will then run AMCL against a map bridged in from '
-                        'a member instead) when turning start_cartographer '
-                        'on for fleet_role:=leader.'
+                        'a scout/member instead) when turning '
+                        'start_cartographer on for fleet_role:=leader.'
                     )
                 raise ValueError(
                     'start_cartographer:=true would fight with the '
@@ -507,15 +534,17 @@ def generate_launch_description():
                 launch_arguments={
                     'use_sim_time': 'false',
                     # The fleet stack above already brings up hardware.
-                    # In the target architecture this risk-map layer owns
-                    # SLAM by default; keep enable_amcl:=false underneath so
-                    # there is only one map->odom source in this domain.
+                    # In the target architecture this Scout risk-map layer
+                    # owns SLAM by default; keep enable_amcl:=false
+                    # underneath so there is only one map->odom source in
+                    # this domain.
                     'start_robot_bringup': 'false',
                     'start_cartographer': (
                         'true' if cartographer_on else 'false'
                     ),
                     'cartographer_configuration_basename': configured_lua,
                     'start_camera': risk_start_camera,
+                    'start_teleop': start_teleop.perform(context),
                     'model_path': risk_model_path.perform(context),
                     'detection_source': risk_detection_source,
                     'enable_yolo': risk_enable_yolo,
@@ -608,7 +637,8 @@ def generate_launch_description():
             choices=['scout', 'leader'],
             description=(
                 "This robot's fleet role: 'scout' (fleet bringup + risk "
-                "map + RL policy) or 'leader' (fleet bringup only)."
+                "map + camera sender) or 'leader' (fleet bringup + "
+                "Jetson/OMX AIM)."
             ),
         ),
         DeclareLaunchArgument(
@@ -662,8 +692,9 @@ def generate_launch_description():
             choices=['true', 'false'],
             description=(
                 'leader fleet_role only (role:=leader), real mode only: '
-                'run Cartographer here. Default false in leader.launch.py '
-                'receives the risk/scout SLAM map and runs AMCL against it.'
+                'run Cartographer here. Default false receives the '
+                'Scout-owned /map via risk_domain_id and runs AMCL against '
+                'it. Set true only for single-leader SLAM compatibility.'
             ),
         ),
         DeclareLaunchArgument(
@@ -688,14 +719,20 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'start_risk_map', default_value='true',
             choices=['true', 'false'],
-            description='Scout only: turn on the Bayesian risk map stack.',
+            description=(
+                'Scout only: turn on the Bayesian risk map stack. Default '
+                'true restores Scout-owned Cartographer/risk processing; '
+                'local YOLO/camera capture remain disabled when '
+                'start_camera_sender:=true.'
+            ),
         ),
         DeclareLaunchArgument(
             'start_cartographer', default_value='true',
             choices=['true', 'false'],
             description=(
-                'Scout only: let the risk map\'s own Cartographer own '
-                'SLAM/TF instead of AMCL. Off by default -- requires '
+                'Scout only: let the risk map launch own Cartographer '
+                'SLAM/TF. Default true for the Domain 22 authoritative map; '
+                'requires '
                 'enable_amcl:=false, and the TF chain still needs the '
                 'robot bringup\'s own odom broadcast reconciled by hand '
                 '(see system_bringup README).'
@@ -710,32 +747,41 @@ def generate_launch_description():
             ),
         ),
         DeclareLaunchArgument(
-            'start_camera', default_value='true',
+            'start_camera', default_value='false',
             choices=['true', 'false'],
-            description='Scout only: start the USB camera feeding the risk map YOLO detector.',
-        ),
-        DeclareLaunchArgument('risk_model_path', default_value='yolo11n.pt'),
-        DeclareLaunchArgument(
-            'detection_source', default_value='local_yolo',
             description=(
-                'Scout only, passed through to real_robot_risk_slam.'
-                'launch.py. Default local_yolo runs YOLO on this robot. '
-                "Set flask_topic to consume detections published by "
-                'flask_yolo_bridge/opencv_camera_to_flask_yolo.'
-                'launch.py instead (offload YOLO to a remote '
-                'flask_yolo_server, normally the leader Jetson) -- also set '
-                'enable_yolo:=false and start_camera:=false in that case, '
-                'since the sender node owns the camera instead.'
+                'Scout only: start the USB camera feeding the local risk map '
+                'YOLO detector. Default false because start_camera_sender '
+                'owns the camera in the lightweight Scout path.'
             ),
         ),
         DeclareLaunchArgument(
-            'enable_yolo', default_value='true',
+            'start_teleop', default_value='false',
+            choices=['true', 'false'],
+            description=(
+                'Scout only: pass through to the risk SLAM launch to start '
+                'turtlebot3_teleop. Default false because teleop_keyboard '
+                'needs an interactive terminal.'
+            ),
+        ),
+        DeclareLaunchArgument('risk_model_path', default_value='yolo11n.pt'),
+        DeclareLaunchArgument(
+            'detection_source', default_value='flask_topic',
+            description=(
+                'Scout only, passed through to real_robot_risk_slam.'
+                'launch.py. Default flask_topic consumes detections published by '
+                'flask_yolo_bridge/opencv_camera_to_flask_yolo.'
+                'launch.py (offloaded to the leader Jetson). Set local_yolo '
+                'only for explicit Scout-local inference debugging.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'enable_yolo', default_value='false',
             choices=['true', 'false'],
             description=(
                 'Scout only: run YOLO inference inside the risk map node '
-                'itself. Set false when detection_source:=flask_topic '
-                '(a remote flask_yolo_server, normally the leader Jetson, '
-                'does the inference instead).'
+                'itself. Default false; the leader Jetson Flask server does '
+                'inference in the lightweight Scout path.'
             ),
         ),
         DeclareLaunchArgument(
@@ -747,7 +793,7 @@ def generate_launch_description():
             ),
         ),
         DeclareLaunchArgument(
-            'start_camera_sender', default_value='false',
+            'start_camera_sender', default_value='true',
             choices=['true', 'false'],
             description=(
                 'Scout only: run flask_yolo_bridge/'
@@ -774,9 +820,12 @@ def generate_launch_description():
             ),
         ),
         DeclareLaunchArgument(
-            'start_rl_policy', default_value='true',
+            'start_rl_policy', default_value='false',
             choices=['true', 'false'],
-            description='Scout only: run the trained RL policy against cmd_vel.',
+            description=(
+                'Scout only: run the trained RL policy against cmd_vel. '
+                'Default false for teleop/lightweight Scout operation.'
+            ),
         ),
         DeclareLaunchArgument(
             'rl_model_path',
@@ -822,12 +871,13 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'enable_risk_to_leader_bridge',
-            default_value='false',
+            default_value='true',
             choices=['true', 'false'],
             description=(
-                'Leader role only: bridge /map and risk debug topics from '
-                'risk_domain_id to leader. Default false because a '
-                'Cartographer-owning scout now forwards its own /map upstream.'
+                'Leader role only: bridge Scout/risk /map and risk debug '
+                'topics from risk_domain_id to leader. With the default '
+                'leader enable_cartographer:=false this is the critical '
+                '22->20 shared-map path.'
             ),
         ),
         DeclareLaunchArgument(
