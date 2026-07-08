@@ -222,9 +222,9 @@ class StateMachine:
                 return entry, blocked_entries
             elif result == LOSResult.UNKNOWN:
                 if entry.target_type == TargetType.BOUNDARY:
-                    self._log(f"LOS UNKNOWN, BOUNDARY 폐기: {entry.coord_map}")
-                    blocked_entries.append(entry)
-                    continue
+                    self._log(f"LOS UNKNOWN, BOUNDARY 탐색 허용: "
+                              f"{entry.coord_map}")
+                    return entry, blocked_entries
                 else:
                     return entry, blocked_entries
             elif result == LOSResult.BLOCKED:

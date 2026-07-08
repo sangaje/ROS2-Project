@@ -161,7 +161,7 @@ autotrack:
 patrol:
   scan_timeout_sec: 2.0
   target_scan_timeout_sec: 5.0
-  boundary_scan_timeout_sec: 1.0
+  boundary_scan_timeout_sec: 0.35
   max_queue_size: 20
   duplicate_threshold_m: 0.3
   los_check_enabled: true
@@ -236,7 +236,7 @@ boundary:
   angle_step_deg: 22.5
   distance_m: 1.5
   z: 0.00
-  period_sec: 2.0
+  period_sec: 0.5
   max_queue_size: 10
   ttl_sec: 10.0
 
