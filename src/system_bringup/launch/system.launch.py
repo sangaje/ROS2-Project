@@ -96,6 +96,10 @@ def generate_launch_description():
     yolo_server_device = LaunchConfiguration('yolo_server_device')
     yolo_server_half = LaunchConfiguration('yolo_server_half')
     omx_yolo_node_delay_sec = LaunchConfiguration('omx_yolo_node_delay_sec')
+    omx_camera_device = LaunchConfiguration('omx_camera_device')
+    omx_camera_fallback_devices = LaunchConfiguration(
+        'omx_camera_fallback_devices'
+    )
     start_patrol_planner = LaunchConfiguration('start_patrol_planner')
     patrol_planner_delay_sec = LaunchConfiguration('patrol_planner_delay_sec')
     debug_stream = LaunchConfiguration('debug_stream')
@@ -388,6 +392,10 @@ def generate_launch_description():
                         'yolo_server_half': yolo_server_half.perform(context),
                         'yolo_node_delay_sec': (
                             omx_yolo_node_delay_sec.perform(context)
+                        ),
+                        'yolo_camera_device': omx_camera_device.perform(context),
+                        'yolo_camera_fallback_devices': (
+                            omx_camera_fallback_devices.perform(context)
                         ),
                         'start_patrol_planner': (
                             start_patrol_planner.perform(context)
@@ -864,6 +872,16 @@ def generate_launch_description():
             'omx_yolo_node_delay_sec',
             default_value='14.0',
             description='Leader role only: delay heavy OMX YOLO/camera/model startup.',
+        ),
+        DeclareLaunchArgument(
+            'omx_camera_device',
+            default_value='auto',
+            description='Leader role only: OMX camera source. auto scans /dev/video0..7.',
+        ),
+        DeclareLaunchArgument(
+            'omx_camera_fallback_devices',
+            default_value='auto',
+            description='Leader role only: OMX camera fallback source list.',
         ),
         DeclareLaunchArgument(
             'start_patrol_planner',
