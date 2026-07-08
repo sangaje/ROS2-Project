@@ -130,7 +130,7 @@ class OmxController:
 
     def scan_sweep(self, now: float, half_angle_deg: float,
                    period_sec: float):
-        """SCANNING 중에도 pan을 계속 좌우로 움직인다."""
+        """SCANNING 중에도 pan을 좌/우 끝점으로 번갈아 움직인다."""
         period_sec = max(0.1, float(period_sec))
         half_angle = math.radians(max(0.0, float(half_angle_deg)))
 
@@ -139,8 +139,10 @@ class OmxController:
             self._scan_sweep_center_yaw = self.yaw
             self._scan_sweep_center_pitch = self.pitch
 
-        phase = 2.0 * math.pi * ((now - self._scan_sweep_start_t) / period_sec)
-        yaw = self._scan_sweep_center_yaw + half_angle * math.sin(phase)
+        half_period = max(0.05, period_sec * 0.5)
+        step = int((now - self._scan_sweep_start_t) / half_period)
+        direction = 1.0 if step % 2 == 0 else -1.0
+        yaw = self._scan_sweep_center_yaw + direction * half_angle
         self._write_angles(yaw, self._scan_sweep_center_pitch)
 
     # ----- 조준 -----

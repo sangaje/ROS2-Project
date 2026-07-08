@@ -508,6 +508,8 @@ class StateMachine:
             if now - self.aim_start_t >= aim_settle:
                 self.scan_start_t = now
                 self.transition(State.SCANNING)
+                action['action'] = 'scan_sweep'
+                action['scan_sweep'] = True
 
         elif self.state == State.SCANNING:
             self._on_scanning(detected, error_norm, now, action)
