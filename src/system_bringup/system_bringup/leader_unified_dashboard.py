@@ -193,6 +193,12 @@ class LeaderUnifiedDashboard(Node):
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
+        latest_best_effort_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
         self.create_subscription(OccupancyGrid, self.map_topic, lambda msg: self._on_grid('map', msg), grid_qos)
         self.create_subscription(OccupancyGrid, self.risk_topic, lambda msg: self._on_grid('risk', msg), grid_qos)
         self.create_subscription(PoseStamped, self.leader_pose_topic, lambda msg: self._on_pose('leader', msg, self.leader_pose_topic), 10)
@@ -205,7 +211,12 @@ class LeaderUnifiedDashboard(Node):
         self.create_subscription(NavPath, self.leader_bridged_nav_path_topic, lambda msg: self._on_nav_path('leader_bridge', msg), 10)
         self.create_subscription(NavPath, self.follower_nav_path_topic, lambda msg: self._on_nav_path('follower', msg), 10)
         self.create_subscription(NavPath, self.member_nav_path_topic, lambda msg: self._on_nav_path('member', msg), 10)
-        self.create_subscription(String, '/risk/yolo_detections', lambda msg: self._set_topic_value('/risk/yolo_detections', msg.data, 'std_msgs/msg/String'), 10)
+        self.create_subscription(
+            String,
+            '/risk/yolo_detections',
+            lambda msg: self._set_topic_value('/risk/yolo_detections', msg.data, 'std_msgs/msg/String'),
+            latest_best_effort_qos,
+        )
         self.create_subscription(String, '/omx/state', lambda msg: self._set_omx('state', msg.data, '/omx/state', 'std_msgs/msg/String'), 10)
         self.create_subscription(String, '/omx/status', lambda msg: self._set_omx('status', msg.data, '/omx/status', 'std_msgs/msg/String'), 10)
         self.create_subscription(Bool, '/omx/target_detected', lambda msg: self._set_omx('target_detected', bool(msg.data), '/omx/target_detected', 'std_msgs/msg/Bool'), 10)
