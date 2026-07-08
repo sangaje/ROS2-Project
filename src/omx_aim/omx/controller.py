@@ -44,6 +44,9 @@ class OmxController:
         self._de_x_ema = 0.0
         self._de_y_ema = 0.0
         self._prev_ibvs_t = None
+        self._scan_sweep_start_t = None
+        self._scan_sweep_center_yaw = 0.0
+        self._scan_sweep_center_pitch = 0.0
 
     def _log(self, msg, level="info"):
         if self.logger:
@@ -83,6 +86,7 @@ class OmxController:
         self._log("OMX 연결 해제")
 
     def go_home(self):
+        self.reset_scan_sweep()
         if self.dry_run:
             self.yaw = 0.0
             self.pitch = 0.0
@@ -94,6 +98,50 @@ class OmxController:
         self.yaw = 0.0
         self.pitch = 0.0
         self._log("Home 명령 전송 (non-blocking)")
+
+    def reset_scan_sweep(self):
+        self._scan_sweep_start_t = None
+        self._scan_sweep_center_yaw = self.yaw
+        self._scan_sweep_center_pitch = self.pitch
+
+    def _write_angles(self, yaw: float, pitch: float):
+        limits = self.cfg.safety.angle_limits_rad
+        lo, hi = limits["shoulder_pan"]
+        yaw = max(lo, min(hi, yaw))
+        lo, hi = limits["shoulder_lift"]
+        pitch = max(lo, min(hi, pitch))
+
+        self.yaw = yaw
+        self.pitch = pitch
+
+        if self.dry_run:
+            return
+
+        home = self.cfg.calibration.home
+        sign = self.cfg.calibration.sign
+        yaw_tick = int(round(home["shoulder_pan"]
+                             + sign["shoulder_pan"] * yaw * RAD2TICK))
+        pitch_tick = int(round(home["shoulder_lift"]
+                               + sign["shoulder_lift"] * pitch * RAD2TICK))
+        self.bus.write("Goal_Position", "shoulder_pan",
+                       yaw_tick, normalize=False)
+        self.bus.write("Goal_Position", "shoulder_lift",
+                       pitch_tick, normalize=False)
+
+    def scan_sweep(self, now: float, half_angle_deg: float,
+                   period_sec: float):
+        """SCANNING 중에도 pan을 계속 좌우로 움직인다."""
+        period_sec = max(0.1, float(period_sec))
+        half_angle = math.radians(max(0.0, float(half_angle_deg)))
+
+        if self._scan_sweep_start_t is None:
+            self._scan_sweep_start_t = now
+            self._scan_sweep_center_yaw = self.yaw
+            self._scan_sweep_center_pitch = self.pitch
+
+        phase = 2.0 * math.pi * ((now - self._scan_sweep_start_t) / period_sec)
+        yaw = self._scan_sweep_center_yaw + half_angle * math.sin(phase)
+        self._write_angles(yaw, self._scan_sweep_center_pitch)
 
     # ----- 조준 -----
 
@@ -107,6 +155,7 @@ class OmxController:
         if x == 0.0 and y == 0.0 and z == 0.0:
             self._log("원점 좌표는 가리킬 수 없음", "warn")
             return
+        self.reset_scan_sweep()
 
         new_yaw = math.atan2(y, x)
         new_pitch = math.atan2(z, math.hypot(x, y))
@@ -153,6 +202,7 @@ class OmxController:
         Returns: True if 움직임 발생, False otherwise.
         """
         max_step = self.cfg.safety.max_step_rad
+        self.reset_scan_sweep()
         deadband_x = self.cfg.ibvs.deadband_x
         deadband_y = self.cfg.ibvs.deadband_y
 

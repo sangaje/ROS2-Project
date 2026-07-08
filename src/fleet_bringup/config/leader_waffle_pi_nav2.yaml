@@ -71,7 +71,7 @@ controller_server:
     # 실제 거동(회전 중 호를 그림)이 어긋난다. 더 자주(controller_frequency
     # 상향) 더 짧게(sim_time 아래 하향) 재평가해서 모델 오차가 누적되기
     # 전에 자주 보정하게 함.
-    controller_frequency: 15.0
+    controller_frequency: 20.0
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.001
     min_theta_velocity_threshold: 0.001
@@ -98,21 +98,21 @@ controller_server:
       debug_trajectory_details: true
       min_vel_x: 0.0
       min_vel_y: 0.0
-      max_vel_x: 0.3
+      max_vel_x: 0.45
       max_vel_y: 0.0
       # 좌우 바퀴 응답 비대칭이 커질수록(고속 회전일수록) 더 벌어지는
       # 것으로 보여서 회전 속도/가감속 한계를 낮춤 -- 더 낮고 꾸준한
       # 회전 속도 구간에서 실제 거동이 명령과 덜 어긋난다.
-      max_vel_theta: 0.6
+      max_vel_theta: 0.9
       min_speed_xy: 0.0
-      max_speed_xy: 0.3
+      max_speed_xy: 0.45
       min_speed_theta: 0.0
-      acc_lim_x: 3.0
+      acc_lim_x: 3.5
       acc_lim_y: 0.0
-      acc_lim_theta: 1.8
-      decel_lim_x: -2.5
+      acc_lim_theta: 2.4
+      decel_lim_x: -3.0
       decel_lim_y: 0.0
-      decel_lim_theta: -1.8
+      decel_lim_theta: -2.4
       vx_samples: 20
       vy_samples: 0
       vtheta_samples: 40

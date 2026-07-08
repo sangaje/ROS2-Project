@@ -162,6 +162,9 @@ patrol:
   scan_timeout_sec: 2.0
   target_scan_timeout_sec: 5.0
   boundary_scan_timeout_sec: 0.35
+  boundary_aim_settle_sec: 0.05
+  scan_sweep_half_angle_deg: 35.0
+  scan_sweep_period_sec: 0.8
   max_queue_size: 20
   duplicate_threshold_m: 0.3
   los_check_enabled: true
@@ -204,7 +207,7 @@ view_pose:
 # VIEW_POSE 이동을 A* 짧은 구간 연속 이동으로 대체 (H5.1)
 # ===========================================================
 nav_crawl:
-  enabled: true
+  enabled: false
   # A* 탐색 - 낮은 cost 셀을 선호하되 완전히 막지는 않음 (돌아가더라도 안전 우선)
   astar_obstacle_cost_weight: 2.0
   astar_allow_unknown: false

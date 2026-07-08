@@ -445,6 +445,7 @@ class StateMachine:
             'nav_goal_xyyaw': None,         # H2: (x, y, yaw) for /omx/nav_goal
             'focus_is_boundary': False,     # H2: 시각화용
             'target_not_found_coord': None, # H3
+            'scan_sweep': False,
         }
 
         # 1. nav_result 처리
@@ -468,8 +469,25 @@ class StateMachine:
                 self.nav_pending_result = None
                 self._handle_nav_result(result, action, now)
 
+        detection_preempted_nav = (
+            detected
+            and error_norm is not None
+            and self._is_waffle_navigating()
+            and self.state not in (State.FIRING, State.COOLDOWN)
+        )
+        if detection_preempted_nav:
+            self.boundary_queue.clear()
+            self.current_focus = None
+            self.nav_waypoints = []
+            self.nav_final_view_pose = None
+            self.pending_cancel_for_preempt = True
+            action['action'] = 'track'
+            action['error'] = error_norm
+            self.transition(State.TRACKING)
+            self._log("카메라 탐지: Nav 작업 중단 -> 즉시 TRACKING")
+
         # 2. State 분기
-        if self.state == State.IDLE:
+        elif self.state == State.IDLE:
             self._on_idle(detected, action, now)
 
         elif self.state == State.WAITING_NAV:
@@ -478,13 +496,21 @@ class StateMachine:
         elif self.state == State.AIMING:
             # H2.1: aim_settle_sec 동안 OMX 모터가 목표 각도로 이동.
             # 그동안 action='wait', 외부에 별다른 영향 없음.
-            aim_settle = self.cfg.fire.aim_settle_sec
+            is_boundary = (
+                self.current_focus is not None
+                and self.current_focus.target_type == TargetType.BOUNDARY
+            )
+            aim_settle = (
+                self.cfg.patrol.boundary_aim_settle_sec
+                if is_boundary and self.cfg.patrol
+                else self.cfg.fire.aim_settle_sec
+            )
             if now - self.aim_start_t >= aim_settle:
                 self.scan_start_t = now
                 self.transition(State.SCANNING)
 
         elif self.state == State.SCANNING:
-            self._on_scanning(detected, now, action)
+            self._on_scanning(detected, error_norm, now, action)
 
         elif self.state == State.TRACKING:
             self._on_tracking(detected, error_norm, now, action)
@@ -640,17 +666,20 @@ class StateMachine:
                         return
                 self.last_processed = entry.coord_map
 
-                # H5.1: 최종 목적지를 A* waypoint 리스트로 변환 -- 한 번에 먼
-                # 목적지로 보내는 대신 짧은 구간씩 이동하면서 매 구간마다
-                # 시야 확보 여부를 다시 검사한다 (_on_waiting_nav 참고).
+                # H5.1: 옵션이 켜진 경우에만 A* waypoint crawl 을 쓴다.
+                # 기본 운용은 최종 VIEW_POSE 로 Nav2 goal 을 바로 보낸다.
                 waffle_xy = self.waffle_pos_fn() if self.waffle_pos_fn else None
-                waypoints = (
-                    self.plan_waypoints_fn(waffle_xy, view_pose[:2])
-                    if self.plan_waypoints_fn and waffle_xy is not None
-                    else None
-                )
+                nav_cfg = self.cfg.nav_crawl
+                if (
+                    nav_cfg is not None
+                    and nav_cfg.enabled
+                    and self.plan_waypoints_fn
+                    and waffle_xy is not None
+                ):
+                    waypoints = self.plan_waypoints_fn(waffle_xy, view_pose[:2])
+                else:
+                    waypoints = None
                 if not waypoints:
-                    # A* 실패(또는 미주입) 시 기존처럼 최종 목적지로 한 번에 이동.
                     waypoints = [view_pose[:2]]
 
                 self.nav_waypoints = waypoints
@@ -819,11 +848,16 @@ class StateMachine:
         # PATROL
         return self.cfg.patrol.scan_timeout_sec
 
-    def _on_scanning(self, detected, now, action):
+    def _on_scanning(self, detected, error_norm, now, action):
         if detected:
             self.lost_start_t = 0.0
+            if error_norm is not None:
+                action['action'] = 'track'
+                action['error'] = error_norm
             self.transition(State.TRACKING)
         else:
+            action['action'] = 'scan_sweep'
+            action['scan_sweep'] = True
             scan_timeout = self._scan_timeout()
             if now - self.scan_start_t >= scan_timeout:
                 # H3: TARGET miss 알림
@@ -836,6 +870,23 @@ class StateMachine:
                 else:
                     self._log(f"SCANNING {scan_timeout:.1f}s 끝, 표적 없음")
                 self._on_focus_done()
+
+    def force_track_now(self, reason: str = "detection") -> bool:
+        """탐지 즉시 현재 작업을 접고 TRACKING 으로 들어간다."""
+        if self.state in (State.FIRING, State.COOLDOWN):
+            return False
+
+        self.boundary_queue.clear()
+        self.current_parent = None
+        self.current_focus = None
+        self.nav_pending_result = None
+        self.nav_waypoints = []
+        self.nav_final_view_pose = None
+        self.confirm_progress = 0.0
+        self.lost_start_t = 0.0
+        self.transition(State.TRACKING)
+        self._log(f"{reason}: 즉시 TRACKING 진입")
+        return True
 
     def _on_tracking(self, detected, error_norm, now, action):
         if detected:
@@ -912,6 +963,13 @@ class StateMachine:
     def _on_focus_done(self):
         """현재 focus 종료. focus 가 parent 면 IDLE, boundary 면 WAITING_NAV 복귀."""
         if self.current_focus is None:
+            if self.current_parent is not None:
+                heapq.heappush(self.main_queue, self.current_parent)
+                self._log(f"중단된 parent 큐 복귀: "
+                          f"{self.current_parent.coord_map}")
+                self.current_parent = None
+                self.nav_waypoints = []
+                self.nav_final_view_pose = None
             self.transition(State.IDLE)
             return
 

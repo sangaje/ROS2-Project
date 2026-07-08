@@ -1367,6 +1367,13 @@ class OmxYoloNode(Node):
             elif action['action'] == 'track':
                 self.ctrl.step_ibvs(*action['error'])
 
+            elif action['action'] == 'scan_sweep':
+                self.ctrl.scan_sweep(
+                    now,
+                    self.cfg.patrol.scan_sweep_half_angle_deg,
+                    self.cfg.patrol.scan_sweep_period_sec,
+                )
+
             elif action['action'] == 'fire':
                 processed_map = (self.sm.current_focus.coord_map
                                  if self.sm.current_focus else None)
