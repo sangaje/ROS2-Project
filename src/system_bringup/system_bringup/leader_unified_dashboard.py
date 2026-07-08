@@ -106,6 +106,9 @@ class LeaderUnifiedDashboard(Node):
         )
         self.follower_nav_path_topic = str(_declare(self, 'follower_nav_path_topic', '/burger_plan'))
         self.member_nav_path_topic = str(_declare(self, 'member_nav_path_topic', '/member_plan'))
+        self.omx_waypoint_route_topic = str(
+            _declare(self, 'omx_waypoint_route_topic', '/omx/waypoint_route')
+        )
         self.omx_debug_port = int(_declare(self, 'omx_debug_port', 8080))
         self.omx_stream_path = str(_declare(self, 'omx_stream_path', '/stream.mjpg'))
         self.omx_state_path = str(_declare(self, 'omx_state_path', '/state.json'))
@@ -150,6 +153,9 @@ class LeaderUnifiedDashboard(Node):
             ),
             'follower': self._empty_path_state('follower', self.follower_nav_path_topic),
             'member': self._empty_path_state('member', self.member_nav_path_topic),
+            'omx_route': self._empty_path_state(
+                'omx_route', self.omx_waypoint_route_topic
+            ),
         }
         self._omx_state: Dict[str, Any] = {
             'state': None,
@@ -211,6 +217,7 @@ class LeaderUnifiedDashboard(Node):
         self.create_subscription(NavPath, self.leader_bridged_nav_path_topic, lambda msg: self._on_nav_path('leader_bridge', msg), 10)
         self.create_subscription(NavPath, self.follower_nav_path_topic, lambda msg: self._on_nav_path('follower', msg), 10)
         self.create_subscription(NavPath, self.member_nav_path_topic, lambda msg: self._on_nav_path('member', msg), 10)
+        self.create_subscription(NavPath, self.omx_waypoint_route_topic, lambda msg: self._on_nav_path('omx_route', msg), 10)
         self.create_subscription(
             String,
             '/risk/yolo_detections',
@@ -632,7 +639,10 @@ class LeaderUnifiedDashboard(Node):
                 },
                 'nav2_paths': [
                     self._nav_path_summary(name, now)
-                    for name in ('leader', 'leader_bridge', 'follower', 'member')
+                    for name in (
+                        'leader', 'leader_bridge', 'follower', 'member',
+                        'omx_route',
+                    )
                 ],
                 'topics': self._topics_summary(now),
             }

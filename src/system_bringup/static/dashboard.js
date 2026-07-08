@@ -17,6 +17,7 @@ const pathColors = {
   leader_bridge: '#ffdf7e',
   follower: '#d2a8ff',
   member: '#ffa657',
+  omx_route: '#ff6b6b',
 };
 
 function statusClass(status) {

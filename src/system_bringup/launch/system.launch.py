@@ -470,6 +470,7 @@ def generate_launch_description():
                         'leader_bridged_nav_path_topic': '/leader_plan',
                         'follower_nav_path_topic': '/burger_plan',
                         'member_nav_path_topic': '/member_plan',
+                        'omx_waypoint_route_topic': '/omx/waypoint_route',
                     }],
                     env=process_env,
                     respawn=True,

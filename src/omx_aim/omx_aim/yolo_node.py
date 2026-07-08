@@ -39,7 +39,7 @@ from rclpy.duration import Duration
 from std_msgs.msg import String, Bool, Float32, Empty, Int32
 from geometry_msgs.msg import Point, PointStamped, PoseStamped, Quaternion
 from sensor_msgs.msg import JointState
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, Path as NavPath
 from visualization_msgs.msg import Marker, MarkerArray
 
 from tf2_ros import Buffer, TransformListener, TransformException
@@ -223,6 +223,9 @@ class OmxYoloNode(Node):
         # H2 신규
         self.pub_nav_goal = self.create_publisher(
             PoseStamped, '/omx/nav_goal', 10)
+        # H5.1: 대시보드 표시용 -- 지금 남은 전체 waypoint 경로
+        self.pub_waypoint_route = self.create_publisher(
+            NavPath, '/omx/waypoint_route', 10)
         # H3 신규
         self.pub_nav_cancel = self.create_publisher(
             Empty, '/omx/nav_cancel', 10)
@@ -1126,6 +1129,29 @@ class OmxYoloNode(Node):
                 f"- 새 nav 시작")
             self.sm.nav_pending_result = None
 
+    def publish_waypoint_route(self):
+        """H5.1: 대시보드 표시용 -- 지금 남은 전체 A* waypoint 경로.
+
+        매 loop tick 마다 호출되어 sm.nav_waypoints 와 항상 동기화된다
+        (크롤이 끝나면 nav_waypoints 가 비어서 빈 Path 가 발행되고,
+        대시보드에서 자연히 지워진다).
+        """
+        waffle = self.get_waffle_xy()
+        points = ([waffle] if waffle is not None else []) + list(
+            self.sm.nav_waypoints)
+        path = NavPath()
+        path.header.frame_id = 'map'
+        path.header.stamp = self.get_clock().now().to_msg()
+        for x, y in points:
+            pose = PoseStamped()
+            pose.header.frame_id = 'map'
+            pose.header.stamp = path.header.stamp
+            pose.pose.position.x = float(x)
+            pose.pose.position.y = float(y)
+            pose.pose.orientation.w = 1.0
+            path.poses.append(pose)
+        self.pub_waypoint_route.publish(path)
+
     def publish_nav_cancel(self):
         """H3: TARGET preempt 시 진행 중 Nav2 cancel 요청."""
         self.pub_nav_cancel.publish(Empty())
@@ -1305,6 +1331,7 @@ class OmxYoloNode(Node):
         self.publish_joint_state()
         self.publish_progress(action.get('confirm_progress', 0.0))
         self.publish_state_change()
+        self.publish_waypoint_route()
 
         # 그리기: display 또는 stream 둘 중 하나라도 필요하면 호출
         need_viz = (not self.no_display) or (self.debug_stream is not None)

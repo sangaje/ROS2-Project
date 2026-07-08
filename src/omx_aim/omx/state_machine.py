@@ -700,14 +700,19 @@ class StateMachine:
            구간을 취소하고 곧장 AIMING 으로 넘어간다 -- 미리 계산해 둔 먼
            최종 지점까지 굳이 다 가지 않는다.
         2) 구간 도착: 현재 waypoint "분포"(waypoint_tolerance_m) 안에 들어
-           오면 다음 구간으로 넘어간다. 단, 마지막 구간은 여기서 먼저
-           AIMING 으로 넘기지 않고 Nav2 자신의 nav_result(_handle_nav_result)
-           를 기다린다 -- 그래야 늦게 도착하는 succeeded 결과가 다음 이동
+           오면 다음 구간(이미 계산해 캐싱해 둔 nav_waypoints 의 다음
+           원소)으로 즉시 넘어간다. 단, 마지막 구간은 여기서 먼저 AIMING
+           으로 넘기지 않고 Nav2 자신의 nav_result(_handle_nav_result) 를
+           기다린다 -- 그래야 늦게 도착하는 succeeded 결과가 다음 이동
            시도에 잘못 적용되는 경합을 만들지 않는다.
-        3) 아직 도착 전: 같은 구간 안에서 costmap 이 갱신됐다면 더 나은
-           지점으로 살짝 보정해서 다시 찍는다("분포 내에 새롭게 찍어줘").
-           단, 미세한 흔들림으로 Nav2 가 매 tick 재계획하지 않도록 일정
-           이상 움직였을 때만 실제로 재발행한다.
+
+        아직 도착 전이면 아무 것도 하지 않는다 -- waffle_pos_fn() 은
+        AMCL/odom 잡음으로 tick 마다 몇 cm씩 흔들리는데, 여기서 매번
+        재계획해서 goal 을 다시 찍으면(구간 지점을 "보정") on_nav_goal
+        이 그때마다 진행 중이던 goal 을 취소하고 새로 보내서 Nav2 가 실제
+        로 움직일 시간을 못 얻는다(경로는 계속 새로 생기는데 로봇은 안
+        가는 증상). 그래서 재계획 없이 이미 캐싱된 다음 지점을 그대로
+        쓴다.
 
         Returns: 이번 tick 에 action 을 채웠으면 True (호출부는 boundary
                  처리 등을 건너뛰고 곧장 return 해야 함).
@@ -758,21 +763,6 @@ class StateMachine:
                 return True
             return False
 
-        # 3) 아직 도착 전: 같은 목적지로 재계획해서 현재 구간 지점을 보정
-        if self.plan_waypoints_fn is not None and self.nav_final_view_pose is not None:
-            refined = self.plan_waypoints_fn(waffle_xy, self.nav_waypoints[-1])
-            if refined:
-                candidate = refined[0]
-                moved = math.hypot(candidate[0] - hop[0], candidate[1] - hop[1])
-                if moved > 0.10:
-                    self.nav_waypoints[0] = candidate
-                    next_pose = self._next_hop_pose()
-                    if next_pose is not None:
-                        self._log(
-                            f"WAYPOINT_CRAWL: 구간 지점 보정 -> {next_pose[:2]}")
-                        action['action'] = 'nav_goal'
-                        action['nav_goal_xyyaw'] = next_pose
-                        return True
         return False
 
     # ----- 핸들러: SCANNING / TRACKING / CONFIRMING / COOLDOWN -----
