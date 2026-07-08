@@ -187,7 +187,11 @@ def generate_launch_description():
                     parameters=[{
                         'scan_topic': scan_topic_value,
                         'spin_enabled': True,
-                        'spin_speed_rad_s': 0.35,
+                        # 좌우 바퀴 비대칭이 심할수록(고속 회전일수록) 더
+                        # 벌어져서 "제자리" spin 이 실제로는 호를 그리며
+                        # 이동한다 -- 낮은 회전 속도로 그 영향을 줄임.
+                        'spin_speed_rad_s': 0.25,
+                        'spin_max_drift_m': 0.35,
                         'cmd_vel_topic': '/cmd_vel',
                         'use_stamped_cmd_vel': True,
                         'amcl_pose_topic': '/amcl_pose',

@@ -6,10 +6,14 @@
 amcl:
   ros__parameters:
     use_sim_time: true
-    alpha1: 0.08
-    alpha2: 0.08
+    # 좌우 바퀴 응답이 비대칭(한쪽이 회전 시 훨씬 느림)이라 odom 의 회전
+    # 추정이 실제 회전량과 어긋난다. alpha1(회전->회전 오차)/alpha4(회전
+    # ->이동 오차)를 크게 잡아서 AMCL 이 odom 의 회전 성분을 덜 믿고
+    # 스캔 매칭으로 더 많이 보정하게 함.
+    alpha1: 0.22
+    alpha2: 0.10
     alpha3: 0.12
-    alpha4: 0.08
+    alpha4: 0.16
     alpha5: 0.03
     base_frame_id: "base_footprint"
     beam_skip_distance: 0.35
@@ -63,7 +67,11 @@ lifecycle_manager_localization:
 controller_server:
   ros__parameters:
     use_sim_time: true
-    controller_frequency: 10.0
+    # 좌우 바퀴 비대칭 때문에 DWB 가 가정하는 이상적인 미분구동 모델과
+    # 실제 거동(회전 중 호를 그림)이 어긋난다. 더 자주(controller_frequency
+    # 상향) 더 짧게(sim_time 아래 하향) 재평가해서 모델 오차가 누적되기
+    # 전에 자주 보정하게 함.
+    controller_frequency: 15.0
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.001
     min_theta_velocity_threshold: 0.001
@@ -92,20 +100,23 @@ controller_server:
       min_vel_y: 0.0
       max_vel_x: 0.3
       max_vel_y: 0.0
-      max_vel_theta: 1.0
+      # 좌우 바퀴 응답 비대칭이 커질수록(고속 회전일수록) 더 벌어지는
+      # 것으로 보여서 회전 속도/가감속 한계를 낮춤 -- 더 낮고 꾸준한
+      # 회전 속도 구간에서 실제 거동이 명령과 덜 어긋난다.
+      max_vel_theta: 0.6
       min_speed_xy: 0.0
       max_speed_xy: 0.3
       min_speed_theta: 0.0
       acc_lim_x: 3.0
       acc_lim_y: 0.0
-      acc_lim_theta: 3.2
+      acc_lim_theta: 1.8
       decel_lim_x: -2.5
       decel_lim_y: 0.0
-      decel_lim_theta: -3.2
+      decel_lim_theta: -1.8
       vx_samples: 20
       vy_samples: 0
       vtheta_samples: 40
-      sim_time: 1.5
+      sim_time: 1.0
       linear_granularity: 0.05
       angular_granularity: 0.025
       transform_tolerance: 0.5
@@ -213,8 +224,13 @@ local_costmap:
       plugins: ["obstacle_layer", "voxel_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        inflation_radius: 0.4
-        cost_scaling_factor: 4.0
+        # 로컬 costmap은 DWB 가 실시간으로 쓰는 값이라 여기를 너무 넓게/
+        # 완만하게 잡으면(예: 0.4/4.0) 실제 좁은 방/가구 사이에서 로봇이
+        # 트래젝토리를 못 찾고 멈춰서는 증상이 났다. 원래 값으로 되돌림 --
+        # "맵이 아직 안 끝남" 안전 마진은 global costmap(아래)과
+        # allow_unknown:false 쪽에서 담당.
+        inflation_radius: 0.3
+        cost_scaling_factor: 5.0
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: true

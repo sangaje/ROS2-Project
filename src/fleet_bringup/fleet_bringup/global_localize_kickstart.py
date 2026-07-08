@@ -93,6 +93,11 @@ class GlobalLocalizeKickstart(Node):
         self.declare_parameter('spin_margin_rad', 0.35)
         self.declare_parameter('spin_timeout_sec', 25.0)
         self.declare_parameter('settle_duration_sec', 1.5)
+        # 좌우 바퀴 응답이 비대칭인 로봇은 angular.z 만 명령해도 제자리
+        # 회전이 아니라 호를 그리며 실제로 이동한다 -- "제자리" 스핀이라는
+        # 전제가 깨지므로, odom 상 시작 위치에서 이 이상 벗어나면 spin을
+        # 중단하고 재시도(반복해도 계속 드리프트하면 결국 FAIL_SAFE).
+        self.declare_parameter('spin_max_drift_m', 0.35)
 
         self.declare_parameter('localization_cov_xy_threshold', 0.35)
         self.declare_parameter('localization_cov_yaw_threshold', 0.25)
@@ -123,6 +128,7 @@ class GlobalLocalizeKickstart(Node):
         self.spin_margin = max(0.0, float(get('spin_margin_rad').value))
         self.spin_timeout_sec = max(1.0, float(get('spin_timeout_sec').value))
         self.settle_duration_sec = max(0.0, float(get('settle_duration_sec').value))
+        self.spin_max_drift_m = max(0.05, float(get('spin_max_drift_m').value))
 
         self.cov_xy_threshold = max(0.0, float(get('localization_cov_xy_threshold').value))
         self.cov_yaw_threshold = max(0.0, float(get('localization_cov_yaw_threshold').value))
@@ -183,6 +189,8 @@ class GlobalLocalizeKickstart(Node):
 
         self.last_scan_wall: Optional[float] = None
         self.last_odom_yaw: Optional[float] = None
+        self.last_odom_xy: Optional[tuple] = None
+        self.spin_start_xy: Optional[tuple] = None
         self.accumulated_yaw = 0.0
         self._last_progress_octant = -1
         self.spin_start_wall = 0.0
@@ -222,6 +230,9 @@ class GlobalLocalizeKickstart(Node):
             delta = wrap_angle(yaw - self.last_odom_yaw)
             self.accumulated_yaw += abs(delta)
         self.last_odom_yaw = yaw
+        self.last_odom_xy = (
+            msg.pose.pose.position.x, msg.pose.pose.position.y,
+        )
 
     def _on_amcl_pose(self, msg: PoseWithCovarianceStamped) -> None:
         cov = msg.pose.covariance
@@ -422,6 +433,7 @@ class GlobalLocalizeKickstart(Node):
         )
         self.accumulated_yaw = 0.0
         self.last_odom_yaw = None
+        self.spin_start_xy = self.last_odom_xy
         self._last_progress_octant = -1
         self.spin_start_wall = self._now()
         if not self.spin_enabled:
@@ -440,6 +452,24 @@ class GlobalLocalizeKickstart(Node):
             )
             self._transition(fallback)
             return
+
+        if self.spin_start_xy is not None and self.last_odom_xy is not None:
+            drift = math.hypot(
+                self.last_odom_xy[0] - self.spin_start_xy[0],
+                self.last_odom_xy[1] - self.spin_start_xy[1],
+            )
+            if drift > self.spin_max_drift_m:
+                self._publish_twist(0.0)
+                self.get_logger().error(
+                    'GLOBAL_LOCALIZE_SPIN_DRIFT | '
+                    f'attempt={self.total_attempts} drift={drift:.2f}m > '
+                    f'{self.spin_max_drift_m:.2f}m -- left/right wheel '
+                    'response is asymmetric enough that "spin in place" is '
+                    'actually arcing away from the seeded position'
+                )
+                self.retry_count += 1
+                self._transition(State.RETRY_SPIN)
+                return
 
         target = self.spin_target_angle + self.spin_margin
         elapsed = self._now() - self.spin_start_wall
