@@ -148,6 +148,21 @@ class ViewPoseConfig:
 
 
 @dataclass
+class NavCrawlConfig:
+    """VIEW_POSE 이동을 A* 짧은 구간(waypoint) 연속 이동으로 대체 (H5.1)."""
+    enabled: bool = True
+    astar_obstacle_cost_weight: float = 2.0
+    astar_allow_unknown: bool = False
+    astar_max_iterations: int = 20000
+    astar_search_margin_m: float = 2.0
+    waypoint_spacing_m: float = 0.6
+    waypoint_tolerance_m: float = 0.35
+    refresh_period_sec: float = 0.5
+    reachability_max_ratio: float = 1.6
+    early_stop_on_los: bool = True
+
+
+@dataclass
 class BoundaryConfig:
     """BOUNDARY 자동 생성 (H4 예정)."""
     enable_during_target: bool = False
@@ -180,6 +195,7 @@ class Config:
     patrol: PatrolConfig | None = None
     waffle: WaffleConfig | None = None
     view_pose: ViewPoseConfig | None = None
+    nav_crawl: NavCrawlConfig | None = None
     boundary: BoundaryConfig | None = None
 
 def find_config_path(path=None):
@@ -237,6 +253,7 @@ def load_config(path=None):
         patrol_cfg = PatrolConfig(**raw["patrol"]) if "patrol" in raw else None
         waffle_cfg = WaffleConfig(**raw["waffle"]) if "waffle" in raw else None
         view_pose_cfg = ViewPoseConfig(**raw["view_pose"]) if "view_pose" in raw else None
+        nav_crawl_cfg = NavCrawlConfig(**raw["nav_crawl"]) if "nav_crawl" in raw else NavCrawlConfig()
         boundary_cfg = BoundaryConfig(**raw["boundary"]) if "boundary" in raw else None
         cfg = Config(
             motor=MotorConfig(**raw["motor"]),
@@ -254,6 +271,7 @@ def load_config(path=None):
             patrol=patrol_cfg,
             waffle=waffle_cfg,  
             view_pose=view_pose_cfg,
+            nav_crawl=nav_crawl_cfg,
             boundary=boundary_cfg,
         )
     except (KeyError, TypeError) as e:

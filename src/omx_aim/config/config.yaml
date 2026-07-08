@@ -201,6 +201,25 @@ view_pose:
   unknown_cost_weight: 0.8
 
 # ===========================================================
+# VIEW_POSE 이동을 A* 짧은 구간 연속 이동으로 대체 (H5.1)
+# ===========================================================
+nav_crawl:
+  enabled: true
+  # A* 탐색 - 낮은 cost 셀을 선호하되 완전히 막지는 않음 (돌아가더라도 안전 우선)
+  astar_obstacle_cost_weight: 2.0
+  astar_allow_unknown: false
+  astar_max_iterations: 20000
+  astar_search_margin_m: 2.0
+  # 다운샘플된 waypoint 간격 및 "도착"으로 볼 반경(분포)
+  waypoint_spacing_m: 0.6
+  waypoint_tolerance_m: 0.35
+  # 이 주기로 진행 상황/조기 종료(LOS) 재평가
+  refresh_period_sec: 0.5
+  # A* 실제 경로 길이가 직선거리의 이 배수를 넘으면 후보 폐기(가깝지만 벽 넘어 있는 경우)
+  reachability_max_ratio: 1.6
+  early_stop_on_los: true
+
+# ===========================================================
 # BOUNDARY 자동 생성 (H4 에서 활성화 예정)
 # ===========================================================
 boundary:

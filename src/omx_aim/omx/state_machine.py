@@ -9,6 +9,8 @@ StateMachine 사용자 (OmxYoloNode) 가 다음 콜백을 주입한다:
     compute_view_pose_fn(target,    -> (x,y,yaw) or None  (H2: 와플 이동 위치)
                         next=None)
     nav_cancel_fn()                 -> None        (H3: /omx/nav_cancel publish)
+    plan_waypoints_fn(start_xy,     -> [(x,y), ...] or None  (H5.1: A*
+                       goal_xy)        waypoint 리스트)
 
 상세 정책은 INTERFACE_v3.md 의 3-4 절 참조.
 """
@@ -43,6 +45,12 @@ class StateMachine:
         # H3: preempt cancel 결과 무시용 flag
         self.pending_cancel_for_preempt: bool = False
 
+        # H5.1: A* waypoint crawl -- WAITING_NAV 동안 유지되는 현재 이동 경로.
+        # nav_waypoints[0] 이 현재 추적 중인 waypoint, 도착하면 pop.
+        self.nav_waypoints: list[tuple] = []
+        self.nav_final_view_pose: Optional[tuple] = None
+        self.nav_last_eval_t: float = 0.0
+
         # 타이머/플래그
         self.aim_start_t: float = 0.0      # H2.1: AIMING 진입 시각
         self.scan_start_t: float = 0.0
@@ -63,6 +71,7 @@ class StateMachine:
         self.check_view_fn = None             # H2: (coord_map) -> bool
         self.compute_view_pose_fn = None      # H2: (coord_map) -> (x,y,yaw) or None
         self.nav_cancel_fn = None             # H3: () -> publish /omx/nav_cancel
+        self.plan_waypoints_fn = None         # H5.1: (start_xy, goal_xy) -> [(x,y)] or None
 
     def _log(self, msg):
         if self.logger:
@@ -364,6 +373,8 @@ class StateMachine:
         self.boundary_queue.clear()
         self.confirm_progress = 0.0
         self.lost_start_t = 0.0
+        self.nav_waypoints = []                    # H5.1
+        self.nav_final_view_pose = None
         self.transition(State.IDLE)
 
     def on_abort(self):
@@ -385,6 +396,8 @@ class StateMachine:
         self.lost_start_t = 0.0
         self.nav_pending_result = None
         self.pending_cancel_for_preempt = False    # H3.2
+        self.nav_waypoints = []                    # H5.1
+        self.nav_final_view_pose = None
 
     def on_arm_enable(self, armed: bool):
         self.armed = armed
@@ -406,6 +419,8 @@ class StateMachine:
         self.current_parent = None
         self.current_focus = None
         self.nav_pending_result = None
+        self.nav_waypoints = []                    # H5.1
+        self.nav_final_view_pose = None
         self.confirm_progress = 1.0
         self.lost_start_t = 0.0
         self.fire_start_t = now
@@ -500,6 +515,23 @@ class StateMachine:
         self.clear_boundary_queue()
 
         if result == "succeeded":
+            # H5.1: 방금 도착한 goal 은 현재 waypoint 하나에 대한 것.
+            # 남은 구간이 있으면 다음 hop 으로, 없으면(원래 동작) parent
+            # AIMING 진입. 중간 구간이 poll(_on_waypoint_eval) 보다 먼저
+            # Nav2 자체 완료 신호로 끝난 경우도 여기서 자연스럽게 처리된다.
+            if self.nav_waypoints:
+                self.nav_waypoints.pop(0)
+            if self.nav_waypoints:
+                next_pose = self._next_hop_pose()
+                if next_pose is not None:
+                    self._log(
+                        f"WAYPOINT_CRAWL: nav_result succeeded, 다음 hop -> "
+                        f"{next_pose[:2]} (남은 {len(self.nav_waypoints)}개)")
+                    action['action'] = 'nav_goal'
+                    action['nav_goal_xyyaw'] = next_pose
+                    return
+
+            self.nav_final_view_pose = None
             if self.current_parent is not None:
                 # parent 의 AIMING 진입
                 self.current_focus = self.current_parent
@@ -517,6 +549,8 @@ class StateMachine:
             self._log(f"Nav 실패 ({result}), parent 폐기")
             self.current_parent = None
             self.current_focus = None
+            self.nav_waypoints = []
+            self.nav_final_view_pose = None
             self.transition(State.IDLE)
 
     # ----- 핸들러: IDLE -----
@@ -567,11 +601,28 @@ class StateMachine:
                     self.current_parent = None
                     return
                 self.last_processed = entry.coord_map
+
+                # H5.1: 최종 목적지를 A* waypoint 리스트로 변환 -- 한 번에 먼
+                # 목적지로 보내는 대신 짧은 구간씩 이동하면서 매 구간마다
+                # 시야 확보 여부를 다시 검사한다 (_on_waiting_nav 참고).
+                waffle_xy = self.waffle_pos_fn() if self.waffle_pos_fn else None
+                waypoints = (
+                    self.plan_waypoints_fn(waffle_xy, view_pose[:2])
+                    if self.plan_waypoints_fn and waffle_xy is not None
+                    else None
+                )
+                if not waypoints:
+                    # A* 실패(또는 미주입) 시 기존처럼 최종 목적지로 한 번에 이동.
+                    waypoints = [view_pose[:2]]
+
+                self.nav_waypoints = waypoints
+                self.nav_final_view_pose = view_pose
+                self.nav_last_eval_t = now
                 self.transition(State.WAITING_NAV)
                 action['action'] = 'nav_goal'
-                action['nav_goal_xyyaw'] = view_pose
+                action['nav_goal_xyyaw'] = self._next_hop_pose()
                 self._log(f"CHECK_VIEW: 불가, VIEW_POSE={view_pose} "
-                          f"-> WAITING_NAV")
+                          f"waypoints={len(self.nav_waypoints)}개 -> WAITING_NAV")
 
         elif self.armed and detected:
             self._log("Autonomous detection -> TRACKING")
@@ -595,6 +646,17 @@ class StateMachine:
         if self.current_focus is not None:
             return  # 이미 처리 중
 
+        # H5.1: A* waypoint crawl 진행 상황 재평가 (refresh_period_sec 마다).
+        # boundary pop 보다 먼저 검사 -- 시야가 이미 확보됐다면 boundary
+        # 처리보다 원래 목표(parent) 조준이 우선이다.
+        if self.current_parent is not None and self.nav_waypoints:
+            nav_cfg = self.cfg.nav_crawl
+            period = nav_cfg.refresh_period_sec if nav_cfg else 0.5
+            if now - self.nav_last_eval_t >= period:
+                self.nav_last_eval_t = now
+                if self._on_waypoint_eval(action, now):
+                    return
+
         # boundary_queue 에서 pop 시도
         if self.boundary_queue:
             waffle_xy = self.waffle_pos_fn() if self.waffle_pos_fn else None
@@ -610,6 +672,108 @@ class StateMachine:
                 self._log(f"WAITING_NAV 중 boundary AIMING: "
                           f"{entry.coord_map}")
         # else: 그냥 대기. nav_result 콜백을 기다림.
+
+    # ----- H5.1: A* waypoint crawl 헬퍼 -----
+
+    def _hop_yaw(self, hop_xy, is_final: bool) -> float:
+        """구간(hop) 도착 시 향할 yaw. 마지막 구간은 VIEW_POSE 가 계산한
+        (OMX 조준 가능성까지 검증된) yaw 를 그대로 쓰고, 중간 구간은 다음
+        지점을 바라보게 한다."""
+        if is_final and self.nav_final_view_pose is not None:
+            return self.nav_final_view_pose[2]
+        waffle_xy = self.waffle_pos_fn() if self.waffle_pos_fn else None
+        if waffle_xy is None:
+            return 0.0
+        return math.atan2(hop_xy[1] - waffle_xy[1], hop_xy[0] - waffle_xy[0])
+
+    def _next_hop_pose(self) -> Optional[tuple]:
+        if not self.nav_waypoints:
+            return None
+        hop = self.nav_waypoints[0]
+        is_final = len(self.nav_waypoints) == 1
+        return (hop[0], hop[1], self._hop_yaw(hop, is_final))
+
+    def _on_waypoint_eval(self, action: dict, now: float) -> bool:
+        """WAITING_NAV 동안 refresh_period_sec 마다 호출.
+
+        1) 조기 종료: 이동 도중 이미 목표가 보이면(CHECK_VIEW 통과) 남은
+           구간을 취소하고 곧장 AIMING 으로 넘어간다 -- 미리 계산해 둔 먼
+           최종 지점까지 굳이 다 가지 않는다.
+        2) 구간 도착: 현재 waypoint "분포"(waypoint_tolerance_m) 안에 들어
+           오면 다음 구간으로 넘어간다. 단, 마지막 구간은 여기서 먼저
+           AIMING 으로 넘기지 않고 Nav2 자신의 nav_result(_handle_nav_result)
+           를 기다린다 -- 그래야 늦게 도착하는 succeeded 결과가 다음 이동
+           시도에 잘못 적용되는 경합을 만들지 않는다.
+        3) 아직 도착 전: 같은 구간 안에서 costmap 이 갱신됐다면 더 나은
+           지점으로 살짝 보정해서 다시 찍는다("분포 내에 새롭게 찍어줘").
+           단, 미세한 흔들림으로 Nav2 가 매 tick 재계획하지 않도록 일정
+           이상 움직였을 때만 실제로 재발행한다.
+
+        Returns: 이번 tick 에 action 을 채웠으면 True (호출부는 boundary
+                 처리 등을 건너뛰고 곧장 return 해야 함).
+        """
+        nav_cfg = self.cfg.nav_crawl
+
+        # 1) 조기 종료
+        early_stop = nav_cfg.early_stop_on_los if nav_cfg else True
+        if (
+            early_stop
+            and self.check_view_fn is not None
+            and self.current_parent is not None
+            and self.check_view_fn(self.current_parent.coord_map)
+        ):
+            self._log("WAYPOINT_CRAWL: 이동 중 시야 확보 -> 조기 종료")
+            if self.nav_cancel_fn is not None:
+                self.nav_cancel_fn()
+                self.pending_cancel_for_preempt = True
+            self.nav_waypoints = []
+            self.nav_final_view_pose = None
+            self.current_focus = self.current_parent
+            self.transition(State.AIMING)
+            self.aim_start_t = now
+            action['action'] = 'aim'
+            action['coord_map'] = self.current_parent.coord_map
+            return True
+
+        waffle_xy = self.waffle_pos_fn() if self.waffle_pos_fn else None
+        if waffle_xy is None or not self.nav_waypoints:
+            return False
+
+        tolerance = nav_cfg.waypoint_tolerance_m if nav_cfg else 0.35
+        hop = self.nav_waypoints[0]
+        dist = math.hypot(waffle_xy[0] - hop[0], waffle_xy[1] - hop[1])
+
+        # 2) 구간 도착 (마지막 구간 제외 -- 위 docstring 참고)
+        if dist <= tolerance:
+            if len(self.nav_waypoints) > 1:
+                self.nav_waypoints.pop(0)
+                next_pose = self._next_hop_pose()
+                if next_pose is None:
+                    return False
+                self._log(
+                    f"WAYPOINT_CRAWL: 구간 도착, 다음 hop -> {next_pose[:2]} "
+                    f"(남은 {len(self.nav_waypoints)}개)")
+                action['action'] = 'nav_goal'
+                action['nav_goal_xyyaw'] = next_pose
+                return True
+            return False
+
+        # 3) 아직 도착 전: 같은 목적지로 재계획해서 현재 구간 지점을 보정
+        if self.plan_waypoints_fn is not None and self.nav_final_view_pose is not None:
+            refined = self.plan_waypoints_fn(waffle_xy, self.nav_waypoints[-1])
+            if refined:
+                candidate = refined[0]
+                moved = math.hypot(candidate[0] - hop[0], candidate[1] - hop[1])
+                if moved > 0.10:
+                    self.nav_waypoints[0] = candidate
+                    next_pose = self._next_hop_pose()
+                    if next_pose is not None:
+                        self._log(
+                            f"WAYPOINT_CRAWL: 구간 지점 보정 -> {next_pose[:2]}")
+                        action['action'] = 'nav_goal'
+                        action['nav_goal_xyyaw'] = next_pose
+                        return True
+        return False
 
     # ----- 핸들러: SCANNING / TRACKING / CONFIRMING / COOLDOWN -----
 

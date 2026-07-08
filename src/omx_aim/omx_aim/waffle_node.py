@@ -41,6 +41,7 @@ from __future__ import annotations
 import sys
 import time
 from enum import Enum
+from functools import partial
 from typing import Optional
 
 import rclpy
@@ -97,6 +98,10 @@ class WaffleNavNode(Node):
         self.current_goal_handle = None
         self.send_goal_future = None
         self.result_future = None
+        # 매 _send_nav_goal 마다 증가 -- 취소된 이전 goal 의 응답/결과
+        # 콜백이 늦게 도착해서 그새 시작된 새 goal 의 상태를 덮어쓰는 것을
+        # 막는다 (H5.1: waypoint crawl 로 preemption 이 빈번해지면서 필요).
+        self._goal_epoch = 0
         self.nav_start_t: float = 0.0
 
         # dry-run 시뮬레이션 타이머 (one-shot)
@@ -331,9 +336,12 @@ class WaffleNavNode(Node):
         self.nav_start_t = time.time()
         self.transition(WaffleState.NAVIGATING)
 
+        self._goal_epoch += 1
+        epoch = self._goal_epoch
         self.send_goal_future = self.action_client.send_goal_async(
             goal, feedback_callback=self._feedback_callback)
-        self.send_goal_future.add_done_callback(self._goal_response_callback)
+        self.send_goal_future.add_done_callback(
+            partial(self._goal_response_callback, epoch=epoch))
 
     def on_nav_cancel(self, msg):
         if self.state == WaffleState.NAVIGATING:
@@ -351,8 +359,15 @@ class WaffleNavNode(Node):
             d = fb.distance_remaining
             self.get_logger().debug(f"남은 거리: {d:.2f} m")
 
-    def _goal_response_callback(self, future):
+    def _goal_response_callback(self, future, epoch: int):
         """Nav2 가 goal accept/reject 응답."""
+        if epoch != self._goal_epoch:
+            # 이미 취소되고 그 뒤로 새 goal 이 전송된, 낡은 goal 의 응답 --
+            # 지금 상태(state/current_goal_handle)를 건드리면 안 됨.
+            self.get_logger().debug(
+                f"stale goal_response 무시 (epoch={epoch}, "
+                f"current={self._goal_epoch})")
+            return
         goal_handle = future.result()
         if not goal_handle.accepted:
             self.get_logger().error("Nav2 goal 거부됨")
@@ -364,10 +379,16 @@ class WaffleNavNode(Node):
         self.get_logger().info("Nav2 goal accepted, 이동 시작")
 
         self.result_future = goal_handle.get_result_async()
-        self.result_future.add_done_callback(self._result_callback)
+        self.result_future.add_done_callback(
+            partial(self._result_callback, epoch=epoch))
 
-    def _result_callback(self, future):
+    def _result_callback(self, future, epoch: int):
         """Nav2 액션 종료."""
+        if epoch != self._goal_epoch:
+            self.get_logger().debug(
+                f"stale nav result 무시 (epoch={epoch}, "
+                f"current={self._goal_epoch})")
+            return
         status = future.result().status
         elapsed = time.time() - self.nav_start_t
 
