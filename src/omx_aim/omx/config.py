@@ -103,7 +103,7 @@ class FireConfig:
     immediate_during_nav: bool = True
     immediate_cancel_nav: bool = True
     immediate_min_interval_sec: float = 1.0
-    immediate_requires_armed: bool = False
+    immediate_requires_armed: bool = True
 
 
 @dataclass

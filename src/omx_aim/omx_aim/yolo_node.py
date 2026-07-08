@@ -828,7 +828,11 @@ class OmxYoloNode(Node):
         slowly while the target remains visible so a late/restarted fire_node
         still gets armed without flooding its logs.
         """
-        if not detected:
+        if not detected or not self.sm.armed:
+            # Detection alone must never clear the safety lock -- only an
+            # operator-armed system may unlock fire_node. Without this check
+            # a mere YOLO detection would clear /omx/fire_disable even while
+            # DISARMED, making the on-screen arm state non-authoritative.
             self._fire_enable_detection_active = False
             return
 
