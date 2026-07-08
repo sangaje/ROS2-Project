@@ -6,6 +6,7 @@ OpenCV VideoCapture + Ultralytics YOLO. ROS 의존성 없음.
 from __future__ import annotations
 
 import os
+import time
 
 import cv2
 from ultralytics import YOLO
@@ -28,11 +29,12 @@ class YoloDetector:
         self.cfg = cfg
         self.logger = logger
 
-        cam_idx = cfg.ibvs.camera_index
-        self.cap = cv2.VideoCapture(cam_idx)
-        if not self.cap.isOpened():
-            raise RuntimeError(f"카메라 {cam_idx} 열기 실패")
-        self._log(f"카메라 {cam_idx} 열림")
+        self.cam_idx = cfg.ibvs.camera_index
+        self.cap = None
+        self._last_reopen_t = 0.0
+        self._reopen_period_sec = 1.0
+        self._consecutive_read_failures = 0
+        self._open_camera(initial=True)
 
         self.device = str(os.environ.get(
             "OMX_YOLO_DEVICE",
@@ -56,10 +58,46 @@ class YoloDetector:
         else:
             print(msg)
 
+    def _warn(self, msg):
+        if self.logger:
+            self.logger.warn(msg)
+        else:
+            print(msg)
+
+    def _open_camera(self, *, initial: bool = False) -> bool:
+        now = time.time()
+        if not initial and now - self._last_reopen_t < self._reopen_period_sec:
+            return False
+        self._last_reopen_t = now
+
+        if self.cap is not None:
+            self.cap.release()
+
+        self.cap = cv2.VideoCapture(self.cam_idx)
+        if self.cap.isOpened():
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            self._consecutive_read_failures = 0
+            self._log(f"카메라 {self.cam_idx} 열림")
+            return True
+
+        self._warn(f"카메라 {self.cam_idx} 열기 실패 - 재연결 대기")
+        return False
+
     def read_frame(self):
         """카메라 1 프레임 읽기. 실패 시 None."""
+        if self.cap is None or not self.cap.isOpened():
+            self._open_camera()
+            return None
+
         ok, frame = self.cap.read()
-        return frame if ok else None
+        if ok and frame is not None:
+            self._consecutive_read_failures = 0
+            return frame
+
+        self._consecutive_read_failures += 1
+        if self._consecutive_read_failures >= 5:
+            self._open_camera()
+        return None
 
     def detect(self, frame):
         """프레임에서 target_class 최고 conf 객체 검출.

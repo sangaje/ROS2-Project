@@ -275,6 +275,7 @@ class OmxYoloNode(Node):
         self._fire_enable_republish_sec = 1.0
         self._last_immediate_fire_t = 0.0
         self._immediate_fire_detection_active = False
+        self._detection_nav_stop_active = False
 
         self.get_logger().info(
             f"Timer: 메인 {self.cfg.ibvs.control_hz} Hz, 상태 1 Hz")
@@ -1131,6 +1132,22 @@ class OmxYoloNode(Node):
             + (" (Nav2 cancel)" if navigating else ""))
         return True
 
+    def maybe_stop_nav_on_detection(self, detected: bool) -> bool:
+        """카메라가 표적을 보면 Nav2 이동부터 멈춘다."""
+        if not detected:
+            self._detection_nav_stop_active = False
+            return False
+        if self._detection_nav_stop_active:
+            return False
+        if not self.sm._is_waffle_navigating():
+            return False
+
+        self.publish_nav_cancel()
+        self._detection_nav_stop_active = True
+        self.get_logger().warn(
+            "[detection_stop] 표적 식별 -> Nav2 이동 정지")
+        return True
+
     def _make_point_stamped(self, coord_map):
         msg = PointStamped()
         msg.header.frame_id = 'map'
@@ -1308,7 +1325,10 @@ class OmxYoloNode(Node):
     def loop(self):
         frame = self.detector.read_frame()
         if frame is None:
-            self.get_logger().warn("프레임 읽기 실패")
+            self.get_logger().warn(
+                "프레임 읽기 실패 - 카메라 재연결 시도 중",
+                throttle_duration_sec=2.0,
+            )
             return
 
         # 격발 후 COOLDOWN 동안엔 YOLO detect 스킵.
@@ -1322,7 +1342,9 @@ class OmxYoloNode(Node):
 
         now = time.time()
         self.publish_fire_enable_if_detected(detected, now)
-        self.maybe_fire_immediately_on_detection(detected, now)
+        stopped_for_detection = self.maybe_stop_nav_on_detection(detected)
+        if not stopped_for_detection:
+            self.maybe_fire_immediately_on_detection(detected, now)
         action = self.sm.update(detected, error_norm, now)
 
         # blocked entries 알림
