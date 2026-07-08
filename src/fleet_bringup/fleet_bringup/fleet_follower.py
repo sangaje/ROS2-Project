@@ -5,6 +5,7 @@ from functools import partial
 from typing import Optional, Tuple
 
 import rclpy
+from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseArray, PoseStamped
 from nav2_msgs.action import NavigateToPose
 from rclpy.action import ActionClient
@@ -74,6 +75,7 @@ class FleetFollower(Node):
         self.declare_parameter('avoidance_trigger_range_m', 0.42)
         self.declare_parameter('avoidance_goal_distance_m', 0.55)
         self.declare_parameter('peer_separation_weight', 0.35)
+        self.declare_parameter('slot_stickiness_bonus', 0.35)
         self.declare_parameter('localization_ready_topic', '/localization_ready')
         self.declare_parameter('require_localization_ready', True)
 
@@ -135,6 +137,9 @@ class FleetFollower(Node):
         self.peer_separation_weight = max(
             0.0, float(parameter('peer_separation_weight').value)
         )
+        self.slot_stickiness_bonus = max(
+            0.0, float(parameter('slot_stickiness_bonus').value)
+        )
         self.localization_ready_topic = self._absolute(
             str(parameter('localization_ready_topic').value)
         )
@@ -148,6 +153,13 @@ class FleetFollower(Node):
         self.active_goal_id = 0
         self.last_goal_xy: Optional[Point2] = None
         self.last_goal_time = -1.0e9
+        # 'none': never sent. 'pending': in flight. 'succeeded'/'failed':
+        # last result. Only 'failed' allows the goal_refresh_sec fallback in
+        # _should_send to re-send -- otherwise a settled, successfully
+        # reached follow goal got needlessly re-issued every few seconds.
+        self.last_goal_outcome = 'none'
+        self._current_slot_offset: Optional[float] = None
+        self._pending_slot_offset: Optional[float] = None
         self.wait_log_time = -1.0e9
         self.goal_count = 0
         self.collision_warning = False
@@ -285,6 +297,8 @@ class FleetFollower(Node):
             self._cancel_goal(command)
         self.last_goal_xy = None
         self.last_goal_time = -1.0e9
+        self.last_goal_outcome = 'none'
+        self._current_slot_offset = None
         if changed:
             state = 'FOLLOWING' if enabled else 'PAUSED'
             self.get_logger().warning(
@@ -405,6 +419,7 @@ class FleetFollower(Node):
             or self.latest_scan is None
             or self.follower_pose is None
         ):
+            self._pending_slot_offset = None
             return self._make_goal_pose(
                 leader.position.x - self.follow_distance * math.cos(leader_yaw),
                 leader.position.y - self.follow_distance * math.sin(leader_yaw),
@@ -413,6 +428,7 @@ class FleetFollower(Node):
 
         follower = self.follower_pose.pose.position
         best_target = None
+        best_offset = None
         best_score = -float('inf')
         for offset in self.formation_candidate_angles:
             slot_angle = leader_yaw + offset
@@ -427,16 +443,32 @@ class FleetFollower(Node):
             travel = math.hypot(x - follower.x, y - follower.y)
             peer_score = self._peer_clearance_score(x, y)
             behind_bonus = 0.25 if abs(wrap_angle(offset - math.pi)) < 0.01 else 0.0
+            # Bias toward whichever slot the last goal actually sent was
+            # for, so a marginal scan-noise fluctuation between ticks can't
+            # flip the target to a different slot around the leader while
+            # it hasn't moved -- that produced a follower that never
+            # settled, constantly re-planning to a "slightly better" slot.
+            sticky = (
+                self.slot_stickiness_bonus
+                if (
+                    self._current_slot_offset is not None
+                    and abs(wrap_angle(offset - self._current_slot_offset)) < 0.01
+                )
+                else 0.0
+            )
             score = (
                 clearance
                 + self.peer_separation_weight * peer_score
                 + behind_bonus
+                + sticky
                 - 0.20 * travel
             )
             if score > best_score:
                 best_score = score
                 best_target = self._make_goal_pose(x, y, leader_yaw)
+                best_offset = offset
 
+        self._pending_slot_offset = best_offset
         if best_target is not None:
             return best_target
 
@@ -450,6 +482,7 @@ class FleetFollower(Node):
         assert self.leader_pose is not None
         avoidance = self._avoidance_target_if_needed()
         if avoidance is not None:
+            self._pending_slot_offset = None
             return avoidance
         return self._target_open_slot_around_leader()
 
@@ -461,10 +494,17 @@ class FleetFollower(Node):
             current[0] - self.last_goal_xy[0],
             current[1] - self.last_goal_xy[1],
         )
-        return (
-            moved >= self.goal_update_distance
-            or self._now() - self.last_goal_time >= self.goal_refresh
-        )
+        if moved >= self.goal_update_distance:
+            return True
+        # Once settled (the last goal succeeded, or is still in flight),
+        # hold still instead of re-issuing the same goal every
+        # goal_refresh_sec -- that made a follower that had already reached
+        # its slot behind the leader keep fidgeting/re-planning in place.
+        # Only a genuinely failed/rejected goal falls back to a periodic
+        # retry so a stuck follower can still recover.
+        if self.last_goal_outcome == 'failed':
+            return self._now() - self.last_goal_time >= self.goal_refresh
+        return False
 
     def _log_wait(self, reason: str) -> None:
         now = self._now()
@@ -503,6 +543,8 @@ class FleetFollower(Node):
             target.pose.position.y,
         )
         self.last_goal_time = self._now()
+        self.last_goal_outcome = 'pending'
+        self._current_slot_offset = self._pending_slot_offset
         self.goal_count += 1
         goal_id = self.goal_count
         future = self.navigation_client.send_goal_async(goal)
@@ -515,9 +557,13 @@ class FleetFollower(Node):
             handle = future.result()
         except Exception as error:
             self.get_logger().error(f'FOLLOW_GOAL_ERROR | {error}')
+            if goal_id == self.goal_count:
+                self.last_goal_outcome = 'failed'
             return
         if not handle.accepted:
             self.get_logger().warning('FOLLOW_GOAL_REJECTED')
+            if goal_id == self.goal_count:
+                self.last_goal_outcome = 'failed'
             return
         if not self.follow_enabled or goal_id != self.goal_count:
             handle.cancel_goal_async()
@@ -532,10 +578,14 @@ class FleetFollower(Node):
         )
 
     def _goal_result_callback(self, future, goal_id: int) -> None:
+        succeeded = False
         try:
-            future.result()
+            result = future.result()
+            succeeded = result.status == GoalStatus.STATUS_SUCCEEDED
         except Exception as error:
             self.get_logger().warning(f'FOLLOW_GOAL_RESULT_ERROR | {error}')
+        if goal_id == self.goal_count:
+            self.last_goal_outcome = 'succeeded' if succeeded else 'failed'
         if goal_id == self.active_goal_id:
             self.active_goal_handle = None
             self.active_goal_id = 0
