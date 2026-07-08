@@ -453,15 +453,22 @@ class OmxYoloNode(Node):
         gx0, gy0 = grid
         vp_cfg = self.cfg.view_pose
         threshold = self.cfg.patrol.los_cost_threshold
+        center_value = self._costmap_cell_value(gx0, gy0)
+        if center_value is None or center_value == -1 or center_value >= threshold:
+            return None
+
         radius_m = max(info.resolution, vp_cfg.footprint_radius_m)
         radius_cells = max(1, int(math.ceil(radius_m / info.resolution)))
         max_cost = 0
         frontier = False
+        known_count = 0
+        total_count = 0
 
         for dy in range(-radius_cells, radius_cells + 1):
             for dx in range(-radius_cells, radius_cells + 1):
                 if dx * dx + dy * dy > radius_cells * radius_cells:
                     continue
+                total_count += 1
                 gx = gx0 + dx
                 gy = gy0 + dy
                 value = self._costmap_cell_value(gx, gy)
@@ -474,12 +481,24 @@ class OmxYoloNode(Node):
                     continue
                 if value >= threshold:
                     return None
+                known_count += 1
                 max_cost = max(max_cost, int(value))
                 frontier = frontier or self._is_frontier_cell(gx, gy)
 
+        known_ratio = known_count / max(1, total_count)
+        if known_ratio < vp_cfg.min_known_footprint_ratio:
+            return None
+
         obstacle_penalty = vp_cfg.obstacle_cost_weight * (max_cost / 100.0)
+        unknown_penalty = vp_cfg.unknown_cost_weight * (1.0 - known_ratio)
         frontier_bonus = vp_cfg.frontier_bonus if frontier else 0.0
-        return obstacle_penalty, frontier_bonus, max_cost, frontier
+        return (
+            obstacle_penalty + unknown_penalty,
+            frontier_bonus,
+            max_cost,
+            frontier,
+            known_ratio,
+        )
 
     # ----- H2: CHECK_VIEW + VIEW_POSE -----
 
@@ -574,7 +593,13 @@ class OmxYoloNode(Node):
             if candidate_score is None:
                 rejection_reasons['costmap'] += 1
                 continue
-            obstacle_penalty, frontier_bonus, cost_val, is_frontier = candidate_score
+            (
+                obstacle_penalty,
+                frontier_bonus,
+                cost_val,
+                is_frontier,
+                known_ratio,
+            ) = candidate_score
 
             # 조건 1.5: 현재 와플 위치에서 후보까지도 ROS map 상 clear 해야 함
             if vp_cfg.require_clear_path_to_candidate:
@@ -585,7 +610,10 @@ class OmxYoloNode(Node):
 
             # 조건 2: LOS from candidate to target
             los = self._los_between((cx, cy), (tx, ty))
-            if los != LOSResult.CLEAR:
+            if los == LOSResult.BLOCKED:
+                rejection_reasons['los'] += 1
+                continue
+            if los == LOSResult.UNKNOWN and not vp_cfg.allow_unknown_target_los:
                 rejection_reasons['los'] += 1
                 continue
 
@@ -626,7 +654,7 @@ class OmxYoloNode(Node):
 
             valid.append((
                 cost, cx, cy, final_yaw, cost_val, dist_from_waffle,
-                is_frontier))
+                is_frontier, known_ratio))
 
         if not valid:
             self.get_logger().warn(
@@ -638,11 +666,12 @@ class OmxYoloNode(Node):
             return None
 
         valid.sort()
-        cost, bx, by, byaw, infl, dw, is_frontier = valid[0]
+        cost, bx, by, byaw, infl, dw, is_frontier, known_ratio = valid[0]
         self.get_logger().info(
             f"VIEW_POSE v2: {n}개 중 {len(valid)} 적합, "
             f"선택 cost={cost:.2f} (infl={infl}, "
-            f"dist_waffle={dw:.2f}m, frontier={is_frontier}) "
+            f"dist_waffle={dw:.2f}m, frontier={is_frontier}, "
+            f"known={known_ratio:.2f}) "
             f"-> ({bx:+.2f}, {by:+.2f}) yaw={math.degrees(byaw):+.1f}°")
         return (bx, by, byaw)
 

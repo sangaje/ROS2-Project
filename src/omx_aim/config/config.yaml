@@ -187,10 +187,13 @@ view_pose:
   candidate_count: 12
   yaw_next_weight: 0.0
   footprint_radius_m: 0.24
-  reject_unknown_footprint: true
-  require_clear_path_to_candidate: true
+  min_known_footprint_ratio: 0.45
+  reject_unknown_footprint: false
+  require_clear_path_to_candidate: false
+  allow_unknown_target_los: true
   frontier_bonus: 0.35
   obstacle_cost_weight: 1.5
+  unknown_cost_weight: 0.8
 
 # ===========================================================
 # BOUNDARY 자동 생성 (H4 에서 활성화 예정)

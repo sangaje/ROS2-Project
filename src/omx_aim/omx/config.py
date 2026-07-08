@@ -138,10 +138,13 @@ class ViewPoseConfig:
     candidate_count: int = 12 
     yaw_next_weight: float = 0.5
     footprint_radius_m: float = 0.24
-    reject_unknown_footprint: bool = True
-    require_clear_path_to_candidate: bool = True
+    min_known_footprint_ratio: float = 0.45
+    reject_unknown_footprint: bool = False
+    require_clear_path_to_candidate: bool = False
+    allow_unknown_target_los: bool = True
     frontier_bonus: float = 0.35
     obstacle_cost_weight: float = 1.5
+    unknown_cost_weight: float = 0.8
 
 
 @dataclass
