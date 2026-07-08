@@ -1392,6 +1392,11 @@ class OmxYoloNode(Node):
                 vp = action['nav_goal_xyyaw']
                 if vp is not None:
                     self.publish_nav_goal(vp)
+                self.ctrl.scan_sweep(
+                    now,
+                    self.cfg.patrol.scan_sweep_half_angle_deg,
+                    self.cfg.patrol.scan_sweep_period_sec,
+                )
 
         if action.get('patrol_complete', False):
             self.publish_patrol_complete()

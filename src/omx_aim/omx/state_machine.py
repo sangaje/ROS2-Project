@@ -738,7 +738,11 @@ class StateMachine:
                 action['coord_map'] = entry.coord_map
                 self._log(f"WAITING_NAV 중 boundary AIMING: "
                           f"{entry.coord_map}")
-        # else: 그냥 대기. nav_result 콜백을 기다림.
+        # boundary 큐가 잠깐 비어 있어도, Nav2 주행 중에는 OMX 가 멈추지
+        # 않고 배경 sweep 을 계속한다.
+        if action['action'] == 'wait':
+            action['action'] = 'scan_sweep'
+            action['scan_sweep'] = True
 
     # ----- H5.1: A* waypoint crawl 헬퍼 -----
 
