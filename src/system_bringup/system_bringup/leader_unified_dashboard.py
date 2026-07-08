@@ -187,6 +187,7 @@ class LeaderUnifiedDashboard(Node):
         self.create_subscription(PoseArray, self.fleet_poses_topic, self._on_fleet_poses, 10)
         self.create_subscription(String, self.fleet_status_topic, self._on_fleet_status, 10)
         self.create_subscription(Bool, self.collision_warning_topic, self._on_collision_warning, 10)
+        self.create_subscription(String, '/risk/yolo_detections', lambda msg: self._set_topic_value('/risk/yolo_detections', msg.data, 'std_msgs/msg/String'), 10)
         self.create_subscription(String, '/omx/state', lambda msg: self._set_omx('state', msg.data, '/omx/state', 'std_msgs/msg/String'), 10)
         self.create_subscription(String, '/omx/status', lambda msg: self._set_omx('status', msg.data, '/omx/status', 'std_msgs/msg/String'), 10)
         self.create_subscription(Bool, '/omx/target_detected', lambda msg: self._set_omx('target_detected', bool(msg.data), '/omx/target_detected', 'std_msgs/msg/Bool'), 10)
@@ -496,6 +497,15 @@ class LeaderUnifiedDashboard(Node):
             'received_wall_sec': now,
             'type': msg_type,
         }
+
+    def _set_topic_value(self, topic_name: str, value: Any, msg_type: str) -> None:
+        now = time.time()
+        with self._lock:
+            self._topic_state[topic_name] = {
+                'value': value,
+                'received_wall_sec': now,
+                'type': msg_type,
+            }
 
     def snapshot(self) -> Dict[str, Any]:
         now = time.time()

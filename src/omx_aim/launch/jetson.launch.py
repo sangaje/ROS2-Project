@@ -40,10 +40,6 @@ def launch_setup(context, *args, **kwargs):
         LaunchConfiguration('start_patrol_planner').perform(context)
     )
     debug_port = LaunchConfiguration('debug_port').perform(context)
-    yolo_camera_device = LaunchConfiguration('yolo_camera_device').perform(context)
-    yolo_camera_fallback_devices = LaunchConfiguration(
-        'yolo_camera_fallback_devices'
-    ).perform(context)
     yolo_node_delay = float(
         LaunchConfiguration('yolo_node_delay_sec').perform(context)
     )
@@ -82,10 +78,6 @@ def launch_setup(context, *args, **kwargs):
         parameters=[{
             'waffle_frame_candidates': ['base_link', 'base_footprint'],
         }],
-        additional_env={
-            'OMX_CAMERA_INDEX': yolo_camera_device,
-            'OMX_CAMERA_FALLBACK_DEVICES': yolo_camera_fallback_devices,
-        },
         respawn=True,
         respawn_delay=3.0,
     )
@@ -175,12 +167,6 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'yolo_node_delay_sec', default_value='14.0',
             description='Delay heavy OMX YOLO/camera/model startup on constrained Jetson hardware.'),
-        DeclareLaunchArgument(
-            'yolo_camera_device', default_value='auto',
-            description='Camera source for omx_yolo_node. Use auto to scan /dev/video0..7.'),
-        DeclareLaunchArgument(
-            'yolo_camera_fallback_devices', default_value='auto',
-            description='Fallback camera sources for omx_yolo_node.'),
         DeclareLaunchArgument(
             'patrol_planner_delay_sec', default_value='6.0',
             description='Small grace before starting patrol_planner.'),

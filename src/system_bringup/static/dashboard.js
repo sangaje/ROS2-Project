@@ -8,6 +8,7 @@ let mapSeq = -1;
 let riskSeq = -1;
 let mapReady = false;
 let riskReady = false;
+let streamSources = {};
 const canvas = document.getElementById('mapCanvas');
 const ctx = canvas.getContext('2d');
 const roleColors = {leader: '#58a6ff', follower: '#63d297'};
@@ -53,26 +54,34 @@ function setPill(id, label, status) {
   el.innerHTML = `<span class="dot"></span>${label} ${status || 'NO DATA'}`;
 }
 
+function setStreamSource(id, url, force = false) {
+  const img = document.getElementById(id);
+  if (!force && img.dataset.baseSrc === url) return;
+  img.dataset.baseSrc = url;
+  img.src = `${url}${url.includes('?') ? '&' : '?'}t=${Date.now()}`;
+}
+
 function configureStream(s) {
-  const omx = document.getElementById('omxStream');
-  if (omx.dataset.configured !== '1') {
-    const port = s.omx_debug.port;
-    const path = s.omx_debug.stream_path || '/stream.mjpg';
-    omx.src = `${location.protocol}//${location.hostname}:${port}${path}`;
-    omx.dataset.configured = '1';
-  }
+  const omxPort = s.omx_debug.port;
+  const omxPath = s.omx_debug.stream_path || '/stream.mjpg';
+  streamSources.omxStream = `${location.protocol}//${location.hostname}:${omxPort}${omxPath}`;
 
   const yolo = s.yolo_server || {};
   const yoloPort = yolo.port || 5005;
-  const streams = [
-    ['scoutRawStream', yolo.raw_stream_path || '/stream/raw.mjpg'],
-    ['scoutYoloStream', yolo.overlay_stream_path || '/stream/yolo.mjpg'],
-  ];
-  streams.forEach(([id, path]) => {
-    const img = document.getElementById(id);
-    if (img.dataset.configured === '1') return;
-    img.src = `${location.protocol}//${location.hostname}:${yoloPort}${path}`;
-    img.dataset.configured = '1';
+  streamSources.scoutRawStream = (
+    `${location.protocol}//${location.hostname}:${yoloPort}`
+    + (yolo.raw_stream_path || '/stream/raw.mjpg')
+  );
+  streamSources.scoutYoloStream = (
+    `${location.protocol}//${location.hostname}:${yoloPort}`
+    + (yolo.overlay_stream_path || '/stream/yolo.mjpg')
+  );
+  refreshStreams(false);
+}
+
+function refreshStreams(force = true) {
+  Object.entries(streamSources).forEach(([id, url]) => {
+    setStreamSource(id, url, force);
   });
 }
 
@@ -377,3 +386,4 @@ async function refresh() {
 window.addEventListener('resize', draw);
 refresh();
 setInterval(refresh, 500);
+setInterval(() => refreshStreams(true), 5000);

@@ -28,11 +28,11 @@ class YoloDetector:
         self.cfg = cfg
         self.logger = logger
 
-        self.camera_source = self._camera_source(cfg)
-        self.fallback_sources = self._camera_fallback_sources()
-        self.cap = None
-        self.active_camera = None
-        self.open_camera()
+        cam_idx = cfg.ibvs.camera_index
+        self.cap = cv2.VideoCapture(cam_idx)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"카메라 {cam_idx} 열기 실패")
+        self._log(f"카메라 {cam_idx} 열림")
 
         self.device = str(os.environ.get(
             "OMX_YOLO_DEVICE",
@@ -49,68 +49,6 @@ class YoloDetector:
         self._log(f"YOLO 로드: {cfg.yolo.model_path}, "
                   f"클래스 {self.target_class} ({self.class_name}), "
                   f"device={self.device}, half={self.use_half}")
-
-    def _camera_source(self, cfg: Config):
-        return str(os.environ.get(
-            "OMX_CAMERA_INDEX",
-            getattr(cfg.ibvs, "camera_index", 0),
-        )).strip()
-
-    def _camera_fallback_sources(self) -> list[str]:
-        raw = os.environ.get(
-            "OMX_CAMERA_FALLBACK_DEVICES",
-            "auto",
-        )
-        return [item.strip() for item in str(raw).split(",") if item.strip()]
-
-    def _camera_candidates(self) -> list[str]:
-        candidates = []
-
-        def add(value) -> None:
-            text = str(value).strip()
-            if not text:
-                return
-            if text.lower() == "auto":
-                for index in range(8):
-                    add(f"/dev/video{index}")
-                    add(str(index))
-                return
-            if text not in candidates:
-                candidates.append(text)
-
-        add(self.camera_source)
-        for source in self.fallback_sources:
-            add(source)
-        return candidates
-
-    @staticmethod
-    def _open_arg(source: str):
-        return int(source) if str(source).isdigit() else source
-
-    def open_camera(self):
-        self.release()
-        tried = []
-        for source in self._camera_candidates():
-            tried.append(source)
-            cap = cv2.VideoCapture(self._open_arg(source), cv2.CAP_V4L2)
-            if not cap.isOpened():
-                cap.release()
-                continue
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                cap.release()
-                continue
-            self.cap = cap
-            self.active_camera = source
-            self._log(
-                f"카메라 열림: active={source} requested={self.camera_source} "
-                f"fallback={','.join(self.fallback_sources)}"
-            )
-            return
-        raise RuntimeError(
-            f"카메라 열기 실패: requested={self.camera_source} "
-            f"tried={tried}"
-        )
 
     def _log(self, msg):
         if self.logger:

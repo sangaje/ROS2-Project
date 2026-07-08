@@ -96,10 +96,6 @@ def generate_launch_description():
     yolo_server_device = LaunchConfiguration('yolo_server_device')
     yolo_server_half = LaunchConfiguration('yolo_server_half')
     omx_yolo_node_delay_sec = LaunchConfiguration('omx_yolo_node_delay_sec')
-    omx_camera_device = LaunchConfiguration('omx_camera_device')
-    omx_camera_fallback_devices = LaunchConfiguration(
-        'omx_camera_fallback_devices'
-    )
     start_patrol_planner = LaunchConfiguration('start_patrol_planner')
     patrol_planner_delay_sec = LaunchConfiguration('patrol_planner_delay_sec')
     debug_stream = LaunchConfiguration('debug_stream')
@@ -393,10 +389,6 @@ def generate_launch_description():
                         'yolo_node_delay_sec': (
                             omx_yolo_node_delay_sec.perform(context)
                         ),
-                        'yolo_camera_device': omx_camera_device.perform(context),
-                        'yolo_camera_fallback_devices': (
-                            omx_camera_fallback_devices.perform(context)
-                        ),
                         'start_patrol_planner': (
                             start_patrol_planner.perform(context)
                         ),
@@ -529,6 +521,19 @@ def generate_launch_description():
                     'device': camera_sender_device.perform(context),
                     'server_url': flask_server_url.perform(context),
                     'output_topic': external_detection_topic.perform(context),
+                    'width': '1920',
+                    'height': '1080',
+                    'send_width': '1920',
+                    'send_height': '1080',
+                    'camera_fps': '15.0',
+                    'max_rate_hz': '5.0',
+                    'http_worker_count': '1',
+                    'jpeg_quality': '65',
+                    'timeout_sec': '1.0',
+                    'connect_timeout_sec': '0.3',
+                    'read_timeout_sec': '1.2',
+                    'max_http_roundtrip_sec': '1.5',
+                    'max_frame_age_sec': '1.0',
                 }.items(),
             ))
 
@@ -872,16 +877,6 @@ def generate_launch_description():
             'omx_yolo_node_delay_sec',
             default_value='14.0',
             description='Leader role only: delay heavy OMX YOLO/camera/model startup.',
-        ),
-        DeclareLaunchArgument(
-            'omx_camera_device',
-            default_value='auto',
-            description='Leader role only: OMX camera source. auto scans /dev/video0..7.',
-        ),
-        DeclareLaunchArgument(
-            'omx_camera_fallback_devices',
-            default_value='auto',
-            description='Leader role only: OMX camera fallback source list.',
         ),
         DeclareLaunchArgument(
             'start_patrol_planner',

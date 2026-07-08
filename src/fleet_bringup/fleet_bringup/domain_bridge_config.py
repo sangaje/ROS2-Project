@@ -41,6 +41,10 @@ def risk_topics() -> Dict[str, Dict]:
     grid_profile = qos(durability='transient_local', depth=1)
     marker_profile = qos(durability='transient_local', depth=1)
     return {
+        '/risk/yolo_detections': topic(
+            'std_msgs/msg/String',
+            profile=qos(reliability='best_effort', durability='volatile', depth=1),
+        ),
         '/risk/risk_map': topic(
             'nav_msgs/msg/OccupancyGrid',
             profile=grid_profile,
