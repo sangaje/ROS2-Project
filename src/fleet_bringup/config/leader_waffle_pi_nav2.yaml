@@ -19,7 +19,7 @@ amcl:
     first_map_only: false
     global_frame_id: "map"
     lambda_short: 0.1
-    laser_likelihood_max_dist: 1.5
+    laser_likelihood_max_dist: 2.0
     laser_max_range: 3.5
     laser_min_range: 0.12
     laser_model_type: "likelihood_field"

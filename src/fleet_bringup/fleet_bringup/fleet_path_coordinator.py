@@ -91,6 +91,8 @@ class FleetPathCoordinator(Node):
         self.declare_parameter('member_pose_topic', '/member_pose')
         self.declare_parameter('member_coord_goal_topic', '/member_goal_pose')
         self.declare_parameter('require_follower_pose', True)
+        self.declare_parameter('localization_ready_topic', '/localization_ready')
+        self.declare_parameter('require_localization_ready', True)
 
         self.declare_parameter('check_period_sec', 0.30)
         self.declare_parameter('pose_stale_sec', 1.5)
@@ -143,6 +145,12 @@ class FleetPathCoordinator(Node):
             get('member_coord_goal_topic').value
         )
         self.require_follower_pose = bool(get('require_follower_pose').value)
+        self.localization_ready_topic = str(
+            get('localization_ready_topic').value
+        )
+        self.require_localization_ready = bool(
+            get('require_localization_ready').value
+        )
 
         self.check_period = max(0.1, float(get('check_period_sec').value))
         self.pose_stale = max(0.5, float(get('pose_stale_sec').value))
@@ -202,6 +210,7 @@ class FleetPathCoordinator(Node):
         self.follower_motion_sample: Optional[Tuple[float, Point2]] = None
         self.collision_warning = False
         self.risk_observation_count = 0
+        self.localization_ready = False
 
         self.state = self.IDLE
         self.state_since = self._now()
@@ -299,6 +308,12 @@ class FleetPathCoordinator(Node):
         self.create_subscription(
             PoseStamped, self.member_pose_topic, self._member_pose_cb, 20
         )
+        self.create_subscription(
+            Bool,
+            self.localization_ready_topic,
+            self._localization_ready_cb,
+            coordination_qos,
+        )
 
         self.member_goal_pub = self.create_publisher(
             PoseStamped, self.member_coord_goal_topic, 10
@@ -395,6 +410,9 @@ class FleetPathCoordinator(Node):
             self.member_motion_sample,
             self._xy(message),
         )
+
+    def _localization_ready_cb(self, message: Bool) -> None:
+        self.localization_ready = bool(message.data)
 
     def _update_velocity(
         self,
@@ -1342,6 +1360,22 @@ class FleetPathCoordinator(Node):
         if self.leader_pose is None:
             self._hold_for_missing_pose()
             self._publish_safety_state(True)
+            return
+
+        if self.require_localization_ready and not self.localization_ready:
+            # Checked before the no-follower short-circuit below so it
+            # applies to every fleet shape (leader-only, leader+member,
+            # leader+follower) -- otherwise a leader+scout fleet with
+            # require_follower_pose:=false would skip this gate entirely.
+            self._hold_for_missing_pose()
+            self._publish_safety_state(True)
+            now = self._now()
+            if now - self.last_pose_warning_log >= 5.0:
+                self.get_logger().warning(
+                    'FLEET_SAFETY_LOCALIZATION_NOT_READY | motion held '
+                    'until the leader has finished its localization spin'
+                )
+                self.last_pose_warning_log = now
             return
 
         if not self.require_follower_pose and self.follower_pose is None:

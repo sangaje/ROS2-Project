@@ -185,21 +185,18 @@ def generate_launch_description():
                     name='leader_global_localize',
                     output='screen',
                     parameters=[{
+                        'scan_topic': scan_topic_value,
                         'spin_enabled': True,
-                        'spin_duration_sec': 8.0,
-                        'spin_speed_rad_s': 0.6,
+                        'spin_speed_rad_s': 0.35,
                         'cmd_vel_topic': '/cmd_vel',
                         'use_stamped_cmd_vel': True,
-                        'retry_enabled': True,
-                        'retry_timeout_sec': 86400.0,
-                        'retry_interval_sec': 8.0,
-                        'stop_when_localized': True,
                         'amcl_pose_topic': '/amcl_pose',
-                        'localized_xy_cov_threshold': 0.35,
-                        'localized_yaw_cov_threshold': 0.25,
-                        'localized_required_samples': 5,
+                        'localization_cov_xy_threshold': 0.35,
+                        'localization_cov_yaw_threshold': 0.25,
                     }],
                     env=process_env,
+                    respawn=True,
+                    respawn_delay=3.0,
                 )
 
         leader_pose = Node(
@@ -347,6 +344,14 @@ def generate_launch_description():
                 'use_sim_time': simulation,
                 'require_follower_pose': launch_bool(
                     require_follower_pose.perform(context)
+                ),
+                # False whenever no leader_global_localize instance exists
+                # to ever publish this: leader-owned-Cartographer mode has
+                # no AMCL/kickstart, and auto_localize:=false skips it too.
+                # Otherwise the coordinator would hold the leader forever
+                # waiting for a ready signal that will never arrive.
+                'require_localization_ready': (
+                    not cartographer_owned and auto
                 ),
             }],
             env=process_env,

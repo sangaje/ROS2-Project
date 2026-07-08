@@ -310,20 +310,16 @@ def generate_launch_description():
                 parameters=[{
                     'use_sim_time': simulation,
                     'spin_enabled': not simulation,
-                    'spin_duration_sec': 8.0,
-                    'spin_speed_rad_s': 0.6,
+                    'spin_speed_rad_s': 0.35,
                     'cmd_vel_topic': '/cmd_vel',
                     'use_stamped_cmd_vel': True,
-                    'retry_enabled': True,
-                    'retry_timeout_sec': 86400.0,
-                    'retry_interval_sec': 8.0,
-                    'stop_when_localized': True,
                     'amcl_pose_topic': '/amcl_pose',
-                    'localized_xy_cov_threshold': 0.35,
-                    'localized_yaw_cov_threshold': 0.25,
-                    'localized_required_samples': 5,
+                    'localization_cov_xy_threshold': 0.35,
+                    'localization_cov_yaw_threshold': 0.25,
                 }],
                 env=process_env,
+                respawn=True,
+                respawn_delay=3.0,
             )
 
         goal_proxy = Node(
@@ -346,6 +342,11 @@ def generate_launch_description():
                 'use_sim_time': simulation,
                 'follow_distance': float(follow_distance.perform(context)),
                 'start_following': True,
+                # False whenever no burger_global_localize instance exists
+                # to ever publish this (enable_amcl:=false or
+                # auto_localize:=false), otherwise the follower would never
+                # chase the leader.
+                'require_localization_ready': amcl_enabled and auto,
             }],
             env=process_env,
             respawn=True,

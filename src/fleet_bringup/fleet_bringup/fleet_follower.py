@@ -74,6 +74,8 @@ class FleetFollower(Node):
         self.declare_parameter('avoidance_trigger_range_m', 0.42)
         self.declare_parameter('avoidance_goal_distance_m', 0.55)
         self.declare_parameter('peer_separation_weight', 0.35)
+        self.declare_parameter('localization_ready_topic', '/localization_ready')
+        self.declare_parameter('require_localization_ready', True)
 
         parameter = self.get_parameter
         self.leader_pose_topic = self._absolute(
@@ -133,6 +135,12 @@ class FleetFollower(Node):
         self.peer_separation_weight = max(
             0.0, float(parameter('peer_separation_weight').value)
         )
+        self.localization_ready_topic = self._absolute(
+            str(parameter('localization_ready_topic').value)
+        )
+        self.require_localization_ready = bool(
+            parameter('require_localization_ready').value
+        )
 
         self.leader_pose: Optional[PoseStamped] = None
         self.follower_pose: Optional[PoseStamped] = None
@@ -145,6 +153,7 @@ class FleetFollower(Node):
         self.collision_warning = False
         self.fleet_poses: Optional[PoseArray] = None
         self.latest_scan: Optional[LaserScan] = None
+        self.localization_ready = False
 
         coordination_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -187,6 +196,12 @@ class FleetFollower(Node):
             self.scan_topic,
             self._scan_callback,
             10,
+        )
+        self.create_subscription(
+            Bool,
+            self.localization_ready_topic,
+            self._localization_ready_callback,
+            coordination_qos,
         )
         self.status_publisher = self.create_publisher(
             Bool,
@@ -244,6 +259,9 @@ class FleetFollower(Node):
 
     def _scan_callback(self, message: LaserScan) -> None:
         self.latest_scan = message
+
+    def _localization_ready_callback(self, message: Bool) -> None:
+        self.localization_ready = bool(message.data)
 
     def _cancel_goal(self, reason: str) -> None:
         handle = self.active_goal_handle
@@ -462,6 +480,9 @@ class FleetFollower(Node):
             return
         if self.follower_pose is None:
             self._log_wait('follower localization is not ready')
+            return
+        if self.require_localization_ready and not self.localization_ready:
+            self._log_wait('waiting for the localization spin to finish')
             return
         if not self.navigation_client.wait_for_server(
             timeout_sec=self.action_wait_timeout

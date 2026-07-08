@@ -1,137 +1,233 @@
 #!/usr/bin/env python3
-"""Kick AMCL into global localization instead of trusting a fixed seed.
+"""AMCL initial-localization spin state machine.
 
 A hardcoded initial pose only works when it matches where the robot was
 actually placed; when it doesn't, AMCL still converges confidently, just to
-the wrong spot near that seed. Calling AMCL's own
-`/reinitialize_global_localization` service spreads particles across the
-whole map instead, and a short in-place spin gives scan matching more than
-one viewpoint to disambiguate against.
+the wrong spot near that seed. This node calls AMCL's own
+`/reinitialize_global_localization` service to spread particles across the
+whole map instead, then drives a verified in-place rotation so scan matching
+gets more than one viewpoint to disambiguate against, and only declares
+"ready" once `/amcl_pose` covariance has genuinely settled.
+
+State machine:
+
+    WAIT_MAP -> WAIT_AMCL_ACTIVE -> WAIT_SCAN -> WAIT_TF
+      -> CHECK_LOCALIZATION_QUALITY (skips the spin only on a re-entry that
+         is already converged -- never on a true first pass, since AMCL's
+         seeded set_initial_pose covariance can look artificially good
+         before the robot has moved at all)
+      -> SPIN (odometry-yaw-integrated, not time-based) -> SETTLE
+      -> CHECK_LOCALIZATION -> READY_FOR_NAV
+                             -> RETRY_SPIN (bounded) -> FAIL_SAFE
+
+Once READY_FOR_NAV is reached the `ready` topic latches true permanently --
+this node never re-triggers motion afterward. Re-spinning while Nav2 might
+already be driving the robot would be a hazard, not a fix; downstream
+consumers (fleet_path_coordinator, fleet_follower) are expected to gate their
+own goal-sending on this flag instead.
 """
 from __future__ import annotations
 
 import math
-import time
+from enum import Enum, auto
+from typing import Optional
 
 import rclpy
 from geometry_msgs.msg import PoseWithCovarianceStamped, Twist, TwistStamped
-from nav_msgs.msg import OccupancyGrid
+from lifecycle_msgs.msg import State as LifecycleState
+from lifecycle_msgs.srv import GetState
+from nav_msgs.msg import Odometry, OccupancyGrid
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.time import Time
+from sensor_msgs.msg import LaserScan
+from std_msgs.msg import Bool
 from std_srvs.srv import Empty
+from tf2_ros import Buffer, TransformListener
+
+
+def wrap_angle(angle: float) -> float:
+    return math.atan2(math.sin(angle), math.cos(angle))
+
+
+def yaw_from_quaternion(q) -> float:
+    siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    return math.atan2(siny_cosp, cosy_cosp)
+
+
+class State(Enum):
+    WAIT_MAP = auto()
+    WAIT_AMCL_ACTIVE = auto()
+    WAIT_SCAN = auto()
+    WAIT_TF = auto()
+    CHECK_LOCALIZATION_QUALITY = auto()
+    SPIN = auto()
+    SETTLE = auto()
+    CHECK_LOCALIZATION = auto()
+    RETRY_SPIN = auto()
+    READY_FOR_NAV = auto()
+    FAIL_SAFE = auto()
 
 
 class GlobalLocalizeKickstart(Node):
 
     def __init__(self) -> None:
         super().__init__('global_localize_kickstart')
-        self.declare_parameter(
-            'reinit_service', '/reinitialize_global_localization'
-        )
+
+        self.declare_parameter('reinit_service', '/reinitialize_global_localization')
         self.declare_parameter('map_topic', '/map')
-        self.declare_parameter('spin_enabled', True)
-        self.declare_parameter('spin_duration_sec', 8.0)
-        self.declare_parameter('spin_speed_rad_s', 0.6)
+        self.declare_parameter('odom_topic', '/odom')
+        self.declare_parameter('scan_topic', '/scan')
         self.declare_parameter('cmd_vel_topic', '/cmd_vel')
         self.declare_parameter('use_stamped_cmd_vel', True)
-        self.declare_parameter('retry_enabled', True)
-        self.declare_parameter('retry_timeout_sec', 86400.0)
-        self.declare_parameter('retry_interval_sec', 8.0)
-        self.declare_parameter('stop_when_localized', True)
         self.declare_parameter('amcl_pose_topic', '/amcl_pose')
-        self.declare_parameter('localized_xy_cov_threshold', 0.35)
-        self.declare_parameter('localized_yaw_cov_threshold', 0.25)
-        self.declare_parameter('localized_required_samples', 5)
+        self.declare_parameter('amcl_lifecycle_service', '/amcl/get_state')
+        self.declare_parameter('base_frame', 'base_footprint')
+        self.declare_parameter('global_frame', 'map')
+        self.declare_parameter('ready_topic', 'localization_ready')
+
+        self.declare_parameter('spin_enabled', True)
+        self.declare_parameter('spin_speed_rad_s', 0.35)
+        self.declare_parameter('spin_target_angle_rad', 2.0 * math.pi)
+        self.declare_parameter('spin_margin_rad', 0.35)
+        self.declare_parameter('spin_timeout_sec', 25.0)
+        self.declare_parameter('settle_duration_sec', 1.5)
+
+        self.declare_parameter('localization_cov_xy_threshold', 0.35)
+        self.declare_parameter('localization_cov_yaw_threshold', 0.25)
+        self.declare_parameter('localization_stable_duration_sec', 1.5)
+        self.declare_parameter('localization_check_timeout_sec', 7.0)
+
+        self.declare_parameter('max_spin_retries', 2)
+        self.declare_parameter('amcl_active_poll_period_sec', 1.0)
+        self.declare_parameter('max_scan_age_sec', 1.0)
+        self.declare_parameter('tick_period_sec', 0.1)
 
         get = self.get_parameter
         self.reinit_service_name = str(get('reinit_service').value)
         self.map_topic = str(get('map_topic').value)
-        self.spin_enabled = bool(get('spin_enabled').value)
-        self.spin_duration = max(0.0, float(get('spin_duration_sec').value))
-        self.spin_speed = float(get('spin_speed_rad_s').value)
+        self.odom_topic = str(get('odom_topic').value)
+        self.scan_topic = str(get('scan_topic').value)
         self.cmd_vel_topic = str(get('cmd_vel_topic').value)
         self.use_stamped = bool(get('use_stamped_cmd_vel').value)
-        self.retry_enabled = bool(get('retry_enabled').value)
-        self.retry_timeout_sec = max(0.0, float(get('retry_timeout_sec').value))
-        self.retry_interval_sec = max(0.0, float(get('retry_interval_sec').value))
-        self.stop_when_localized = bool(get('stop_when_localized').value)
         self.amcl_pose_topic = str(get('amcl_pose_topic').value)
-        self.localized_xy_cov_threshold = max(
-            0.0, float(get('localized_xy_cov_threshold').value)
+        self.amcl_lifecycle_service_name = str(get('amcl_lifecycle_service').value)
+        self.base_frame = str(get('base_frame').value)
+        self.global_frame = str(get('global_frame').value)
+        self.ready_topic = str(get('ready_topic').value)
+
+        self.spin_enabled = bool(get('spin_enabled').value)
+        self.spin_speed = abs(float(get('spin_speed_rad_s').value))
+        self.spin_target_angle = max(0.0, float(get('spin_target_angle_rad').value))
+        self.spin_margin = max(0.0, float(get('spin_margin_rad').value))
+        self.spin_timeout_sec = max(1.0, float(get('spin_timeout_sec').value))
+        self.settle_duration_sec = max(0.0, float(get('settle_duration_sec').value))
+
+        self.cov_xy_threshold = max(0.0, float(get('localization_cov_xy_threshold').value))
+        self.cov_yaw_threshold = max(0.0, float(get('localization_cov_yaw_threshold').value))
+        self.stable_duration_sec = max(
+            0.0, float(get('localization_stable_duration_sec').value)
         )
-        self.localized_yaw_cov_threshold = max(
-            0.0, float(get('localized_yaw_cov_threshold').value)
-        )
-        self.localized_required_samples = max(
-            1, int(get('localized_required_samples').value)
+        self.check_timeout_sec = max(
+            0.0, float(get('localization_check_timeout_sec').value)
         )
 
-        self.client = self.create_client(Empty, self.reinit_service_name)
-        if self.use_stamped:
-            self.cmd_pub = self.create_publisher(
-                TwistStamped, self.cmd_vel_topic, 10
-            )
-        else:
-            self.cmd_pub = self.create_publisher(
-                Twist, self.cmd_vel_topic, 10
-            )
+        self.max_spin_retries = max(0, int(get('max_spin_retries').value))
+        self.amcl_active_poll_period_sec = max(
+            0.1, float(get('amcl_active_poll_period_sec').value)
+        )
+        self.max_scan_age_sec = max(0.05, float(get('max_scan_age_sec').value))
+        self.tick_period_sec = max(0.02, float(get('tick_period_sec').value))
 
-        # AMCL advertises /reinitialize_global_localization as soon as it
-        # configures, well before it has actually received a map -- calling
-        # it that early just spreads particles over an empty/nonexistent
-        # map and wastes the one-shot spin. Wait for a real map first (this
-        # is what has to cross the domain_bridge -> map_relay pipeline when
-        # a member/follower owns SLAM instead of this robot).
-        map_qos = QoSProfile(
+        latched_qos = QoSProfile(
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
         )
-        self.map_received = False
-        self.map_sub = self.create_subscription(
-            OccupancyGrid, self.map_topic, self._on_map, map_qos
-        )
-        self.pose_sub = self.create_subscription(
-            PoseWithCovarianceStamped,
-            self.amcl_pose_topic,
-            self._on_amcl_pose,
-            10,
+        scan_qos = QoSProfile(
+            depth=5,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
         )
 
-        self.spin_timer = None
-        self.spin_deadline = 0.0
-        self.done = False
+        self.ready_pub = self.create_publisher(Bool, self.ready_topic, latched_qos)
+        if self.use_stamped:
+            self.cmd_pub = self.create_publisher(TwistStamped, self.cmd_vel_topic, 10)
+        else:
+            self.cmd_pub = self.create_publisher(Twist, self.cmd_vel_topic, 10)
+
+        self.reinit_client = self.create_client(Empty, self.reinit_service_name)
+        self.amcl_state_client = self.create_client(
+            GetState, self.amcl_lifecycle_service_name
+        )
+
+        self.map_received = False
+        self.create_subscription(OccupancyGrid, self.map_topic, self._on_map, latched_qos)
+        self.create_subscription(
+            PoseWithCovarianceStamped, self.amcl_pose_topic, self._on_amcl_pose, 10
+        )
+        self.create_subscription(Odometry, self.odom_topic, self._on_odom, 10)
+        self.create_subscription(LaserScan, self.scan_topic, self._on_scan, scan_qos)
+
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
+        self.state = State.WAIT_MAP
+        self.total_attempts = 0
+        self.retry_count = 0
         self.reinit_in_flight = False
-        self.localized = False
-        self.localized_samples = 0
+        self._amcl_state_call_in_flight = False
+        self._last_amcl_poll_wall = 0.0
+
+        self.last_scan_wall: Optional[float] = None
+        self.last_odom_yaw: Optional[float] = None
+        self.accumulated_yaw = 0.0
+        self._last_progress_octant = -1
+        self.spin_start_wall = 0.0
+        self.settle_start_wall = 0.0
+        self.check_start_wall = 0.0
+        self.good_since_wall: Optional[float] = None
         self.last_pose_cov = None
-        self.start_wall_sec = time.monotonic()
-        self.next_reinit_wall_sec = self.start_wall_sec
-        self.attempt = 0
-        self.wait_timer = self.create_timer(0.5, self._tick)
+        self.done = False
+
+        self._publish_ready(False)
+        self.timer = self.create_timer(self.tick_period_sec, self._tick)
 
         self.get_logger().info(
-            'GLOBAL_LOCALIZE_KICKSTART_READY | '
-            f'service={self.reinit_service_name} map_topic={self.map_topic} '
-            f'spin={self.spin_enabled} duration={self.spin_duration:.1f}s '
-            f'retry={self.retry_enabled} timeout={self.retry_timeout_sec:.1f}s '
-            f'interval={self.retry_interval_sec:.1f}s '
-            f'stop_when_localized={self.stop_when_localized}'
+            'GLOBAL_LOCALIZE_READY | '
+            f'map_topic={self.map_topic} scan_topic={self.scan_topic} '
+            f'odom_topic={self.odom_topic} '
+            f'spin_enabled={self.spin_enabled} spin_speed={self.spin_speed:.2f}rad/s '
+            f'target={self.spin_target_angle + self.spin_margin:.2f}rad '
+            f'max_spin_retries={self.max_spin_retries}'
         )
 
     def _now(self) -> float:
         return self.get_clock().now().nanoseconds * 1.0e-9
 
-    def _on_map(self, _msg: OccupancyGrid) -> None:
-        self.map_received = True
+    # -- subscriptions ----------------------------------------------------
+
+    def _on_map(self, msg: OccupancyGrid) -> None:
+        if msg.info.width > 0 and msg.info.height > 0:
+            self.map_received = True
+
+    def _on_scan(self, _msg: LaserScan) -> None:
+        self.last_scan_wall = self._now()
+
+    def _on_odom(self, msg: Odometry) -> None:
+        yaw = yaw_from_quaternion(msg.pose.pose.orientation)
+        if self.state == State.SPIN and self.last_odom_yaw is not None:
+            delta = wrap_angle(yaw - self.last_odom_yaw)
+            self.accumulated_yaw += abs(delta)
+        self.last_odom_yaw = yaw
 
     def _on_amcl_pose(self, msg: PoseWithCovarianceStamped) -> None:
         cov = msg.pose.covariance
         xy_cov = max(float(cov[0]), float(cov[7]))
         yaw_cov = float(cov[35])
         if not all(math.isfinite(value) for value in (xy_cov, yaw_cov)):
-            self.localized_samples = 0
             return
         self.last_pose_cov = {
             'xy_cov': xy_cov,
@@ -139,63 +235,179 @@ class GlobalLocalizeKickstart(Node):
             'x': float(msg.pose.pose.position.x),
             'y': float(msg.pose.pose.position.y),
         }
-        if (
-            xy_cov <= self.localized_xy_cov_threshold
-            and yaw_cov <= self.localized_yaw_cov_threshold
-        ):
-            self.localized_samples += 1
-        else:
-            self.localized_samples = 0
 
-        if (
-            not self.localized
-            and self.attempt > 0
-            and self.localized_samples >= self.localized_required_samples
-        ):
-            self.localized = True
-            self.get_logger().warning(
-                'GLOBAL_LOCALIZE_LOCALIZED | '
-                f'x={self.last_pose_cov["x"]:+.3f} '
-                f'y={self.last_pose_cov["y"]:+.3f} '
-                f'xy_cov={xy_cov:.4f} yaw_cov={yaw_cov:.4f} '
-                f'samples={self.localized_samples}'
+    # -- shared helpers -----------------------------------------------------
+
+    def _scan_fresh(self) -> bool:
+        if self.last_scan_wall is None:
+            return False
+        return (self._now() - self.last_scan_wall) <= self.max_scan_age_sec
+
+    def _tf_ok(self) -> bool:
+        try:
+            return self.tf_buffer.can_transform(
+                self.global_frame, self.base_frame, Time()
             )
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _covariance_ok(self) -> bool:
+        if self.last_pose_cov is None:
+            return False
+        return (
+            self.last_pose_cov['xy_cov'] <= self.cov_xy_threshold
+            and self.last_pose_cov['yaw_cov'] <= self.cov_yaw_threshold
+        )
+
+    def _update_stability_tracking(self) -> bool:
+        """True once covariance has been continuously good for
+        stable_duration_sec (resets on any bad sample)."""
+        now = self._now()
+        if self._covariance_ok():
+            if self.good_since_wall is None:
+                self.good_since_wall = now
+            return (now - self.good_since_wall) >= self.stable_duration_sec
+        self.good_since_wall = None
+        return False
+
+    def _publish_ready(self, ready: bool) -> None:
+        self.ready_pub.publish(Bool(data=ready))
+
+    def _publish_twist(self, angular_z: float) -> None:
+        if self.use_stamped:
+            message = TwistStamped()
+            message.header.stamp = self.get_clock().now().to_msg()
+            message.header.frame_id = self.base_frame
+            message.twist.angular.z = angular_z
+            self.cmd_pub.publish(message)
+        else:
+            message = Twist()
+            message.angular.z = angular_z
+            self.cmd_pub.publish(message)
+
+    def _transition(self, new_state: State) -> None:
+        if new_state == self.state:
+            return
+        self.get_logger().warning(
+            f'GLOBAL_LOCALIZE_STATE | from={self.state.name} to={new_state.name}'
+        )
+        self.state = new_state
+        hook = getattr(self, f'_on_enter_{new_state.name.lower()}', None)
+        if hook is not None:
+            hook()
+
+    # -- state entry hooks ----------------------------------------------
+
+    def _on_enter_ready_for_nav(self) -> None:
+        self._publish_twist(0.0)
+        self._publish_ready(True)
+        self.done = True
+        self.get_logger().warning('GLOBAL_LOCALIZE_READY_FOR_NAV')
+
+    def _on_enter_fail_safe(self) -> None:
+        self._publish_twist(0.0)
+        self._publish_ready(False)
+        self.good_since_wall = None
+        self.get_logger().error(
+            'GLOBAL_LOCALIZE_FAIL_SAFE | automatic retries exhausted, '
+            'still watching /amcl_pose passively (will not spin again)'
+        )
+
+    # -- main dispatch ----------------------------------------------------
 
     def _tick(self) -> None:
         if self.done:
             return
-        if self.stop_when_localized and self.localized:
-            self._finish('localized')
-            return
-        elapsed = time.monotonic() - self.start_wall_sec
-        if self.retry_timeout_sec > 0.0 and elapsed >= self.retry_timeout_sec:
-            self._finish(f'timeout_after_{elapsed:.1f}s')
-            return
-        if not self.map_received:
-            self.get_logger().info(
-                f'GLOBAL_LOCALIZE_WAIT | no map yet on {self.map_topic}',
-                throttle_duration_sec=5.0,
-            )
-            return
-        if not self.client.service_is_ready():
-            self.get_logger().info(
-                'GLOBAL_LOCALIZE_WAIT | '
-                f'service not ready: {self.reinit_service_name}',
-                throttle_duration_sec=5.0,
-            )
-            return
-        if self.reinit_in_flight or self.spin_timer is not None:
-            return
-        if time.monotonic() < self.next_reinit_wall_sec:
-            return
+        getattr(self, f'_tick_{self.state.name.lower()}')()
 
-        self.reinit_in_flight = True
-        self.attempt += 1
-        self.get_logger().warning(
-            'GLOBAL_LOCALIZE_ATTEMPT | '
-            f'attempt={self.attempt} elapsed={elapsed:.1f}s'
+    def _tick_wait_map(self) -> None:
+        if self.map_received:
+            self._transition(State.WAIT_AMCL_ACTIVE)
+            return
+        self.get_logger().info(
+            f'GLOBAL_LOCALIZE_WAIT_MAP | no valid map yet on {self.map_topic}',
+            throttle_duration_sec=5.0,
         )
-        future = self.client.call_async(Empty.Request())
+
+    def _tick_wait_amcl_active(self) -> None:
+        now = self._now()
+        if now - self._last_amcl_poll_wall < self.amcl_active_poll_period_sec:
+            return
+        self._last_amcl_poll_wall = now
+        if self._amcl_state_call_in_flight:
+            return
+        if not self.amcl_state_client.service_is_ready():
+            self.get_logger().info(
+                'GLOBAL_LOCALIZE_WAIT_AMCL | service not ready: '
+                f'{self.amcl_lifecycle_service_name}',
+                throttle_duration_sec=5.0,
+            )
+            return
+        self._amcl_state_call_in_flight = True
+        future = self.amcl_state_client.call_async(GetState.Request())
+        future.add_done_callback(self._on_amcl_get_state)
+
+    def _on_amcl_get_state(self, future) -> None:
+        self._amcl_state_call_in_flight = False
+        try:
+            result = future.result()
+        except Exception as error:  # noqa: BLE001
+            self.get_logger().warning(f'GLOBAL_LOCALIZE_AMCL_STATE_ERROR | {error}')
+            return
+        if result.current_state.id == LifecycleState.PRIMARY_STATE_ACTIVE:
+            self._transition(State.WAIT_SCAN)
+
+    def _tick_wait_scan(self) -> None:
+        if self._scan_fresh():
+            self._transition(State.WAIT_TF)
+            return
+        self.get_logger().info(
+            f'GLOBAL_LOCALIZE_WAIT_SCAN | no fresh scan on {self.scan_topic}',
+            throttle_duration_sec=5.0,
+        )
+
+    def _tick_wait_tf(self) -> None:
+        if self._tf_ok():
+            self._transition(State.CHECK_LOCALIZATION_QUALITY)
+            return
+        self.get_logger().info(
+            f'GLOBAL_LOCALIZE_WAIT_TF | {self.global_frame}->{self.base_frame} '
+            'not available yet',
+            throttle_duration_sec=5.0,
+        )
+
+    def _tick_check_localization_quality(self) -> None:
+        # Never skip the spin on a genuine first pass -- AMCL's seeded
+        # set_initial_pose covariance can look artificially good before the
+        # robot has moved at all. Only a process that has already completed
+        # a real reinit+spin+converge cycle may skip a re-spin here (e.g.
+        # this node respawned while AMCL was already localized).
+        if self.total_attempts > 0 and self._update_stability_tracking():
+            self.get_logger().warning(
+                'GLOBAL_LOCALIZE_ALREADY_CONVERGED | skipping spin'
+            )
+            self._transition(State.READY_FOR_NAV)
+            return
+        self.good_since_wall = None
+        self._start_spin()
+
+    def _start_spin(self) -> None:
+        if self.reinit_in_flight:
+            return
+        if not self.reinit_client.service_is_ready():
+            self.get_logger().info(
+                'GLOBAL_LOCALIZE_WAIT_REINIT_SERVICE | '
+                f'{self.reinit_service_name} not ready',
+                throttle_duration_sec=5.0,
+            )
+            return
+        self.total_attempts += 1
+        self.reinit_in_flight = True
+        self.get_logger().warning(
+            f'GLOBAL_LOCALIZE_ATTEMPT | attempt={self.total_attempts} '
+            f'retry={self.retry_count}/{self.max_spin_retries}'
+        )
+        future = self.reinit_client.call_async(Empty.Request())
         future.add_done_callback(self._on_reinitialized)
 
     def _on_reinitialized(self, future) -> None:
@@ -203,83 +415,114 @@ class GlobalLocalizeKickstart(Node):
         try:
             future.result()
         except Exception as error:  # noqa: BLE001
+            self.get_logger().error(f'GLOBAL_LOCALIZE_REINIT_FAILED | {error}')
+            return
+        self.get_logger().warning(
+            f'GLOBAL_LOCALIZE_REINITIALIZED | attempt={self.total_attempts}'
+        )
+        self.accumulated_yaw = 0.0
+        self.last_odom_yaw = None
+        self._last_progress_octant = -1
+        self.spin_start_wall = self._now()
+        if not self.spin_enabled:
+            self.settle_start_wall = self._now()
+            self._transition(State.SETTLE)
+            return
+        self._transition(State.SPIN)
+
+    def _tick_spin(self) -> None:
+        if not self._scan_fresh() or not self._tf_ok():
+            self._publish_twist(0.0)
+            fallback = State.WAIT_SCAN if not self._scan_fresh() else State.WAIT_TF
+            self.get_logger().warning(
+                'GLOBAL_LOCALIZE_SPIN_PAUSED | scan/TF dropped out mid-spin, '
+                f'falling back to {fallback.name} (not counted as a failed attempt)'
+            )
+            self._transition(fallback)
+            return
+
+        target = self.spin_target_angle + self.spin_margin
+        elapsed = self._now() - self.spin_start_wall
+
+        if self.accumulated_yaw >= target:
+            self._publish_twist(0.0)
+            self.get_logger().warning(
+                f'GLOBAL_LOCALIZE_SPIN_COMPLETE | attempt={self.total_attempts} '
+                f'rotated={math.degrees(self.accumulated_yaw):.0f}deg '
+                f'elapsed={elapsed:.1f}s'
+            )
+            self.settle_start_wall = self._now()
+            self._transition(State.SETTLE)
+            return
+
+        if elapsed >= self.spin_timeout_sec:
+            self._publish_twist(0.0)
             self.get_logger().error(
-                f'GLOBAL_LOCALIZE_REINIT_FAILED | {error}'
+                f'GLOBAL_LOCALIZE_SPIN_TIMEOUT | attempt={self.total_attempts} '
+                f'rotated={math.degrees(self.accumulated_yaw):.0f}deg of '
+                f'{math.degrees(target):.0f}deg'
             )
-            self._schedule_next_attempt()
+            self.retry_count += 1
+            self._transition(State.RETRY_SPIN)
             return
-        else:
-            self.get_logger().warning(
-                f'GLOBAL_LOCALIZE_REINITIALIZED | attempt={self.attempt}'
-            )
 
-        if not self.spin_enabled or self.spin_duration <= 0.0:
-            if self.retry_enabled:
-                self._schedule_next_attempt()
-            else:
-                self._finish('single_reinitialize_complete')
-            return
-        self.spin_deadline = self._now() + self.spin_duration
-        self.spin_timer = self.create_timer(0.1, self._spin_tick)
-
-    def _spin_tick(self) -> None:
-        if self.stop_when_localized and self.localized:
-            self._publish_twist(0.0)
-            self.spin_timer.cancel()
-            self.spin_timer = None
-            self._finish('localized_during_spin')
-            return
-        if self._now() >= self.spin_deadline:
-            self._publish_twist(0.0)
-            self.spin_timer.cancel()
-            self.spin_timer = None
-            self.get_logger().warning(
-                f'GLOBAL_LOCALIZE_SPIN_COMPLETE | attempt={self.attempt}'
+        octant = int(self.accumulated_yaw / (math.pi / 4.0))
+        if octant != self._last_progress_octant:
+            self._last_progress_octant = octant
+            self.get_logger().info(
+                'GLOBAL_LOCALIZE_SPIN_PROGRESS | '
+                f'{math.degrees(self.accumulated_yaw):.0f}/'
+                f'{math.degrees(target):.0f}deg'
             )
-            if self.retry_enabled:
-                self._schedule_next_attempt()
-            else:
-                self._finish('single_spin_complete')
-            return
         self._publish_twist(self.spin_speed)
 
-    def _schedule_next_attempt(self) -> None:
-        if not self.retry_enabled:
-            self._finish('retry_disabled')
-            return
-        self.next_reinit_wall_sec = time.monotonic() + self.retry_interval_sec
-        cov_text = 'no_amcl_pose'
-        if self.last_pose_cov is not None:
-            cov_text = (
+    def _tick_settle(self) -> None:
+        self._publish_twist(0.0)
+        if self._now() - self.settle_start_wall >= self.settle_duration_sec:
+            self.get_logger().info('GLOBAL_LOCALIZE_SETTLING_DONE')
+            self.good_since_wall = None
+            self.check_start_wall = self._now()
+            self._transition(State.CHECK_LOCALIZATION)
+
+    def _tick_check_localization(self) -> None:
+        if self._update_stability_tracking():
+            self.get_logger().warning(
+                'GLOBAL_LOCALIZE_LOCALIZED | '
                 f'xy_cov={self.last_pose_cov["xy_cov"]:.4f} '
                 f'yaw_cov={self.last_pose_cov["yaw_cov"]:.4f}'
             )
-        self.get_logger().warning(
-            'GLOBAL_LOCALIZE_RETRY_SCHEDULED | '
-            f'next_in={self.retry_interval_sec:.1f}s {cov_text}'
-        )
+            self._transition(State.READY_FOR_NAV)
+            return
+        if self._now() - self.check_start_wall >= self.check_timeout_sec:
+            cov_text = 'no_amcl_pose'
+            if self.last_pose_cov is not None:
+                cov_text = (
+                    f'xy_cov={self.last_pose_cov["xy_cov"]:.4f} '
+                    f'yaw_cov={self.last_pose_cov["yaw_cov"]:.4f}'
+                )
+            self.get_logger().warning(
+                f'GLOBAL_LOCALIZE_NOT_CONVERGED | attempt={self.total_attempts} '
+                f'{cov_text}'
+            )
+            self.retry_count += 1
+            self._transition(State.RETRY_SPIN)
 
-    def _finish(self, reason: str) -> None:
-        self._publish_twist(0.0)
-        if self.spin_timer is not None:
-            self.spin_timer.cancel()
-            self.spin_timer = None
-        self.done = True
-        self.get_logger().warning(
-            f'GLOBAL_LOCALIZE_DONE | reason={reason} attempts={self.attempt}'
-        )
+    def _tick_retry_spin(self) -> None:
+        if self.retry_count > self.max_spin_retries:
+            self._transition(State.FAIL_SAFE)
+            return
+        self._start_spin()
 
-    def _publish_twist(self, angular_z: float) -> None:
-        if self.use_stamped:
-            message = TwistStamped()
-            message.header.stamp = self.get_clock().now().to_msg()
-            message.header.frame_id = 'base_footprint'
-            message.twist.angular.z = angular_z
-            self.cmd_pub.publish(message)
-        else:
-            message = Twist()
-            message.angular.z = angular_z
-            self.cmd_pub.publish(message)
+    def _tick_ready_for_nav(self) -> None:
+        pass
+
+    def _tick_fail_safe(self) -> None:
+        if self._update_stability_tracking():
+            self.get_logger().warning(
+                'GLOBAL_LOCALIZE_RECOVERED_AFTER_FAILSAFE | covariance became '
+                'stable without another automatic spin'
+            )
+            self._transition(State.READY_FOR_NAV)
 
     def destroy_node(self) -> None:
         try:
