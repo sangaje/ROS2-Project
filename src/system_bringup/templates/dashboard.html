@@ -17,10 +17,25 @@
     </div>
   </header>
   <main>
-    <section>
-      <h2>OMX AIM Debug Stream</h2>
-      <div class="stream-wrap"><img id="omxStream" alt="OMX MJPEG stream"></div>
-    </section>
+    <div class="video-column">
+      <section>
+        <h2>OMX AIM Debug Stream</h2>
+        <div class="stream-wrap"><img id="omxStream" alt="OMX MJPEG stream"></div>
+      </section>
+      <section>
+        <h2>Scout Camera</h2>
+        <div class="scout-stream-grid">
+          <div class="stream-tile">
+            <div class="stream-label">Raw</div>
+            <img id="scoutRawStream" alt="Scout raw camera stream">
+          </div>
+          <div class="stream-tile">
+            <div class="stream-label">YOLO</div>
+            <img id="scoutYoloStream" alt="Scout YOLO overlay stream">
+          </div>
+        </div>
+      </section>
+    </div>
     <section class="map-panel">
       <h2>Shared Map + Risk Overlay</h2>
       <div class="map-tools">

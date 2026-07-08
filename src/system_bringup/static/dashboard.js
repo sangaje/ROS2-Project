@@ -33,12 +33,26 @@ function setPill(id, label, status) {
 }
 
 function configureStream(s) {
-  const img = document.getElementById('omxStream');
-  if (img.dataset.configured === '1') return;
-  const port = s.omx_debug.port;
-  const path = s.omx_debug.stream_path || '/stream.mjpg';
-  img.src = `${location.protocol}//${location.hostname}:${port}${path}`;
-  img.dataset.configured = '1';
+  const omx = document.getElementById('omxStream');
+  if (omx.dataset.configured !== '1') {
+    const port = s.omx_debug.port;
+    const path = s.omx_debug.stream_path || '/stream.mjpg';
+    omx.src = `${location.protocol}//${location.hostname}:${port}${path}`;
+    omx.dataset.configured = '1';
+  }
+
+  const yolo = s.yolo_server || {};
+  const yoloPort = yolo.port || 5005;
+  const streams = [
+    ['scoutRawStream', yolo.raw_stream_path || '/stream/raw.mjpg'],
+    ['scoutYoloStream', yolo.overlay_stream_path || '/stream/yolo.mjpg'],
+  ];
+  streams.forEach(([id, path]) => {
+    const img = document.getElementById(id);
+    if (img.dataset.configured === '1') return;
+    img.src = `${location.protocol}//${location.hostname}:${yoloPort}${path}`;
+    img.dataset.configured = '1';
+  });
 }
 
 function updateImages(s) {

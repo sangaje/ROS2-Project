@@ -100,6 +100,14 @@ class LeaderUnifiedDashboard(Node):
         self.omx_debug_port = int(_declare(self, 'omx_debug_port', 8080))
         self.omx_stream_path = str(_declare(self, 'omx_stream_path', '/stream.mjpg'))
         self.omx_state_path = str(_declare(self, 'omx_state_path', '/state.json'))
+        self.yolo_server_port = int(_declare(self, 'yolo_server_port', 5005))
+        self.yolo_raw_stream_path = str(
+            _declare(self, 'yolo_raw_stream_path', '/stream/raw.mjpg')
+        )
+        self.yolo_overlay_stream_path = str(
+            _declare(self, 'yolo_overlay_stream_path', '/stream/yolo.mjpg')
+        )
+        self.yolo_status_path = str(_declare(self, 'yolo_status_path', '/api/status'))
         self.robot_stale_timeout_sec = float(_declare(self, 'robot_stale_timeout_sec', 3.0))
         self.map_stale_timeout_sec = float(_declare(self, 'map_stale_timeout_sec', 30.0))
         self.risk_stale_timeout_sec = float(_declare(self, 'risk_stale_timeout_sec', 10.0))
@@ -357,6 +365,12 @@ class LeaderUnifiedDashboard(Node):
                     'port': self.omx_debug_port,
                     'stream_path': self.omx_stream_path,
                     'state_path': self.omx_state_path,
+                },
+                'yolo_server': {
+                    'port': self.yolo_server_port,
+                    'raw_stream_path': self.yolo_raw_stream_path,
+                    'overlay_stream_path': self.yolo_overlay_stream_path,
+                    'status_path': self.yolo_status_path,
                 },
                 'omx': dict(self._omx_state),
                 'map': self._grid_summary('map', now, self.map_stale_timeout_sec),
