@@ -209,6 +209,7 @@ class OmxYoloNode(Node):
         self.pub_error = self.create_publisher(Point, '/omx/error_norm', 10)
         self.pub_joint = self.create_publisher(JointState, '/omx/joint_state', 10)
         self.pub_fire = self.create_publisher(Empty, '/omx/fire', 10)
+        self.pub_fire_disable = self.create_publisher(Bool, '/omx/fire_disable', 10)
         self.pub_processed = self.create_publisher(PointStamped, '/omx/target_processed', 10)
         self.pub_target_lost = self.create_publisher(PointStamped, '/omx/target_lost', 10)
         self.pub_target_blocked = self.create_publisher(PointStamped, '/omx/target_blocked', 10)
@@ -261,6 +262,9 @@ class OmxYoloNode(Node):
         self.status_timer = self.create_timer(1.0, self.publish_periodic)
 
         self._last_state = self.sm.state
+        self._last_fire_enable_t = 0.0
+        self._fire_enable_detection_active = False
+        self._fire_enable_republish_sec = 1.0
 
         self.get_logger().info(
             f"Timer: 메인 {self.cfg.ibvs.control_hz} Hz, 상태 1 Hz")
@@ -708,6 +712,34 @@ class OmxYoloNode(Node):
     def publish_fire(self):
         self.pub_fire.publish(Empty())
 
+    def publish_fire_enable_if_detected(self, detected: bool, now: float):
+        """Enemy seen -> immediately clear fire_node safety disable.
+
+        fire_node's actual gate is /omx/fire_disable Bool:
+            false = armed/enabled, true = disabled.
+        Publish on the first frame of each detection streak, then republish
+        slowly while the target remains visible so a late/restarted fire_node
+        still gets armed without flooding its logs.
+        """
+        if not detected:
+            self._fire_enable_detection_active = False
+            return
+
+        should_publish = (
+            not self._fire_enable_detection_active
+            or now - self._last_fire_enable_t >= self._fire_enable_republish_sec
+        )
+        if not should_publish:
+            return
+
+        msg = Bool()
+        msg.data = False
+        self.pub_fire_disable.publish(msg)
+        self._last_fire_enable_t = now
+        self._fire_enable_detection_active = True
+        self.get_logger().info(
+            "[fire_enable] 적 식별 -> /omx/fire_disable=false 발행")
+
     def _make_point_stamped(self, coord_map):
         msg = PointStamped()
         msg.header.frame_id = 'map'
@@ -875,6 +907,7 @@ class OmxYoloNode(Node):
             detected, error_norm, bbox, conf = self.detector.detect(frame)
 
         now = time.time()
+        self.publish_fire_enable_if_detected(detected, now)
         action = self.sm.update(detected, error_norm, now)
 
         # blocked entries 알림

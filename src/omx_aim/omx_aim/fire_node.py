@@ -95,6 +95,8 @@ class FireNode(Node):
         self.create_subscription(Empty, '/omx/fire', self.on_fire, 10)
         self.create_subscription(
             Bool, '/omx/fire_disable', self.on_disable, 10)
+        self.create_subscription(
+            Bool, '/omx/fire_diable', self.on_disable_alias, 10)
         self.pub_status = self.create_publisher(String, '/omx/fire_status', 10)
 
         # ---------- Status timer ----------
@@ -148,6 +150,11 @@ class FireNode(Node):
             self.disabled = msg.data
         state = "DISABLED" if msg.data else "ARMED"
         self.get_logger().info(f"Fire {state}")
+
+    def on_disable_alias(self, msg: Bool):
+        self.get_logger().warn(
+            "/omx/fire_diable is deprecated typo; use /omx/fire_disable")
+        self.on_disable(msg)
 
     # ----- 실제 GPIO 동작 -----
 
