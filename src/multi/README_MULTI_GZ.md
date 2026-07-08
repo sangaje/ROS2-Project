@@ -130,3 +130,61 @@ This is a Gazebo/RViz coordinate-following test. It does not use Nav2 path plann
   - `rescue_offset_m:=0.0`: both remaining robots are commanded to the exact failed position.
   - `rescue_offset_m:=0.45`: the second robot stops 0.45 m away to avoid overlap.
 - `maps/turtlemap.yaml` origin was aligned to the Gazebo `turtlebot3_world` model coordinate frame so RViz map coordinates match Gazebo world coordinates more closely.
+
+## Automatic Scout Failover
+
+`multi` is a centralized Gazebo/RViz test package, not the real
+`system_bringup` fleet stack. The active coordinator is
+`auto_patrol_rescue`; robot motion is handled by each
+`simple_goal_controller` through map-frame `PointStamped` goals on
+`/<robot>/goal_point` and `/<robot>/rescue_goal`. There is no runtime
+`ROS_DOMAIN_ID` role change and no subprocess `ros2 launch` takeover.
+
+Current role structure:
+
+| Feature | Scout (`burger1`) | Follower/successor (`waffle1`) |
+| --- | --- | --- |
+| robot base | Gazebo/physical bridge namespace | Gazebo/physical bridge namespace |
+| pose publisher | publishes `/burger1/map_pose` | publishes `/waffle1/map_pose` |
+| liveness topics | `/burger1/map_pose`, `/burger1/odom`; `/burger1/signal` when launched | same per namespace |
+| follow/controller | waypoint patrol point goals | idle until rescue/failover goal |
+| Nav2 | optional `region_nav2_goal`; rescue uses existing point controller | same |
+| AMCL | not used in this package | not used in this package |
+| Cartographer | not used in this package | not used in this package |
+| patrol/exploration | waypoint patrol in `auto_patrol_rescue` | dormant until promotion |
+| camera/risk | not modeled here | not modeled here |
+| domain bridge | dynamic `/tmp` domain_bridge YAML | same |
+
+Scout DOWN detection is aggregate-based. The coordinator keeps
+`last_rx_time` for each required liveness source and only enters
+`SCOUT_SUSPECTED_DOWN` when all required Scout sources are stale. After
+`scout_down_grace_sec`, the last fresh Scout `/map_pose` is frozen as the
+death pose. Odom is tracked as liveness only; it is not converted directly
+into a recovery goal.
+
+Failover state:
+
+```text
+FOLLOWING
+  -> SCOUT_SUSPECTED_DOWN
+  -> FAILOVER_COMMITTED
+  -> NAVIGATING_TO_LAST_SCOUT_POSE
+  -> PROMOTING_TO_SCOUT
+  -> SCOUT_ACTIVE
+```
+
+The recovery goal is sent a bounded number of times to the designated
+successor (`waffle1` by default), offset behind the last Scout yaw by
+`failover_standoff_m` to avoid driving into the failed robot footprint.
+Promotion happens only after the successor reaches the recovery target within
+the existing `goal_tolerance`. Once promoted, automatic failback is disabled;
+use `/multi/recover_robot` or `/multi/fail_robot` reset/clear to return to the
+initial patrol assignment.
+
+Map continuity: in this package the optional `static_map_publisher` publishes
+a valid TRANSIENT_LOCAL static `/map` once. `auto_patrol_rescue` subscribes to
+`/map` for diagnostics and ignores invalid empty maps (`width == 0`,
+`height == 0`, invalid resolution, or mismatched data length) so its last valid
+map diagnostic is not overwritten. Seamless Cartographer state takeover is not
+implemented here because `multi` has no Cartographer, pbstream, or trajectory
+resume mechanism.
