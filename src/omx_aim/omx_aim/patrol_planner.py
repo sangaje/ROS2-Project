@@ -19,6 +19,9 @@ Burger 가 발행한 /risk/risk_map (0~100 위험도) 위에서 NMS 로 hotspot 
     risk_topic                /risk/risk_map
     patrol_topic              /omx/patrol_in_map
     min_risk                  40       # 이 이상만 후보
+    relative_threshold_ratio  0.55     # peak 가 min_risk 보다 낮을 때 peak 대비 후보 컷
+    min_fallback_risk         5        # 상대 컷을 쓸 때도 이보다 낮은 잡음은 무시
+    max_candidate_cells       2000     # NMS 전에 볼 상위 cell 개수
     min_distance_m            1.0      # NMS: 후보 간 최소 거리
     max_candidates_per_cycle  3        # 한 주기에 발행할 좌표 수
     publish_period_sec        10.0     # 주기 발행 간격
@@ -32,6 +35,7 @@ from __future__ import annotations
 import math
 from typing import Optional
 
+import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy
@@ -50,6 +54,9 @@ class PatrolPlanner(Node):
         self.declare_parameter('risk_topic', '/risk/risk_map')
         self.declare_parameter('patrol_topic', '/omx/patrol_in_map')
         self.declare_parameter('min_risk', 40)
+        self.declare_parameter('relative_threshold_ratio', 0.55)
+        self.declare_parameter('min_fallback_risk', 5)
+        self.declare_parameter('max_candidate_cells', 2000)
         self.declare_parameter('min_distance_m', 1.0)
         self.declare_parameter('max_candidates_per_cycle', 3)
         self.declare_parameter('publish_period_sec', 10.0)
@@ -60,6 +67,12 @@ class PatrolPlanner(Node):
         self.risk_topic = self.get_parameter('risk_topic').value
         self.patrol_topic = self.get_parameter('patrol_topic').value
         self.min_risk = int(self.get_parameter('min_risk').value)
+        self.relative_threshold_ratio = float(
+            self.get_parameter('relative_threshold_ratio').value)
+        self.min_fallback_risk = int(
+            self.get_parameter('min_fallback_risk').value)
+        self.max_candidate_cells = int(
+            self.get_parameter('max_candidate_cells').value)
         self.min_distance_m = float(self.get_parameter('min_distance_m').value)
         self.max_candidates = int(self.get_parameter(
             'max_candidates_per_cycle').value)
@@ -74,6 +87,7 @@ class PatrolPlanner(Node):
         self.risk_map: Optional[OccupancyGrid] = None
         self.cycle_count = 0
         self.total_published = 0
+        self.last_candidate_stats = {}
 
         # ---------- QoS ----------
         # risk_map 은 latched 가능 (bridge 가 transient_local 로 보냄)
@@ -104,6 +118,12 @@ class PatrolPlanner(Node):
             f"필터: risk>={self.min_risk}, NMS 간격={self.min_distance_m}m, "
             f"주기당 최대 {self.max_candidates}개")
         self.get_logger().info(
+            "fallback: "
+            f"peak<{self.min_risk}이면 "
+            f"max({self.min_fallback_risk}, "
+            f"ceil(peak*{self.relative_threshold_ratio:.2f})) 사용, "
+            f"NMS 전 상위 {self.max_candidate_cells} cells만 평가")
+        self.get_logger().info(
             f"주기: {self.publish_period_sec}s")
         self.get_logger().info("=== Patrol Planner ready ===")
 
@@ -131,11 +151,18 @@ class PatrolPlanner(Node):
 
         self.cycle_count += 1
         candidates = self._find_candidates(self.risk_map)
+        stats = self.last_candidate_stats
 
         if not candidates:
+            max_risk = stats.get('max_risk', 'n/a')
+            threshold = stats.get('threshold', 'n/a')
+            mode = stats.get('threshold_mode', 'n/a')
+            above = stats.get('above_threshold_count', 0)
+            valid = stats.get('valid_count', 0)
             self.get_logger().info(
                 f"[cycle #{self.cycle_count}] 후보 없음 "
-                f"(risk_map 전체 risk < {self.min_risk})")
+                f"(max={max_risk}, threshold={threshold}, mode={mode}, "
+                f"above={above}, valid={valid})")
             self._publish_markers([])
             return
 
@@ -161,6 +188,17 @@ class PatrolPlanner(Node):
 
     # ----- 알고리즘 -----
 
+    def _effective_threshold(self, max_risk: int):
+        if max_risk >= self.min_risk:
+            return self.min_risk, 'absolute'
+        if max_risk >= self.min_fallback_risk:
+            threshold = max(
+                self.min_fallback_risk,
+                int(math.ceil(max_risk * self.relative_threshold_ratio)),
+            )
+            return threshold, 'relative_peak'
+        return self.min_risk, 'below_noise_floor'
+
     def _find_candidates(self, risk_map: OccupancyGrid):
         """NMS 로 risk hotspot 추출.
 
@@ -174,28 +212,75 @@ class PatrolPlanner(Node):
         oy = info.origin.position.y
         data = risk_map.data
 
-        # 1. risk >= min_risk 셀 모두 추출 (list of (risk, gx, gy))
-        threshold = self.min_risk
-        cells = []
-        for gy in range(h):
-            row_offset = gy * w
-            for gx in range(w):
-                v = data[row_offset + gx]
-                if v >= threshold:   # -1 (unknown) 자동 제외
-                    cells.append((v, gx, gy))
-
-        if not cells:
+        if w == 0 or h == 0 or len(data) != w * h:
+            self.last_candidate_stats = {
+                'valid_count': 0,
+                'max_risk': 'invalid',
+                'threshold': self.min_risk,
+                'threshold_mode': 'invalid_grid',
+                'above_threshold_count': 0,
+                'evaluated_count': 0,
+            }
             return []
 
-        # 2. risk 내림차순 정렬
-        cells.sort(key=lambda c: c[0], reverse=True)
+        arr = np.asarray(data, dtype=np.int16).reshape((h, w))
+        valid = arr >= 0
+        valid_count = int(np.count_nonzero(valid))
+        if valid_count == 0:
+            self.last_candidate_stats = {
+                'valid_count': 0,
+                'max_risk': -1,
+                'threshold': self.min_risk,
+                'threshold_mode': 'no_known_cells',
+                'above_threshold_count': 0,
+                'evaluated_count': 0,
+            }
+            return []
+
+        max_risk = int(np.max(arr[valid]))
+        threshold, mode = self._effective_threshold(max_risk)
+        candidate_mask = valid & (arr >= threshold)
+        ys, xs = np.nonzero(candidate_mask)
+        above_count = int(xs.size)
+
+        if above_count == 0:
+            self.last_candidate_stats = {
+                'valid_count': valid_count,
+                'max_risk': max_risk,
+                'threshold': threshold,
+                'threshold_mode': mode,
+                'above_threshold_count': 0,
+                'evaluated_count': 0,
+            }
+            return []
+
+        vals = arr[ys, xs]
+        max_cells = max(1, self.max_candidate_cells)
+        if above_count > max_cells:
+            keep = np.argpartition(vals, -max_cells)[-max_cells:]
+            vals = vals[keep]
+            xs = xs[keep]
+            ys = ys[keep]
+
+        order = np.argsort(vals)[::-1]
+        self.last_candidate_stats = {
+            'valid_count': valid_count,
+            'max_risk': max_risk,
+            'threshold': threshold,
+            'threshold_mode': mode,
+            'above_threshold_count': above_count,
+            'evaluated_count': int(order.size),
+        }
 
         # 3. NMS: world 좌표로 변환 후 거리 검사
         # cell 중심 좌표 = origin + (gx + 0.5) * res
         selected = []  # [(x, y, risk)]
         min_d_sq = self.min_distance_m * self.min_distance_m
 
-        for risk_val, gx, gy in cells:
+        for i in order:
+            risk_val = int(vals[i])
+            gx = int(xs[i])
+            gy = int(ys[i])
             x = ox + (gx + 0.5) * res
             y = oy + (gy + 0.5) * res
 

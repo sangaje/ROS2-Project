@@ -98,6 +98,12 @@ def generate_launch_description():
     omx_yolo_node_delay_sec = LaunchConfiguration('omx_yolo_node_delay_sec')
     start_patrol_planner = LaunchConfiguration('start_patrol_planner')
     patrol_planner_delay_sec = LaunchConfiguration('patrol_planner_delay_sec')
+    patrol_min_risk = LaunchConfiguration('patrol_min_risk')
+    patrol_relative_threshold_ratio = LaunchConfiguration(
+        'patrol_relative_threshold_ratio'
+    )
+    patrol_min_fallback_risk = LaunchConfiguration('patrol_min_fallback_risk')
+    patrol_max_candidate_cells = LaunchConfiguration('patrol_max_candidate_cells')
     debug_stream = LaunchConfiguration('debug_stream')
     debug_port = LaunchConfiguration('debug_port')
     unified_dashboard = LaunchConfiguration('unified_dashboard')
@@ -394,6 +400,16 @@ def generate_launch_description():
                         ),
                         'patrol_planner_delay_sec': (
                             patrol_planner_delay_sec.perform(context)
+                        ),
+                        'patrol_min_risk': patrol_min_risk.perform(context),
+                        'patrol_relative_threshold_ratio': (
+                            patrol_relative_threshold_ratio.perform(context)
+                        ),
+                        'patrol_min_fallback_risk': (
+                            patrol_min_fallback_risk.perform(context)
+                        ),
+                        'patrol_max_candidate_cells': (
+                            patrol_max_candidate_cells.perform(context)
                         ),
                         'debug_stream': debug_stream.perform(context),
                         'debug_port': debug_port.perform(context),
@@ -888,6 +904,26 @@ def generate_launch_description():
             'patrol_planner_delay_sec',
             default_value='6.0',
             description='Leader role only: small grace before starting patrol planner.',
+        ),
+        DeclareLaunchArgument(
+            'patrol_min_risk',
+            default_value='40',
+            description='Leader role only: absolute 0-100 risk cutoff for patrol planner.',
+        ),
+        DeclareLaunchArgument(
+            'patrol_relative_threshold_ratio',
+            default_value='0.55',
+            description='Leader role only: fallback cutoff ratio of current risk peak.',
+        ),
+        DeclareLaunchArgument(
+            'patrol_min_fallback_risk',
+            default_value='5',
+            description='Leader role only: noise floor for relative patrol candidates.',
+        ),
+        DeclareLaunchArgument(
+            'patrol_max_candidate_cells',
+            default_value='2000',
+            description='Leader role only: maximum top-risk cells evaluated by patrol NMS.',
         ),
         DeclareLaunchArgument(
             'debug_stream',

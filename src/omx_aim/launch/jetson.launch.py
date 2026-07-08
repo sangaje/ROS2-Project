@@ -118,6 +118,18 @@ def launch_setup(context, *args, **kwargs):
     patrol_planner = Node(
         package='omx_aim', executable='patrol_planner', name='patrol_planner',
         output='screen',
+        parameters=[{
+            'min_risk': int(LaunchConfiguration('patrol_min_risk').perform(context)),
+            'relative_threshold_ratio': float(
+                LaunchConfiguration('patrol_relative_threshold_ratio').perform(context)
+            ),
+            'min_fallback_risk': int(
+                LaunchConfiguration('patrol_min_fallback_risk').perform(context)
+            ),
+            'max_candidate_cells': int(
+                LaunchConfiguration('patrol_max_candidate_cells').perform(context)
+            ),
+        }],
     )
     if start_patrol_planner:
         if patrol_delay > 0.0:
@@ -170,6 +182,18 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'patrol_planner_delay_sec', default_value='6.0',
             description='Small grace before starting patrol_planner.'),
+        DeclareLaunchArgument(
+            'patrol_min_risk', default_value='40',
+            description='Absolute 0-100 risk cutoff for patrol candidate extraction.'),
+        DeclareLaunchArgument(
+            'patrol_relative_threshold_ratio', default_value='0.55',
+            description='Fallback cutoff ratio of current risk peak when peak is below patrol_min_risk.'),
+        DeclareLaunchArgument(
+            'patrol_min_fallback_risk', default_value='5',
+            description='Noise floor for relative patrol candidate extraction.'),
+        DeclareLaunchArgument(
+            'patrol_max_candidate_cells', default_value='2000',
+            description='Maximum top-risk cells evaluated by patrol_planner NMS per cycle.'),
         DeclareLaunchArgument(
             'debug_stream', default_value='false',
             description='yolo_node 의 Flask MJPEG 디버그 스트림 켜기'),
