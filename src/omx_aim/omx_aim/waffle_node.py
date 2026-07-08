@@ -48,7 +48,7 @@ from rclpy.node import Node
 from rclpy.action import ActionClient
 
 from std_msgs.msg import String, Empty
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 
 try:
     from nav2_msgs.action import NavigateToPose
@@ -87,6 +87,11 @@ class WaffleNavNode(Node):
             raise RuntimeError("config.yaml 에 waffle 섹션 필요")
 
         self.state = WaffleState.IDLE
+        self._pending_goal: Optional[PoseStamped] = None
+        self._pending_goal_received_wall: Optional[float] = None
+        self._last_amcl_pose_wall: Optional[float] = None
+        self._amcl_ready = False
+        self._amcl_cov_text = "no_amcl_pose"
 
         # Nav2 액션 핸들
         self.current_goal_handle = None
@@ -104,6 +109,28 @@ class WaffleNavNode(Node):
         self._nav_server_ready_logged = False
         self._nav_server_timer = None
 
+        self.declare_parameter('require_amcl_ready', True)
+        self.declare_parameter('amcl_pose_topic', '/amcl_pose')
+        self.declare_parameter('max_amcl_pose_age_sec', 3.0)
+        self.declare_parameter('max_xy_covariance', 0.50)
+        self.declare_parameter('max_yaw_covariance', 0.50)
+        self.declare_parameter('pending_goal_retry_period_sec', 0.5)
+        self.declare_parameter('max_pending_goal_age_sec', 60.0)
+        self.require_amcl_ready = bool(
+            self.get_parameter('require_amcl_ready').value)
+        self.amcl_pose_topic = str(
+            self.get_parameter('amcl_pose_topic').value)
+        self.max_amcl_pose_age_sec = float(
+            self.get_parameter('max_amcl_pose_age_sec').value)
+        self.max_xy_covariance = float(
+            self.get_parameter('max_xy_covariance').value)
+        self.max_yaw_covariance = float(
+            self.get_parameter('max_yaw_covariance').value)
+        self.max_pending_goal_age_sec = float(
+            self.get_parameter('max_pending_goal_age_sec').value)
+        pending_retry_period = float(
+            self.get_parameter('pending_goal_retry_period_sec').value)
+
         if dry_run:
             self.get_logger().info(
                 "[dry-run] Nav2 액션 서버 대기 생략 - 시뮬레이션 모드")
@@ -119,6 +146,12 @@ class WaffleNavNode(Node):
                                  self.on_nav_goal, 10)
         self.create_subscription(Empty, '/omx/nav_cancel',
                                  self.on_nav_cancel, 10)
+        self.create_subscription(
+            PoseWithCovarianceStamped,
+            self.amcl_pose_topic,
+            self.on_amcl_pose,
+            10,
+        )
 
         # Publishers
         self.pub_result = self.create_publisher(
@@ -130,12 +163,19 @@ class WaffleNavNode(Node):
 
         # Status timer
         self.create_timer(1.0, self.publish_status)
+        self.create_timer(max(0.1, pending_retry_period),
+                          self._try_send_pending_goal)
 
         self.get_logger().info("=" * 50)
         self.get_logger().info("Waffle Nav Node (H1 골격)")
         self.get_logger().info("=" * 50)
         self.get_logger().info(f"Nav2 액션: {action_name}")
         self.get_logger().info(f"Map frame: {self.cfg.waffle.frame}")
+        self.get_logger().info(
+            f"AMCL gate: require={self.require_amcl_ready} "
+            f"topic={self.amcl_pose_topic} "
+            f"xy_cov<={self.max_xy_covariance:.3f} "
+            f"yaw_cov<={self.max_yaw_covariance:.3f}")
         self.get_logger().info("입력:")
         self.get_logger().info("  /omx/nav_goal    PoseStamped")
         self.get_logger().info("  /omx/nav_cancel  Empty")
@@ -178,6 +218,73 @@ class WaffleNavNode(Node):
 
     # ----- Subscribers -----
 
+    def on_amcl_pose(self, msg: PoseWithCovarianceStamped):
+        cov = msg.pose.covariance
+        xy_cov = max(abs(float(cov[0])), abs(float(cov[7])))
+        yaw_cov = abs(float(cov[35]))
+        ready = (
+            xy_cov <= self.max_xy_covariance
+            and yaw_cov <= self.max_yaw_covariance
+        )
+        self._last_amcl_pose_wall = time.time()
+        self._amcl_ready = ready
+        self._amcl_cov_text = f"xy={xy_cov:.3f}, yaw={yaw_cov:.3f}"
+        if ready:
+            self.get_logger().debug(
+                f"AMCL ready ({self._amcl_cov_text})")
+
+    def _localization_ready(self) -> bool:
+        if self.dry_run or not self.require_amcl_ready:
+            return True
+        if not self._amcl_ready or self._last_amcl_pose_wall is None:
+            return False
+        age = time.time() - self._last_amcl_pose_wall
+        return age <= self.max_amcl_pose_age_sec
+
+    def _queue_nav_goal(self, msg: PoseStamped, reason: str):
+        self._pending_goal = msg
+        self._pending_goal_received_wall = time.time()
+        self.get_logger().warn(
+            f"nav_goal 보류: {reason}. AMCL={self._amcl_cov_text}",
+            throttle_duration_sec=2.0,
+        )
+
+    def _try_send_pending_goal(self):
+        if self._pending_goal is None:
+            return
+        if self.state == WaffleState.NAVIGATING:
+            return
+
+        age = time.time() - (self._pending_goal_received_wall or time.time())
+        if age > self.max_pending_goal_age_sec:
+            self.get_logger().warn(
+                f"pending nav_goal 폐기: {age:.1f}s old")
+            self._pending_goal = None
+            self._pending_goal_received_wall = None
+            self._publish_result("rejected")
+            return
+
+        if not self.action_client.server_is_ready():
+            self.get_logger().warn(
+                f"pending nav_goal 대기: Nav2 액션 서버 '{self.action_name}' "
+                "아직 준비 안 됨",
+                throttle_duration_sec=5.0,
+            )
+            return
+        if not self._localization_ready():
+            self.get_logger().warn(
+                f"pending nav_goal 대기: AMCL not ready ({self._amcl_cov_text})",
+                throttle_duration_sec=5.0,
+            )
+            return
+
+        goal_msg = self._pending_goal
+        self._pending_goal = None
+        self._pending_goal_received_wall = None
+        self.get_logger().info(
+            f"pending nav_goal 전송: AMCL ready ({self._amcl_cov_text})")
+        self._send_nav_goal(goal_msg)
+
     def on_nav_goal(self, msg: PoseStamped):
         """yolo_node 가 발행한 와플 이동 목표 (VIEW_POSE)."""
         x = msg.pose.position.x
@@ -203,10 +310,16 @@ class WaffleNavNode(Node):
             return
 
         if not self.action_client.server_is_ready():
-            self.get_logger().error("Nav2 액션 서버 준비 안 됨. goal 거부")
-            self._publish_result("rejected")
+            self._queue_nav_goal(
+                msg, f"Nav2 액션 서버 '{self.action_name}' 준비 전")
+            return
+        if not self._localization_ready():
+            self._queue_nav_goal(msg, "AMCL localization 준비 전")
             return
 
+        self._send_nav_goal(msg)
+
+    def _send_nav_goal(self, msg: PoseStamped):
         # Nav2 goal 생성 및 전송
         goal = NavigateToPose.Goal()
         goal.pose = msg
