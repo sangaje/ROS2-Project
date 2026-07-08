@@ -71,7 +71,7 @@ def generate_launch_description():
                 (
                     'leader_nav2.yaml'
                     if cartographer_owned
-                    else 'follower_nav2_amcl.yaml'
+                    else 'leader_waffle_pi_nav2.yaml'
                 ),
             ),
             param_rewrites={
