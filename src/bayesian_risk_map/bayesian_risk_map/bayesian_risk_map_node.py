@@ -285,6 +285,18 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.person_bayes_max_update_dt_sec = float(
             self.declare_parameter('person_bayes_max_update_dt_sec', 1.0).value
         )
+        self.enable_visible_risk_decay = self.declare_bool_parameter(
+            'enable_visible_risk_decay', True
+        )
+        self.visible_risk_decay_per_sec = float(
+            self.declare_parameter('visible_risk_decay_per_sec', 0.35).value
+        )
+        self.visible_risk_decay_grace_sec = float(
+            self.declare_parameter('visible_risk_decay_grace_sec', 1.5).value
+        )
+        self.visible_evidence_clear_threshold = float(
+            self.declare_parameter('visible_evidence_clear_threshold', 0.5).value
+        )
 
         # Halo
         self.source_halo_radius_m = float(self.declare_parameter('source_halo_radius_m', 0.75).value)
@@ -466,6 +478,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.person_probability_map = None
         self.person_location_estimate: Optional[Tuple[float, float, float]] = None
         self.last_person_bayes_update_ros_sec = None
+        self.last_visible_risk_decay_ros_sec = None
         self.last_person_detection_ros_sec = None
         self.topic_pose: Optional[PoseStamped] = None
         self.topic_pose_stamp = None
@@ -2177,6 +2190,83 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.observed_empty_map = np.maximum(self.observed_empty_map, a * visibility)
         self.observed_empty_map[~self.valid_free_mask()] = 0.0
 
+    def apply_visible_no_detection_risk_decay(
+        self,
+        visibility,
+        had_detection: bool,
+        now_ros_sec: float,
+    ) -> bool:
+        if (
+            not self.enable_visible_risk_decay
+            or self.occ_grid is None
+            or visibility is None
+            or had_detection
+        ):
+            self.last_visible_risk_decay_ros_sec = now_ros_sec
+            return False
+
+        last_detection = getattr(self, 'last_person_detection_ros_sec', None)
+        if (
+            last_detection is not None
+            and now_ros_sec - float(last_detection)
+            < max(0.0, float(self.visible_risk_decay_grace_sec))
+        ):
+            self.last_visible_risk_decay_ros_sec = now_ros_sec
+            return False
+
+        h, w = self.occ_grid.shape
+        if visibility.shape != (h, w):
+            return False
+
+        last_update = getattr(self, 'last_visible_risk_decay_ros_sec', None)
+        if last_update is None:
+            dt = 0.0
+        else:
+            dt = clamp(now_ros_sec - float(last_update), 0.0, 1.0)
+        self.last_visible_risk_decay_ros_sec = now_ros_sec
+        if dt <= 0.0:
+            return False
+
+        visible = np.clip(visibility, 0.0, 1.0).astype(np.float32)
+        visible[~self.valid_free_mask()] = 0.0
+        decay = max(0.0, float(self.visible_risk_decay_per_sec)) * dt * visible
+        changed = False
+
+        for layer_name in (
+            'positive_memory_map',
+            'bearing_consensus_map',
+            'detection_candidate_map',
+        ):
+            layer = getattr(self, layer_name, None)
+            if layer is None or layer.shape != (h, w):
+                continue
+            updated = np.maximum(0.0, layer - decay).astype(np.float32)
+            if np.any(updated < layer - 1e-6):
+                setattr(self, layer_name, updated)
+                changed = True
+
+        if self.evidence_points:
+            threshold = clamp(float(self.visible_evidence_clear_threshold), 0.0, 1.0)
+            kept = []
+            removed = 0
+            for ev in self.evidence_points:
+                grid = self.world_to_grid(float(ev.x), float(ev.y))
+                if grid is None:
+                    removed += 1
+                    continue
+                gx, gy = grid
+                if visible[gy, gx] >= threshold:
+                    removed += 1
+                else:
+                    kept.append(ev)
+            if removed:
+                self.evidence_points = kept
+                changed = True
+
+        if changed:
+            self.risk_dirty = True
+        return changed
+
     # ---------------- Live SLAM region segmentation / priority ----------------
 
     def connected_components(self, free_mask):
@@ -2695,6 +2785,11 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             self.visibility_map = self.compute_visibility_map(robot_pose)
             self.update_visual_seen_map(self.visibility_map)
             self.update_observed_empty(self.visibility_map, currently_detecting_person)
+            self.apply_visible_no_detection_risk_decay(
+                self.visibility_map,
+                currently_detecting_person,
+                now_ros_sec,
+            )
 
         self.update_person_bayesian_memory(
             bayes_positive_candidate,

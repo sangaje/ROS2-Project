@@ -390,6 +390,31 @@ class StateMachine:
         self.armed = armed
         self._log(f"Armed: {armed}")
 
+    def force_fire_now(self, now: float, *, cancel_nav: bool = True,
+                       reason: str = "immediate_detection") -> bool:
+        """현재 작업을 접고 즉시 격발 쿨다운 상태로 진입한다."""
+        if self.state in (State.FIRING, State.COOLDOWN):
+            return False
+
+        if cancel_nav and self._is_waffle_navigating():
+            if self.nav_cancel_fn is not None:
+                self.nav_cancel_fn()
+                self.pending_cancel_for_preempt = True
+                self._log(f"{reason}: nav_cancel 발송")
+
+        self.boundary_queue.clear()
+        self.current_parent = None
+        self.current_focus = None
+        self.nav_pending_result = None
+        self.confirm_progress = 1.0
+        self.lost_start_t = 0.0
+        self.fire_start_t = now
+        self.cooldown_until = now + self.cfg.fire.cooldown_sec
+        self.cooldown_home_sent = False
+        self.transition(State.COOLDOWN)
+        self._log(f"{reason}: 즉시 격발 -> COOLDOWN")
+        return True
+
     # ----- update() 메인 -----
 
     def update(self, detected: bool, error_norm, now: float) -> dict:

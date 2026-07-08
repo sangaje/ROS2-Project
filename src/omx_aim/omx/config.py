@@ -98,6 +98,12 @@ class FireConfig:
     # COOLDOWN 진입 후 이 시간이 지나야 home 명령이 발사됨.
     # cooldown_sec 보다 작아야 home 이 실행됨.
     fire_pulse_sec: float = 1.5
+    # 카메라가 적을 식별한 즉시 격발한다. Boundary/Nav2 처리보다 우선한다.
+    immediate_on_detection: bool = True
+    immediate_during_nav: bool = True
+    immediate_cancel_nav: bool = True
+    immediate_min_interval_sec: float = 1.0
+    immediate_requires_armed: bool = False
 
 
 @dataclass
@@ -131,6 +137,11 @@ class ViewPoseConfig:
     stand_off_distance: float = 1.0
     candidate_count: int = 12 
     yaw_next_weight: float = 0.5
+    footprint_radius_m: float = 0.24
+    reject_unknown_footprint: bool = True
+    require_clear_path_to_candidate: bool = True
+    frontier_bonus: float = 0.35
+    obstacle_cost_weight: float = 1.5
 
 
 @dataclass

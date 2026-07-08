@@ -130,6 +130,13 @@ fire:
   # 흐름: fire_pulse_sec 동안 조준 유지 → home 이동 → 나머지 시간 휴지 → IDLE
   cooldown_sec: 3.0
   lost_timeout_sec: 1.5
+
+  # 적 식별 즉시 격발. Boundary scan/Nav2 이동 중이어도 적 탐지가 최우선.
+  immediate_on_detection: true
+  immediate_during_nav: true
+  immediate_cancel_nav: true
+  immediate_min_interval_sec: 1.0
+  immediate_requires_armed: false
 # ===========================================================
 # Auto-track (자율 검출)
 # ===========================================================
@@ -179,6 +186,11 @@ view_pose:
   stand_off_distance: 1.5
   candidate_count: 12
   yaw_next_weight: 0.0
+  footprint_radius_m: 0.24
+  reject_unknown_footprint: true
+  require_clear_path_to_candidate: true
+  frontier_bonus: 0.35
+  obstacle_cost_weight: 1.5
 
 # ===========================================================
 # BOUNDARY 자동 생성 (H4 에서 활성화 예정)

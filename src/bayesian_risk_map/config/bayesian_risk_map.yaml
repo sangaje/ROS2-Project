@@ -98,6 +98,10 @@ bayesian_risk_map_node:
     person_bayes_decay_grace_sec: 1.5
     person_bayes_max_probability: 0.995
     person_bayes_max_update_dt_sec: 1.0
+    enable_visible_risk_decay: true
+    visible_risk_decay_per_sec: 0.35
+    visible_risk_decay_grace_sec: 1.5
+    visible_evidence_clear_threshold: 0.5
     person_prob_viz_threshold: 0.01
     person_prob_marker_max_count: 1000
     person_prob_estimate_min_views: 2

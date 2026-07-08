@@ -265,6 +265,8 @@ class OmxYoloNode(Node):
         self._last_fire_enable_t = 0.0
         self._fire_enable_detection_active = False
         self._fire_enable_republish_sec = 1.0
+        self._last_immediate_fire_t = 0.0
+        self._immediate_fire_detection_active = False
 
         self.get_logger().info(
             f"Timer: 메인 {self.cfg.ibvs.control_hz} Hz, 상태 1 Hz")
@@ -414,6 +416,71 @@ class OmxYoloNode(Node):
             return None
         return cost
 
+    def _costmap_grid(self, x, y):
+        if self.costmap is None:
+            return None
+        info = self.costmap.info
+        gx = int(math.floor((x - info.origin.position.x) / info.resolution))
+        gy = int(math.floor((y - info.origin.position.y) / info.resolution))
+        if gx < 0 or gx >= info.width or gy < 0 or gy >= info.height:
+            return None
+        return gx, gy
+
+    def _costmap_cell_value(self, gx, gy):
+        if self.costmap is None:
+            return None
+        info = self.costmap.info
+        if gx < 0 or gx >= info.width or gy < 0 or gy >= info.height:
+            return None
+        return self.costmap.data[gy * info.width + gx]
+
+    def _is_frontier_cell(self, gx, gy) -> bool:
+        for nx, ny in ((gx + 1, gy), (gx - 1, gy), (gx, gy + 1), (gx, gy - 1)):
+            value = self._costmap_cell_value(nx, ny)
+            if value == -1:
+                return True
+        return False
+
+    def _view_pose_candidate_score(self, x, y):
+        """후보 위치의 footprint 전체가 known/free인지 검사하고 cost를 반환."""
+        if self.costmap is None:
+            return None
+        grid = self._costmap_grid(x, y)
+        if grid is None:
+            return None
+
+        info = self.costmap.info
+        gx0, gy0 = grid
+        vp_cfg = self.cfg.view_pose
+        threshold = self.cfg.patrol.los_cost_threshold
+        radius_m = max(info.resolution, vp_cfg.footprint_radius_m)
+        radius_cells = max(1, int(math.ceil(radius_m / info.resolution)))
+        max_cost = 0
+        frontier = False
+
+        for dy in range(-radius_cells, radius_cells + 1):
+            for dx in range(-radius_cells, radius_cells + 1):
+                if dx * dx + dy * dy > radius_cells * radius_cells:
+                    continue
+                gx = gx0 + dx
+                gy = gy0 + dy
+                value = self._costmap_cell_value(gx, gy)
+                if value is None:
+                    return None
+                if value == -1:
+                    if vp_cfg.reject_unknown_footprint:
+                        return None
+                    frontier = True
+                    continue
+                if value >= threshold:
+                    return None
+                max_cost = max(max_cost, int(value))
+                frontier = frontier or self._is_frontier_cell(gx, gy)
+
+        obstacle_penalty = vp_cfg.obstacle_cost_weight * (max_cost / 100.0)
+        frontier_bonus = vp_cfg.frontier_bonus if frontier else 0.0
+        return obstacle_penalty, frontier_bonus, max_cost, frontier
+
     # ----- H2: CHECK_VIEW + VIEW_POSE -----
 
     def check_view(self, target_map) -> bool:
@@ -485,7 +552,6 @@ class OmxYoloNode(Node):
         stand_off = vp_cfg.stand_off_distance
 
         # cost 가중치 (낮을수록 좋음)
-        W_INFL = 1.0    # costmap inflation (벽 가까움 penalty)
         W_DIST = 2.0    # ideal stand_off 거리와의 편차
         W_WAFL = 0.5    # 와플과의 거리 (이동 시간)
 
@@ -500,18 +566,26 @@ class OmxYoloNode(Node):
 
         # 필수 조건 + cost 평가
         valid = []
-        rejection_reasons = {'costmap': 0, 'los': 0, 'omx': 0}
+        rejection_reasons = {'costmap': 0, 'los': 0, 'path': 0, 'omx': 0}
 
         for cx, cy in candidates:
-            # 조건 1: costmap free
-            cost_val = self._costmap_value(cx, cy)
-            if cost_val is None or cost_val >= 80:
+            # 조건 1: 후보 footprint 전체가 known/free 이어야 함
+            candidate_score = self._view_pose_candidate_score(cx, cy)
+            if candidate_score is None:
                 rejection_reasons['costmap'] += 1
                 continue
+            obstacle_penalty, frontier_bonus, cost_val, is_frontier = candidate_score
+
+            # 조건 1.5: 현재 와플 위치에서 후보까지도 ROS map 상 clear 해야 함
+            if vp_cfg.require_clear_path_to_candidate:
+                path_los = self._los_between((wx, wy), (cx, cy))
+                if path_los != LOSResult.CLEAR:
+                    rejection_reasons['path'] += 1
+                    continue
 
             # 조건 2: LOS from candidate to target
             los = self._los_between((cx, cy), (tx, ty))
-            if los == LOSResult.BLOCKED:
+            if los != LOSResult.CLEAR:
                 rejection_reasons['los'] += 1
                 continue
 
@@ -545,26 +619,30 @@ class OmxYoloNode(Node):
             # Cost 계산
             dist_to_target = math.hypot(tx - cx, ty - cy)
             dist_from_waffle = math.hypot(wx - cx, wy - cy)
-            cost = (W_INFL * (cost_val / 100.0)
+            cost = (obstacle_penalty
                     + W_DIST * abs(dist_to_target - stand_off)
-                    + W_WAFL * dist_from_waffle)
+                    + W_WAFL * dist_from_waffle
+                    - frontier_bonus)
 
-            valid.append((cost, cx, cy, final_yaw, cost_val, dist_from_waffle))
+            valid.append((
+                cost, cx, cy, final_yaw, cost_val, dist_from_waffle,
+                is_frontier))
 
         if not valid:
             self.get_logger().warn(
                 f"VIEW_POSE v2: 적합 후보 없음 ({n}개 중 "
                 f"costmap={rejection_reasons['costmap']}, "
                 f"LOS={rejection_reasons['los']}, "
+                f"path={rejection_reasons['path']}, "
                 f"OMX={rejection_reasons['omx']})")
             return None
 
         valid.sort()
-        cost, bx, by, byaw, infl, dw = valid[0]
+        cost, bx, by, byaw, infl, dw, is_frontier = valid[0]
         self.get_logger().info(
             f"VIEW_POSE v2: {n}개 중 {len(valid)} 적합, "
             f"선택 cost={cost:.2f} (infl={infl}, "
-            f"dist_waffle={dw:.2f}m) "
+            f"dist_waffle={dw:.2f}m, frontier={is_frontier}) "
             f"-> ({bx:+.2f}, {by:+.2f}) yaw={math.degrees(byaw):+.1f}°")
         return (bx, by, byaw)
 
@@ -740,6 +818,47 @@ class OmxYoloNode(Node):
         self.get_logger().info(
             "[fire_enable] 적 식별 -> /omx/fire_disable=false 발행")
 
+    def maybe_fire_immediately_on_detection(self, detected: bool,
+                                            now: float) -> bool:
+        fire_cfg = self.cfg.fire
+        if not detected:
+            self._immediate_fire_detection_active = False
+            return False
+
+        if fire_cfg is None or not fire_cfg.immediate_on_detection:
+            return False
+        if self.paused:
+            return False
+        if fire_cfg.immediate_requires_armed and not self.sm.armed:
+            return False
+        if self.sm.state in (State.FIRING, State.COOLDOWN):
+            self._immediate_fire_detection_active = True
+            return False
+        if self._immediate_fire_detection_active:
+            return False
+        if now - self._last_immediate_fire_t < fire_cfg.immediate_min_interval_sec:
+            return False
+
+        navigating = self.sm._is_waffle_navigating()
+        if navigating and not fire_cfg.immediate_during_nav:
+            return False
+
+        if not self.sm.force_fire_now(
+                now,
+                cancel_nav=(navigating and fire_cfg.immediate_cancel_nav),
+                reason="immediate_detection"):
+            return False
+
+        self.publish_fire()
+        self.ctrl.fire()
+        self.publish_processed(None)
+        self._last_immediate_fire_t = now
+        self._immediate_fire_detection_active = True
+        self.get_logger().info(
+            "[immediate_fire] 적 식별 즉시 격발"
+            + (" (Nav2 cancel)" if navigating else ""))
+        return True
+
     def _make_point_stamped(self, coord_map):
         msg = PointStamped()
         msg.header.frame_id = 'map'
@@ -908,6 +1027,7 @@ class OmxYoloNode(Node):
 
         now = time.time()
         self.publish_fire_enable_if_detected(detected, now)
+        self.maybe_fire_immediately_on_detection(detected, now)
         action = self.sm.update(detected, error_norm, now)
 
         # blocked entries 알림
