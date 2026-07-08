@@ -254,7 +254,7 @@ class LeaderUnifiedDashboard(Node):
 
     def _build_app(self):
         try:
-            from flask import Flask, Response, jsonify, render_template
+            from flask import Flask, Response, jsonify, render_template, stream_with_context
         except ImportError as exc:
             raise RuntimeError('Flask is required for leader_unified_dashboard') from exc
 
@@ -302,6 +302,39 @@ class LeaderUnifiedDashboard(Node):
         @app.get('/risk.png')
         def risk_png():
             return self._grid_response(Response, 'risk')
+
+        @app.get('/api/yolo_stream/<kind>.mjpg')
+        def yolo_stream(kind):
+            if kind == 'raw':
+                path = self.yolo_raw_stream_path
+            elif kind in ('yolo', 'overlay'):
+                path = self.yolo_overlay_stream_path
+            else:
+                return jsonify({'ok': False, 'error': 'kind must be raw or yolo'}), 404
+
+            url = f'http://127.0.0.1:{self.yolo_server_port}{path}'
+
+            def generate():
+                try:
+                    with urllib.request.urlopen(url, timeout=2.0) as upstream:
+                        while True:
+                            chunk = upstream.read(65536)
+                            if not chunk:
+                                break
+                            yield chunk
+                except Exception as exc:  # noqa: BLE001
+                    self.get_logger().warn(
+                        'UNIFIED_DASHBOARD_YOLO_STREAM_PROXY_ERROR | '
+                        f'kind={kind} url={url} error={exc}',
+                        throttle_duration_sec=5.0,
+                    )
+
+            response = Response(
+                stream_with_context(generate()),
+                mimetype='multipart/x-mixed-replace; boundary=frame',
+            )
+            response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+            return response
 
         return app
 
@@ -523,6 +556,8 @@ class LeaderUnifiedDashboard(Node):
                     'port': self.yolo_server_port,
                     'raw_stream_path': self.yolo_raw_stream_path,
                     'overlay_stream_path': self.yolo_overlay_stream_path,
+                    'raw_proxy_path': '/api/yolo_stream/raw.mjpg',
+                    'overlay_proxy_path': '/api/yolo_stream/yolo.mjpg',
                     'status_path': self.yolo_status_path,
                 },
                 'omx': dict(self._omx_state),

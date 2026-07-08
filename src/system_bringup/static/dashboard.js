@@ -67,15 +67,8 @@ function configureStream(s) {
   streamSources.omxStream = `${location.protocol}//${location.hostname}:${omxPort}${omxPath}`;
 
   const yolo = s.yolo_server || {};
-  const yoloPort = yolo.port || 5005;
-  streamSources.scoutRawStream = (
-    `${location.protocol}//${location.hostname}:${yoloPort}`
-    + (yolo.raw_stream_path || '/stream/raw.mjpg')
-  );
-  streamSources.scoutYoloStream = (
-    `${location.protocol}//${location.hostname}:${yoloPort}`
-    + (yolo.overlay_stream_path || '/stream/yolo.mjpg')
-  );
+  streamSources.scoutRawStream = yolo.raw_proxy_path || '/api/yolo_stream/raw.mjpg';
+  streamSources.scoutYoloStream = yolo.overlay_proxy_path || '/api/yolo_stream/yolo.mjpg';
   refreshStreams(false);
 }
 
