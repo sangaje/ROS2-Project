@@ -134,7 +134,7 @@ planner_server:
       plugin: "nav2_navfn_planner::NavfnPlanner"
       tolerance: 0.5
       use_astar: false
-      allow_unknown: true
+      allow_unknown: false
 
 behavior_server:
   ros__parameters:
@@ -213,8 +213,8 @@ local_costmap:
       plugins: ["obstacle_layer", "voxel_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        inflation_radius: 0.3
-        cost_scaling_factor: 5.0
+        inflation_radius: 0.4
+        cost_scaling_factor: 4.0
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: true
@@ -305,8 +305,8 @@ global_costmap:
           obstacle_min_range: 0.0
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        inflation_radius: 0.4
-        cost_scaling_factor: 4.0
+        inflation_radius: 0.55
+        cost_scaling_factor: 3.0
       always_send_full_costmap: true
 
 lifecycle_manager_navigation:

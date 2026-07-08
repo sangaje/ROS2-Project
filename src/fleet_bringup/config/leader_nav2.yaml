@@ -75,7 +75,7 @@ planner_server:
       plugin: "nav2_navfn_planner::NavfnPlanner"
       tolerance: 0.20
       use_astar: true
-      allow_unknown: true
+      allow_unknown: false
 
 behavior_server:
   ros__parameters:

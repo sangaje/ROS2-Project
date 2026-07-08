@@ -126,7 +126,7 @@ planner_server:
       plugin: "nav2_navfn_planner::NavfnPlanner"
       tolerance: 0.15
       use_astar: true
-      allow_unknown: true
+      allow_unknown: false
 
 behavior_server:
   ros__parameters:
@@ -184,8 +184,8 @@ local_costmap:
       plugins: ["voxel_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 10.0
-        inflation_radius: 0.24
+        cost_scaling_factor: 6.0
+        inflation_radius: 0.32
       voxel_layer:
         plugin: "nav2_costmap_2d::VoxelLayer"
         enabled: true
@@ -226,8 +226,8 @@ global_costmap:
         map_subscribe_transient_local: true
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 10.0
-        inflation_radius: 0.26
+        cost_scaling_factor: 6.0
+        inflation_radius: 0.34
       always_send_full_costmap: true
 
 lifecycle_manager_navigation:
