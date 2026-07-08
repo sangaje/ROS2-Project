@@ -166,7 +166,7 @@ def generate_launch_description():
             'yolo_server_port', default_value='5005',
             description='flask_yolo_server HTTP port.'),
         DeclareLaunchArgument(
-            'yolo_server_model_path', default_value='best.pt',
+            'yolo_server_model_path', default_value='yolo11s.pt',
             description='YOLO model path for flask_yolo_server.'),
         DeclareLaunchArgument(
             'yolo_server_device', default_value='0',

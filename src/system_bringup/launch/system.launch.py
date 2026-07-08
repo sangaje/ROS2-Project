@@ -765,7 +765,7 @@ def generate_launch_description():
                 'needs an interactive terminal.'
             ),
         ),
-        DeclareLaunchArgument('risk_model_path', default_value='yolo11n.pt'),
+        DeclareLaunchArgument('risk_model_path', default_value='yolo11s.pt'),
         DeclareLaunchArgument(
             'detection_source', default_value='flask_topic',
             description=(
@@ -926,7 +926,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'yolo_server_model_path',
-            default_value='best.pt',
+            default_value='yolo11s.pt',
             description='Leader role only: YOLO model path for flask_yolo_server.',
         ),
         DeclareLaunchArgument(

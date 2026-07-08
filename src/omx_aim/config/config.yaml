@@ -99,7 +99,7 @@ ibvs:
   derivative_reset_gap_sec: 0.5
 
 yolo:
-  model_path: yolo11n.pt    # custom best.pt가 있으면 OMX_YOLO_MODEL_PATH=/abs/path/best.pt 로 override
+  model_path: yolo11s.pt    # custom best.pt가 있으면 OMX_YOLO_MODEL_PATH=/abs/path/best.pt 로 override
   device: 0                 # Jetson CUDA device. cpu로 강제하려면 "cpu"
   half: true                # CUDA에서 FP16 사용
   target_class: 0           # COCO: 0=person. custom best.pt 사용 시 class id에 맞게 변경
@@ -226,10 +226,10 @@ nav_crawl:
   early_stop_on_los: true
 
 # ===========================================================
-# BOUNDARY 자동 생성 (H4 에서 활성화 예정)
+# BOUNDARY 자동 생성
 # ===========================================================
 boundary:
-  enable_during_target: false    # 런타임 토픽으로 토글 가능
+  enable_during_target: true     # 런타임 토픽으로 토글 가능
   enable_during_patrol: true
   
   fan_half_angle_deg: 45.0       # ± 이 각도 (좌우 합 90° fan)

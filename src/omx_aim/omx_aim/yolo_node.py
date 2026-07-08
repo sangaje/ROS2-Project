@@ -1371,8 +1371,9 @@ class OmxYoloNode(Node):
         if action.get('target_not_found_coord') is not None:
             self.publish_target_not_found(action['target_not_found_coord'])
 
-        # H4: BOUNDARY 자동 생성 (WAITING_NAV + PATROL parent 일 때만)
-        if (self.sm.state == State.WAITING_NAV
+        # H4: BOUNDARY 자동 생성. Nav2 이동 중이면 parent type 과 무관하게
+        # 계속 생성하고, PATROL 은 patrol 목표 방향을 sweep 기준으로 쓴다.
+        if (self.sm._is_waffle_navigating()
                 and self.sm.current_parent is not None):
             reference_yaw = self.get_patrol_reference_yaw()
             coord = self.boundary_gen.maybe_generate(
