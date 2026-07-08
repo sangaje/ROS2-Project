@@ -342,11 +342,9 @@ def generate_launch_description():
                 'use_sim_time': simulation,
                 'follow_distance': float(follow_distance.perform(context)),
                 'start_following': True,
-                # False whenever no burger_global_localize instance exists
-                # to ever publish this (enable_amcl:=false or
-                # auto_localize:=false), otherwise the follower would never
-                # chase the leader.
-                'require_localization_ready': amcl_enabled and auto,
+                # Do not hold Nav2 goals behind the localization spin; AMCL can
+                # keep refining while the robot starts moving.
+                'require_localization_ready': False,
             }],
             env=process_env,
             respawn=True,

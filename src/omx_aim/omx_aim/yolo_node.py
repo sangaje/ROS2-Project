@@ -358,6 +358,22 @@ class OmxYoloNode(Node):
         except TransformException:
             return None
 
+    def get_patrol_reference_yaw(self) -> Optional[float]:
+        """현재 PATROL parent 방향을 boundary sweep 기준 yaw 로 반환."""
+        parent = self.sm.current_parent
+        if parent is None or parent.target_type != TargetType.PATROL:
+            return None
+
+        waffle = self.get_waffle_xy()
+        if waffle is None:
+            return None
+
+        dx = parent.coord_map[0] - waffle[0]
+        dy = parent.coord_map[1] - waffle[1]
+        if math.hypot(dx, dy) < 1.0e-3:
+            return None
+        return math.atan2(dy, dx)
+
     # ----- LOS -----
 
     def check_line_of_sight(self, target_map) -> LOSResult:
@@ -1358,8 +1374,9 @@ class OmxYoloNode(Node):
         # H4: BOUNDARY 자동 생성 (WAITING_NAV + PATROL parent 일 때만)
         if (self.sm.state == State.WAITING_NAV
                 and self.sm.current_parent is not None):
+            reference_yaw = self.get_patrol_reference_yaw()
             coord = self.boundary_gen.maybe_generate(
-                now, self.sm.current_parent.target_type)
+                now, self.sm.current_parent.target_type, reference_yaw)
             if coord is not None:
                 self.sm.on_boundary(coord)
 

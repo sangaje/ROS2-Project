@@ -114,7 +114,7 @@ class WaffleNavNode(Node):
         self._nav_server_ready_logged = False
         self._nav_server_timer = None
 
-        self.declare_parameter('require_amcl_ready', True)
+        self.declare_parameter('require_amcl_ready', False)
         self.declare_parameter('amcl_pose_topic', '/amcl_pose')
         self.declare_parameter('max_amcl_pose_age_sec', 3.0)
         self.declare_parameter('max_xy_covariance', 2.00)

@@ -7,7 +7,9 @@ Sweep 동작:
     매 period_sec 마다 sweep 한 칸씩 진행하며 BOUNDARY 1개 생성.
 
 좌표 계산 (map frame):
-    absolute_angle = waffle.yaw + sweep_offset
+    absolute_angle = reference_yaw + sweep_offset
+    reference_yaw 는 기본적으로 waffle.yaw 이며, 호출자가 patrol 방향처럼
+    별도 기준을 넘기면 그 방향을 중심으로 fan sweep 한다.
     x = waffle.x + distance_m * cos(absolute)
     y = waffle.y + distance_m * sin(absolute)
     z = boundary.z
@@ -75,7 +77,8 @@ class BoundaryGenerator:
             return self.enabled_patrol
         return False
 
-    def maybe_generate(self, now: float, parent_type) -> Optional[tuple]:
+    def maybe_generate(self, now: float, parent_type,
+                       reference_yaw: Optional[float] = None) -> Optional[tuple]:
         """주기 시간 됐고 enabled 면 다음 BOUNDARY 좌표 반환.
 
         Returns:
@@ -90,12 +93,13 @@ class BoundaryGenerator:
         if pose is None:
             return None
         wx, wy, wyaw = pose
+        base_yaw = wyaw if reference_yaw is None else reference_yaw
 
         # sweep 한 칸 진행
         offset_deg = self.sweep_angles_deg[self.sweep_idx]
         self.sweep_idx = (self.sweep_idx + 1) % len(self.sweep_angles_deg)
 
-        absolute_angle = wyaw + math.radians(offset_deg)
+        absolute_angle = base_yaw + math.radians(offset_deg)
         d = self.cfg.distance_m
         bx = wx + d * math.cos(absolute_angle)
         by = wy + d * math.sin(absolute_angle)

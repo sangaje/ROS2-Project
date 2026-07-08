@@ -92,7 +92,7 @@ class FleetPathCoordinator(Node):
         self.declare_parameter('member_coord_goal_topic', '/member_goal_pose')
         self.declare_parameter('require_follower_pose', True)
         self.declare_parameter('localization_ready_topic', '/localization_ready')
-        self.declare_parameter('require_localization_ready', True)
+        self.declare_parameter('require_localization_ready', False)
 
         self.declare_parameter('check_period_sec', 0.30)
         self.declare_parameter('pose_stale_sec', 1.5)

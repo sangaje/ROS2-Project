@@ -349,14 +349,9 @@ def generate_launch_description():
                 'require_follower_pose': launch_bool(
                     require_follower_pose.perform(context)
                 ),
-                # False whenever no leader_global_localize instance exists
-                # to ever publish this: leader-owned-Cartographer mode has
-                # no AMCL/kickstart, and auto_localize:=false skips it too.
-                # Otherwise the coordinator would hold the leader forever
-                # waiting for a ready signal that will never arrive.
-                'require_localization_ready': (
-                    not cartographer_owned and auto
-                ),
+                # Do not hold Nav2 goals behind the localization spin; AMCL can
+                # keep refining while the robot starts moving.
+                'require_localization_ready': False,
             }],
             env=process_env,
             respawn=True,

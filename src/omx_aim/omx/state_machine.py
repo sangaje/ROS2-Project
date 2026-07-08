@@ -456,7 +456,14 @@ class StateMachine:
                           f"무시 - TARGET 처리 계속")
                 self.nav_pending_result = None
                 self.pending_cancel_for_preempt = False
-            elif self.state == State.WAITING_NAV:
+            elif (
+                self.state == State.WAITING_NAV
+                or (
+                    self.state in (State.AIMING, State.SCANNING)
+                    and self.current_focus is not None
+                    and self.current_focus.target_type == TargetType.BOUNDARY
+                )
+            ):
                 result = self.nav_pending_result
                 self.nav_pending_result = None
                 self._handle_nav_result(result, action, now)
@@ -505,11 +512,11 @@ class StateMachine:
     # ----- 핸들러: nav_result -----
 
     def _handle_nav_result(self, result: str, action: dict, now: float):
-        """nav_result 적용. update() 시작에서 state == WAITING_NAV 가 보장됨.
+        """nav_result 적용.
 
-        boundary 처리 중에 nav_result 가 들어오면 update() 의 조건문에서
-        nav_pending_result 가 큐에 남고, _on_focus_done 으로 WAITING_NAV 복귀 후
-        다음 tick 에서 다시 시도된다.
+        WAITING_NAV 이거나 BOUNDARY AIMING/SCANNING 중일 때 처리된다. 그래서
+        OMX 가 주행 중 좌우를 훑는 동안에도 Nav2 다음 hop/도착 처리가 밀리지
+        않는다.
         """
         # 도착 정책: boundary 큐 일괄 폐기 (적용 시점에만)
         self.clear_boundary_queue()
@@ -533,6 +540,15 @@ class StateMachine:
 
             self.nav_final_view_pose = None
             if self.current_parent is not None:
+                if self.current_parent.target_type == TargetType.PATROL:
+                    self._log(f"PATROL Nav2 도착, parent 조준 생략: "
+                              f"{self.current_parent.coord_map}")
+                    self.nav_waypoints = []
+                    self.current_parent = None
+                    self.current_focus = None
+                    self.transition(State.IDLE)
+                    return
+
                 # parent 의 AIMING 진입
                 self.current_focus = self.current_parent
                 self.transition(State.AIMING)
@@ -573,9 +589,16 @@ class StateMachine:
             self._log(f"main_queue pop: {entry.type_name} "
                       f"{entry.coord_map} dist={entry.distance:.2f}m")
 
-            # CHECK_VIEW
-            can_view = (self.check_view_fn is None
-                        or self.check_view_fn(entry.coord_map))
+            # TARGET 은 현재 위치에서 바로 보이면 즉시 조준한다.
+            # PATROL 은 정찰 주행 자체가 목적이므로 바로 Nav2 를 출발시키고,
+            # 이동 중 BOUNDARY sweep 으로 OMX 가 좌우를 훑는다.
+            can_view = (
+                entry.target_type != TargetType.PATROL
+                and (
+                    self.check_view_fn is None
+                    or self.check_view_fn(entry.coord_map)
+                )
+            )
 
             if can_view:
                 # 현 위치에서 조준 가능 → AIMING
@@ -596,10 +619,25 @@ class StateMachine:
                                  entry.coord_map, next_target_map)
                              if self.compute_view_pose_fn else None)
                 if view_pose is None:
-                    self._log(f"VIEW_POSE 계산 실패, parent 폐기")
-                    self.last_processed = entry.coord_map
-                    self.current_parent = None
-                    return
+                    if entry.target_type == TargetType.PATROL:
+                        waffle_xy = (
+                            self.waffle_pos_fn() if self.waffle_pos_fn else None
+                        )
+                        if waffle_xy is not None:
+                            yaw = math.atan2(
+                                entry.coord_map[1] - waffle_xy[1],
+                                entry.coord_map[0] - waffle_xy[0],
+                            )
+                        else:
+                            yaw = 0.0
+                        view_pose = (entry.coord_map[0], entry.coord_map[1], yaw)
+                        self._log(
+                            "VIEW_POSE 계산 실패, PATROL 좌표로 바로 Nav2 출발")
+                    else:
+                        self._log(f"VIEW_POSE 계산 실패, parent 폐기")
+                        self.last_processed = entry.coord_map
+                        self.current_parent = None
+                        return
                 self.last_processed = entry.coord_map
 
                 # H5.1: 최종 목적지를 A* waypoint 리스트로 변환 -- 한 번에 먼
@@ -725,6 +763,7 @@ class StateMachine:
             early_stop
             and self.check_view_fn is not None
             and self.current_parent is not None
+            and self.current_parent.target_type != TargetType.PATROL
             and self.check_view_fn(self.current_parent.coord_map)
         ):
             self._log("WAYPOINT_CRAWL: 이동 중 시야 확보 -> 조기 종료")

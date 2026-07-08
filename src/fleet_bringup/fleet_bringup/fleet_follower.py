@@ -77,7 +77,7 @@ class FleetFollower(Node):
         self.declare_parameter('peer_separation_weight', 0.35)
         self.declare_parameter('slot_stickiness_bonus', 0.35)
         self.declare_parameter('localization_ready_topic', '/localization_ready')
-        self.declare_parameter('require_localization_ready', True)
+        self.declare_parameter('require_localization_ready', False)
 
         parameter = self.get_parameter
         self.leader_pose_topic = self._absolute(
