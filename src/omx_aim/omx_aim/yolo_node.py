@@ -86,6 +86,9 @@ def bresenham_line(x0: int, y0: int, x1: int, y1: int):
     return cells
 
 
+def wrap_angle(angle: float) -> float:
+    return math.atan2(math.sin(angle), math.cos(angle))
+
 
 # ===========================================================
 # OmxYoloNode
@@ -573,26 +576,59 @@ class OmxYoloNode(Node):
             prev = point
         return total
 
-    def _downsample_path(self, path_xy, spacing_m) -> list:
-        """A* 경로를 spacing_m 간격으로 다운샘플. 마지막 점은 항상 유지."""
+    def _downsample_path(self, path_xy, min_spacing_m, turn_angle_rad) -> list:
+        """A* 경로를 거리 등분이 아니라 누적 회전량 기준으로 나눈다.
+
+        좌우 바퀴가 비대칭이라 회전 중에 실제 궤적이 명령과 크게 벗어나는
+        (호를 그리는) 문제가 있어서, 코너/갈지자처럼 방향이 많이 바뀌는
+        구간은 짧은 hop 으로 잘게 나눠 자주 재평가·보정하게 하고, 방향이
+        안 바뀌는 직선 구간은 waypoint 를 거의 안 찍고 하나의 긴 hop 으로
+        쭉 이어간다(회전이 없으면 사실상 무한정 길게).
+
+        min_spacing_m 은 A* 그리드 특유의 계단식 셀 패턴 때문에 매 셀마다
+        살짝 방향이 바뀌어 waypoint 가 과하게 촘촘히 찍히는 것만 막는 최소
+        간격 바닥값이다. 마지막 점은 항상 유지.
+        """
         if not path_xy:
             return []
-        spacing_m = max(0.05, spacing_m)
+        if len(path_xy) == 1:
+            return list(path_xy)
+
+        min_spacing_m = max(0.05, min_spacing_m)
+        turn_angle_rad = max(0.05, turn_angle_rad)
+
         downsampled = []
-        accumulated = 0.0
-        prev = path_xy[0]
+        accumulated_turn = 0.0
+        dist_since_last = 0.0
+        prev_point = path_xy[0]
+        prev_heading = None
+
         for point in path_xy[1:]:
-            accumulated += math.hypot(point[0] - prev[0], point[1] - prev[1])
-            prev = point
-            if accumulated >= spacing_m:
+            seg_dx = point[0] - prev_point[0]
+            seg_dy = point[1] - prev_point[1]
+            seg_len = math.hypot(seg_dx, seg_dy)
+            dist_since_last += seg_len
+            if seg_len > 1e-6:
+                heading = math.atan2(seg_dy, seg_dx)
+                if prev_heading is not None:
+                    accumulated_turn += abs(wrap_angle(heading - prev_heading))
+                prev_heading = heading
+            prev_point = point
+
+            if (
+                accumulated_turn >= turn_angle_rad
+                and dist_since_last >= min_spacing_m
+            ):
                 downsampled.append(point)
-                accumulated = 0.0
+                accumulated_turn = 0.0
+                dist_since_last = 0.0
+
         if not downsampled or downsampled[-1] != path_xy[-1]:
             downsampled.append(path_xy[-1])
         return downsampled
 
     def plan_waypoints_to(self, start_xy, goal_xy) -> Optional[list]:
-        """H5.1: start_xy -> goal_xy 를 A* + 다운샘플로 waypoint 리스트화.
+        """H5.1: start_xy -> goal_xy 를 A* + 회전 기준 다운샘플로 waypoint화.
 
         state_machine.py 의 plan_waypoints_fn 으로 주입됨.
         Returns: [(x, y), ...] (마지막 원소가 goal_xy 근방) 또는 None(경로 없음).
@@ -603,7 +639,9 @@ class OmxYoloNode(Node):
             return None
         if not path:
             return [goal_xy]
-        return self._downsample_path(path, nav_cfg.waypoint_spacing_m)
+        return self._downsample_path(
+            path, nav_cfg.waypoint_min_spacing_m, nav_cfg.waypoint_turn_angle_rad
+        )
 
     def _view_pose_candidate_score(self, x, y):
         """후보 위치의 footprint 전체가 known/free인지 검사하고 cost를 반환."""

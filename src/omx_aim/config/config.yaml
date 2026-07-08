@@ -210,8 +210,14 @@ nav_crawl:
   astar_allow_unknown: false
   astar_max_iterations: 20000
   astar_search_margin_m: 2.0
-  # 다운샘플된 waypoint 간격 및 "도착"으로 볼 반경(분포)
-  waypoint_spacing_m: 0.6
+  # 거리 등분 대신 누적 회전량 기준으로 waypoint 를 나눔: 회전이 많으면
+  # 짧게(자주 재평가/보정), 회전이 없는 직선 구간은 waypoint 없이 길게.
+  # waypoint_min_spacing_m 은 A* 그리드 계단식 패턴 때문에 매 셀마다
+  # waypoint 가 과하게 촘촘히 찍히지 않게 막는 최소 간격일 뿐(목표 간격
+  # 아님). waypoint_turn_angle_rad 는 이 각도(라디안, 기본 약 35도)만큼
+  # 누적 회전하면 새 waypoint 를 찍는다는 뜻.
+  waypoint_min_spacing_m: 0.25
+  waypoint_turn_angle_rad: 0.6108652381980153
   waypoint_tolerance_m: 0.35
   # 이 주기로 진행 상황/조기 종료(LOS) 재평가
   refresh_period_sec: 0.5

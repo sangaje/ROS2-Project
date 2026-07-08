@@ -155,7 +155,13 @@ class NavCrawlConfig:
     astar_allow_unknown: bool = False
     astar_max_iterations: int = 20000
     astar_search_margin_m: float = 2.0
-    waypoint_spacing_m: float = 0.6
+    # 거리 등분이 아니라 누적 회전량 기준으로 waypoint 를 나눈다: 회전이
+    # 많은 구간(코너/갈지자)은 짧게, 직선 구간은 waypoint 없이 쭉 길게.
+    # waypoint_min_spacing_m 은 A* 그리드 계단식 패턴 때문에 매 셀마다
+    # waypoint 가 과하게 촘촘히 찍히지 않게 막는 최소 간격일 뿐, 목표
+    # 간격이 아니다.
+    waypoint_min_spacing_m: float = 0.25
+    waypoint_turn_angle_rad: float = math.radians(35.0)
     waypoint_tolerance_m: float = 0.35
     refresh_period_sec: float = 0.5
     reachability_max_ratio: float = 1.6
