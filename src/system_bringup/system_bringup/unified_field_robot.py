@@ -29,7 +29,7 @@ from nav_msgs.msg import Odometry
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 
 
 class Role(Enum):
@@ -82,6 +82,8 @@ class UnifiedFieldRobot(Node):
         self.declare_parameter('enable_exploration', True)
         self.declare_parameter('leader_pose_topic', '/leader_pose')
         self.declare_parameter('self_pose_topic', '/burger_pose')
+        self.declare_parameter('localization_ready_topic', '/localization_ready')
+        self.declare_parameter('require_localization_ready', True)
         self.declare_parameter('role_command_topic', '/fleet/field_robot_role_cmd')
         self.declare_parameter('fleet_role_topic', '/fleet/scout_role')
         self.declare_parameter('status_topic', '/fleet/field_robot_status')
@@ -117,6 +119,8 @@ class UnifiedFieldRobot(Node):
         self.enable_exploration = bool(get('enable_exploration').value)
         self.leader_pose_topic = str(get('leader_pose_topic').value)
         self.self_pose_topic = str(get('self_pose_topic').value)
+        self.localization_ready_topic = str(get('localization_ready_topic').value)
+        self.require_localization_ready = bool(get('require_localization_ready').value)
         self.role_command_topic = str(get('role_command_topic').value)
         self.fleet_role_topic = str(get('fleet_role_topic').value)
         self.status_topic = str(get('status_topic').value)
@@ -164,12 +168,16 @@ class UnifiedFieldRobot(Node):
         self.create_subscription(PoseStamped, self.self_pose_topic, self._on_self_pose, 10)
         self.create_subscription(PoseWithCovarianceStamped, self.amcl_pose_topic, self._on_amcl, 10)
         self.create_subscription(Odometry, self.odom_topic, self._on_odom, 10)
+        self.create_subscription(
+            Bool, self.localization_ready_topic, self._on_localization_ready, latched_qos
+        )
 
         self.epoch = 0
         self.goal_epoch = 0
         self.active_goal_handle = None
         self.leader_pose: Optional[PoseStamped] = None
         self.self_pose: Optional[PoseStamped] = None
+        self.localization_ready = False
         self.last_follow_goal_xy: Optional[tuple[float, float]] = None
         self.last_follow_goal_wall = -1.0e9
         self.recovery_target: Optional[PoseStamped] = None
@@ -202,6 +210,9 @@ class UnifiedFieldRobot(Node):
 
     def _on_self_pose(self, msg: PoseStamped) -> None:
         self.self_pose = msg
+
+    def _on_localization_ready(self, msg: Bool) -> None:
+        self.localization_ready = bool(msg.data)
 
     def _on_amcl(self, msg: PoseWithCovarianceStamped) -> None:
         cov = msg.pose.covariance
@@ -264,6 +275,14 @@ class UnifiedFieldRobot(Node):
 
     def _tick_follow(self) -> None:
         if not self.enable_follow or self.leader_pose is None:
+            return
+        if self.require_localization_ready and not self.localization_ready:
+            # Without this, FOLLOWER starts sending Nav2 goals the instant
+            # it has a leader pose, before this robot's own AMCL has
+            # converged (global_localize_kickstart's spin state machine
+            # hasn't finished/published /localization_ready yet). Nav2
+            # then acts on a bad pose estimate, and the reported position
+            # "teleports" once AMCL catches up or re-converges elsewhere.
             return
         now = self._now()
         if now - self.last_follow_goal_wall < self.follow_goal_period:
