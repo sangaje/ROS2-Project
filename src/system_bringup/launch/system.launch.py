@@ -349,6 +349,13 @@ def generate_launch_description():
                         'recovery_arrival_tolerance_m': float(
                             scout_takeover_arrival_tolerance_m.perform(context)
                         ),
+                        'max_xy_covariance': 0.22,
+                        'max_yaw_covariance': 0.16,
+                        'spin_speed_rad_s': 0.40,
+                        'spin_target_angle_rad': 7.10,
+                        'spin_timeout_sec': 42.0,
+                        'settle_duration_sec': 3.0,
+                        'max_spin_retries': 3,
                         'cmd_vel_topic': '/cmd_vel',
                         'use_stamped_cmd_vel': True,
                     }],

@@ -200,6 +200,7 @@ def generate_launch_description():
 
         amcl_enabled = launch_bool(enable_amcl.perform(context))
         auto = launch_bool(auto_localize.perform(context))
+        require_ready_for_follow = bool(amcl_enabled and auto and not simulation)
 
         amcl = None
         localization_lifecycle = None
@@ -311,12 +312,27 @@ def generate_launch_description():
                 parameters=[{
                     'use_sim_time': simulation,
                     'spin_enabled': not simulation,
-                    'spin_speed_rad_s': 0.35,
+                    'spin_speed_rad_s': 0.40,
+                    'spin_target_angle_rad': 7.10,
+                    'spin_timeout_sec': 42.0,
+                    'spin_sensor_dropout_grace_sec': 1.5,
+                    'settle_duration_sec': 3.0,
+                    'require_valid_map': True,
+                    'min_known_map_cells': 100,
+                    'require_scan_before_spin': True,
+                    'require_odom_before_spin': True,
+                    'require_amcl_before_spin': True,
+                    'max_scan_age_sec': 1.2,
+                    'max_odom_age_sec': 1.2,
                     'cmd_vel_topic': '/cmd_vel',
                     'use_stamped_cmd_vel': True,
                     'amcl_pose_topic': '/amcl_pose',
-                    'localization_cov_xy_threshold': 0.35,
-                    'localization_cov_yaw_threshold': 0.25,
+                    'localization_cov_xy_threshold': 0.22,
+                    'localization_cov_yaw_threshold': 0.16,
+                    'localization_stable_duration_sec': 2.5,
+                    'localization_check_timeout_sec': 9.0,
+                    'max_spin_retries': 3,
+                    'force_spin_after_sec': 14.0,
                 }],
                 env=process_env,
                 respawn=True,
@@ -343,9 +359,7 @@ def generate_launch_description():
                 'use_sim_time': simulation,
                 'follow_distance': float(follow_distance.perform(context)),
                 'start_following': True,
-                # Do not hold Nav2 goals behind the localization spin; AMCL can
-                # keep refining while the robot starts moving.
-                'require_localization_ready': False,
+                'require_localization_ready': require_ready_for_follow,
             }],
             env=process_env,
             respawn=True,

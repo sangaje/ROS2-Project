@@ -129,6 +129,7 @@ class GlobalLocalizeKickstart(Node):
         self.declare_parameter('spin_target_angle_rad', 6.45)
         self.declare_parameter('spin_margin_rad', 0.0)
         self.declare_parameter('spin_timeout_sec', 30.0)
+        self.declare_parameter('spin_sensor_dropout_grace_sec', 1.2)
         self.declare_parameter('settle_duration_sec', 2.0)
         # 좌우 바퀴 응답이 비대칭인 로봇은 angular.z 만 명령해도 제자리
         # 회전이 아니라 호를 그리며 실제로 이동한다 -- "제자리" 스핀이라는
@@ -197,6 +198,9 @@ class GlobalLocalizeKickstart(Node):
         self.spin_target_angle = max(0.0, float(get('spin_target_angle_rad').value))
         self.spin_margin = max(0.0, float(get('spin_margin_rad').value))
         self.spin_timeout_sec = max(1.0, float(get('spin_timeout_sec').value))
+        self.spin_sensor_dropout_grace_sec = max(
+            0.0, float(get('spin_sensor_dropout_grace_sec').value)
+        )
         self.settle_duration_sec = max(0.0, float(get('settle_duration_sec').value))
         self.spin_max_drift_m = max(0.05, float(get('spin_max_drift_m').value))
 
@@ -283,6 +287,7 @@ class GlobalLocalizeKickstart(Node):
         self.spin_direction = 1.0
         self.accumulated_yaw = 0.0
         self._last_progress_octant = -1
+        self._last_spin_dropout_log_wall = -1.0e9
         self.spin_start_wall = 0.0
         self.settle_start_wall = 0.0
         self.check_start_wall = 0.0
@@ -398,6 +403,17 @@ class GlobalLocalizeKickstart(Node):
         if self.last_odom_wall is None or self.last_odom_yaw is None:
             return False
         return (self._now() - self.last_odom_wall) <= self.max_odom_age_sec
+
+    def _spin_sensor_outage_is_brief(self) -> bool:
+        if self.last_scan_wall is None or self.last_odom_wall is None:
+            return False
+        now = self._now()
+        max_scan_age = self.max_scan_age_sec + self.spin_sensor_dropout_grace_sec
+        max_odom_age = self.max_odom_age_sec + self.spin_sensor_dropout_grace_sec
+        return (
+            now - self.last_scan_wall <= max_scan_age
+            and now - self.last_odom_wall <= max_odom_age
+        )
 
     def _tf_ok(self) -> bool:
         try:
@@ -738,6 +754,16 @@ class GlobalLocalizeKickstart(Node):
 
     def _tick_spin(self) -> None:
         if not self._scan_fresh() or not self._odom_fresh():
+            if self._spin_sensor_outage_is_brief():
+                now = self._now()
+                if now - self._last_spin_dropout_log_wall >= 2.0:
+                    self.get_logger().warning(
+                        'GLOBAL_LOCALIZE_SPIN_SENSOR_DROPOUT_GRACE | '
+                        'scan/odom briefly stale; keeping spin command active'
+                    )
+                    self._last_spin_dropout_log_wall = now
+                self._publish_twist(self.spin_direction * self.spin_speed)
+                return
             self._publish_twist(0.0)
             if not self._scan_fresh():
                 fallback = State.WAIT_SCAN

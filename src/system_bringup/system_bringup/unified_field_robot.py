@@ -7,7 +7,8 @@ goal sources:
 * FOLLOWER -> follow leader pose with Nav2.
 * ACTIVE_SCOUT -> publish active-scout heartbeat and run exploration command.
 * RECOVERY_NAVIGATING -> cancel the previous role and navigate to failure pose.
-* LOCALIZATION_SPIN -> own cmd_vel until AMCL covariance is good enough.
+* LOCALIZATION_SPIN -> own cmd_vel for a verified in-place rotation.
+* LOCALIZATION_SETTLE -> wait briefly so AMCL can settle before checking.
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ class Role(Enum):
     ARRIVED_AT_FAILURE_POSE = 'ARRIVED_AT_FAILURE_POSE'
     LOCALIZATION_CHECK = 'LOCALIZATION_CHECK'
     LOCALIZATION_SPIN = 'LOCALIZATION_SPIN'
+    LOCALIZATION_SETTLE = 'LOCALIZATION_SETTLE'
     FAILED = 'FAILED'
 
 
@@ -98,14 +100,14 @@ class UnifiedFieldRobot(Node):
         self.declare_parameter('follow_goal_period_sec', 1.0)
         self.declare_parameter('follow_goal_update_distance_m', 0.25)
         self.declare_parameter('recovery_arrival_tolerance_m', 0.40)
-        self.declare_parameter('max_xy_covariance', 0.35)
-        self.declare_parameter('max_yaw_covariance', 0.25)
+        self.declare_parameter('max_xy_covariance', 0.22)
+        self.declare_parameter('max_yaw_covariance', 0.16)
         self.declare_parameter('max_amcl_pose_age_sec', 3.0)
-        self.declare_parameter('spin_speed_rad_s', 0.35)
-        self.declare_parameter('spin_target_angle_rad', 6.45)
-        self.declare_parameter('spin_timeout_sec', 30.0)
+        self.declare_parameter('spin_speed_rad_s', 0.40)
+        self.declare_parameter('spin_target_angle_rad', 7.10)
+        self.declare_parameter('spin_timeout_sec', 42.0)
         self.declare_parameter('settle_duration_sec', 2.0)
-        self.declare_parameter('max_spin_retries', 2)
+        self.declare_parameter('max_spin_retries', 3)
         self.declare_parameter('heartbeat_period_sec', 0.5)
         self.declare_parameter('exploration_command', '')
 
@@ -271,6 +273,8 @@ class UnifiedFieldRobot(Node):
             self._tick_localization_check()
         elif self.role == Role.LOCALIZATION_SPIN:
             self._tick_spin()
+        elif self.role == Role.LOCALIZATION_SETTLE:
+            self._tick_localization_settle()
         self._publish_status()
 
     def _tick_follow(self) -> None:
@@ -335,13 +339,20 @@ class UnifiedFieldRobot(Node):
         if self.accumulated_yaw >= self.spin_target:
             self._publish_twist(0.0)
             self.settle_start_wall = self._now()
-            self._enter_role(Role.LOCALIZATION_CHECK, reason='spin_complete')
+            self._enter_role(Role.LOCALIZATION_SETTLE, reason='spin_complete')
             return
         if elapsed >= self.spin_timeout:
             self._publish_twist(0.0)
-            self._enter_role(Role.LOCALIZATION_CHECK, reason='spin_timeout')
+            self.settle_start_wall = self._now()
+            self._enter_role(Role.LOCALIZATION_SETTLE, reason='spin_timeout')
             return
         self._publish_twist(self.spin_direction * self.spin_speed)
+
+    def _tick_localization_settle(self) -> None:
+        self._publish_twist(0.0)
+        if self._now() - self.settle_start_wall < self.settle_duration:
+            return
+        self._enter_role(Role.LOCALIZATION_CHECK, reason='settled')
 
     def _enter_role(self, role: Role, reason: str) -> None:
         if role == self.role and reason != 'startup':
