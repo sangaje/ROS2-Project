@@ -204,7 +204,7 @@ def generate_launch_description():
             'patrol_max_candidate_cells', default_value='2000',
             description='Maximum top-risk cells evaluated by patrol_planner NMS per cycle.'),
         DeclareLaunchArgument(
-            'debug_stream', default_value='false',
+            'debug_stream', default_value='true',
             description='yolo_node 의 Flask MJPEG 디버그 스트림 켜기'),
         DeclareLaunchArgument(
             'debug_port', default_value='8080',

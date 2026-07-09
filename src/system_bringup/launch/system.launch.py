@@ -1366,9 +1366,12 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'debug_stream',
-            default_value='false',
+            default_value='true',
             choices=['true', 'false'],
-            description='Leader role only: enable the OMX MJPEG debug stream.',
+            description=(
+                'Leader role only: enable the OMX MJPEG debug stream shown '
+                'inside the integrated dashboard.'
+            ),
         ),
         DeclareLaunchArgument(
             'debug_port',
@@ -1379,7 +1382,7 @@ def generate_launch_description():
             'unified_dashboard',
             default_value='true',
             choices=['true', 'false'],
-            description='Leader role only: run the integrated leader dashboard when debug_stream is true.',
+            description='Leader role only: run the integrated leader dashboard.',
         ),
         DeclareLaunchArgument(
             'dashboard_host',
