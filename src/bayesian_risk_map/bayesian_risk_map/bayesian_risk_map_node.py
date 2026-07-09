@@ -15,7 +15,7 @@ from rclpy.node import Node
 from rclpy.duration import Duration
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy, HistoryPolicy
 
-from std_msgs.msg import Bool, ColorRGBA, String
+from std_msgs.msg import Bool, ColorRGBA, Float32, String
 from sensor_msgs.msg import CompressedImage, Image
 from nav_msgs.msg import OccupancyGrid
 from geometry_msgs.msg import PointStamped, Point, PoseStamped
@@ -371,8 +371,18 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.leader_detected_topic = str(
             self.declare_parameter('leader_detected_topic', '/omx/target_detected').value
         )
+        # The leader's actual camera is the OMX pan/tilt head, not the
+        # robot's own front -- narrower FOV than the scout's own camera,
+        # and it looks wherever the arm is currently pointed, not
+        # wherever the robot base happens to be facing.
         self.leader_camera_hfov_deg = float(
-            self.declare_parameter('leader_camera_hfov_deg', 62.0).value
+            self.declare_parameter('leader_camera_hfov_deg', 35.0).value
+        )
+        self.leader_camera_yaw_topic = str(
+            self.declare_parameter('leader_camera_yaw_topic', '/omx/camera_yaw').value
+        )
+        self.leader_camera_yaw_max_age_sec = float(
+            self.declare_parameter('leader_camera_yaw_max_age_sec', 1.0).value
         )
         self.leader_pose_max_age_sec = float(
             self.declare_parameter('leader_pose_max_age_sec', 2.0).value
@@ -447,6 +457,8 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.leader_pose_wall = None
         self.leader_detected = False
         self.leader_detected_wall = None
+        self.leader_camera_yaw = None
+        self.leader_camera_yaw_wall = None
 
         self.visual_seen_map = None
         self.region_id_map = None
@@ -612,6 +624,9 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             )
             self.leader_detected_sub = self.create_subscription(
                 Bool, self.leader_detected_topic, self.on_leader_detected, 10
+            )
+            self.leader_camera_yaw_sub = self.create_subscription(
+                Float32, self.leader_camera_yaw_topic, self.on_leader_camera_yaw, 10
             )
 
         self.pub_risk = self.create_publisher(OccupancyGrid, '/risk/risk_map', self.qos_grid_pub)
@@ -1117,7 +1132,20 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.leader_detected = bool(msg.data)
         self.leader_detected_wall = self.get_clock().now().nanoseconds * 1e-9
 
+    def on_leader_camera_yaw(self, msg: Float32) -> None:
+        self.leader_camera_yaw = float(msg.data)
+        self.leader_camera_yaw_wall = self.get_clock().now().nanoseconds * 1e-9
+
     def get_leader_pose(self) -> Optional[Tuple[float, float, float]]:
+        """Leader's (x, y, yaw) for visibility raycasting -- yaw is where
+        the OMX camera is actually pointed, not the robot base heading.
+        /leader_pose only gives the base pose; the camera pans
+        independently on top of it, so its yaw must be added on top of
+        the base yaw. Falls back to base yaw alone if the camera-yaw
+        feed is missing or stale, rather than blocking entirely -- a
+        forward-facing guess is still better than no leader contribution
+        at all, and simply wrong if the arm happens to be panned away.
+        """
         if self.leader_pose_msg is None or self.leader_pose_wall is None:
             return None
         now = self.get_clock().now().nanoseconds * 1e-9
@@ -1125,7 +1153,15 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             return None
         p = self.leader_pose_msg.pose.position
         q = self.leader_pose_msg.pose.orientation
-        return (float(p.x), float(p.y), yaw_from_quaternion(q))
+        base_yaw = yaw_from_quaternion(q)
+        camera_offset = 0.0
+        if (
+            self.leader_camera_yaw is not None
+            and self.leader_camera_yaw_wall is not None
+            and now - self.leader_camera_yaw_wall <= self.leader_camera_yaw_max_age_sec
+        ):
+            camera_offset = self.leader_camera_yaw
+        return (float(p.x), float(p.y), base_yaw + camera_offset)
 
     def leader_currently_detecting(self) -> bool:
         if self.leader_detected_wall is None:

@@ -130,8 +130,18 @@ class OmxController:
 
     def scan_sweep(self, now: float, half_angle_deg: float,
                    period_sec: float):
-        """SCANNING 중에도 pan을 좌/우 끝점으로 번갈아 움직인다."""
-        period_sec = max(0.1, float(period_sec))
+        """SCANNING 중에도 pan을 좌우로 연속적으로(호를 그리며) 훑는다.
+
+        예전 구현은 half_period 마다 목표를 반대쪽 끝으로 순간 이동시켰다
+        -- 서보가 실제로 그 끝까지 도달하기 전에 목표가 또 뒤집히면
+        중간에서 방향이 꺾여서 period_sec 를 아무리 늘려도(서보 속도가
+        그에 못 미치면) 절대 끝까지 못 가는 경우가 있었다. 대신 매 tick
+        마다 목표 각도를 삼각파로 조금씩(연속적으로) 옮겨서 서보가 항상
+        "바로 앞"의 목표를 매끄럽게 뒤쫓게 한다 -- 서보가 못 따라가도
+        방향은 위상에 따라서만 바뀌므로 순간이동/중간에 꺾이는 문제
+        자체가 없고, 늦게라도 결국 양 끝까지 도달한다.
+        """
+        period_sec = max(0.5, float(period_sec))
         half_angle = math.radians(max(0.0, float(half_angle_deg)))
 
         if self._scan_sweep_start_t is None:
@@ -139,10 +149,10 @@ class OmxController:
             self._scan_sweep_center_yaw = self.yaw
             self._scan_sweep_center_pitch = self.pitch
 
-        half_period = max(0.05, period_sec * 0.5)
-        step = int((now - self._scan_sweep_start_t) / half_period)
-        direction = 1.0 if step % 2 == 0 else -1.0
-        yaw = self._scan_sweep_center_yaw + direction * half_angle
+        elapsed = max(0.0, now - self._scan_sweep_start_t)
+        phase = (elapsed % period_sec) / period_sec  # 0..1, 한 바퀴(왕복) 주기
+        triangle = 2.0 * abs(2.0 * phase - 1.0) - 1.0  # +1 -> -1 -> +1 삼각파
+        yaw = self._scan_sweep_center_yaw + triangle * half_angle
         self._write_angles(yaw, self._scan_sweep_center_pitch)
 
     # ----- 조준 -----

@@ -278,6 +278,10 @@ def write_member_bridge_configs(
             'std_msgs/msg/Bool',
             profile=qos(reliability='best_effort', durability='volatile', depth=5),
         ),
+        '/omx/camera_yaw': topic(
+            'std_msgs/msg/Float32',
+            profile=qos(reliability='best_effort', durability='volatile', depth=5),
+        ),
         '/member_goal_pose': topic('geometry_msgs/msg/PoseStamped'),
         '/fleet/coordination_status': topic(
             'std_msgs/msg/String',

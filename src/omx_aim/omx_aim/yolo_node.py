@@ -219,6 +219,11 @@ class OmxYoloNode(Node):
         self.pub_target_lost = self.create_publisher(PointStamped, '/omx/target_lost', 10)
         self.pub_target_blocked = self.create_publisher(PointStamped, '/omx/target_blocked', 10)
         self.pub_progress = self.create_publisher(Float32, '/omx/aim_progress', 10)
+        # 카메라(팬/틸트)가 로봇 base 정면 기준으로 지금 어느 방향을
+        # 보고 있는지 -- risk map 의 leader-visibility fusion 등 다른
+        # 도메인 소비자가 "젯슨의 시야 = 로봇 정면"으로 잘못 가정하지
+        # 않도록 실제 조준 방향을 별도로 발행한다.
+        self.pub_camera_yaw = self.create_publisher(Float32, '/omx/camera_yaw', 10)
         self.pub_queue_size = self.create_publisher(Int32, '/omx/queue_size', 10)
         self.pub_patrol_complete = self.create_publisher(Empty, '/omx/patrol_complete', 10)
         self.pub_queue_markers = self.create_publisher(
@@ -1059,6 +1064,12 @@ class OmxYoloNode(Node):
         msg.position = list(positions.values())
         self.pub_joint.publish(msg)
 
+    def publish_camera_yaw(self):
+        """현재 카메라(팬) 각도 -- arm_base(=로봇 정면) 기준 라디안."""
+        msg = Float32()
+        msg.data = float(self.ctrl.yaw)
+        self.pub_camera_yaw.publish(msg)
+
     def publish_progress(self, p):
         msg = Float32()
         msg.data = float(p)
@@ -1451,6 +1462,7 @@ class OmxYoloNode(Node):
         if error_norm is not None:
             self.publish_error(error_norm[0], error_norm[1])
         self.publish_joint_state()
+        self.publish_camera_yaw()
         self.publish_progress(action.get('confirm_progress', 0.0))
         self.publish_state_change()
         self.publish_waypoint_route()
