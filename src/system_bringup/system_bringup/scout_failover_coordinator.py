@@ -56,6 +56,7 @@ class ScoutFailoverCoordinator(Node):
         self.declare_parameter('leader_pose_topic', '/leader_pose')
         self.declare_parameter('follower_pose_topic', '/burger_pose')
         self.declare_parameter('leader_goal_topic', '/fleet/leader_coord_goal')
+        self.declare_parameter('leader_cancel_topic', '/fleet/leader_nav_cancel')
         self.declare_parameter('follow_command_topic', '/fleet/follow_command')
         self.declare_parameter('role_command_topic', '/fleet/field_robot_role_cmd')
         self.declare_parameter('field_robot_status_topic', '/fleet/field_robot_status')
@@ -65,6 +66,7 @@ class ScoutFailoverCoordinator(Node):
         self.declare_parameter('scout_pose_timeout_sec', 5.0)
         self.declare_parameter('startup_grace_sec', 5.0)
         self.declare_parameter('leader_recovery_standoff_m', 0.70)
+        self.declare_parameter('leader_failure_arrival_tolerance_m', 0.80)
         self.declare_parameter('follower_recovery_standoff_m', 0.15)
         self.declare_parameter('scout_takeover_arrival_tolerance_m', 0.40)
         self.declare_parameter('recovery_goal_republish_sec', 2.0)
@@ -81,6 +83,7 @@ class ScoutFailoverCoordinator(Node):
         self.leader_pose_topic = str(get('leader_pose_topic').value)
         self.follower_pose_topic = str(get('follower_pose_topic').value)
         self.leader_goal_topic = str(get('leader_goal_topic').value)
+        self.leader_cancel_topic = str(get('leader_cancel_topic').value)
         self.follow_command_topic = str(get('follow_command_topic').value)
         self.role_command_topic = str(get('role_command_topic').value)
         self.field_robot_status_topic = str(get('field_robot_status_topic').value)
@@ -90,6 +93,9 @@ class ScoutFailoverCoordinator(Node):
         self.pose_timeout = max(0.2, float(get('scout_pose_timeout_sec').value))
         self.startup_grace = max(0.0, float(get('startup_grace_sec').value))
         self.leader_standoff = max(0.0, float(get('leader_recovery_standoff_m').value))
+        self.leader_arrival_tolerance = max(
+            0.05, float(get('leader_failure_arrival_tolerance_m').value)
+        )
         self.follower_standoff = max(0.0, float(get('follower_recovery_standoff_m').value))
         self.arrival_tolerance = max(
             0.05, float(get('scout_takeover_arrival_tolerance_m').value)
@@ -107,6 +113,7 @@ class ScoutFailoverCoordinator(Node):
         )
 
         self.leader_goal_pub = self.create_publisher(PoseStamped, self.leader_goal_topic, 10)
+        self.leader_cancel_pub = self.create_publisher(Bool, self.leader_cancel_topic, latched_qos)
         self.follow_command_pub = self.create_publisher(String, self.follow_command_topic, latched_qos)
         self.role_command_pub = self.create_publisher(String, self.role_command_topic, latched_qos)
         self.role_pub = self.create_publisher(String, self.role_topic, latched_qos)
@@ -137,6 +144,7 @@ class ScoutFailoverCoordinator(Node):
         self.last_recovery_goal_wall = -1.0e9
         self.leader_goal: Optional[PoseStamped] = None
         self.follower_goal: Optional[PoseStamped] = None
+        self.leader_recovery_position_reached = False
 
         self.create_timer(0.2, self._tick)
         self._publish_state()
@@ -263,6 +271,7 @@ class ScoutFailoverCoordinator(Node):
         self.scout_epoch += 1
         self.leader_goal = self._offset_pose(self.failure_pose, self.leader_standoff)
         self.follower_goal = self._offset_pose(self.failure_pose, self.follower_standoff)
+        self.leader_recovery_position_reached = self._leader_already_near_failure()
         self.recovery_goal_publish_count = 0
         self.last_recovery_goal_wall = -1.0e9
         self.get_logger().warning(
@@ -278,6 +287,7 @@ class ScoutFailoverCoordinator(Node):
         self._trigger_failover()
 
     def _trigger_failover(self) -> None:
+        self._cancel_leader_goal()
         command = String()
         command.data = 'PAUSE'
         self.follow_command_pub.publish(command)
@@ -295,15 +305,22 @@ class ScoutFailoverCoordinator(Node):
             and self.recovery_goal_publish_count < self.max_goal_republishes
         )
         if should_publish:
-            self.leader_goal_pub.publish(self.leader_goal)
+            if self.leader_recovery_position_reached:
+                self.get_logger().warning(
+                    '[FAILOVER] LEADER_RECOVERY_POSITION_REACHED | '
+                    'already inside failure tolerance; recovery goal skipped'
+                )
+            else:
+                self.leader_goal_pub.publish(self.leader_goal)
             self._publish_recovery_role_command()
             self.recovery_goal_publish_count += 1
             self.last_recovery_goal_wall = now
-            self.get_logger().warning(
-                '[FAILOVER] LEADER_RECOVERY_GOAL_SENT | '
-                f'x={self.leader_goal.pose.position.x:.3f} '
-                f'y={self.leader_goal.pose.position.y:.3f}'
-            )
+            if not self.leader_recovery_position_reached:
+                self.get_logger().warning(
+                    '[FAILOVER] LEADER_RECOVERY_GOAL_SENT | '
+                    f'x={self.leader_goal.pose.position.x:.3f} '
+                    f'y={self.leader_goal.pose.position.y:.3f}'
+                )
             self.get_logger().warning(
                 '[FAILOVER] FOLLOWER_RECOVERY_ROLE_SENT | '
                 f'x={self.follower_goal.pose.position.x:.3f} '
@@ -320,6 +337,22 @@ class ScoutFailoverCoordinator(Node):
         dx = self.follower_pose.pose.position.x - self.failure_pose.pose.position.x
         dy = self.follower_pose.pose.position.y - self.failure_pose.pose.position.y
         return math.hypot(dx, dy) <= self.arrival_tolerance
+
+    def _leader_already_near_failure(self) -> bool:
+        if self.leader_pose is None or self.failure_pose is None:
+            return False
+        dx = self.leader_pose.pose.position.x - self.failure_pose.pose.position.x
+        dy = self.leader_pose.pose.position.y - self.failure_pose.pose.position.y
+        distance = math.hypot(dx, dy)
+        return distance <= self.leader_arrival_tolerance
+
+    def _cancel_leader_goal(self) -> None:
+        msg = Bool()
+        msg.data = True
+        self.leader_cancel_pub.publish(msg)
+        self.get_logger().warning(
+            f'[FAILOVER] LEADER_NAV_CANCEL | topic={self.leader_cancel_topic}'
+        )
 
     def _publish_recovery_role_command(self) -> None:
         if self.follower_goal is None or self.failure_pose is None:

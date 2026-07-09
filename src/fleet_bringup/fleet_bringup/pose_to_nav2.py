@@ -86,6 +86,8 @@ class PoseToNav2Action(Node):
         self.localization_ready_topic = self._abs(str(
             _safe_declare(self, 'localization_ready_topic', '/localization_ready')
         ))
+        cancel_topic = str(_safe_declare(self, 'cancel_topic', '')).strip()
+        self.cancel_topic = self._abs(cancel_topic) if cancel_topic else ''
 
         self.client: ActionClient = ActionClient(
             self, NavigateToPose, self.navigate_action
@@ -116,6 +118,19 @@ class PoseToNav2Action(Node):
                 self._on_localization_ready,
                 latched_qos,
             )
+        if self.cancel_topic:
+            cancel_qos = QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                history=HistoryPolicy.KEEP_LAST,
+            )
+            self.create_subscription(
+                Bool,
+                self.cancel_topic,
+                self._on_cancel,
+                cancel_qos,
+            )
         self.current_goal_handle = None
         self.current_goal_id = 0
         self.pending_goal: Optional[PoseStamped] = None
@@ -136,7 +151,8 @@ class PoseToNav2Action(Node):
             f'cancel_previous={self.cancel_previous_goal} '
             f'wait_lifecycle={self.wait_for_lifecycle_active} '
             f'require_localization_ready={self.require_localization_ready} '
-            f'localization_ready_topic={self.localization_ready_topic}'
+            f'localization_ready_topic={self.localization_ready_topic} '
+            f'cancel_topic={self.cancel_topic or "disabled"}'
         )
 
     @staticmethod
@@ -165,6 +181,23 @@ class PoseToNav2Action(Node):
             )
             self.retry_not_before = -1.0e9
             self._try_send_pending()
+
+    def _on_cancel(self, msg: Bool) -> None:
+        if not msg.data:
+            return
+        self.pending_goal = None
+        if self.current_goal_handle is None:
+            self.get_logger().info(
+                f'NAV2_GOAL_CANCEL_REQUEST_EMPTY | topic={self.cancel_topic}'
+            )
+            return
+        try:
+            self.current_goal_handle.cancel_goal_async()
+            self.get_logger().warn(
+                f'NAV2_GOAL_CANCEL_REQUESTED | topic={self.cancel_topic}'
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f'NAV2_GOAL_CANCEL_FAILED | {exc}')
 
     def _try_send_pending(self) -> None:
         if self.pending_goal is None:

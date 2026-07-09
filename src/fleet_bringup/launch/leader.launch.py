@@ -323,6 +323,7 @@ def generate_launch_description():
                     parameters=[{
                         'use_sim_time': simulation,
                         'goal_pose_topic': '/fleet/leader_coord_goal',
+                        'cancel_topic': '/fleet/leader_nav_cancel',
                     }],
                     env=process_env,
                 ),
@@ -348,6 +349,7 @@ def generate_launch_description():
                     'start_nav2': start_nav2.perform(context),
                     'nav2_params_file': nav2_params,
                     'goal_pose_topic': '/fleet/leader_coord_goal',
+                    'cancel_topic': '/fleet/leader_nav_cancel',
                     'goal_proxy_name': 'leader_goal_arbiter_output',
                     'nav_delay_sec': nav_delay_sec,
                     'lifecycle_delay_sec': lifecycle_delay_sec,

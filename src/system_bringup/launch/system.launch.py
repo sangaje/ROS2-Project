@@ -97,7 +97,32 @@ def generate_launch_description():
     scout_failure_confirm_sec = LaunchConfiguration('scout_failure_confirm_sec')
     scout_pose_topic = LaunchConfiguration('scout_pose_topic')
     scout_pose_timeout_sec = LaunchConfiguration('scout_pose_timeout_sec')
+    enable_leader_shadow_follow = LaunchConfiguration('enable_leader_shadow_follow')
+    leader_shadow_follow_distance_m = LaunchConfiguration('leader_shadow_follow_distance_m')
+    leader_shadow_stop_distance_m = LaunchConfiguration('leader_shadow_stop_distance_m')
+    leader_shadow_resume_distance_m = LaunchConfiguration('leader_shadow_resume_distance_m')
+    leader_shadow_far_distance_m = LaunchConfiguration('leader_shadow_far_distance_m')
+    leader_shadow_max_linear_vel = LaunchConfiguration('leader_shadow_max_linear_vel')
+    leader_shadow_max_angular_vel = LaunchConfiguration('leader_shadow_max_angular_vel')
+    leader_shadow_goal_update_period_sec = LaunchConfiguration(
+        'leader_shadow_goal_update_period_sec'
+    )
+    leader_shadow_goal_min_change_m = LaunchConfiguration(
+        'leader_shadow_goal_min_change_m'
+    )
+    leader_shadow_heading_min_motion_m = LaunchConfiguration(
+        'leader_shadow_heading_min_motion_m'
+    )
+    enable_leader_continuous_scan = LaunchConfiguration(
+        'enable_leader_continuous_scan'
+    )
+    leader_scan_fov_deg = LaunchConfiguration('leader_scan_fov_deg')
+    leader_scan_update_rate_hz = LaunchConfiguration('leader_scan_update_rate_hz')
+    leader_scan_timeout_sec = LaunchConfiguration('leader_scan_timeout_sec')
     leader_recovery_standoff_m = LaunchConfiguration('leader_recovery_standoff_m')
+    leader_failure_arrival_tolerance_m = LaunchConfiguration(
+        'leader_failure_arrival_tolerance_m'
+    )
     follower_recovery_standoff_m = LaunchConfiguration('follower_recovery_standoff_m')
     scout_takeover_arrival_tolerance_m = LaunchConfiguration(
         'scout_takeover_arrival_tolerance_m'
@@ -527,6 +552,76 @@ def generate_launch_description():
                         'debug_port': debug_port.perform(context),
                     }.items(),
                 ))
+            if launch_bool(enable_leader_shadow_follow.perform(context)):
+                actions.append(TimerAction(
+                    period=9.0,
+                    actions=[Node(
+                        package='system_bringup',
+                        executable='leader_shadow_follow',
+                        name='leader_shadow_follow',
+                        output='screen',
+                        parameters=[{
+                            'enable_leader_shadow_follow': True,
+                            'leader_pose_topic': '/leader_pose',
+                            'active_scout_pose_topic': scout_pose_topic.perform(context),
+                            'follower_scout_pose_topic': '/burger_pose',
+                            'leader_goal_topic': '/fleet/leader_coord_goal',
+                            'leader_cancel_topic': '/fleet/leader_nav_cancel',
+                            'map_topic': '/map',
+                            'failover_state_topic': '/failover/state',
+                            'active_scout_id_topic': '/failover/active_scout_id',
+                            'active_scout_robot_name': active_scout_robot_name.perform(context),
+                            'follower_robot_name': follower_robot_name.perform(context),
+                            'scout_pose_timeout_sec': float(
+                                scout_pose_timeout_sec.perform(context)
+                            ),
+                            'startup_grace_sec': 8.0,
+                            'leader_shadow_follow_distance_m': float(
+                                leader_shadow_follow_distance_m.perform(context)
+                            ),
+                            'leader_shadow_stop_distance_m': float(
+                                leader_shadow_stop_distance_m.perform(context)
+                            ),
+                            'leader_shadow_resume_distance_m': float(
+                                leader_shadow_resume_distance_m.perform(context)
+                            ),
+                            'leader_shadow_far_distance_m': float(
+                                leader_shadow_far_distance_m.perform(context)
+                            ),
+                            'leader_shadow_max_linear_vel': float(
+                                leader_shadow_max_linear_vel.perform(context)
+                            ),
+                            'leader_shadow_max_angular_vel': float(
+                                leader_shadow_max_angular_vel.perform(context)
+                            ),
+                            'leader_shadow_goal_update_period_sec': float(
+                                leader_shadow_goal_update_period_sec.perform(context)
+                            ),
+                            'leader_shadow_goal_min_change_m': float(
+                                leader_shadow_goal_min_change_m.perform(context)
+                            ),
+                            'leader_shadow_heading_min_motion_m': float(
+                                leader_shadow_heading_min_motion_m.perform(context)
+                            ),
+                            'enable_leader_continuous_scan': launch_bool(
+                                enable_leader_continuous_scan.perform(context)
+                            ),
+                            'leader_scan_topic': '/scan_filtered',
+                            'leader_scan_fov_deg': float(
+                                leader_scan_fov_deg.perform(context)
+                            ),
+                            'leader_scan_update_rate_hz': float(
+                                leader_scan_update_rate_hz.perform(context)
+                            ),
+                            'leader_scan_timeout_sec': float(
+                                leader_scan_timeout_sec.perform(context)
+                            ),
+                        }],
+                        env=process_env,
+                        respawn=True,
+                        respawn_delay=3.0,
+                    )],
+                ))
             if launch_bool(unified_dashboard.perform(context)):
                 actions.append(Node(
                     package='system_bringup',
@@ -589,6 +684,9 @@ def generate_launch_description():
                         ),
                         'leader_recovery_standoff_m': float(
                             leader_recovery_standoff_m.perform(context)
+                        ),
+                        'leader_failure_arrival_tolerance_m': float(
+                            leader_failure_arrival_tolerance_m.perform(context)
                         ),
                         'follower_recovery_standoff_m': float(
                             follower_recovery_standoff_m.perform(context)
@@ -677,6 +775,7 @@ def generate_launch_description():
                     'external_detection_topic': (
                         external_detection_topic.perform(context)
                     ),
+                    'camera_hfov_deg': leader_scan_fov_deg.perform(context),
                     'start_rviz': 'false',
                 }.items(),
             ))
@@ -1057,9 +1156,86 @@ def generate_launch_description():
             description='Maximum age of scout pose allowed for failure target freeze.',
         ),
         DeclareLaunchArgument(
+            'enable_leader_shadow_follow',
+            default_value='true',
+            choices=['true', 'false'],
+            description='Leader role only: move slowly behind the active scout during normal operation.',
+        ),
+        DeclareLaunchArgument(
+            'leader_shadow_follow_distance_m',
+            default_value='2.8',
+            description='Leader shadow target distance behind active scout movement direction.',
+        ),
+        DeclareLaunchArgument(
+            'leader_shadow_stop_distance_m',
+            default_value='2.2',
+            description='Leader stops shadow goal updates when closer than this to the active scout.',
+        ),
+        DeclareLaunchArgument(
+            'leader_shadow_resume_distance_m',
+            default_value='3.0',
+            description='Leader resumes shadow follow when scout distance reaches this hysteresis threshold.',
+        ),
+        DeclareLaunchArgument(
+            'leader_shadow_far_distance_m',
+            default_value='4.5',
+            description='Distance where shadow follow permits catch-up speed limits.',
+        ),
+        DeclareLaunchArgument(
+            'leader_shadow_max_linear_vel',
+            default_value='0.12',
+            description='Best-effort DWB linear velocity cap while shadow following.',
+        ),
+        DeclareLaunchArgument(
+            'leader_shadow_max_angular_vel',
+            default_value='0.35',
+            description='Best-effort DWB angular velocity cap while shadow following.',
+        ),
+        DeclareLaunchArgument(
+            'leader_shadow_goal_update_period_sec',
+            default_value='1.0',
+            description='Minimum time between leader shadow Nav2 goal updates.',
+        ),
+        DeclareLaunchArgument(
+            'leader_shadow_goal_min_change_m',
+            default_value='0.5',
+            description='Minimum shadow target displacement before sending another leader goal.',
+        ),
+        DeclareLaunchArgument(
+            'leader_shadow_heading_min_motion_m',
+            default_value='0.15',
+            description='Scout displacement required before updating movement-heading estimate.',
+        ),
+        DeclareLaunchArgument(
+            'enable_leader_continuous_scan',
+            default_value='true',
+            choices=['true', 'false'],
+            description='Publish leader scan freshness/FOV state independently from navigation.',
+        ),
+        DeclareLaunchArgument(
+            'leader_scan_fov_deg',
+            default_value='60.0',
+            description='Risk/visibility scan FOV in degrees; Nav2 obstacle LaserScan is not clipped.',
+        ),
+        DeclareLaunchArgument(
+            'leader_scan_update_rate_hz',
+            default_value='10.0',
+            description='Leader scan freshness/status update rate.',
+        ),
+        DeclareLaunchArgument(
+            'leader_scan_timeout_sec',
+            default_value='1.0',
+            description='Maximum leader scan age before scan state becomes stale.',
+        ),
+        DeclareLaunchArgument(
             'leader_recovery_standoff_m',
             default_value='0.70',
             description='Leader goal offset behind failed scout pose.',
+        ),
+        DeclareLaunchArgument(
+            'leader_failure_arrival_tolerance_m',
+            default_value='0.80',
+            description='If leader is already this close to failure pose, skip recovery goal and only cancel shadow goal.',
         ),
         DeclareLaunchArgument(
             'follower_recovery_standoff_m',

@@ -41,6 +41,7 @@ def generate_launch_description():
     nav2_params_file = LaunchConfiguration('nav2_params_file')
     start_nav2 = LaunchConfiguration('start_nav2')
     goal_pose_topic = LaunchConfiguration('goal_pose_topic')
+    cancel_topic = LaunchConfiguration('cancel_topic')
     goal_proxy_name = LaunchConfiguration('goal_proxy_name')
     nav_delay_sec = LaunchConfiguration('nav_delay_sec')
     lifecycle_delay_sec = LaunchConfiguration('lifecycle_delay_sec')
@@ -108,6 +109,7 @@ def generate_launch_description():
             parameters=[{
                 'use_sim_time': False,
                 'goal_pose_topic': goal_pose_topic.perform(context),
+                'cancel_topic': cancel_topic.perform(context),
                 'require_localization_ready': launch_bool(
                     require_localization_ready.perform(context)
                 ),
@@ -208,6 +210,11 @@ def generate_launch_description():
             ),
         ),
         DeclareLaunchArgument('goal_pose_topic', default_value='/goal_pose'),
+        DeclareLaunchArgument(
+            'cancel_topic',
+            default_value='',
+            description='Optional std_msgs/Bool topic that cancels the current Nav2 action goal.',
+        ),
         DeclareLaunchArgument('goal_proxy_name', default_value='goal_arbiter'),
         DeclareLaunchArgument('nav_delay_sec', default_value='8.0'),
         DeclareLaunchArgument('lifecycle_delay_sec', default_value='12.0'),

@@ -39,6 +39,7 @@ setup(
     entry_points={
         'console_scripts': [
             'leader_unified_dashboard = system_bringup.leader_unified_dashboard:main',
+            'leader_shadow_follow = system_bringup.leader_shadow_follow:main',
             'scout_failover_coordinator = system_bringup.scout_failover_coordinator:main',
             'unified_field_robot = system_bringup.unified_field_robot:main',
         ],

@@ -418,6 +418,15 @@ def write_leader_to_pc_bridge_config(
         ),
         '/goal_pose': topic('geometry_msgs/msg/PoseStamped'),
         '/fleet/leader_coord_goal': topic('geometry_msgs/msg/PoseStamped'),
+        '/leader_shadow/goal': topic('geometry_msgs/msg/PoseStamped'),
+        '/leader_shadow/state': topic(
+            'std_msgs/msg/String',
+            profile=qos(durability='transient_local', depth=1),
+        ),
+        '/leader_scan/state': topic(
+            'std_msgs/msg/String',
+            profile=qos(durability='transient_local', depth=1),
+        ),
         '/burger_goal_pose': topic('geometry_msgs/msg/PoseStamped'),
         '/member_goal_pose': topic('geometry_msgs/msg/PoseStamped'),
         '/fleet/coordination_status': topic(
