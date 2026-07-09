@@ -30,7 +30,18 @@ for name in ROS_DOMAIN_ID RMW_IMPLEMENTATION; do
   fi
 done
 if [[ "${RMW_IMPLEMENTATION:-}" == "rmw_cyclonedds_cpp" && -z "${CYCLONEDDS_URI:-}" ]]; then
-  missing+=("CYCLONEDDS_URI")
+  packaged_cyclone=""
+  if command -v ros2 >/dev/null 2>&1; then
+    share_dir="$(ros2 pkg prefix --share fleet_bringup 2>/dev/null || true)"
+    if [[ -n "${share_dir}" && -f "${share_dir}/config/cyclonedds_fleet.xml" ]]; then
+      packaged_cyclone="file://${share_dir}/config/cyclonedds_fleet.xml"
+    fi
+  fi
+  if [[ -n "${packaged_cyclone}" ]]; then
+    export CYCLONEDDS_URI="${packaged_cyclone}"
+  else
+    missing+=("CYCLONEDDS_URI")
+  fi
 fi
 if (( ${#missing[@]} > 0 )); then
   printf 'Missing required shell environment variable(s): %s\n' "${missing[*]}" >&2

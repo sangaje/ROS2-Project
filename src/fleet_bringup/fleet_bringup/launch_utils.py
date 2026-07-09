@@ -4,14 +4,12 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 from xml.etree import ElementTree as ET
 
+from ament_index_python.packages import get_package_share_directory
 from launch.actions import OpaqueFunction
 
 
 REQUIRED_DDS_ENVIRONMENT = (
     'ROS_DOMAIN_ID',
-)
-CYCLONEDDS_REQUIRED_ENVIRONMENT = (
-    'CYCLONEDDS_URI',
 )
 _CYCLONEDDS_CONFIG_NS = 'https://cdds.io/config'
 
@@ -26,12 +24,6 @@ def _perform_if_needed(value, context):
 
 def _missing_required_environment() -> List[str]:
     missing = [name for name in REQUIRED_DDS_ENVIRONMENT if not os.environ.get(name, '').strip()]
-    rmw = os.environ.get('RMW_IMPLEMENTATION', '').strip()
-    if rmw == 'rmw_cyclonedds_cpp':
-        missing.extend(
-            name for name in CYCLONEDDS_REQUIRED_ENVIRONMENT
-            if not os.environ.get(name, '').strip()
-        )
     return missing
 
 
@@ -99,18 +91,41 @@ def _read_kernel_limit(name: str) -> int | None:
         return None
 
 
-def _validate_cyclonedds_socket_buffers() -> None:
+def _packaged_cyclonedds_uri() -> str:
+    path = Path(get_package_share_directory('fleet_bringup')) / 'config' / 'cyclonedds_fleet.xml'
+    return f'file://{path}'
+
+
+def _prepare_process_environment(domain_id: str) -> Dict[str, str]:
+    env = os.environ.copy()
+    env['ROS_DOMAIN_ID'] = str(domain_id)
+    if (
+        env.get('RMW_IMPLEMENTATION', '').strip() == 'rmw_cyclonedds_cpp'
+        and not env.get('CYCLONEDDS_URI', '').strip()
+    ):
+        # Do not modify the user's shell, bashrc, or system DDS config. The
+        # integrated robot launch simply has more standalone ROS processes
+        # than CycloneDDS' small participant-index ranges tolerate on some
+        # robot images, so give only these child processes the fleet-local
+        # participant range.
+        env['CYCLONEDDS_URI'] = _packaged_cyclonedds_uri()
+    _validate_cyclonedds_socket_buffers(env)
+    return env
+
+
+def _validate_cyclonedds_socket_buffers(env: Dict[str, str] | None = None) -> None:
     """Fail early for Cyclone configs that the current kernel cannot satisfy.
 
     This intentionally does not modify CYCLONEDDS_URI or sysctl values.  It only
     replaces the later rmw_create_node crash storm with one actionable message.
     """
-    if os.environ.get('RMW_IMPLEMENTATION', '').strip() != 'rmw_cyclonedds_cpp':
+    env = env or os.environ
+    if env.get('RMW_IMPLEMENTATION', '').strip() != 'rmw_cyclonedds_cpp':
         return
     if not _env_bool('FLEET_VALIDATE_CYCLONEDDS_BUFFERS', True):
         return
 
-    path = _cyclonedds_uri_to_path(os.environ.get('CYCLONEDDS_URI', ''))
+    path = _cyclonedds_uri_to_path(env.get('CYCLONEDDS_URI', ''))
     if path is None or not path.exists():
         return
 
@@ -168,8 +183,10 @@ def validate_shell_environment(expected_domain_id: str | None = None) -> None:
     """Fail fast when launch-time DDS values are missing or conflicting.
 
     Launch files in this workspace intentionally inherit DDS/RMW settings from
-    the user's shell.  They should not patch, unset, invent, or require an RMW
-    override when the ROS installation default is intended.
+    the user's shell.  They do not patch bashrc or system DDS files.  When the
+    inherited RMW is CycloneDDS and no CYCLONEDDS_URI is set, child processes
+    receive the package-local cyclonedds_fleet.xml to avoid participant-index
+    exhaustion in this large integrated launch.
     """
     missing = _missing_required_environment()
     if missing:
@@ -178,7 +195,7 @@ def validate_shell_environment(expected_domain_id: str | None = None) -> None:
             + ', '.join(missing)
             + '. Source your bashrc/setup before launching.'
         )
-    _validate_cyclonedds_socket_buffers()
+    _validate_cyclonedds_socket_buffers(os.environ)
 
     actual_domain = os.environ.get('ROS_DOMAIN_ID', '').strip()
     if expected_domain_id is not None and str(expected_domain_id).strip() != actual_domain:
@@ -192,7 +209,7 @@ def validate_shell_environment(expected_domain_id: str | None = None) -> None:
 def clean_process_environment(domain_id: str) -> Dict[str, str]:
     """Return the current shell environment after validating it."""
     validate_shell_environment(str(domain_id))
-    return os.environ.copy()
+    return _prepare_process_environment(str(domain_id))
 
 
 def dds_launch_environment(domain_id) -> List:
@@ -200,6 +217,7 @@ def dds_launch_environment(domain_id) -> List:
 
     def _validate(context, *args, **kwargs):
         validate_shell_environment(_perform_if_needed(domain_id, context))
+        _prepare_process_environment(_perform_if_needed(domain_id, context))
         return []
 
     return [OpaqueFunction(function=_validate)]
