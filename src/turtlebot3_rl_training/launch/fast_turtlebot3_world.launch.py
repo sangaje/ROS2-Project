@@ -25,12 +25,22 @@ def generate_launch_description():
     gui = LaunchConfiguration("gui")
     verbose = LaunchConfiguration("verbose")
 
-    # 소스 경로와 설치 경로 모두 지원
-    _src_world = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "..", "world", "fast_empty.sdf")
+    source_training_world = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "world", "training_house.sdf")
     )
-    _inst_world = os.path.join(rl_training_share, "world", "fast_empty.sdf")
-    world = _inst_world if os.path.exists(_inst_world) else _src_world
+    installed_training_world = os.path.join(
+        rl_training_share, "world", "training_house.sdf"
+    )
+    tb3_house_world = os.path.join(tb3_gazebo_share, "worlds", "turtlebot3_house.world")
+    default_world = os.environ.get("SIM_WORLD", "").strip()
+    if not default_world:
+        if os.path.exists(source_training_world):
+            default_world = source_training_world
+        elif os.path.exists(installed_training_world):
+            default_world = installed_training_world
+        else:
+            default_world = tb3_house_world
+    world = LaunchConfiguration("world")
 
     declare_use_sim_time = DeclareLaunchArgument(
         "use_sim_time",
@@ -57,6 +67,12 @@ def generate_launch_description():
         "verbose",
         default_value="1",
         description="Gazebo verbosity level.",
+    )
+
+    declare_world = DeclareLaunchArgument(
+        "world",
+        default_value=default_world,
+        description="SDF world used for RL training. Must contain obstacle geometry.",
     )
 
     set_env_vars_resources = AppendEnvironmentVariable(
@@ -111,6 +127,7 @@ def generate_launch_description():
     ld.add_action(declare_y_pose)
     ld.add_action(declare_gui)
     ld.add_action(declare_verbose)
+    ld.add_action(declare_world)
 
     # 중요: Gazebo 실행 전에 resource path를 먼저 잡는다.
     ld.add_action(set_env_vars_resources)

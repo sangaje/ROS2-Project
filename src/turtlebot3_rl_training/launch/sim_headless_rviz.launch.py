@@ -52,8 +52,11 @@ def generate_launch_description() -> LaunchDescription:
     installed_fast_launch = os.path.join(
         this_pkg_share, "launch", "fast_turtlebot3_world.launch.py"
     )
+    prefer_source_launch = os.environ.get("TB3_RL_PREFER_SOURCE_LAUNCH", "1").strip().lower()
     fast_launch_path = (
-        installed_fast_launch
+        source_fast_launch
+        if prefer_source_launch not in {"0", "false", "no", "off"} and os.path.exists(source_fast_launch)
+        else installed_fast_launch
         if os.path.exists(installed_fast_launch)
         else source_fast_launch
     )
@@ -64,6 +67,21 @@ def generate_launch_description() -> LaunchDescription:
     )
     installed_rviz = os.path.join(this_pkg_share, "rviz", "rl_sim_headless.rviz")
     rviz_default = installed_rviz if os.path.exists(installed_rviz) else source_rviz
+
+    source_training_world = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "world", "training_house.sdf")
+    )
+    installed_training_world = os.path.join(this_pkg_share, "world", "training_house.sdf")
+    tb3_gazebo_share = _pkg_share("turtlebot3_gazebo")
+    tb3_house_world = os.path.join(tb3_gazebo_share, "worlds", "turtlebot3_house.world") if tb3_gazebo_share else ""
+    world_default = os.environ.get("SIM_WORLD", "").strip()
+    if not world_default:
+        if os.path.exists(source_training_world):
+            world_default = source_training_world
+        elif os.path.exists(installed_training_world):
+            world_default = installed_training_world
+        else:
+            world_default = tb3_house_world
 
     cartographer_config_default = (
         os.path.join(tb3_cartographer_share, "config") if tb3_cartographer_share else ""
@@ -78,6 +96,7 @@ def generate_launch_description() -> LaunchDescription:
     start_rviz = LaunchConfiguration("start_rviz")
     start_cartographer = LaunchConfiguration("start_cartographer")
     rviz_config = LaunchConfiguration("rviz_config")
+    world = LaunchConfiguration("world")
 
     args = [
         DeclareLaunchArgument("use_sim_time", default_value="true"),
@@ -96,6 +115,11 @@ def generate_launch_description() -> LaunchDescription:
             description="train_sac 사용 시 false 유지.",
         ),
         DeclareLaunchArgument("rviz_config", default_value=rviz_default),
+        DeclareLaunchArgument(
+            "world",
+            default_value=world_default,
+            description="Optional SDF world override. Default uses training_house.sdf.",
+        ),
     ]
 
     # ── Gazebo 서버 + RSP + 로봇 스폰 (fast_turtlebot3_world 재사용) ──
@@ -107,6 +131,7 @@ def generate_launch_description() -> LaunchDescription:
             "verbose": verbose,
             "x_pose": x_pose,
             "y_pose": y_pose,
+            "world": world,
         }.items(),
     )
 
