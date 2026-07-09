@@ -2,12 +2,10 @@
 """Member stack: domain bridge, AMCL and (via base.launch.py) Nav2 for a
 generic fleet member.
 
-A member never leads and never follows on its own. It reports its pose to
-the coordinator and executes whatever short yield/return goal the
-coordinator sends on /member_goal_pose when the leader or follower needs to
-pass. follower.launch.py builds on top of this file by adding its own
-trailing behaviour; leader.launch.py is a sibling that builds on
-base.launch.py directly with Cartographer instead of AMCL.
+A member reports its pose and executes direct Nav2 goals on /member_goal_pose.
+follower.launch.py builds on top of this file by adding trailing behaviour;
+leader.launch.py is a sibling that builds on base.launch.py directly with
+Cartographer instead of AMCL.
 """
 
 import os

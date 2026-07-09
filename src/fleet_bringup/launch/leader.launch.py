@@ -567,12 +567,11 @@ def generate_launch_description():
             choices=['true', 'false'],
             description=(
                 'Whether a follower.launch.py robot is expected in this '
-                'fleet. When true (default) the coordinator holds the '
-                "leader in place until BOTH /leader_pose and /burger_pose "
-                'are fresh -- correct for a leader+follower fleet, but it '
-                'freezes the leader forever if no follower ever '
-                'publishes. Set false for a leader-only or '
-                'leader+member fleet with no follower robot.'
+                'fleet. When true (default) the coordinator monitors both '
+                '/leader_pose and /burger_pose for safety telemetry. Set '
+                'false for a leader-only or leader+member fleet with no '
+                'follower robot to suppress follower-pose wait warnings. '
+                'Direct Nav2 goal passthrough never publishes a hold goal.'
             ),
         ),
         DeclareLaunchArgument(

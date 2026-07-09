@@ -262,10 +262,9 @@ def write_member_bridge_configs(
     output_directory: Optional[Path] = None,
 ) -> Tuple[Path, Path]:
     """Create the two directional domain_bridge configurations for a plain
-    fleet member: it never leads or follows, it only reports its pose and
-    receives a short yield goal from the coordinator when another robot
-    needs to pass. Map and initial-pose flow mirror the follower's bridge
-    so the same PC RViz can localize it.
+    fleet member: it never leads or follows, it reports its pose and accepts
+    direct Nav2 goals on /member_goal_pose. Map and initial-pose flow mirror
+    the follower's bridge so the same PC RViz can localize it.
     """
     main_topics = {
         '/map': topic(

@@ -217,8 +217,9 @@ Cartographer)이 동시에 주장해서 TF 트리가 두 갈래로 쪼개지고
 하는 것으로 간주).
 
 - 정찰봇이 자기 SLAM으로 독자 맵을 가지면 `/member_pose`가 리더의 공유
-  맵 좌표계와 달라져서 `fleet_path_coordinator`의 회피 계산이 어긋날 수
-  있다 — 아직 해결 방법을 논의 중.
+  맵 좌표계와 달라질 수 있다. direct Nav2 전달 모드에서는 코디네이터가
+  회피 goal을 계산하지 않지만, 대시보드/거리 경고는 같은 좌표계일 때 가장
+  정확하다.
 - `map_relay`의 `count_publishers()` 감지는 Cartographer가 막 뜨는 중이라
   아직 discovery에 안 잡힌 순간(수 초)에는 "발행자 없음"으로 오판해서
   잠깐 넘겨받을 수 있다. `start_cartographer:=true` 조합에서는
