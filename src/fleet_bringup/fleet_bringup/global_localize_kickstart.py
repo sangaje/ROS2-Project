@@ -115,6 +115,14 @@ class GlobalLocalizeKickstart(Node):
         self.declare_parameter('max_scan_age_sec', 1.0)
         self.declare_parameter('max_odom_age_sec', 1.0)
         self.declare_parameter('tick_period_sec', 0.1)
+        # Master guarantee: no matter which WAIT_* precondition is stuck
+        # (map/AMCL-active/scan/odom/TF), the spin gets attempted anyway
+        # once this much time has passed since this node started. Getting
+        # the preconditions right is *preferred* -- spinning against a
+        # real map with fresh sensors converges better -- but this node's
+        # one non-negotiable job is to eventually spin and let Nav2 through,
+        # not to wait forever for a perfect precondition that never arrives.
+        self.declare_parameter('force_spin_after_sec', 20.0)
 
         get = self.get_parameter
         self.reinit_service_name = str(get('reinit_service').value)
@@ -158,6 +166,9 @@ class GlobalLocalizeKickstart(Node):
         self.max_scan_age_sec = max(0.05, float(get('max_scan_age_sec').value))
         self.max_odom_age_sec = max(0.05, float(get('max_odom_age_sec').value))
         self.tick_period_sec = max(0.02, float(get('tick_period_sec').value))
+        self.force_spin_after_sec = max(
+            1.0, float(get('force_spin_after_sec').value)
+        )
 
         latched_qos = QoSProfile(
             depth=1,
@@ -199,6 +210,8 @@ class GlobalLocalizeKickstart(Node):
         self.reinit_in_flight = False
         self._amcl_state_call_in_flight = False
         self._last_amcl_poll_wall = 0.0
+        self.node_start_wall = self._now()
+        self._forced_spin = False
 
         self.last_scan_wall: Optional[float] = None
         self.last_odom_wall: Optional[float] = None
@@ -375,9 +388,34 @@ class GlobalLocalizeKickstart(Node):
 
     # -- main dispatch ----------------------------------------------------
 
+    _PRE_SPIN_STATES = (
+        State.WAIT_MAP,
+        State.WAIT_AMCL_ACTIVE,
+        State.WAIT_SCAN,
+        State.WAIT_ODOM,
+        State.WAIT_TF,
+        State.CHECK_LOCALIZATION_QUALITY,
+    )
+
     def _tick(self) -> None:
         if self.done:
             return
+        if (
+            not self._forced_spin
+            and self.state in self._PRE_SPIN_STATES
+            and self._now() - self.node_start_wall >= self.force_spin_after_sec
+        ):
+            self._forced_spin = True
+            self.get_logger().error(
+                'GLOBAL_LOCALIZE_FORCE_SPIN | '
+                f'stuck in {self.state.name} for '
+                f'{self.force_spin_after_sec:.0f}s+ since startup -- forcing '
+                'the spin attempt anyway. Blocking condition snapshot: '
+                f'map_received={self.map_received} '
+                f'scan_fresh={self._scan_fresh()} '
+                f'odom_fresh={self._odom_fresh()} tf_ok={self._tf_ok()}'
+            )
+            self._transition(State.CHECK_LOCALIZATION_QUALITY)
         getattr(self, f'_tick_{self.state.name.lower()}')()
 
     def _tick_wait_map(self) -> None:
