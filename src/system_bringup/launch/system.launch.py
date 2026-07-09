@@ -290,6 +290,12 @@ def generate_launch_description():
                 'Leader/member AMCL/Nav2 remains available in their own roles.',
             ]))
 
+        scout_robot_name = (
+            follower_robot_name.perform(context)
+            if role_value == 'scout' and fleet_role_value == 'follower'
+            else active_scout_robot_name.perform(context)
+        )
+
         if role_value == 'scout' and launch_bool(enable_scout_failover.perform(context)):
             local_robot_name = (
                 follower_robot_name.perform(context)
@@ -785,6 +791,7 @@ def generate_launch_description():
             sender_launch_path = os.path.join(
                 sender_share, 'launch', 'opencv_camera_to_flask_yolo.launch.py'
             )
+            role_gating_on = launch_bool(enable_scout_failover.perform(context))
             actions.append(IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(sender_launch_path),
                 launch_arguments={
@@ -804,22 +811,30 @@ def generate_launch_description():
                     'read_timeout_sec': '1.2',
                     'max_http_roundtrip_sec': '1.5',
                     'max_frame_age_sec': '1.0',
+                    'enable_role_gating': 'true' if role_gating_on else 'false',
+                    'robot_name': scout_robot_name,
+                    'role_topic': f'/{scout_robot_name}/role',
+                    'initial_role_active': (
+                        'true'
+                        if (not role_gating_on or fleet_role_value == 'member')
+                        else 'false'
+                    ),
+                    'active_roles': 'ACTIVE_SCOUT,SCOUT',
                 }.items(),
             ))
 
         if fleet_role_value == 'follower':
             # A follower is a scout that is temporarily suspending its own
             # recon duty to tail the leader instead -- follower.launch.py's
-            # Nav2 stack already drives cmd_vel to chase the leader, so the
-            # RL policy (which also drives cmd_vel directly) must not run
-            # at the same time or the two fight over the motors. The risk
-            # map/camera/YOLO stay on above: they only accumulate risk data
-            # passively and never command movement themselves.
+            # Nav2 stack already drives cmd_vel to chase the leader. The
+            # camera sender is role-gated above, so it opens only after this
+            # robot actually becomes ACTIVE_SCOUT during failover takeover.
             if launch_bool(start_rl_policy.perform(context)):
                 actions.append(LogInfo(msg=[
                     'SYSTEM_BRINGUP | fleet_role=follower: suspending the '
                     'RL policy (follower.launch.py\'s own Nav2 pursuit '
-                    'drives cmd_vel instead). Risk map/camera stay on.'
+                    'drives cmd_vel instead). Camera sender waits for '
+                    'ACTIVE_SCOUT role before streaming.'
                 ]))
         elif launch_bool(start_rl_policy.perform(context)):
             rl_command = [
