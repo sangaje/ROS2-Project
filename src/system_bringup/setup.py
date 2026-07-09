@@ -39,6 +39,8 @@ setup(
     entry_points={
         'console_scripts': [
             'leader_unified_dashboard = system_bringup.leader_unified_dashboard:main',
+            'scout_failover_coordinator = system_bringup.scout_failover_coordinator:main',
+            'scout_takeover_agent = system_bringup.scout_takeover_agent:main',
         ],
     },
 )

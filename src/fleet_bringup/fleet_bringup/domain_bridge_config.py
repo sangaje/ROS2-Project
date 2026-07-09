@@ -142,6 +142,14 @@ def write_fleet_bridge_configs(
             'std_msgs/msg/String',
             profile=qos(durability='transient_local', depth=1),
         ),
+        '/fleet/scout_takeover': topic(
+            'std_msgs/msg/String',
+            profile=qos(durability='transient_local', depth=1),
+        ),
+        '/fleet/scout_role': topic(
+            'std_msgs/msg/String',
+            profile=qos(durability='transient_local', depth=1),
+        ),
         '/fleet/robot_poses': topic(
             'geometry_msgs/msg/PoseArray',
             profile=qos(depth=5),
@@ -189,6 +197,10 @@ def write_fleet_bridge_configs(
         ),
         '/fleet/follow_enabled': topic(
             'std_msgs/msg/Bool',
+            profile=qos(durability='transient_local', depth=1),
+        ),
+        '/fleet/scout_takeover_status': topic(
+            'std_msgs/msg/String',
             profile=qos(durability='transient_local', depth=1),
         ),
         '/burger_scan_relay': topic(
@@ -259,6 +271,14 @@ def write_member_bridge_configs(
             'std_msgs/msg/String',
             profile=qos(durability='transient_local', depth=1),
         ),
+        '/fleet/scout_takeover': topic(
+            'std_msgs/msg/String',
+            profile=qos(durability='transient_local', depth=1),
+        ),
+        '/fleet/scout_role': topic(
+            'std_msgs/msg/String',
+            profile=qos(durability='transient_local', depth=1),
+        ),
         '/fleet/robot_poses': topic(
             'geometry_msgs/msg/PoseArray',
             profile=qos(depth=5),
@@ -278,6 +298,14 @@ def write_member_bridge_configs(
     }
     member_topics = {
         '/member_pose': topic('geometry_msgs/msg/PoseStamped'),
+        '/scout/signal': topic(
+            'std_msgs/msg/String',
+            profile=qos(reliability='best_effort', durability='volatile', depth=5),
+        ),
+        '/fleet/scout_takeover_status': topic(
+            'std_msgs/msg/String',
+            profile=qos(durability='transient_local', depth=1),
+        ),
         **risk_topics(),
     }
     if forward_map_to_main:
@@ -326,6 +354,10 @@ def write_risk_to_leader_bridge_config(
     Cartographer remains the only /map source in that mode.
     """
     topics = risk_topics()
+    topics['/scout/signal'] = topic(
+        'std_msgs/msg/String',
+        profile=qos(reliability='best_effort', durability='volatile', depth=5),
+    )
     if include_map:
         topics['/map'] = topic(
             'nav_msgs/msg/OccupancyGrid',
@@ -374,6 +406,42 @@ def write_leader_to_pc_bridge_config(
         '/member_goal_pose': topic('geometry_msgs/msg/PoseStamped'),
         '/fleet/coordination_status': topic(
             'std_msgs/msg/String',
+            profile=qos(durability='transient_local', depth=1),
+        ),
+        '/fleet/scout_takeover': topic(
+            'std_msgs/msg/String',
+            profile=qos(durability='transient_local', depth=1),
+        ),
+        '/fleet/scout_role': topic(
+            'std_msgs/msg/String',
+            profile=qos(durability='transient_local', depth=1),
+        ),
+        '/fleet/scout_takeover_status': topic(
+            'std_msgs/msg/String',
+            profile=qos(durability='transient_local', depth=1),
+        ),
+        '/failover/state': topic(
+            'std_msgs/msg/String',
+            profile=qos(durability='transient_local', depth=1),
+        ),
+        '/failover/active_scout_id': topic(
+            'std_msgs/msg/String',
+            profile=qos(durability='transient_local', depth=1),
+        ),
+        '/failover/scout_epoch': topic(
+            'std_msgs/msg/String',
+            profile=qos(durability='transient_local', depth=1),
+        ),
+        '/failover/scout_alive': topic(
+            'std_msgs/msg/Bool',
+            profile=qos(durability='transient_local', depth=1),
+        ),
+        '/failover/last_scout_pose': topic(
+            'geometry_msgs/msg/PoseStamped',
+            profile=qos(durability='transient_local', depth=1),
+        ),
+        '/failover/failure_pose': topic(
+            'geometry_msgs/msg/PoseStamped',
             profile=qos(durability='transient_local', depth=1),
         ),
         '/fleet/robot_poses': topic(

@@ -88,6 +88,27 @@ def generate_launch_description():
     )
     member_domain_id = LaunchConfiguration('member_domain_id')
     follower_domain_id = LaunchConfiguration('follower_domain_id')
+    enable_scout_failover = LaunchConfiguration('enable_scout_failover')
+    leader_robot_name = LaunchConfiguration('leader_robot_name')
+    active_scout_robot_name = LaunchConfiguration('active_scout_robot_name')
+    follower_robot_name = LaunchConfiguration('follower_robot_name')
+    scout_liveness_topic = LaunchConfiguration('scout_liveness_topic')
+    scout_liveness_timeout_sec = LaunchConfiguration('scout_liveness_timeout_sec')
+    scout_failure_confirm_sec = LaunchConfiguration('scout_failure_confirm_sec')
+    scout_pose_topic = LaunchConfiguration('scout_pose_topic')
+    scout_pose_timeout_sec = LaunchConfiguration('scout_pose_timeout_sec')
+    leader_recovery_standoff_m = LaunchConfiguration('leader_recovery_standoff_m')
+    follower_recovery_standoff_m = LaunchConfiguration('follower_recovery_standoff_m')
+    scout_takeover_arrival_tolerance_m = LaunchConfiguration(
+        'scout_takeover_arrival_tolerance_m'
+    )
+    enable_localization_spin_on_takeover = LaunchConfiguration(
+        'enable_localization_spin_on_takeover'
+    )
+    enable_exploration_after_takeover = LaunchConfiguration(
+        'enable_exploration_after_takeover'
+    )
+    takeover_exploration_command = LaunchConfiguration('takeover_exploration_command')
     start_omx_aim = LaunchConfiguration('start_omx_aim')
     start_yolo_server = LaunchConfiguration('start_yolo_server')
     yolo_server_delay_sec = LaunchConfiguration('yolo_server_delay_sec')
@@ -236,6 +257,71 @@ def generate_launch_description():
                 'fleet start_nav2:=false for lightweight Scout operation. ',
                 'Leader/member AMCL/Nav2 remains available in their own roles.',
             ]))
+
+        if role_value == 'scout' and launch_bool(enable_scout_failover.perform(context)):
+            local_robot_name = (
+                follower_robot_name.perform(context)
+                if fleet_role_value == 'follower'
+                else active_scout_robot_name.perform(context)
+            )
+            if fleet_role_value == 'member':
+                actions.append(TimerAction(
+                    period=2.0,
+                    actions=[Node(
+                        package='multi',
+                        executable='robot_signal',
+                        name='scout_robot_signal',
+                        output='screen',
+                        parameters=[{
+                            'robot_name': 'scout',
+                            'peer_robots': [],
+                            'publish_signal': True,
+                            'signal_period_sec': 0.5,
+                        }],
+                        env=process_env,
+                        respawn=True,
+                        respawn_delay=3.0,
+                    )],
+                ))
+            takeover_command = takeover_exploration_command.perform(context).strip()
+            if not takeover_command:
+                takeover_command_parts = [
+                    'ros2', 'run', 'turtlebot3_rl_training', 'eval_policy',
+                    '--model', rl_model_path.perform(context),
+                    '--real-robot',
+                ]
+                if launch_bool(rl_disable_slam_map.perform(context)):
+                    takeover_command_parts.append('--disable-slam-map')
+                extra = rl_extra_args.perform(context).strip()
+                if extra:
+                    takeover_command_parts.extend(shlex.split(extra))
+                takeover_command = ' '.join(
+                    shlex.quote(part) for part in takeover_command_parts
+                )
+            actions.append(TimerAction(
+                period=2.5,
+                actions=[Node(
+                    package='system_bringup',
+                    executable='scout_takeover_agent',
+                    name='scout_takeover_agent',
+                    output='screen',
+                    parameters=[{
+                        'robot_name': local_robot_name,
+                        'enable_localization_spin_on_takeover': launch_bool(
+                            enable_localization_spin_on_takeover.perform(context)
+                        ),
+                        'enable_exploration_after_takeover': launch_bool(
+                            enable_exploration_after_takeover.perform(context)
+                        ),
+                        'exploration_command': takeover_command,
+                        'cmd_vel_topic': '/cmd_vel',
+                        'use_stamped_cmd_vel': True,
+                    }],
+                    env=process_env,
+                    respawn=True,
+                    respawn_delay=3.0,
+                )],
+            ))
 
         if role_value == 'leader':
             process_env = clean_process_environment(str(domain))
@@ -471,6 +557,42 @@ def generate_launch_description():
                         'follower_nav_path_topic': '/burger_plan',
                         'member_nav_path_topic': '/member_plan',
                         'omx_waypoint_route_topic': '/omx/waypoint_route',
+                    }],
+                    env=process_env,
+                    respawn=True,
+                    respawn_delay=3.0,
+                ))
+            if launch_bool(enable_scout_failover.perform(context)):
+                actions.append(Node(
+                    package='system_bringup',
+                    executable='scout_failover_coordinator',
+                    name='scout_failover_coordinator',
+                    output='screen',
+                    parameters=[{
+                        'enable_scout_failover': True,
+                        'leader_robot_name': leader_robot_name.perform(context),
+                        'active_scout_robot_name': active_scout_robot_name.perform(context),
+                        'follower_robot_name': follower_robot_name.perform(context),
+                        'scout_liveness_topic': scout_liveness_topic.perform(context),
+                        'scout_liveness_timeout_sec': float(
+                            scout_liveness_timeout_sec.perform(context)
+                        ),
+                        'scout_failure_confirm_sec': float(
+                            scout_failure_confirm_sec.perform(context)
+                        ),
+                        'scout_pose_topic': scout_pose_topic.perform(context),
+                        'scout_pose_timeout_sec': float(
+                            scout_pose_timeout_sec.perform(context)
+                        ),
+                        'leader_recovery_standoff_m': float(
+                            leader_recovery_standoff_m.perform(context)
+                        ),
+                        'follower_recovery_standoff_m': float(
+                            follower_recovery_standoff_m.perform(context)
+                        ),
+                        'scout_takeover_arrival_tolerance_m': float(
+                            scout_takeover_arrival_tolerance_m.perform(context)
+                        ),
                     }],
                     env=process_env,
                     respawn=True,
@@ -896,6 +1018,72 @@ def generate_launch_description():
             'follower_domain_id',
             default_value='',
             description='Leader debug marker label for a follower domain.',
+        ),
+        DeclareLaunchArgument(
+            'enable_scout_failover',
+            default_value='true',
+            choices=['true', 'false'],
+            description='Enable active-scout liveness watchdog and follower takeover orchestration.',
+        ),
+        DeclareLaunchArgument('leader_robot_name', default_value='leader'),
+        DeclareLaunchArgument('active_scout_robot_name', default_value='scout22'),
+        DeclareLaunchArgument('follower_robot_name', default_value='follower21'),
+        DeclareLaunchArgument(
+            'scout_liveness_topic',
+            default_value='/scout/signal',
+            description='Leader-domain heartbeat topic bridged from the active scout.',
+        ),
+        DeclareLaunchArgument(
+            'scout_liveness_timeout_sec',
+            default_value='2.0',
+            description='Seconds without scout heartbeat before suspected-dead.',
+        ),
+        DeclareLaunchArgument(
+            'scout_failure_confirm_sec',
+            default_value='0.5',
+            description='Additional confirmation time before declaring scout dead.',
+        ),
+        DeclareLaunchArgument(
+            'scout_pose_topic',
+            default_value='/member_pose',
+            description='Leader-domain active-scout map-frame pose topic.',
+        ),
+        DeclareLaunchArgument(
+            'scout_pose_timeout_sec',
+            default_value='5.0',
+            description='Maximum age of scout pose allowed for failure target freeze.',
+        ),
+        DeclareLaunchArgument(
+            'leader_recovery_standoff_m',
+            default_value='0.70',
+            description='Leader goal offset behind failed scout pose.',
+        ),
+        DeclareLaunchArgument(
+            'follower_recovery_standoff_m',
+            default_value='0.15',
+            description='Follower goal offset behind failed scout pose.',
+        ),
+        DeclareLaunchArgument(
+            'scout_takeover_arrival_tolerance_m',
+            default_value='0.40',
+            description='Follower distance to failed scout pose required for takeover.',
+        ),
+        DeclareLaunchArgument(
+            'enable_localization_spin_on_takeover',
+            default_value='true',
+            choices=['true', 'false'],
+            description='Follower-side takeover agent performs 360deg AMCL spin when covariance is poor.',
+        ),
+        DeclareLaunchArgument(
+            'enable_exploration_after_takeover',
+            default_value='true',
+            choices=['true', 'false'],
+            description='Start the configured exploration command after follower is promoted.',
+        ),
+        DeclareLaunchArgument(
+            'takeover_exploration_command',
+            default_value='',
+            description='Optional raw command launched by follower takeover agent; empty builds eval_policy from rl_* args.',
         ),
         DeclareLaunchArgument(
             'start_omx_aim',
