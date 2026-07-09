@@ -2884,7 +2884,20 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                 bayes_positive_candidate = new_candidate
 
         if self.enable_visibility_tracking:
-            self.visibility_map = self.compute_visibility_map(robot_pose)
+            # Raycast from where the camera actually was when the frame
+            # driving currently_detecting_person was captured, not from the
+            # robot's current position -- with real network/processing
+            # delay (flask_yolo_bridge round-trip) the robot can have moved
+            # meaningfully in between, which would otherwise clear risk for
+            # cells the camera never actually looked at. Same freshness/
+            # distance gate (can_reuse_detection) already used for the
+            # positive-detection projection_pose above.
+            visibility_pose = (
+                latest_detection_pose
+                if can_reuse_detection and latest_detection_pose is not None
+                else robot_pose
+            )
+            self.visibility_map = self.compute_visibility_map(visibility_pose)
             combined_visibility = self.visibility_map
             combined_had_detection = currently_detecting_person
 

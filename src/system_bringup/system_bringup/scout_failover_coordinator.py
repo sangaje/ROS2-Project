@@ -196,9 +196,20 @@ class ScoutFailoverCoordinator(Node):
             return
         status = str(data.get('status', '')).upper()
         if status == 'ACTIVE_SCOUT':
-            self.active_scout_id = str(data.get('robot', self.follower_name))
-            self._transition(FailoverState.NEW_SCOUT_EXPLORING)
+            robot = str(data.get('robot', self.follower_name))
+            # unified_field_robot republishes its status at 10 Hz, so this
+            # callback fires continuously while a scout stays ACTIVE_SCOUT --
+            # only log/transition on the actual edge into that role, not on
+            # every repeat message, or this spams the log forever.
+            already_resumed = (
+                self.state == FailoverState.NEW_SCOUT_EXPLORING
+                and self.active_scout_id == robot
+            )
+            self.active_scout_id = robot
             self._publish_role()
+            if already_resumed:
+                return
+            self._transition(FailoverState.NEW_SCOUT_EXPLORING)
             self.get_logger().warning(
                 '[FAILOVER] EXPLORATION_RESUMED | '
                 f'active_scout={self.active_scout_id} epoch={self.scout_epoch}'

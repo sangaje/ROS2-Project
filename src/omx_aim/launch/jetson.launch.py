@@ -87,7 +87,11 @@ def launch_setup(context, *args, **kwargs):
             package='omx_aim', executable='waffle_node', name='waffle_node',
             output='screen',
             parameters=[{
-                'require_amcl_ready': True,
+                # /localization_ready (from global_localize_kickstart) is the
+                # single source of truth for nav readiness -- don't also
+                # gate on a separately-computed AMCL covariance check here,
+                # or the two can disagree.
+                'require_amcl_ready': False,
                 'require_localization_ready': True,
                 'localization_ready_topic': '/localization_ready',
             }],

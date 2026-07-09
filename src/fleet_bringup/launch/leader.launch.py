@@ -190,6 +190,23 @@ def generate_launch_description():
                     output='screen',
                     parameters=[{
                         'scan_topic': scan_topic_value,
+                        # Seed AMCL's initial pose from the active scout's
+                        # known map-frame pose before spinning, instead of
+                        # blindly scattering particles across a still-sparse
+                        # shared map -- falls back to blind reinit if no
+                        # scout pose is available in time.
+                        'enable_scout_pose_seed': True,
+                        'active_scout_id_topic': '/failover/active_scout_id',
+                        'active_scout_robot_name': 'scout22',
+                        'follower_robot_name': 'follower21',
+                        'member_pose_topic': '/member_pose',
+                        'burger_pose_topic': '/burger_pose',
+                        'scout_pose_max_age_sec': 5.0,
+                        'scout_pose_wait_timeout_sec': 3.0,
+                        'initial_pose_topic': '/initialpose',
+                        'initial_pose_xy_std_m': 0.5,
+                        'initial_pose_yaw_std_deg': 25.0,
+                        'initial_pose_settle_sec': 0.5,
                         'spin_enabled': True,
                         # 좌우 바퀴 비대칭이 심할수록(고속 회전일수록) 더
                         # 벌어져서 "제자리" spin 이 실제로는 호를 그리며
