@@ -32,6 +32,12 @@ def test_real_bridge_directions_and_control_qos(tmp_path):
     assert main['topics']['/leader_pose']['type'] == (
         'geometry_msgs/msg/PoseStamped'
     )
+    assert main['topics']['/member_pose']['type'] == (
+        'geometry_msgs/msg/PoseStamped'
+    )
+    assert main['topics']['/failover/active_scout_id']['qos']['durability'] == (
+        'transient_local'
+    )
     assert '/fleet/hazard_pose' in main['topics']
     assert follower['topics']['/fleet/follow_enabled']['qos']['durability'] == (
         'transient_local'

@@ -113,7 +113,7 @@ class GlobalLocalizeKickstart(Node):
         self.declare_parameter('member_pose_topic', '/member_pose')
         self.declare_parameter('burger_pose_topic', '/burger_pose')
         self.declare_parameter('scout_pose_max_age_sec', 5.0)
-        self.declare_parameter('scout_pose_wait_timeout_sec', 3.0)
+        self.declare_parameter('scout_pose_wait_timeout_sec', 8.0)
         self.declare_parameter('initial_pose_topic', '/initialpose')
         self.declare_parameter('initial_pose_xy_std_m', 0.5)
         self.declare_parameter('initial_pose_yaw_std_deg', 25.0)
@@ -302,6 +302,9 @@ class GlobalLocalizeKickstart(Node):
         self._burger_pose_wall: Optional[float] = None
         self._scout_pose_wait_start: Optional[float] = None
         self._pending_seed_pose: Optional[tuple] = None
+        self._pending_seed_source: Optional[str] = None
+        self._pending_seed_age: Optional[float] = None
+        self._last_seed_wait_detail = 'no pose messages'
         self._seeded_this_attempt = False
         self._initial_pose_publish_wall = 0.0
 
@@ -423,25 +426,62 @@ class GlobalLocalizeKickstart(Node):
         except Exception:  # noqa: BLE001
             return False
 
+    def _fresh_seed_candidate(
+        self,
+        source: str,
+        pose: Optional[PoseStamped],
+        wall: Optional[float],
+    ) -> Optional[tuple]:
+        if pose is None or wall is None:
+            return None
+        age = self._now() - wall
+        if age > self.scout_pose_max_age_sec:
+            return None
+        yaw = yaw_from_quaternion(pose.pose.orientation)
+        return (pose.pose.position.x, pose.pose.position.y, yaw, source, age)
+
     def _scout_seed_pose(self) -> Optional[tuple]:
-        """(x, y, yaw) of the currently active scout, or None if unknown/stale.
+        """(x, y, yaw) of the active/fresh scout, or None if unknown/stale.
 
         Which topic counts as "the active scout" is resolved dynamically via
         active_scout_id_topic rather than hardcoded, since the active scout
-        changes across failover.
+        changes across failover.  If that latched status has not arrived yet,
+        prefer any fresh scout pose over falling straight back to blind global
+        reinitialize; the whole point is to start AMCL near the robot that
+        already owns the map.
         """
-        if self._active_scout_id is None:
-            return None
+        member = (
+            self.active_scout_robot_name,
+            self._member_pose,
+            self._member_pose_wall,
+        )
+        follower = (
+            self.follower_robot_name,
+            self._burger_pose,
+            self._burger_pose_wall,
+        )
         if self._active_scout_id == self.follower_robot_name:
-            pose, wall = self._burger_pose, self._burger_pose_wall
+            ordered = (follower, member)
+        elif self._active_scout_id == self.active_scout_robot_name:
+            ordered = (member, follower)
         else:
-            pose, wall = self._member_pose, self._member_pose_wall
-        if pose is None or wall is None:
-            return None
-        if self._now() - wall > self.scout_pose_max_age_sec:
-            return None
-        yaw = yaw_from_quaternion(pose.pose.orientation)
-        return (pose.pose.position.x, pose.pose.position.y, yaw)
+            ordered = (member, follower)
+
+        stale = []
+        for source, pose, wall in ordered:
+            candidate = self._fresh_seed_candidate(source, pose, wall)
+            if candidate is not None:
+                x, y, yaw, candidate_source, age = candidate
+                self._pending_seed_source = candidate_source
+                self._pending_seed_age = age
+                return (x, y, yaw)
+            if pose is not None and wall is not None:
+                stale.append(f'{source}:{self._now() - wall:.1f}s')
+        if stale:
+            self._last_seed_wait_detail = 'stale ' + ','.join(stale)
+        else:
+            self._last_seed_wait_detail = 'no pose messages'
+        return None
 
     def _covariance_ok(self) -> bool:
         if self.last_pose_cov is None:
@@ -595,15 +635,19 @@ class GlobalLocalizeKickstart(Node):
             self.get_logger().warning(
                 'GLOBAL_LOCALIZE_SCOUT_POSE_UNAVAILABLE | '
                 f'no fresh pose for active_scout={self._active_scout_id} within '
-                f'{self.scout_pose_wait_timeout_sec:.1f}s -- falling back to '
+                f'{self.scout_pose_wait_timeout_sec:.1f}s '
+                f'({self._last_seed_wait_detail}) -- falling back to '
                 'blind global reinitialize for this attempt'
             )
             self._scout_pose_wait_start = None
+            self._pending_seed_source = None
+            self._pending_seed_age = None
             self._transition(State.WAIT_SCAN)
             return
         self.get_logger().info(
             'GLOBAL_LOCALIZE_WAIT_SCOUT_POSE | '
-            f'active_scout={self._active_scout_id} no fresh pose yet',
+            f'active_scout={self._active_scout_id} '
+            f'{self._last_seed_wait_detail}',
             throttle_duration_sec=2.0,
         )
 
@@ -630,9 +674,12 @@ class GlobalLocalizeKickstart(Node):
         self.initial_pose_pub.publish(msg)
         self._seeded_this_attempt = True
         self._initial_pose_publish_wall = self._now()
+        source = self._pending_seed_source or self._active_scout_id or 'unknown'
+        age = self._pending_seed_age
+        age_text = 'unknown' if age is None else f'{age:.1f}s'
         self.get_logger().warning(
             'GLOBAL_LOCALIZE_INITIAL_POSE_SEEDED | '
-            f'source={self._active_scout_id} x={x:.3f} y={y:.3f} '
+            f'source={source} age={age_text} x={x:.3f} y={y:.3f} '
             f'yaw={math.degrees(yaw):.1f}deg topic={self.initial_pose_topic}'
         )
 
@@ -696,10 +743,11 @@ class GlobalLocalizeKickstart(Node):
             # go straight to spinning instead of also blindly scattering
             # particles right after, which would undo the seed.
             self.total_attempts += 1
+            source = self._pending_seed_source or self._active_scout_id or 'unknown'
             self.get_logger().warning(
                 f'GLOBAL_LOCALIZE_ATTEMPT | attempt={self.total_attempts} '
                 f'retry={self.retry_count}/{self.max_spin_retries} '
-                f'seed=scout_pose({self._active_scout_id})'
+                f'seed=scout_pose({source})'
             )
             self._begin_spin()
             return
@@ -865,6 +913,8 @@ class GlobalLocalizeKickstart(Node):
             self._transition(State.FAIL_SAFE)
             return
         self._seeded_this_attempt = False
+        self._pending_seed_source = None
+        self._pending_seed_age = None
         if self.enable_scout_pose_seed:
             # Re-fetch the active scout's current pose rather than reusing
             # the stale seed from the failed attempt.

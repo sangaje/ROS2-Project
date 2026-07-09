@@ -128,6 +128,7 @@ def write_fleet_bridge_configs(
             profile=map_qos(depth=5),
         ),
         '/leader_pose': topic('geometry_msgs/msg/PoseStamped'),
+        '/member_pose': topic('geometry_msgs/msg/PoseStamped'),
         '/plan': topic(
             'nav_msgs/msg/Path',
             remap='/leader_plan',
@@ -148,6 +149,14 @@ def write_fleet_bridge_configs(
         ),
         '/fleet/scout_role': topic(
             'std_msgs/msg/String',
+            profile=qos(durability='transient_local', depth=1),
+        ),
+        '/failover/active_scout_id': topic(
+            'std_msgs/msg/String',
+            profile=qos(durability='transient_local', depth=1),
+        ),
+        '/failover/last_scout_pose': topic(
+            'geometry_msgs/msg/PoseStamped',
             profile=qos(durability='transient_local', depth=1),
         ),
         '/fleet/field_robot_role_cmd': topic(
