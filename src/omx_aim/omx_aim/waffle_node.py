@@ -124,7 +124,7 @@ class WaffleNavNode(Node):
         self.declare_parameter('max_xy_covariance', 2.00)
         self.declare_parameter('max_yaw_covariance', 1.50)
         self.declare_parameter('pending_goal_retry_period_sec', 0.5)
-        self.declare_parameter('max_pending_goal_age_sec', 60.0)
+        self.declare_parameter('max_pending_goal_age_sec', 300.0)
         self.require_amcl_ready = bool(
             self.get_parameter('require_amcl_ready').value)
         self.require_localization_ready = bool(

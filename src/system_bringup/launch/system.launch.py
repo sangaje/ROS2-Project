@@ -585,6 +585,8 @@ def generate_launch_description():
                             'active_scout_id_topic': '/failover/active_scout_id',
                             'active_scout_robot_name': active_scout_robot_name.perform(context),
                             'follower_robot_name': follower_robot_name.perform(context),
+                            'require_localization_ready': True,
+                            'localization_ready_topic': '/localization_ready',
                             'scout_pose_timeout_sec': float(
                                 scout_pose_timeout_sec.perform(context)
                             ),
@@ -695,6 +697,8 @@ def generate_launch_description():
                         'scout_pose_timeout_sec': float(
                             scout_pose_timeout_sec.perform(context)
                         ),
+                        'require_bootstrap_complete': True,
+                        'bootstrap_ready_topic': '/localization_ready',
                         'leader_recovery_standoff_m': float(
                             leader_recovery_standoff_m.perform(context)
                         ),

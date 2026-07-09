@@ -3,7 +3,18 @@ import math
 import pytest
 from geometry_msgs.msg import PoseStamped
 
-from fleet_bringup.global_localize_kickstart import GlobalLocalizeKickstart
+from fleet_bringup.global_localize_kickstart import GlobalLocalizeKickstart, State
+
+
+class _Logger:
+    def warning(self, *args, **kwargs):
+        pass
+
+    def error(self, *args, **kwargs):
+        pass
+
+    def info(self, *args, **kwargs):
+        pass
 
 
 def _pose(x: float, y: float, yaw: float) -> PoseStamped:
@@ -79,3 +90,43 @@ def test_scout_seed_can_fallback_to_latched_last_scout_pose():
     assert seed[1] == 0.5
     assert seed[2] == pytest.approx(1.2)
     assert node._pending_seed_source == 'last_scout_pose'
+
+
+def test_retry_spin_never_reenters_scout_pose_seed_path():
+    node = _bare_node()
+    transitions = []
+    starts = []
+    node.retry_count = 0
+    node.max_spin_retries = 3
+    node._seeded_this_attempt = True
+    node._pending_seed_source = 'scout22'
+    node._pending_seed_age = 0.2
+    node.get_logger = lambda: _Logger()
+    node._transition = transitions.append
+    node._start_spin = lambda: starts.append('spin')
+
+    node._tick_retry_spin()
+
+    assert starts == ['spin']
+    assert State.WAIT_SCOUT_POSE not in transitions
+    assert node._seeded_this_attempt is False
+    assert node._pending_seed_source is None
+
+
+def test_completed_bootstrap_latch_blocks_future_ticks():
+    node = _bare_node()
+    node.done = False
+    node.localization_bootstrap_completed = True
+    node.bootstrap_failed = False
+    called = []
+    node._PRE_SPIN_STATES = (State.WAIT_MAP,)
+    node.state = State.WAIT_MAP
+    node._forced_spin = False
+    node.node_start_wall = 0.0
+    node.force_spin_after_sec = 1.0
+    node._transition = lambda state: called.append(state)
+    node._tick_wait_map = lambda: called.append('tick_wait_map')
+
+    node._tick()
+
+    assert called == []

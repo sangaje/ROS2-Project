@@ -35,6 +35,7 @@ import cv2
 import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from std_msgs.msg import String, Bool, Float32, Empty, Int32
 from geometry_msgs.msg import Point, PointStamped, PoseStamped, Quaternion
@@ -150,6 +151,15 @@ class OmxYoloNode(Node):
         self.waffle_frame_candidates = self._frame_candidates(
             self.get_parameter('waffle_frame_candidates').value
         )
+        self.declare_parameter('require_localization_ready', True)
+        self.declare_parameter('localization_ready_topic', '/localization_ready')
+        self.require_localization_ready = bool(
+            self.get_parameter('require_localization_ready').value
+        )
+        self.localization_ready_topic = str(
+            self.get_parameter('localization_ready_topic').value
+        )
+        self.localization_ready = not self.require_localization_ready
 
         # Arm base offset
         self.declare_parameter('arm_base_x', 0.10)
@@ -261,6 +271,19 @@ class OmxYoloNode(Node):
                                  self.on_nav_result, 10)
         self.create_subscription(String, '/waffle/status',
                                  self.on_waffle_status, 10)
+        if self.require_localization_ready:
+            latched_qos = QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                history=HistoryPolicy.KEEP_LAST,
+            )
+            self.create_subscription(
+                Bool,
+                self.localization_ready_topic,
+                self.on_localization_ready,
+                latched_qos,
+            )
         # H4 신규
         self.create_subscription(String, '/omx/boundary_enable',
                                  self.on_boundary_enable, 10)
@@ -290,6 +313,10 @@ class OmxYoloNode(Node):
         self.get_logger().info(
             f"Timer: 메인 {self.cfg.ibvs.control_hz} Hz, 상태 1 Hz")
         self.get_logger().info(f"Initial armed: {self.sm.armed}")
+        self.get_logger().info(
+            f"Localization gate: require={self.require_localization_ready} "
+            f"topic={self.localization_ready_topic}"
+        )
         self.get_logger().info("=== Node ready (H4) ===")
 
     # ----- Costmap -----
@@ -983,6 +1010,15 @@ class OmxYoloNode(Node):
     def on_waffle_status(self, msg: String):
         self.waffle_status = msg.data
 
+    def on_localization_ready(self, msg: Bool):
+        previous = self.localization_ready
+        self.localization_ready = bool(msg.data)
+        if self.localization_ready and not previous:
+            self.get_logger().warn(
+                f"[localization_ready] {self.localization_ready_topic}=true; "
+                "WAITING_NAV retry enabled"
+            )
+
     def on_boundary_enable(self, msg: String):
         """H4: BOUNDARY 자동 생성 런타임 토글.
         
@@ -1253,6 +1289,13 @@ class OmxYoloNode(Node):
         if self.sm.state != State.WAITING_NAV:
             return
         if now - self._last_nav_retry_t < self._nav_retry_period_sec:
+            return
+        if self.require_localization_ready and not self.localization_ready:
+            self._last_nav_retry_t = now
+            self.get_logger().warn(
+                "[nav_retry] suppressed until localization_ready=true",
+                throttle_duration_sec=5.0,
+            )
             return
 
         status = (self.waffle_status or "unknown").lower()

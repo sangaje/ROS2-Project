@@ -73,6 +73,8 @@ class LeaderShadowFollow(Node):
         self.declare_parameter('active_scout_id_topic', '/failover/active_scout_id')
         self.declare_parameter('active_scout_robot_name', 'scout22')
         self.declare_parameter('follower_robot_name', 'follower21')
+        self.declare_parameter('require_localization_ready', True)
+        self.declare_parameter('localization_ready_topic', '/localization_ready')
         self.declare_parameter('scout_pose_timeout_sec', 2.5)
         self.declare_parameter('startup_grace_sec', 8.0)
 
@@ -116,6 +118,8 @@ class LeaderShadowFollow(Node):
         self.active_scout_id_topic = str(get('active_scout_id_topic').value)
         self.original_scout_id = str(get('active_scout_robot_name').value)
         self.follower_robot_name = str(get('follower_robot_name').value)
+        self.require_localization_ready = bool(get('require_localization_ready').value)
+        self.localization_ready_topic = str(get('localization_ready_topic').value)
         self.scout_pose_timeout = max(0.2, float(get('scout_pose_timeout_sec').value))
         self.startup_grace = max(0.0, float(get('startup_grace_sec').value))
 
@@ -172,6 +176,13 @@ class LeaderShadowFollow(Node):
         self.create_subscription(OccupancyGrid, self.map_topic, self._on_map, map_qos)
         self.create_subscription(String, self.failover_state_topic, self._on_failover_state, latched_qos)
         self.create_subscription(String, self.active_scout_id_topic, self._on_active_scout_id, latched_qos)
+        if self.require_localization_ready:
+            self.create_subscription(
+                Bool,
+                self.localization_ready_topic,
+                self._on_localization_ready,
+                latched_qos,
+            )
         if self.scan_enabled:
             self.create_subscription(LaserScan, self.scan_topic, self._on_scan, 10)
 
@@ -183,6 +194,7 @@ class LeaderShadowFollow(Node):
         self.start_wall = self._now()
         self.active_scout_id = self.original_scout_id
         self.failover_state = 'NORMAL_OPERATION'
+        self.localization_ready = not self.require_localization_ready
         self.leader_pose: Optional[PoseStamped] = None
         self.original_scout_pose: Optional[PoseStamped] = None
         self.follower_scout_pose: Optional[PoseStamped] = None
@@ -216,7 +228,8 @@ class LeaderShadowFollow(Node):
             f'enabled={self.enabled} scout={self.original_scout_id}:{self.active_pose_topic} '
             f'follower_scout={self.follower_robot_name}:{self.follower_pose_topic} '
             f'distance={self.follow_distance:.2f}m fov={self.scan_fov_deg:.1f}deg '
-            f'controller_service={self.controller_set_parameters_service}'
+            f'controller_service={self.controller_set_parameters_service} '
+            f'localization_gate={self.require_localization_ready}:{self.localization_ready_topic}'
         )
 
     def _now(self) -> float:
@@ -257,6 +270,14 @@ class LeaderShadowFollow(Node):
             f'[LEADER_SHADOW] ACTIVE_SCOUT_CHANGED | active_scout={scout_id}'
         )
 
+    def _on_localization_ready(self, msg: Bool) -> None:
+        previous = self.localization_ready
+        self.localization_ready = bool(msg.data)
+        if self.localization_ready and not previous:
+            self.get_logger().warning(
+                f'[LEADER_SHADOW] LOCALIZATION_READY | topic={self.localization_ready_topic}'
+            )
+
     def _on_scan(self, msg: LaserScan) -> None:
         self.last_scan_wall = self._now()
         stamp = msg.header.stamp
@@ -270,6 +291,11 @@ class LeaderShadowFollow(Node):
             return
         if self._now() - self.start_wall < self.startup_grace:
             self._publish_state('startup_grace')
+            return
+        if self.require_localization_ready and not self.localization_ready:
+            self.mode = LeaderMode.IDLE
+            self._set_controller_speed_limit(False)
+            self._publish_state('waiting_localization_ready')
             return
         if not self._failover_allows_shadow():
             self._stop_shadow_for_failover()

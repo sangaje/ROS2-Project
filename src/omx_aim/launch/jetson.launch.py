@@ -77,6 +77,8 @@ def launch_setup(context, *args, **kwargs):
         arguments=yolo_args,
         parameters=[{
             'waffle_frame_candidates': ['base_link', 'base_footprint'],
+            'require_localization_ready': True,
+            'localization_ready_topic': '/localization_ready',
         }],
         respawn=True,
         respawn_delay=3.0,
@@ -94,6 +96,7 @@ def launch_setup(context, *args, **kwargs):
                 'require_amcl_ready': False,
                 'require_localization_ready': True,
                 'localization_ready_topic': '/localization_ready',
+                'max_pending_goal_age_sec': 300.0,
             }],
         ),
         Node(

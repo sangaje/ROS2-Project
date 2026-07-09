@@ -61,6 +61,8 @@ class ScoutFailoverCoordinator(Node):
         self.declare_parameter('role_command_topic', '/fleet/field_robot_role_cmd')
         self.declare_parameter('field_robot_status_topic', '/fleet/field_robot_status')
         self.declare_parameter('role_topic', '/fleet/scout_role')
+        self.declare_parameter('require_bootstrap_complete', True)
+        self.declare_parameter('bootstrap_ready_topic', '/localization_ready')
         self.declare_parameter('scout_liveness_timeout_sec', 2.0)
         self.declare_parameter('scout_failure_confirm_sec', 0.5)
         self.declare_parameter('scout_pose_timeout_sec', 5.0)
@@ -88,6 +90,8 @@ class ScoutFailoverCoordinator(Node):
         self.role_command_topic = str(get('role_command_topic').value)
         self.field_robot_status_topic = str(get('field_robot_status_topic').value)
         self.role_topic = str(get('role_topic').value)
+        self.require_bootstrap_complete = bool(get('require_bootstrap_complete').value)
+        self.bootstrap_ready_topic = str(get('bootstrap_ready_topic').value)
         self.liveness_timeout = max(0.2, float(get('scout_liveness_timeout_sec').value))
         self.confirm_sec = max(0.0, float(get('scout_failure_confirm_sec').value))
         self.pose_timeout = max(0.2, float(get('scout_pose_timeout_sec').value))
@@ -129,9 +133,17 @@ class ScoutFailoverCoordinator(Node):
         self.create_subscription(PoseStamped, self.leader_pose_topic, self._on_leader_pose, 10)
         self.create_subscription(PoseStamped, self.follower_pose_topic, self._on_follower_pose, 10)
         self.create_subscription(String, self.field_robot_status_topic, self._on_field_status, 10)
+        if self.require_bootstrap_complete:
+            self.create_subscription(
+                Bool,
+                self.bootstrap_ready_topic,
+                self._on_bootstrap_ready,
+                latched_qos,
+            )
 
         self.state = FailoverState.NORMAL_OPERATION
         self.start_wall = self._now()
+        self.bootstrap_ready = not self.require_bootstrap_complete
         self.last_liveness_wall: Optional[float] = None
         self.last_scout_pose_wall: Optional[float] = None
         self.last_scout_pose: Optional[PoseStamped] = None
@@ -151,7 +163,8 @@ class ScoutFailoverCoordinator(Node):
         self.get_logger().warning(
             '[FAILOVER] READY | '
             f'enabled={self.enabled} liveness={self.scout_liveness_topic} '
-            f'scout_pose={self.scout_pose_topic} follower_pose={self.follower_pose_topic}'
+            f'scout_pose={self.scout_pose_topic} follower_pose={self.follower_pose_topic} '
+            f'bootstrap_gate={self.require_bootstrap_complete}:{self.bootstrap_ready_topic}'
         )
 
     def _now(self) -> float:
@@ -187,12 +200,22 @@ class ScoutFailoverCoordinator(Node):
     def _on_follower_pose(self, msg: PoseStamped) -> None:
         self.follower_pose = msg
 
+    def _on_bootstrap_ready(self, msg: Bool) -> None:
+        previous = self.bootstrap_ready
+        self.bootstrap_ready = bool(msg.data)
+        if self.bootstrap_ready and not previous:
+            self.get_logger().warning(
+                f'[FAILOVER] BOOTSTRAP_READY | topic={self.bootstrap_ready_topic}'
+            )
+
     def _on_field_status(self, msg: String) -> None:
         try:
             data = json.loads(msg.data)
         except json.JSONDecodeError:
             return
         if int(data.get('epoch', -1)) != self.scout_epoch:
+            return
+        if self.require_bootstrap_complete and not self.bootstrap_ready:
             return
         status = str(data.get('status', '')).upper()
         if status == 'ACTIVE_SCOUT':
@@ -221,6 +244,13 @@ class ScoutFailoverCoordinator(Node):
         if not self.enabled:
             return
         if self._now() - self.start_wall < self.startup_grace:
+            return
+        if self.require_bootstrap_complete and not self.bootstrap_ready:
+            self.get_logger().info(
+                '[FAILOVER] BOOTSTRAP_HOLD | '
+                f'waiting for {self.bootstrap_ready_topic}=true',
+                throttle_duration_sec=5.0,
+            )
             return
 
         if self.state == FailoverState.NORMAL_OPERATION:
