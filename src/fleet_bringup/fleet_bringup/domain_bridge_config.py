@@ -274,6 +274,10 @@ def write_member_bridge_configs(
             profile=map_qos(depth=5),
         ),
         '/leader_pose': topic('geometry_msgs/msg/PoseStamped'),
+        '/omx/target_detected': topic(
+            'std_msgs/msg/Bool',
+            profile=qos(reliability='best_effort', durability='volatile', depth=5),
+        ),
         '/member_goal_pose': topic('geometry_msgs/msg/PoseStamped'),
         '/fleet/coordination_status': topic(
             'std_msgs/msg/String',

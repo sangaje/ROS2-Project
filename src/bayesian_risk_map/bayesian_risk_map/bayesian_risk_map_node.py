@@ -356,6 +356,31 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             self.visibility_num_rays = min(self.visibility_num_rays, 48)
         self.observed_empty_alpha = float(self.declare_parameter('observed_empty_alpha', 0.20).value)
 
+        # Leader visibility: the leader (waffle/OMX) also looks at the
+        # shared map from wherever it's standing. When it has a fresh pose
+        # and isn't currently seeing a person, cells in its view get folded
+        # into the same visibility/observed-empty/decay pipeline as the
+        # scout's own camera -- "the leader has eyes on this too" clears
+        # risk there just like the scout's own look would.
+        self.enable_leader_visibility_tracking = self.declare_bool_parameter(
+            'enable_leader_visibility_tracking', True
+        )
+        self.leader_pose_topic = str(
+            self.declare_parameter('leader_pose_topic', '/leader_pose').value
+        )
+        self.leader_detected_topic = str(
+            self.declare_parameter('leader_detected_topic', '/omx/target_detected').value
+        )
+        self.leader_camera_hfov_deg = float(
+            self.declare_parameter('leader_camera_hfov_deg', 62.0).value
+        )
+        self.leader_pose_max_age_sec = float(
+            self.declare_parameter('leader_pose_max_age_sec', 2.0).value
+        )
+        self.leader_detected_max_age_sec = float(
+            self.declare_parameter('leader_detected_max_age_sec', 1.0).value
+        )
+
         # Occupancy policy
         self.allow_unknown = self.declare_bool_parameter('allow_unknown', False)
         self.risk_persist_in_unknown = self.declare_bool_parameter('risk_persist_in_unknown', True)
@@ -417,6 +442,11 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.observed_empty_map = None
         self.visibility_map = None
         self.room_probability_map = None
+
+        self.leader_pose_msg = None
+        self.leader_pose_wall = None
+        self.leader_detected = False
+        self.leader_detected_wall = None
 
         self.visual_seen_map = None
         self.region_id_map = None
@@ -576,6 +606,13 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             self.enable_yolo = False
         self.clear_point_sub = self.create_subscription(PointStamped, '/risk/clear_point', self.on_clear_point, 10)
         self.clear_all_sub = self.create_subscription(Bool, '/risk/clear_all', self.on_clear_all, 10)
+        if self.enable_leader_visibility_tracking:
+            self.leader_pose_sub = self.create_subscription(
+                PoseStamped, self.leader_pose_topic, self.on_leader_pose, 10
+            )
+            self.leader_detected_sub = self.create_subscription(
+                Bool, self.leader_detected_topic, self.on_leader_detected, 10
+            )
 
         self.pub_risk = self.create_publisher(OccupancyGrid, '/risk/risk_map', self.qos_grid_pub)
         self.pub_bearing_consensus = self.create_publisher(
@@ -1071,6 +1108,35 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         p = msg.pose.position
         q = msg.pose.orientation
         self.record_pose_sample(pose_sec, (float(p.x), float(p.y), yaw_from_quaternion(q)))
+
+    def on_leader_pose(self, msg: PoseStamped) -> None:
+        self.leader_pose_msg = msg
+        self.leader_pose_wall = self.get_clock().now().nanoseconds * 1e-9
+
+    def on_leader_detected(self, msg: Bool) -> None:
+        self.leader_detected = bool(msg.data)
+        self.leader_detected_wall = self.get_clock().now().nanoseconds * 1e-9
+
+    def get_leader_pose(self) -> Optional[Tuple[float, float, float]]:
+        if self.leader_pose_msg is None or self.leader_pose_wall is None:
+            return None
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if now - self.leader_pose_wall > self.leader_pose_max_age_sec:
+            return None
+        p = self.leader_pose_msg.pose.position
+        q = self.leader_pose_msg.pose.orientation
+        return (float(p.x), float(p.y), yaw_from_quaternion(q))
+
+    def leader_currently_detecting(self) -> bool:
+        if self.leader_detected_wall is None:
+            return False
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if now - self.leader_detected_wall > self.leader_detected_max_age_sec:
+            # Stale detection state -- treat as unknown/possibly-occupied
+            # rather than confidently "no one there", so a dead detection
+            # feed can't quietly start clearing risk on its own.
+            return True
+        return self.leader_detected
 
     def record_pose_sample(self, stamp_sec: float, pose):
         sample = PoseSample(
@@ -2150,12 +2216,12 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.risk_dirty = True
         return True
 
-    def compute_visibility_map(self, robot_pose):
+    def compute_visibility_map(self, robot_pose, hfov_deg: Optional[float] = None):
         h, w = self.occ_grid.shape
         vis = np.zeros((h, w), dtype=np.float32)
 
         rx, ry, ryaw = robot_pose
-        hfov = math.radians(self.camera_hfov_deg)
+        hfov = math.radians(self.camera_hfov_deg if hfov_deg is None else hfov_deg)
         # Half-cell sampling prevents a thin/diagonal wall from being skipped by a
         # ray. This is intentionally independent from navigation's allow_unknown.
         r_step = max(0.01, min(0.03, 0.5 * self.map_resolution))
@@ -2783,11 +2849,33 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
 
         if self.enable_visibility_tracking:
             self.visibility_map = self.compute_visibility_map(robot_pose)
-            self.update_visual_seen_map(self.visibility_map)
-            self.update_observed_empty(self.visibility_map, currently_detecting_person)
+            combined_visibility = self.visibility_map
+            combined_had_detection = currently_detecting_person
+
+            # Fold in the leader's own view of the shared map: cells it can
+            # see (and isn't currently seeing a person in) count as
+            # observed-empty and decay risk the same as the scout's own
+            # look would, using np.maximum fusion so this never has to
+            # duplicate apply_visible_no_detection_risk_decay's rate-limit
+            # bookkeeping -- it just enriches the one existing call below.
+            if self.enable_leader_visibility_tracking:
+                leader_pose = self.get_leader_pose()
+                if leader_pose is not None:
+                    leader_visibility = self.compute_visibility_map(
+                        leader_pose, hfov_deg=self.leader_camera_hfov_deg
+                    )
+                    combined_visibility = np.maximum(
+                        combined_visibility, leader_visibility
+                    )
+                    combined_had_detection = (
+                        combined_had_detection or self.leader_currently_detecting()
+                    )
+
+            self.update_visual_seen_map(combined_visibility)
+            self.update_observed_empty(combined_visibility, combined_had_detection)
             self.apply_visible_no_detection_risk_decay(
-                self.visibility_map,
-                currently_detecting_person,
+                combined_visibility,
+                combined_had_detection,
                 now_ros_sec,
             )
 
