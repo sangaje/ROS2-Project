@@ -165,6 +165,7 @@ def generate_launch_description():
             )
 
         domain = int(domain_id.perform(context))
+        process_env = clean_process_environment(str(domain))
 
         fleet_role_value = fleet_role.perform(context).strip().lower()
         if not fleet_role_value:
@@ -352,7 +353,6 @@ def generate_launch_description():
             ))
 
         if role_value == 'leader':
-            process_env = clean_process_environment(str(domain))
             risk_domain_value = risk_domain_id.perform(context).strip()
             if (
                 launch_bool(enable_risk_to_leader_bridge.perform(context))
@@ -822,7 +822,6 @@ def generate_launch_description():
                     'drives cmd_vel instead). Risk map/camera stay on.'
                 ]))
         elif launch_bool(start_rl_policy.perform(context)):
-            process_env = clean_process_environment(str(domain))
             rl_command = [
                 'ros2', 'run', 'turtlebot3_rl_training', 'eval_policy',
                 '--model', rl_model_path.perform(context),
