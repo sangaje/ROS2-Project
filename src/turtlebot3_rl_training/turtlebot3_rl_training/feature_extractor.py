@@ -285,11 +285,11 @@ class MapVectorFeatureExtractor(BaseFeaturesExtractor):
     # Sanitizers
     # ------------------------------------------------------------------ #
     def _sanitize_map(self, map_obs: torch.Tensor) -> torch.Tensor:
-        map_obs = torch.nan_to_num(map_obs.float(), nan=0.0, posinf=1.0, neginf=0.0)
+        map_obs = torch.nan_to_num(map_obs, nan=0.0, posinf=1.0, neginf=0.0)
         return torch.clamp(map_obs, 0.0, 1.0)
 
     def _sanitize_vector(self, vector_obs: torch.Tensor) -> torch.Tensor:
-        vector_obs = torch.nan_to_num(vector_obs.float(), nan=0.0, posinf=1.0, neginf=-1.0)
+        vector_obs = torch.nan_to_num(vector_obs, nan=0.0, posinf=1.0, neginf=-1.0)
         if vector_obs.shape[-1] >= self.lidar_dim:
             lidar = torch.clamp(vector_obs[..., : self.lidar_dim], 0.0, 1.0)
             stats = torch.clamp(vector_obs[..., self.lidar_dim :], -1.0, 1.0)
@@ -309,13 +309,13 @@ class MapVectorFeatureExtractor(BaseFeaturesExtractor):
         return self.map_linear(self.map_cnn(self._sanitize_map(map_flat)))
 
     def _encode_lidar_flat(self, lidar_flat: torch.Tensor) -> torch.Tensor:
-        lidar_flat = torch.clamp(lidar_flat.float(), 0.0, 1.0).unsqueeze(1)
+        lidar_flat = torch.clamp(lidar_flat, 0.0, 1.0).unsqueeze(1)
         return self.lidar_linear(self.lidar_conv(lidar_flat))
 
     def _encode_stats_flat(self, stats_flat: torch.Tensor | None) -> torch.Tensor | None:
         if self.stats_net is None or stats_flat is None:
             return None
-        stats_flat = torch.nan_to_num(stats_flat.float(), nan=0.0, posinf=1.0, neginf=-1.0)
+        stats_flat = torch.nan_to_num(stats_flat, nan=0.0, posinf=1.0, neginf=-1.0)
         stats_flat = torch.clamp(stats_flat, -1.0, 1.0)
         return self.stats_net(stats_flat)
 
@@ -332,6 +332,19 @@ class MapVectorFeatureExtractor(BaseFeaturesExtractor):
         map_features = self._encode_map_flat(map_flat)
         vector_token = self._encode_vector_token_flat(vector_flat)
         return self.step_fusion(torch.cat([map_features, vector_token], dim=1))
+
+    def _encode_full_step_flat_with_map(
+        self, map_flat: torch.Tensor, vector_flat: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Same as _encode_full_step_flat but also returns the map feature vector.
+
+        Used by the temporal branch to avoid recomputing the current-step map CNN.
+        Returns (step_token, map_features) both with shape (B, *_features_dim).
+        """
+        map_features = self._encode_map_flat(map_flat)
+        vector_token = self._encode_vector_token_flat(vector_flat)
+        step_token = self.step_fusion(torch.cat([map_features, vector_token], dim=1))
+        return step_token, map_features
 
     # ------------------------------------------------------------------ #
     # Temporal branch: Map-conditioned Delta-TCN with FiLM
@@ -356,13 +369,19 @@ class MapVectorFeatureExtractor(BaseFeaturesExtractor):
         flat_maps = map_seq.reshape(batch_size * history_len, *map_seq.shape[2:])
         flat_vecs = seq_obs.reshape(batch_size * history_len, -1)
 
-        # z_k for every history step.
+        # z_k for every history step.  Also retrieve the last-step map feature
+        # m_t so the FiLM conditioning does NOT require a second CNN forward pass.
         z_flat = self._encode_full_step_flat(flat_maps, flat_vecs)
         z_seq = z_flat.reshape(batch_size, history_len, self.vector_features_dim)  # (B,H,D)
 
-        # Current-step token z_t (last in history) for the skip connection and
-        # for FiLM conditioning via its map feature.
+        # Current-step token z_t (last in history) for the skip connection.
         z_t = z_seq[:, -1, :]  # (B, D)
+
+        # FiLM conditioning uses the CURRENT map feature m_t.
+        # Re-encode only the last-step map (avoids duplicating the full batch).
+        last_map_flat = map_seq[:, -1]                          # (B, C, H, W)
+        last_vec_flat = seq_obs[:, -1, :]                       # (B, vector_dim)
+        _, m_t = self._encode_full_step_flat_with_map(last_map_flat, last_vec_flat)  # (B, map_features_dim)
 
         # Delta over time: dz_k = z_k - z_{k-1}, with dz_0 = 0.
         dz_seq = torch.zeros_like(z_seq)
@@ -373,9 +392,6 @@ class MapVectorFeatureExtractor(BaseFeaturesExtractor):
         s_seq = torch.cat([z_seq, dz_seq], dim=-1)
         s_proj = self.temporal_input_proj(s_seq)        # (B,H,hidden)
         x = s_proj.transpose(1, 2).contiguous()         # (B,hidden,H)
-
-        # FiLM conditioning uses the CURRENT map feature m_t.
-        m_t = self._encode_map_flat(map_seq[:, -1])     # (B, map_features_dim)
 
         x = self.temporal_block1(x, m_t)
         x = self.temporal_block2(x, m_t)
@@ -389,9 +405,11 @@ class MapVectorFeatureExtractor(BaseFeaturesExtractor):
     def forward(self, observations: dict[str, torch.Tensor]) -> torch.Tensor:
         if self.use_temporal_cnn and "map_seq" in observations and "seq" in observations:
             h_t, z_t = self._encode_temporal_map_conditioned_delta_tcn(
-                observations["map_seq"], observations["seq"]
+                observations["map_seq"].float(), observations["seq"].float()
             )
             features = torch.cat([h_t, z_t], dim=1)
         else:
-            features = self._encode_full_step_flat(observations["map"], observations["vector"])
+            features = self._encode_full_step_flat(
+                observations["map"].float(), observations["vector"].float()
+            )
         return self.final_fusion(features)

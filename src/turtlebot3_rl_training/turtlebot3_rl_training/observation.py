@@ -107,11 +107,10 @@ def _circular_median_filter(values: np.ndarray, kernel_size: int) -> np.ndarray:
         return values.astype(np.float32, copy=False)
 
     half = kernel_size // 2
-    stacked = np.stack(
-        [np.roll(values, shift) for shift in range(-half, half + 1)],
-        axis=0,
-    )
-    return np.median(stacked, axis=0).astype(np.float32)
+    from numpy.lib.stride_tricks import sliding_window_view
+    padded = np.concatenate([values[-half:], values, values[:half]])
+    windows = sliding_window_view(padded, kernel_size)
+    return np.median(windows, axis=1).astype(np.float32)
 
 
 def _circular_lowpass_filter(values: np.ndarray, kernel_size: int) -> np.ndarray:
@@ -125,10 +124,8 @@ def _circular_lowpass_filter(values: np.ndarray, kernel_size: int) -> np.ndarray
     weights = np.exp(-0.5 * x * x).astype(np.float32)
     weights /= float(np.sum(weights))
 
-    filtered = np.zeros_like(values, dtype=np.float32)
-    for weight, shift in zip(weights, range(-half, half + 1)):
-        filtered += float(weight) * np.roll(values, shift)
-    return filtered.astype(np.float32)
+    padded = np.concatenate([values[-half:], values, values[:half]])
+    return np.convolve(padded, weights[::-1], mode='valid').astype(values.dtype)
 
 
 def _valid_scan_geometry(
@@ -369,31 +366,45 @@ def _canonical_angle_resample(
     target_centers = 2.0 * math.pi * bin_offsets / float(num_bins)
     target_centers = np.arctan2(np.sin(target_centers), np.cos(target_centers)).astype(np.float32)
 
-    pooled = np.empty(num_bins, dtype=np.float32)
-    for j, center in enumerate(target_centers):
-        diff = np.arctan2(np.sin(source_angles - center), np.cos(source_angles - center))
-        abs_diff = np.abs(diff)
+    # Vectorized: build (n_source, num_bins) broadcast instead of a Python loop.
+    source_col = source_angles[:, None]       # (n, 1)
+    target_row = target_centers[None, :]     # (1, num_bins)
+    diff_matrix = source_col - target_row    # (n, num_bins)
+    # Normalize to [-pi, pi] using arctan2 on the whole matrix.
+    diff_matrix = np.arctan2(np.sin(diff_matrix), np.cos(diff_matrix))
+    abs_diff = np.abs(diff_matrix)           # (n, num_bins)
 
-        # Angular cell-overlap criterion.  This is the key fix for 253/254-beam
-        # scans mapped into 360 policy bins.
-        mask = abs_diff <= (support_width + eps)
-        if not np.any(mask):
-            # Fallback only for malformed/non-full scans. Use nearest physical ray
-            # instead of index-space interpolation to preserve angular semantics.
-            nearest = int(np.argmin(abs_diff))
-            raw_min = float(robust_ranges[nearest])
-            smooth_mean = float(smooth_ranges[nearest])
-        else:
-            raw_min = float(np.min(robust_ranges[mask]))
-            # Triangular overlap-like weights.  These are for smooth anti-aliasing
-            # only; raw_min still prevents smoothing from hiding close obstacles.
-            weights = np.maximum((support_width + eps) - abs_diff[mask], eps).astype(np.float32)
-            smooth_vals = smooth_ranges[mask].astype(np.float32, copy=False)
-            smooth_mean = float(np.sum(weights * smooth_vals) / max(float(np.sum(weights)), eps))
+    support = support_width + eps
+    in_support = abs_diff <= support         # bool (n, num_bins)
 
-        pooled[j] = min(smooth_mean, raw_min + obstacle_margin)
+    # Min pool (obstacle detection)
+    r_expanded = np.where(in_support, robust_ranges[:, None], np.inf)  # (n, num_bins)
+    pooled_min = np.min(r_expanded, axis=0)  # (num_bins,)
+    # For bins with no source in support, fall back to nearest source ray.
+    no_support_mask = np.isinf(pooled_min)
+    if np.any(no_support_mask):
+        nearest_idx = np.argmin(abs_diff, axis=0)  # (num_bins,)
+        fallback_min = robust_ranges[nearest_idx]
+        pooled_min = np.where(no_support_mask, fallback_min, pooled_min)
+
+    # Weighted smooth mean (triangular overlap weights for anti-aliasing)
+    weights_matrix = np.maximum(support - abs_diff, eps) * in_support  # (n, num_bins)
+    weight_sum = weights_matrix.sum(axis=0)  # (num_bins,)
+    weight_sum_safe = np.maximum(weight_sum, eps)
+    pooled_smooth = (weights_matrix * smooth_ranges[:, None]).sum(axis=0) / weight_sum_safe  # (num_bins,)
+    # For bins with no support, fall back to nearest source ray smooth value.
+    if np.any(no_support_mask):
+        fallback_smooth = smooth_ranges[nearest_idx]
+        pooled_smooth = np.where(no_support_mask, fallback_smooth, pooled_smooth)
+
+    pooled = np.minimum(pooled_smooth, pooled_min + obstacle_margin)
 
     return np.clip(pooled, min_range, max_range).astype(np.float32)
+
+_LIDAR_MEDIAN_KERNEL: int | None = None
+_LIDAR_LOWPASS_KERNEL: int | None = None
+_LIDAR_OBSTACLE_MARGIN: float | None = None
+
 
 def downsample_lidar(
     scan_ranges: Sequence[float],
@@ -425,6 +436,18 @@ def downsample_lidar(
       TB3_RL_LIDAR_LOWPASS_KERNEL         default 5, set 1 to disable
       TB3_RL_LIDAR_OBSTACLE_MARGIN_M      default 0.08
     """
+    global _LIDAR_MEDIAN_KERNEL, _LIDAR_LOWPASS_KERNEL, _LIDAR_OBSTACLE_MARGIN
+    if _LIDAR_MEDIAN_KERNEL is None:
+        _LIDAR_MEDIAN_KERNEL = _make_odd_kernel(
+            _env_int("TB3_RL_LIDAR_MEDIAN_KERNEL", 3),
+            min_value=1,
+        )
+        _LIDAR_LOWPASS_KERNEL = _make_odd_kernel(
+            _env_int("TB3_RL_LIDAR_LOWPASS_KERNEL", 5),
+            min_value=1,
+        )
+        _LIDAR_OBSTACLE_MARGIN = _env_float("TB3_RL_LIDAR_OBSTACLE_MARGIN_M", 0.08)
+
     num_bins = max(int(num_bins), 1)
     ranges = np.asarray(scan_ranges, dtype=np.float32)
 
@@ -439,15 +462,9 @@ def downsample_lidar(
     )
     ranges = np.clip(ranges, min_range, max_range).astype(np.float32)
 
-    median_kernel = _make_odd_kernel(
-        _env_int("TB3_RL_LIDAR_MEDIAN_KERNEL", 3),
-        min_value=1,
-    )
-    lowpass_kernel = _make_odd_kernel(
-        _env_int("TB3_RL_LIDAR_LOWPASS_KERNEL", 5),
-        min_value=1,
-    )
-    obstacle_margin = _env_float("TB3_RL_LIDAR_OBSTACLE_MARGIN_M", 0.08)
+    median_kernel = _LIDAR_MEDIAN_KERNEL
+    lowpass_kernel = _LIDAR_LOWPASS_KERNEL
+    obstacle_margin = _LIDAR_OBSTACLE_MARGIN
 
     robust_ranges = _circular_median_filter(ranges, median_kernel)
     smooth_ranges = _circular_lowpass_filter(robust_ranges, lowpass_kernel)
