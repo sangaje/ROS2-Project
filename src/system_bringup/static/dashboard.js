@@ -86,14 +86,17 @@ function refreshStreams(force = true) {
 }
 
 function updateImages(s) {
+  // Don't clear mapReady/riskReady here -- that blanks the canvas on every
+  // poll cycle where seq changed (i.e. constantly during active SLAM),
+  // since the new image only finishes loading asynchronously later. Keep
+  // drawing the still-valid previous image until onload actually swaps it
+  // in; only onerror below should ever mark it not-ready.
   if (s.map.seq !== mapSeq && s.map.status !== 'NO DATA') {
     mapSeq = s.map.seq;
-    mapReady = false;
     mapImg.src = `/api/map.png?v=${mapSeq}&t=${Date.now()}`;
   }
   if (s.risk.seq !== riskSeq && s.risk.status !== 'NO DATA') {
     riskSeq = s.risk.seq;
-    riskReady = false;
     riskImg.src = `/api/risk.png?v=${riskSeq}&t=${Date.now()}`;
   }
 }
