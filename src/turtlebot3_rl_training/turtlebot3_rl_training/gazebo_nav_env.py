@@ -2,7 +2,10 @@ import math
 import os
 import random
 import re
+import signal
 import subprocess
+import tempfile
+import threading
 import time
 from copy import deepcopy
 from dataclasses import replace
@@ -49,11 +52,17 @@ from turtlebot3_rl_training.exploration_map import ExplorationGridMap, MapUpdate
 from turtlebot3_rl_training.observation import build_exploration_observation
 from turtlebot3_rl_training.reset_manager import ResetManager
 from turtlebot3_rl_training.reward import (
+    PHYSICAL_TERMINAL_REWARD,
     compute_exploration_reward,
     compute_velocity_safety_slowdown_penalty,
     compute_waypoint_macro_reward_adjustment,
 )
 from turtlebot3_rl_training.sim_controller import GazeboSimController
+
+# Module-level cache for pre-computed scan angle arrays keyed on scan geometry.
+# Avoids recomputing np.arange + angle_min + idx*angle_increment on every call
+# to _scan_min_distance_in_sector (which is called multiple times per step).
+_SCAN_ANGLES_CACHE: dict = {}
 
 
 def _quiet_reset_logs() -> bool:
@@ -67,11 +76,12 @@ class RecoverableResetError(RuntimeError):
     """Reset/readiness failure that should retry the whole reset instead of killing SB3.
 
     These errors are caused by transient reset races such as delayed Cartographer
-    /map, missing map->base TF immediately after teleport, or post-reset readiness
-    timeout.  They must not return an empty observation, because that would insert
-    a corrupted initial state into the replay buffer.  The environment reset wrapper
-    catches this exception, holds the robot still, clears transient TF/Nav2 state,
-    and retries the reset from the beginning.
+    /map, missing map->base TF immediately after teleport, post-reset physical
+    shake, or post-reset readiness timeout.  They must not return an empty
+    observation, because that would insert a corrupted initial state into the
+    replay buffer.  The environment reset wrapper catches this exception, holds
+    the robot still, clears transient TF/Nav2 state, and retries the reset from
+    the beginning.
     """
 
 
@@ -89,17 +99,50 @@ class GazeboNavEnv(gym.Env):
     # house_random은 문/외곽 후보도 섞이므로, 실내에서만 시작시키고 싶을 때는
     # --reset-pose-mode house_inside_random을 사용한다.
     HOUSE_INSIDE_RESET_CANDIDATES: tuple[tuple[float, float], ...] = (
-        # User-selected safe indoor spawn points only.
-        # Keep this list small and explicit; do not mix old corridor/door candidates.
-        # Coordinates are Gazebo/world-frame x,y. The ResetManager still performs
-        # LiDAR clearance validation before accepting a candidate.
-        (-2.80,  0.96),
-        ( 5.00,  0.86),
-        ( 1.20, -1.60),
+        # Positive-y indoor points with conservative clearance from the SDF box
+        # geometry.  Avoid the lower/south area and near-partition/furniture
+        # starts; ResetManager still performs live LiDAR clearance validation.
+        (-5.30,  1.25),
+        (-5.30,  2.25),
+        (-2.80,  0.95),
+        (-2.20,  0.65),
+        (-0.60,  1.25),
+        ( 0.80,  1.55),
+        ( 0.80,  1.90),
+        ( 1.50,  1.25),
+        ( 3.10,  1.25),
+        ( 3.60,  1.25),
     )
 
     DEFAULT_HOUSE_RESET_CANDIDATES: tuple[tuple[float, float], ...] = (
         *HOUSE_INSIDE_RESET_CANDIDATES,
+    )
+
+    RANDOM_OBSTACLE_CANDIDATES: tuple[tuple[float, float], ...] = (
+        # Upper half of the house (y > 0).
+        (-5.60, 0.85), (-5.60, 1.35), (-5.60, 1.85), (-5.60, 2.35), (-5.60, 2.85),
+        (-4.40, 0.85), (-4.40, 1.35), (-4.40, 1.85), (-4.40, 2.35), (-4.40, 2.85),
+        (-3.20, 0.85), (-3.20, 1.35), (-3.20, 1.85), (-3.20, 2.35), (-3.20, 2.85),
+        (-2.00, 0.85), (-2.00, 1.35), (-2.00, 1.85), (-2.00, 2.35), (-2.00, 2.85),
+        (-0.80, 0.85), (-0.80, 1.35), (-0.80, 1.85), (-0.80, 2.35), (-0.80, 2.85),
+        ( 0.40, 0.85), ( 0.40, 1.35), ( 0.40, 1.85), ( 0.40, 2.35), ( 0.40, 2.85),
+        ( 1.60, 0.85), ( 1.60, 1.35), ( 1.60, 1.85), ( 1.60, 2.35), ( 1.60, 2.85),
+        ( 2.80, 0.85), ( 2.80, 1.35), ( 2.80, 1.85), ( 2.80, 2.35), ( 2.80, 2.85),
+        ( 4.00, 0.85), ( 4.00, 1.35), ( 4.00, 1.85), ( 4.00, 2.35), ( 4.00, 2.85),
+        ( 5.20, 0.85), ( 5.20, 1.35), ( 5.20, 1.85), ( 5.20, 2.35), ( 5.20, 2.85),
+        # v133: lower half of the house (y < 0) -- same x columns (already
+        # chosen to avoid the vertical partitions at x=-1.5/2.45), mirrored to
+        # negative y. This half was never used for obstacle placement before.
+        (-5.60, -0.85), (-5.60, -1.35), (-5.60, -1.85), (-5.60, -2.35), (-5.60, -2.85),
+        (-4.40, -0.85), (-4.40, -1.35), (-4.40, -1.85), (-4.40, -2.35), (-4.40, -2.85),
+        (-3.20, -0.85), (-3.20, -1.35), (-3.20, -1.85), (-3.20, -2.35), (-3.20, -2.85),
+        (-2.00, -0.85), (-2.00, -1.35), (-2.00, -1.85), (-2.00, -2.35), (-2.00, -2.85),
+        (-0.80, -0.85), (-0.80, -1.35), (-0.80, -1.85), (-0.80, -2.35), (-0.80, -2.85),
+        ( 0.40, -0.85), ( 0.40, -1.35), ( 0.40, -1.85), ( 0.40, -2.35), ( 0.40, -2.85),
+        ( 1.60, -0.85), ( 1.60, -1.35), ( 1.60, -1.85), ( 1.60, -2.35), ( 1.60, -2.85),
+        ( 2.80, -0.85), ( 2.80, -1.35), ( 2.80, -1.85), ( 2.80, -2.35), ( 2.80, -2.85),
+        ( 4.00, -0.85), ( 4.00, -1.35), ( 4.00, -1.85), ( 4.00, -2.35), ( 4.00, -2.85),
+        ( 5.20, -0.85), ( 5.20, -1.35), ( 5.20, -1.85), ( 5.20, -2.35), ( 5.20, -2.85),
     )
 
     """
@@ -146,7 +189,7 @@ class GazeboNavEnv(gym.Env):
     def __init__(
         self,
         ros_interface,
-        entity_name: str = "turtlebot3_burger",
+        entity_name: str = "burger",
         set_pose_service: str = "",
         enable_pose_reset: bool = True,
         random_reset_yaw: bool = True,
@@ -188,6 +231,8 @@ class GazeboNavEnv(gym.Env):
         disable_priority_map: bool = False,
         corridor_priority_reward_weight: float = 1.65,
         confidence_reward_weight: float = 1.0,
+        confidence_fill_reward_weight: float = 0.0,
+        confidence_fill_hold_weight: float = 0.0,
         slam_map_update_reward: bool = False,
         slam_map_update_reward_weight: float = 0.20,
         slam_map_update_reward_norm_cells: float = 80.0,
@@ -250,7 +295,7 @@ class GazeboNavEnv(gym.Env):
         map_bounds_min_local_known_ratio: float = 0.04,
         map_bounds_min_local_known_cells: int = 12,
         map_bounds_grace_steps: int = 8,
-        map_bounds_restart_penalty: float = 100.0,
+        map_bounds_restart_penalty: float = 0.0,
         nav2_action_name: str = "/navigate_to_pose",
         nav2_goal_timeout_sec: float = 2.0,
         nav2_control_window_sec: float = 1.35,
@@ -378,11 +423,11 @@ class GazeboNavEnv(gym.Env):
         explored_stall_growth: float = 0.008,
         explored_stall_power: float = 1.45,
         explored_stall_max_penalty: float = 1.20,
-        confidence_stall_start_steps: int = 6,
-        confidence_stall_growth: float = 0.010,
-        confidence_stall_power: float = 1.35,
-        confidence_stall_max_penalty: float = 1.60,
-        confidence_stall_gain_threshold: float = 0.02,
+        confidence_stall_start_steps: int = 5,
+        confidence_stall_growth: float = 0.018,
+        confidence_stall_power: float = 1.45,
+        confidence_stall_max_penalty: float = 3.00,
+        confidence_stall_gain_threshold: float = 0.035,
         confidence_stall_low_ratio_threshold: float = 0.20,
         priority_stuck_restart: bool = True,
         priority_stuck_restart_sec: float = 0.0,
@@ -390,20 +435,22 @@ class GazeboNavEnv(gym.Env):
         priority_stuck_score_threshold: float = 0.15,
         priority_stuck_clear_gain_threshold: float = 0.03,
         priority_stuck_info_gain_threshold: float = 0.0005,
-        priority_stuck_restart_penalty: float = 45.0,
+        priority_stuck_restart_penalty: float = 0.0,
         lidar_empty_restart: bool = True,
         lidar_empty_timeout_sec: float = 2.5,
         lidar_empty_grace_sec: float = 1.0,
         lidar_empty_min_valid_range_m: float = 0.12,
         lidar_empty_max_valid_range_m: float = 3.35,
         lidar_empty_min_valid_beams: int = 2,
-        lidar_empty_restart_penalty: float = 100.0,
+        lidar_empty_restart_penalty: float = 0.0,
         coverage_stall_terminal: bool = False,
         coverage_stall_start_steps: int = 1000,
         coverage_stall_window_steps: int = 500,
         coverage_stall_min_slam_new_cells: int = 5,
         coverage_stall_min_confidence_updated_cells: int = 30,
-        coverage_stall_terminal_penalty: float = -1.0,
+        coverage_stall_min_coverage_delta: float = 0.002,
+        coverage_stall_required_consecutive_windows: int = 2,
+        coverage_stall_terminal_penalty: float = 0.0,
         velocity_safety_backup: bool = True,
         velocity_safety_trigger_distance_m: float = 0.28,
         velocity_safety_stop_distance_m: float = 0.36,
@@ -442,6 +489,7 @@ class GazeboNavEnv(gym.Env):
         shake_ground_max_z: float = 0.13,
         shake_leaky_decay: bool = True,
         shake_yaw_wobble: bool = False,
+        shake_yaw_wobble_grace_steps: int = 80,
         shake_yaw_rate_threshold: float = 0.24,
         shake_cmd_flip_threshold: float = 0.16,
         shake_wobble_window_steps: int = 8,
@@ -463,7 +511,7 @@ class GazeboNavEnv(gym.Env):
         nav2_stuck_backup_speed_mps: float = 0.07,
         nav2_stuck_backup_timeout_sec: float = 4.0,
         nav2_stuck_backup_cooldown_sec: float = 2.5,
-        nav2_stuck_backup_penalty: float = 3.0,
+        nav2_stuck_backup_penalty: float = 0.0,
         reward_gamma: float = 0.99,
     ):
         super().__init__()
@@ -473,8 +521,40 @@ class GazeboNavEnv(gym.Env):
         self.entity_name = entity_name
         self.enable_pose_reset = bool(enable_pose_reset)
         self.random_reset_yaw = bool(random_reset_yaw)
+        self.random_obstacles_enabled = str(os.environ.get("TB3_RL_RANDOM_OBSTACLES", "0")).strip().lower() in {"1", "true", "yes", "on"}
+        try:
+            self.random_obstacle_count_min = max(int(os.environ.get("TB3_RL_RANDOM_OBSTACLE_COUNT_MIN", "15") or 15), 0)
+            self.random_obstacle_count_max = max(int(os.environ.get("TB3_RL_RANDOM_OBSTACLE_COUNT_MAX", "20") or 20), self.random_obstacle_count_min)
+        except Exception:
+            self.random_obstacle_count_min = 15
+            self.random_obstacle_count_max = 20
+        try:
+            self.random_obstacle_robot_clearance_m = max(float(os.environ.get("TB3_RL_RANDOM_OBSTACLE_ROBOT_CLEARANCE_M", "0.85") or 0.85), 0.30)
+            self.random_obstacle_pair_clearance_m = max(float(os.environ.get("TB3_RL_RANDOM_OBSTACLE_PAIR_CLEARANCE_M", "0.34") or 0.34), 0.18)
+            self.random_obstacle_noise_sigma_m = max(float(os.environ.get("TB3_RL_RANDOM_OBSTACLE_NOISE_SIGMA_M", "0.35") or 0.35), 0.0)
+        except Exception:
+            self.random_obstacle_robot_clearance_m = 0.85
+            self.random_obstacle_pair_clearance_m = 0.34
+            self.random_obstacle_noise_sigma_m = 0.35
+        self.random_obstacle_prefix = str(os.environ.get("TB3_RL_RANDOM_OBSTACLE_PREFIX", "tb3_rl_rand_obs")).strip() or "tb3_rl_rand_obs"
+        self.random_obstacle_world_name = self._world_name_from_service_path(world_control_service, fallback="default")
+        self._random_obstacle_names = [f"{self.random_obstacle_prefix}_{idx}" for idx in range(30)]
+        self._active_random_obstacle_names: list[str] = []
+        self._known_random_obstacle_names: set[str] = set()
 
         self.control_dt = float(control_dt)
+        # v133: decouple confidence-map sampling density from the SAC decision
+        # rate. With N>1, every control_dt advance is internally split into N
+        # physics sub-ticks of control_dt/N each, with the confidence map
+        # painted after every sub-tick -- but reward/observation/termination
+        # (and therefore step_count, train_freq_steps cadence, etc.) still
+        # only happen once per outer env.step(), exactly like N=1. This lets
+        # control_dt stay coarse (cheap decisions/gradient updates) while the
+        # map still fills in at the finer per-sub-tick rate.
+        try:
+            self.map_substeps_per_action = max(int(os.environ.get("TB3_RL_MAP_SUBSTEPS_PER_ACTION", "1") or 1), 1)
+        except Exception:
+            self.map_substeps_per_action = 1
         self.physics_step_size = float(physics_step_size)
         self.use_world_step = bool(use_world_step)
         # Gazebo ControlWorld multi_step is not perfectly synchronous on every
@@ -487,6 +567,13 @@ class GazeboNavEnv(gym.Env):
         self.world_step_stale_warn_every_n = max(int(world_step_stale_warn_every_n), 1)
         self.world_step_auto_disable_on_stale = bool(world_step_auto_disable_on_stale)
         self.world_step_stale_limit = max(int(world_step_stale_limit), 1)
+        try:
+            self.world_step_contract_wait_sec = max(
+                float(os.environ.get("TB3_RL_WORLD_STEP_CONTRACT_WAIT_SEC", "0.25") or 0.25),
+                0.0,
+            )
+        except Exception:
+            self.world_step_contract_wait_sec = 0.25
         self.realtime_spin_steps = max(int(realtime_spin_steps), 0)
         self.realtime_spin_timeout_sec = max(float(realtime_spin_timeout_sec), 0.0)
         self.realtime_sleep_sec = max(float(realtime_sleep_sec), 0.0)
@@ -494,12 +581,35 @@ class GazeboNavEnv(gym.Env):
         self.realtime_control_dt_wall_margin_sec = max(float(realtime_control_dt_wall_margin_sec), 0.0)
         self._last_realtime_step_wall_elapsed_sec = 0.0
         self._world_step_stale_count = 0
+        # Lifetime (never-reset) counter of steps where Gazebo returned before
+        # sim-time/odom/sensor actually advanced by the requested control_dt.
+        # Surfaced in STEP_PROFILE so "is the reported speed real" can be
+        # checked from the log instead of trusting it silently.
+        self._world_step_stale_total = 0
+        self.world_reset_on_episode = str(
+            os.environ.get("TB3_RL_WORLD_RESET_ON_EPISODE", "0")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self.world_reset_mode = str(
+            os.environ.get("TB3_RL_WORLD_RESET_MODE", "all")
+        ).strip().lower() or "all"
+        try:
+            self.world_reset_timeout_sec = max(
+                float(os.environ.get("TB3_RL_WORLD_RESET_TIMEOUT_SEC", "3.0") or 3.0),
+                0.5,
+            )
+        except Exception:
+            self.world_reset_timeout_sec = 3.0
+        try:
+            self.post_world_reset_settle_sec = max(
+                float(os.environ.get("TB3_RL_POST_WORLD_RESET_SETTLE_SEC", "0.30") or 0.30),
+                0.0,
+            )
+        except Exception:
+            self.post_world_reset_settle_sec = 0.30
         # /rl_path based planning/reward is removed.  Keep the attribute for old
         # callers, but force it disabled at runtime.
         self.disable_path_reward = True
-        # Nav2-only training still needs a dense safety signal.  Nav2 owns /cmd_vel,
-        # but the critic must see wall/obstacle risk before a hard collision terminal.
-        self.disable_wall_proximity_penalty = False
+        self.disable_wall_proximity_penalty = bool(disable_wall_proximity_penalty)
         # v93: hard no-priority mode.  When active, priority is removed from
         # publishers, reward, reset gates, stuck restarts, and policy input.
         force_no_priority = (
@@ -516,6 +626,11 @@ class GazeboNavEnv(gym.Env):
         self.enable_corridor_priority_reward = bool(enable_corridor_priority_reward) and (not self.disable_priority_map)
         self.corridor_priority_reward_weight = 0.0 if self.disable_priority_map else max(float(corridor_priority_reward_weight), 0.0)
         self.confidence_reward_weight = max(float(confidence_reward_weight), 0.0)
+        self.confidence_fill_reward_weight = max(float(confidence_fill_reward_weight), 0.0)
+        self.confidence_fill_hold_weight = max(float(confidence_fill_hold_weight), 0.0)
+        self._last_confidence_fill_score = 0.0
+        self._last_confidence_fill_delta = 0.0
+        self._last_confidence_fill_hold = 0.0
         self.slam_map_update_reward = bool(slam_map_update_reward)
         self.slam_map_update_reward_weight = max(float(slam_map_update_reward_weight), 0.0)
         self.slam_map_update_reward_norm_cells = max(float(slam_map_update_reward_norm_cells), 1.0)
@@ -525,6 +640,8 @@ class GazeboNavEnv(gym.Env):
         self._last_slam_map_update_reward_raw = 0.0
         self._last_slam_map_update_reward_reason = "init"
         self._episode_slam_map_update_reward = 0.0
+        self._direct_slam_prev_map_data: Optional[np.ndarray] = None  # full map snapshot for delta comparison
+        self._direct_slam_stamp_key: Optional[tuple] = None  # stamp key to detect new map arrivals
 
         # v119: Optional positive reward log-compression.
         # This keeps early large map-building rewards from dominating critic targets
@@ -934,8 +1051,6 @@ class GazeboNavEnv(gym.Env):
         self._slam_transform_cache_key = None
         self._slam_transform_cache_msg = None
         self._episode_slam_transform = None
-        self._slam_transform_cache_key = None
-        self._slam_transform_cache_msg = None
 
         # v8 confidence pose policy.
         # Do NOT integrate commands.  Confidence/priority/task maps must be
@@ -1058,13 +1173,12 @@ class GazeboNavEnv(gym.Env):
             dtype=np.float32,
         )
         self.current_boundary_center_xy = self.current_reset_xy.copy()
-        # Hard invariant for this project: Gazebo pose reset must always be followed
-        # by a fresh SLAM reset.  Otherwise raw /map, /rl_priority_map and Nav2
-        # costmaps gradually diverge after repeated respawns.
-        self.reset_slam_on_reset = True if self.use_slam_map else bool(reset_slam_on_reset)
-        self.restart_slam_on_reset = True if self.use_slam_map else bool(restart_slam_on_reset)
-        self.reset_slam_every_n_episodes = 1 if self.use_slam_map else max(int(reset_slam_every_n_episodes), 0)
-        self.reset_tf_buffer_on_reset = True if self.use_slam_map else bool(reset_tf_buffer_on_reset)
+        # SLAM reset policy is configured by CLI.  Older training scripts reset
+        # SLAM every episode; v132 keeps the mapper alive across pose resets.
+        self.reset_slam_on_reset = bool(reset_slam_on_reset)
+        self.restart_slam_on_reset = bool(restart_slam_on_reset)
+        self.reset_slam_every_n_episodes = max(int(reset_slam_every_n_episodes), 0)
+        self.reset_tf_buffer_on_reset = bool(reset_tf_buffer_on_reset)
         self.episode_index = 0
         self.slam_reset_timeout_sec = float(slam_reset_timeout_sec)
         self.slam_reset_warmup_steps = max(int(slam_reset_warmup_steps), 0)
@@ -1106,7 +1220,7 @@ class GazeboNavEnv(gym.Env):
         self.gap_min_width_m = float(gap_min_width_m)
         self.gap_max_width_m = float(gap_max_width_m)
         self.map_expand_chunk_cells = max(int(map_expand_chunk_cells), 1)
-        self.map_publish_every_n = max(int(map_publish_every_n), 1)
+        self.map_publish_every_n = max(int(map_publish_every_n), 0)
         self.max_planned_candidates = max(int(max_planned_candidates), 1)
         self.max_alternative_paths = max(int(max_alternative_paths), 1)
         self.path_visual_publish_every_n = max(int(path_visual_publish_every_n), 0)
@@ -1136,6 +1250,7 @@ class GazeboNavEnv(gym.Env):
         self._map_live_update_timer = None
         self._map_live_update_paused = True
         self._map_live_update_busy = False
+        self._map_update_lock = threading.Lock()
         self._last_live_map_update_wall = 0.0
         self._last_live_map_update_error_wall = 0.0
         self._last_live_map_update_count = 0
@@ -1231,6 +1346,7 @@ class GazeboNavEnv(gym.Env):
             int(round(self.control_dt / self.physics_step_size)),
             1,
         )
+        self.effective_control_dt = float(self.sim_steps_per_action) * float(self.physics_step_size)
 
         self.reset_manager: Optional[ResetManager] = None
         self.sim_controller: Optional[GazeboSimController] = None
@@ -1256,8 +1372,16 @@ class GazeboNavEnv(gym.Env):
                 "World stepping enabled: "
                 f"control_dt={self.control_dt}, "
                 f"physics_step_size={self.physics_step_size}, "
-                f"sim_steps_per_action={self.sim_steps_per_action}"
+                f"sim_steps_per_action={self.sim_steps_per_action}, "
+                f"effective_control_dt={self.effective_control_dt:.6f}"
             )
+            if abs(float(self.effective_control_dt) - float(self.control_dt)) > max(1e-6, float(self.physics_step_size) * 0.5):
+                self.ros.get_logger().warn(
+                    "WORLD_STEP_DT_MISMATCH | "
+                    f"control_dt={self.control_dt:.6f} physics_step_size={self.physics_step_size:.6f} "
+                    f"sim_steps_per_action={self.sim_steps_per_action} "
+                    f"effective_control_dt={self.effective_control_dt:.6f}"
+                )
 
         # v5: policy LiDAR input can be reduced to 60 sectors.
         # Existing 360-bin checkpoints are not compatible with this setting;
@@ -1639,6 +1763,8 @@ class GazeboNavEnv(gym.Env):
         self.collision_cancel_nav2_goal = bool(collision_cancel_nav2_goal)
         self._last_terminal_reason = "none"
         self._last_collision_restart_requested = False
+        self._cached_collision_scan = None
+        self._cached_collision_scan_time = None
 
         self.fallen_roll_threshold = float(fallen_roll_threshold)
         self.fallen_pitch_threshold = float(fallen_pitch_threshold)
@@ -1650,6 +1776,7 @@ class GazeboNavEnv(gym.Env):
         self.step_count = 0
         self._last_step_reward = 0.0
         self._episode_reward_sum = 0.0
+        self._info_dict = {}
         self.reward_gamma = float(np.clip(float(reward_gamma), 0.0, 1.0))
         # v112 return/debug metrics.
         # _episode_discounted_return is now the live/recent discounted return:
@@ -1675,6 +1802,8 @@ class GazeboNavEnv(gym.Env):
         self._last_slam_map_update_reward_raw = 0.0
         self._last_slam_map_update_reward_reason = "reset"
         self._episode_slam_map_update_reward = 0.0
+        self._direct_slam_prev_map_data = None  # reset so first map after reset initializes
+        self._direct_slam_stamp_key = None
         self._last_reward_text_valid = False
         self._live_priority_reward_collection_enabled = False
         self._reset_priority_event_accumulators()
@@ -1719,15 +1848,60 @@ class GazeboNavEnv(gym.Env):
         self.coverage_stall_window_steps = max(int(coverage_stall_window_steps), 1)
         self.coverage_stall_min_slam_new_cells = max(int(coverage_stall_min_slam_new_cells), 0)
         self.coverage_stall_min_confidence_updated_cells = max(int(coverage_stall_min_confidence_updated_cells), 0)
+        self.coverage_stall_min_coverage_delta = max(float(coverage_stall_min_coverage_delta), 0.0)
+        self.coverage_stall_required_consecutive_windows = max(int(coverage_stall_required_consecutive_windows), 1)
         self.coverage_stall_terminal_penalty = float(coverage_stall_terminal_penalty)
+        self.coverage_stall_ignore_priority_gate = str(
+            os.environ.get("TB3_RL_COVERAGE_STALL_IGNORE_PRIORITY_GATE", "0")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        try:
+            self.coverage_stall_hard_no_progress_steps = max(
+                int(os.environ.get("TB3_RL_COVERAGE_STALL_HARD_NO_PROGRESS_STEPS", "0") or 0),
+                0,
+            )
+        except Exception:
+            self.coverage_stall_hard_no_progress_steps = 0
+        try:
+            self.coverage_stall_hard_min_slam_new_cells = max(
+                int(os.environ.get("TB3_RL_COVERAGE_STALL_HARD_MIN_SLAM_NEW_CELLS", "0") or 0),
+                0,
+            )
+        except Exception:
+            self.coverage_stall_hard_min_slam_new_cells = 0
+        try:
+            self.coverage_stall_hard_min_confidence_updated_cells = max(
+                int(os.environ.get("TB3_RL_COVERAGE_STALL_HARD_MIN_CONF_UPDATED_CELLS", "0") or 0),
+                0,
+            )
+        except Exception:
+            self.coverage_stall_hard_min_confidence_updated_cells = 0
+        try:
+            self.coverage_stall_hard_min_coverage_delta = max(
+                float(os.environ.get("TB3_RL_COVERAGE_STALL_HARD_MIN_COVERAGE_DELTA", "0.0") or 0.0),
+                0.0,
+            )
+        except Exception:
+            self.coverage_stall_hard_min_coverage_delta = 0.0
+        try:
+            self.coverage_stall_hard_min_confidence_gain = max(
+                float(os.environ.get("TB3_RL_COVERAGE_STALL_HARD_MIN_CONFIDENCE_GAIN", "0.02") or 0.02),
+                0.0,
+            )
+        except Exception:
+            self.coverage_stall_hard_min_confidence_gain = 0.02
         self._coverage_stall_slam_window = deque(maxlen=self.coverage_stall_window_steps)
         self._coverage_stall_conf_window = deque(maxlen=self.coverage_stall_window_steps)
+        self._coverage_stall_cov_window = deque(maxlen=self.coverage_stall_window_steps)
+        self._coverage_stall_consecutive_hits = 0
+        self._coverage_stall_no_progress_steps = 0
         self._last_coverage_stall_terminal = False
         self._last_coverage_stall_active = False
         self._last_coverage_stall_reason = "disabled"
         self._last_coverage_stall_slam_window = 0
         self._last_coverage_stall_conf_window = 0
+        self._last_coverage_stall_cov_window = 0.0
         self._last_coverage_stall_window_len = 0
+        self._last_coverage_stall_no_progress_steps = 0
 
         # Direct velocity safety shield.  The policy action space remains forward-only
         # [0, max_linear_speed] x [-max_angular_speed, max_angular_speed], but the
@@ -1798,6 +1972,7 @@ class GazeboNavEnv(gym.Env):
         # bouncing in z, or not planted on the floor.  Planar yaw oscillation is
         # no longer counted as shake by default; use the spin breaker for that.
         self.shake_yaw_wobble = bool(shake_yaw_wobble)
+        self.shake_yaw_wobble_grace_steps = max(int(shake_yaw_wobble_grace_steps), 0)
         self.shake_yaw_rate_threshold = max(float(shake_yaw_rate_threshold), 0.01)
         self.shake_cmd_flip_threshold = max(float(shake_cmd_flip_threshold), 0.01)
         self.shake_wobble_window_steps = max(int(shake_wobble_window_steps), 3)
@@ -1814,6 +1989,11 @@ class GazeboNavEnv(gym.Env):
         self._shake_wobble_history = deque(maxlen=int(self.shake_wobble_window_steps))
         self._shake_last_wobble_reason = "none"
         self._reset_nominal_z = float(reset_z)
+
+        # Cache hot-path env var lookups that would otherwise call os.environ.get
+        # on every step or every shake check.
+        self._shake_z_dev_strict = str(os.environ.get("TB3_RL_SHAKE_Z_DEV_STRICT", "0")).strip().lower() in {"1", "true", "yes", "on"}
+        self._force_map_publish_every_update = str(os.environ.get("TB3_RL_FORCE_MAP_PUBLISH_EVERY_UPDATE", "0")).strip().lower() in {"1", "true", "yes", "on"}
 
         self.nav2_stuck_steps = 0
         self.nav2_backup_cooldown_steps = 0
@@ -1882,7 +2062,8 @@ class GazeboNavEnv(gym.Env):
             f"stuck_backup={self.nav2_stuck_backup}:stationary>={self.nav2_stuck_backup_stationary_sec:.1f}s/{self.nav2_stuck_backup_steps}steps "
             f"xy<{self.nav2_stuck_backup_stationary_xy_m:.3f}m yaw<{math.degrees(self.nav2_stuck_backup_stationary_yaw_rad):.1f}deg dist={self.nav2_stuck_backup_distance_m:.2f}m | "
             f"nav2={self.nav2_action_name if self.action_mode == 'nav2' else '(off)'} window={self.nav2_control_window_sec:.2f}s tol={self.nav2_goal_reached_tolerance:.2f}m | "
-            f"topics priority={self.rl_priority_topic or '(off)'} filtered_slam={self.rl_filtered_slam_topic or '(off)'} marker={self.waypoint_marker_topic or '(off)'}"
+            f"topics priority={self.rl_priority_topic or '(off)'} filtered_slam={self.rl_filtered_slam_topic or '(off)'} marker={self.waypoint_marker_topic or '(off)'} | "
+            f"world_reset_on_episode={self.world_reset_on_episode}:{self.world_reset_mode}"
         )
         self.ros.get_logger().debug(
             "ENV_CONFIG_VERBOSE | "
@@ -1903,7 +2084,7 @@ class GazeboNavEnv(gym.Env):
         if self.action_mode == "nav2":
             self.ros.get_logger().info(
                 "NAV2_STRICT_RESTORED | action_mode=nav2 | "
-                "collision/fallen/drop reward=-100 | "
+                f"collision/fallen/drop reward={PHYSICAL_TERMINAL_REWARD:.1f} | "
                 f"reset_slam_on_reset={self.reset_slam_on_reset} | "
                 f"post_reset_stabilize={self.post_reset_stabilize_sec:.2f}s | "
                 f"out_of_bounds_terminal={self.terminate_on_out_of_bounds}"
@@ -1923,7 +2104,7 @@ class GazeboNavEnv(gym.Env):
                 f"fallen_roll={self.fallen_roll_threshold:.3f}rad | "
                 f"fallen_pitch={self.fallen_pitch_threshold:.3f}rad | "
                 f"drop_abs_z={self.safety_boundary_max_abs_z:.3f}m | "
-                "collision/fallen/drop -> stop + cancel_nav2 + clear_costmap + terminated + reward=-100"
+                f"collision/fallen/drop -> stop + cancel_nav2 + clear_costmap + terminated + reward={PHYSICAL_TERMINAL_REWARD:.1f}"
             )
         if self.pose_frame == self.map_frame:
             self.ros.get_logger().warn(
@@ -1991,6 +2172,351 @@ class GazeboNavEnv(gym.Env):
             return self._parse_reset_pose_list(self.reset_pose_list)
 
         raise ValueError(f"Unsupported reset_pose_mode={mode!r}")
+
+    @staticmethod
+    def _world_name_from_service_path(service_path: str, fallback: str = "default") -> str:
+        parts = [part for part in str(service_path or "").split("/") if part]
+        if "world" in parts:
+            idx = parts.index("world")
+            if idx + 1 < len(parts):
+                return parts[idx + 1]
+        return str(fallback or "default")
+
+    @staticmethod
+    def _textproto_quote(value: str) -> str:
+        return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+    def _gz_service_bool(self, service: str, reqtype: str, req: str, timeout_ms: int = 1200) -> bool:
+        cmd = [
+            "gz",
+            "service",
+            "-s",
+            str(service),
+            "--reqtype",
+            str(reqtype),
+            "--reptype",
+            "gz.msgs.Boolean",
+            "--timeout",
+            str(int(timeout_ms)),
+            "--req",
+            str(req),
+        ]
+        try:
+            completed = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=max(float(timeout_ms) / 1000.0 + 0.8, 1.5), check=False)
+            out = (completed.stdout or "") + "\n" + (completed.stderr or "")
+            return completed.returncode == 0 and ("data: true" in out or "data:true" in out)
+        except Exception:
+            return False
+
+    def _gz_service_bool_batch(
+        self, requests: list[tuple[str, str, str, int]]
+    ) -> list[bool]:
+        """Fire multiple independent `gz service` calls concurrently.
+
+        v133: each call in _reset_random_episode_obstacles used to spawn its own
+        `gz service` subprocess and wait for it *sequentially* -- with 15-20
+        obstacles per episode reset, at ~0.3-1s of process-spawn +
+        gz-transport-discovery overhead each, that alone was ~16s of the
+        ~20-30s per-episode reset cost. These calls are independent (distinct
+        obstacle names/services) and mostly wait on I/O, so launching them all
+        at once and waiting afterward is safe real parallelism (unlike
+        CPU-bound Python loops elsewhere in this file, which the GIL prevents
+        from actually running concurrently).
+        """
+        if not requests:
+            return []
+
+        # v133 fix: firing 15-20+ of these at once overwhelmed gz-transport
+        # discovery (spurious failures + "Host unreachable" on the Gazebo
+        # side). Cap concurrency so we still avoid the ~1s-per-call sequential
+        # cost but don't flood gz-transport with that many simultaneous
+        # ephemeral participants.
+        chunk_size = 6
+        results: list[bool] = []
+        for start in range(0, len(requests), chunk_size):
+            chunk = requests[start:start + chunk_size]
+            procs: list[tuple[Optional[subprocess.Popen], float]] = []
+            for service, reqtype, req, timeout_ms in chunk:
+                cmd = [
+                    "gz",
+                    "service",
+                    "-s",
+                    str(service),
+                    "--reqtype",
+                    str(reqtype),
+                    "--reptype",
+                    "gz.msgs.Boolean",
+                    "--timeout",
+                    str(int(timeout_ms)),
+                    "--req",
+                    str(req),
+                ]
+                wait_sec = max(float(timeout_ms) / 1000.0 + 0.8, 1.5)
+                try:
+                    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                except Exception:
+                    proc = None
+                procs.append((proc, wait_sec))
+
+            for proc, wait_sec in procs:
+                if proc is None:
+                    results.append(False)
+                    continue
+                try:
+                    out, err = proc.communicate(timeout=wait_sec)
+                    text = (out or "") + "\n" + (err or "")
+                    results.append(proc.returncode == 0 and ("data: true" in text or "data:true" in text))
+                except Exception:
+                    try:
+                        proc.kill()
+                        proc.communicate(timeout=0.5)
+                    except Exception:
+                        pass
+                    results.append(False)
+        return results
+
+    def _refresh_known_random_obstacles(self) -> None:
+        names = set(getattr(self, "_random_obstacle_names", []))
+        if not names:
+            return
+        for cmd in (["gz", "model", "--list"], ["ign", "model", "--list"]):
+            try:
+                completed = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=1.8,
+                    check=False,
+                )
+            except Exception:
+                continue
+            out = (completed.stdout or "") + "\n" + (completed.stderr or "")
+            listed = set()
+            for raw_line in out.splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("["):
+                    continue
+                for prefix in ("- ", "* "):
+                    if line.startswith(prefix):
+                        line = line[len(prefix):].strip()
+                if line:
+                    listed.add(line.split()[0])
+            found = names.intersection(listed)
+            if found:
+                self._known_random_obstacle_names.update(found)
+                return
+
+    def _random_obstacle_sdf(
+        self, name: str, size_x: float, size_y: float, size_z: float, shape: str = "box"
+    ) -> str:
+        if shape == "cylinder":
+            radius = max((float(size_x) + float(size_y)) / 4.0, 0.05)
+            geometry = f"<cylinder><radius>{radius:.3f}</radius><length>{size_z:.3f}</length></cylinder>"
+        else:
+            geometry = f"<box><size>{size_x:.3f} {size_y:.3f} {size_z:.3f}</size></box>"
+        return (
+            f"<sdf version='1.9'><model name='{name}'><static>true</static>"
+            "<link name='link'>"
+            f"<collision name='collision'><geometry>{geometry}</geometry></collision>"
+            f"<visual name='visual'><geometry>{geometry}</geometry>"
+            "<material><ambient>0.70 0.36 0.22 1</ambient><diffuse>0.70 0.36 0.22 1</diffuse></material></visual>"
+            "</link></model></sdf>"
+        )
+
+    def _set_random_obstacle_pose(self, name: str, x: float, y: float, z: float, yaw: float, timeout_ms: int = 900) -> bool:
+        service = f"/world/{self.random_obstacle_world_name}/set_pose"
+        req = (
+            f'name: "{self._textproto_quote(name)}" '
+            f'position {{ x: {float(x):.6f} y: {float(y):.6f} z: {float(z):.6f} }} '
+            f'orientation {{ z: {math.sin(float(yaw) / 2.0):.6f} w: {math.cos(float(yaw) / 2.0):.6f} }}'
+        )
+        return self._gz_service_bool(service, "gz.msgs.Pose", req, timeout_ms=timeout_ms)
+
+    def _remove_random_episode_obstacles(self) -> None:
+        if not bool(getattr(self, "random_obstacles_enabled", False)):
+            return
+        service = f"/world/{self.random_obstacle_world_name}/remove"
+        active_names = list(getattr(self, "_active_random_obstacle_names", []))
+        if not active_names:
+            return
+        removed = 0
+        for name in active_names:
+            req = f'name: "{self._textproto_quote(name)}" type: MODEL'
+            if self._gz_service_bool(service, "gz.msgs.Entity", req, timeout_ms=700):
+                removed += 1
+        self._active_random_obstacle_names = []
+        if removed > 0:
+            self.ros.get_logger().debug(f"RANDOM_OBSTACLES_REMOVED | removed={removed}/{len(active_names)}")
+
+    def _reset_random_episode_obstacles(self, reset_xy: np.ndarray | None = None) -> None:
+        if not bool(getattr(self, "random_obstacles_enabled", False)):
+            return
+        _diag_on = str(os.environ.get("TB3_RL_RESET_PROFILER", "0")).strip().lower() in {"1", "true", "yes", "on"}
+        _diag_t0 = time.perf_counter() if _diag_on else 0.0
+        self._refresh_known_random_obstacles()
+        if _diag_on:
+            print(f"OBSTACLE_DIAG | refresh_known={(time.perf_counter()-_diag_t0)*1000.0:.1f}ms known_count={len(getattr(self, '_known_random_obstacle_names', []))}", flush=True)
+        try:
+            reset_arr = np.asarray(reset_xy if reset_xy is not None else getattr(self, "current_reset_xy", np.zeros(2)), dtype=np.float32)
+        except Exception:
+            reset_arr = np.zeros(2, dtype=np.float32)
+
+        candidates = list(self.RANDOM_OBSTACLE_CANDIDATES)
+        random.shuffle(candidates)
+        count = min(
+            random.randint(int(self.random_obstacle_count_min), int(self.random_obstacle_count_max)),
+            len(getattr(self, "_random_obstacle_names", [])),
+        )
+        selected: list[tuple[float, float, float, float, float, float, str]] = []
+        max_place_attempts = max(count * 18, len(candidates))
+        for attempt_idx in range(max_place_attempts):
+            if len(selected) >= count:
+                break
+            base_x, base_y = candidates[attempt_idx % len(candidates)] if candidates else (0.0, 0.0)
+            x = float(base_x) + float(np.clip(random.gauss(0.0, float(self.random_obstacle_noise_sigma_m)), -0.55, 0.55))
+            y = float(base_y) + float(np.clip(random.gauss(0.0, float(self.random_obstacle_noise_sigma_m)), -0.55, 0.55))
+            shape = random.choice(("box", "box", "cylinder"))
+            sx = random.uniform(0.20, 0.55)
+            sy = random.uniform(0.20, 0.55)
+            sz = random.uniform(0.30, 0.90)
+            # Hard safety clamp: training_house.sdf's outer walls are at
+            # x=+-6.5/y=+-3.5 with 0.18m thickness, so the inner face is at
+            # +-6.41/+-3.41. The +-0.55m noise clip above can otherwise push an
+            # outer-row candidate (e.g. y=+-2.85) to y=+-3.40, and with the
+            # obstacle's own half-size (up to 0.21m) added on top, the box
+            # pokes through the wall and renders outside the house. Clamp the
+            # final center so box_center +/- half_size always stays inside,
+            # regardless of which candidate row/column produced it.
+            x = float(np.clip(x, -(6.41 - 0.08 - sx / 2.0), 6.41 - 0.08 - sx / 2.0))
+            y = float(np.clip(y, -(3.41 - 0.08 - sy / 2.0), 3.41 - 0.08 - sy / 2.0))
+            if float(np.linalg.norm(np.asarray([x, y], dtype=np.float32) - reset_arr)) < float(self.random_obstacle_robot_clearance_m):
+                continue
+            if any(math.hypot(x - ox, y - oy) < float(self.random_obstacle_pair_clearance_m) for ox, oy, *_ in selected):
+                continue
+            yaw = random.uniform(-math.pi, math.pi)
+            selected.append((x, y, sx, sy, sz, yaw, shape))
+
+        pose_service = f"/world/{self.random_obstacle_world_name}/set_pose"
+        create_service = f"/world/{self.random_obstacle_world_name}/create"
+
+        def _pose_req(name: str, x: float, y: float, z: float, yaw: float) -> str:
+            return (
+                f'name: "{self._textproto_quote(name)}" '
+                f'position {{ x: {float(x):.6f} y: {float(y):.6f} z: {float(z):.6f} }} '
+                f'orientation {{ z: {math.sin(float(yaw) / 2.0):.6f} w: {math.cos(float(yaw) / 2.0):.6f} }}'
+            )
+
+        entries = []
+        for idx, (x, y, sx, sy, sz, yaw, shape) in enumerate(selected):
+            name = self._random_obstacle_names[idx]
+            entries.append({"name": name, "x": x, "y": y, "sx": sx, "sy": sy, "sz": sz, "yaw": yaw, "shape": shape})
+
+        # Pass 1: obstacles we already spawned in a previous episode only need
+        # repositioning. Fire every set_pose call concurrently instead of one
+        # subprocess-per-obstacle in sequence (see _gz_service_bool_batch).
+        _diag_pass_t0 = time.perf_counter() if _diag_on else 0.0
+        known_idx = [
+            i for i, e in enumerate(entries)
+            if e["name"] in getattr(self, "_known_random_obstacle_names", set())
+        ]
+        if known_idx:
+            reqs = [
+                (pose_service, "gz.msgs.Pose", _pose_req(entries[i]["name"], entries[i]["x"], entries[i]["y"], entries[i]["sz"] / 2.0, entries[i]["yaw"]), 1200)
+                for i in known_idx
+            ]
+            results = self._gz_service_bool_batch(reqs)
+            retry_idx = [i for i, ok in zip(known_idx, results, strict=True) if not ok]
+            for i, ok in zip(known_idx, results, strict=True):
+                entries[i]["placed_ok"] = bool(ok)
+            # A failed set_pose here is ambiguous: either the entity is truly
+            # gone, or the concurrent batch transiently failed it (gz-transport
+            # congestion). A single sequential retry disambiguates before we
+            # give up and discard it as "known" -- discarding on a false
+            # negative routes it into Pass 2's create, which then fails loudly
+            # with "already exists" against an entity that was fine all along.
+            for i in retry_idx:
+                entries[i]["placed_ok"] = self._set_random_obstacle_pose(
+                    entries[i]["name"], entries[i]["x"], entries[i]["y"], entries[i]["sz"] / 2.0, entries[i]["yaw"], timeout_ms=1200
+                )
+                if not entries[i]["placed_ok"]:
+                    self._known_random_obstacle_names.discard(entries[i]["name"])
+        for e in entries:
+            e.setdefault("placed_ok", False)
+        if _diag_on:
+            print(f"OBSTACLE_DIAG | pass1={(time.perf_counter()-_diag_pass_t0)*1000.0:.1f}ms known_idx={len(known_idx)}", flush=True)
+
+        # Pass 2: anything not known yet, or whose reposition failed, needs a
+        # fresh spawn. Also concurrent.
+        _diag_pass_t0 = time.perf_counter() if _diag_on else 0.0
+        need_create_idx = [i for i, e in enumerate(entries) if not e["placed_ok"]]
+        if need_create_idx:
+            reqs = []
+            for i in need_create_idx:
+                e = entries[i]
+                sdf = self._textproto_quote(self._random_obstacle_sdf(e["name"], e["sx"], e["sy"], e["sz"], shape=e["shape"]))
+                req = (
+                    f'name: "{self._textproto_quote(e["name"])}" allow_renaming: false '
+                    f'sdf: "{sdf}" '
+                    f'pose {{ position {{ x: {e["x"]:.6f} y: {e["y"]:.6f} z: {e["sz"] / 2.0:.6f} }} '
+                    f'orientation {{ z: {math.sin(e["yaw"] / 2.0):.6f} w: {math.cos(e["yaw"] / 2.0):.6f} }} }}'
+                )
+                reqs.append((create_service, "gz.msgs.EntityFactory", req, 1800))
+            results = self._gz_service_bool_batch(reqs)
+            for i, ok in zip(need_create_idx, results, strict=True):
+                entries[i]["placed_ok"] = bool(ok)
+        if _diag_on:
+            print(f"OBSTACLE_DIAG | pass2={(time.perf_counter()-_diag_pass_t0)*1000.0:.1f}ms need_create_idx={len(need_create_idx)}", flush=True)
+
+        # Pass 3: fallback for creates that raced against an entity already
+        # existing under that name (stale from a prior episode _refresh_known
+        # failed to detect). This used to be a sequential per-obstacle loop --
+        # on a cold known-names cache (e.g. right after a training restart)
+        # every obstacle can land here at once, turning into 15-30 sequential
+        # ~1.5-2s gz-service calls (20-50s alone). Batch it like Pass 1/2.
+        _diag_pass_t0 = time.perf_counter() if _diag_on else 0.0
+        retry_create_idx = [i for i, e in enumerate(entries) if not e["placed_ok"]]
+        if retry_create_idx:
+            reqs = [
+                (pose_service, "gz.msgs.Pose", _pose_req(entries[i]["name"], entries[i]["x"], entries[i]["y"], entries[i]["sz"] / 2.0, entries[i]["yaw"]), 1200)
+                for i in retry_create_idx
+            ]
+            results = self._gz_service_bool_batch(reqs)
+            for i, ok in zip(retry_create_idx, results, strict=True):
+                entries[i]["placed_ok"] = bool(ok)
+        if _diag_on:
+            print(f"OBSTACLE_DIAG | pass3={(time.perf_counter()-_diag_pass_t0)*1000.0:.1f}ms retry_create_idx={len(retry_create_idx)}", flush=True)
+
+        placed = 0
+        placed_names: list[str] = []
+        for e in entries:
+            if e["placed_ok"]:
+                placed += 1
+                placed_names.append(e["name"])
+                self._known_random_obstacle_names.add(e["name"])
+
+        inactive_names = [name for name in list(getattr(self, "_active_random_obstacle_names", [])) if name not in set(placed_names)]
+        if inactive_names:
+            reqs = [
+                (pose_service, "gz.msgs.Pose", _pose_req(name, 0.0, 0.0, -20.0, 0.0), 500)
+                for name in inactive_names
+            ]
+            self._gz_service_bool_batch(reqs)
+        self._active_random_obstacle_names = placed_names
+        if _diag_on:
+            print(f"OBSTACLE_DIAG | placed={placed}/{len(selected)} known_after={len(self._known_random_obstacle_names)}", flush=True)
+        if placed > 0:
+            self.ros.get_logger().info(
+                f"RANDOM_OBSTACLES_RESET | placed={placed}/{len(selected)} "
+                f"reset=({float(reset_arr[0]):+.2f},{float(reset_arr[1]):+.2f})"
+            )
+            try:
+                self.ros.spin_steps(num_spins=8, timeout_sec=0.002)
+                self._advance_world_after_command(target_delta_sec=0.04)
+            except Exception:
+                pass
+        elif selected:
+            self.ros.get_logger().warn(f"RANDOM_OBSTACLES_RESET_FAILED | requested={len(selected)} service={create_service}")
 
     def _wait_for_rviz_map_origin_after_reset(self) -> bool:
         """Verify that map-frame base pose is near (0, 0) after SLAM reset."""
@@ -2077,13 +2603,12 @@ class GazeboNavEnv(gym.Env):
     def _is_reset_pose_clear(self) -> tuple[bool, str, float, float, float]:
         global_min, front_min, rear_min = self._reset_pose_scan_clearance()
 
-        # TurtleBot3 house has several valid start poses where a side wall or
-        # furniture leg appears at ~0.18-0.22 m in the 360-degree LiDAR minimum.
-        # Treating the global minimum as a hard front-clearance test rejects
-        # valid spawns repeatedly.  Use a two-level test instead:
-        #   - side/global clearance: only reject true overlaps / near-contact
-        #   - front clearance      : keep stricter because Nav2 starts moving there
-        side_threshold = min(float(self.reset_pose_min_clearance_m), 0.10)
+        # Reset poses must be clear in every direction.  Previous builds only
+        # required ~0.10m side clearance, which allowed wall/furniture-adjacent
+        # starts that immediately became collision/velocity-safety terminals
+        # after random yaw.  Use the configured reset clearance for global,
+        # front, and rear checks; the candidate list now avoids tight spots.
+        side_threshold = float(self.reset_pose_min_clearance_m)
         front_rear_threshold = float(self.reset_pose_min_clearance_m)
 
         if global_min < side_threshold:
@@ -2118,6 +2643,13 @@ class GazeboNavEnv(gym.Env):
           - This implementation uses absolute deadlines and a bounded reapply
             count.  A reset can delay the episode, but it cannot permanently
             block motion.
+
+                v133 shake gate:
+                    - After a shake_restart episode, do not start the next episode while
+                        the body is still wobbling.  Wait for a clean no-shake window first,
+                        then clear shake counters so the next episode starts from zero.
+                    - Use a reset-specific physical check so a static, normal Burger
+                        landing pitch does not trap reset() forever.
         """
         sec = float(getattr(self, "post_reset_stabilize_sec", 0.0))
         if sec <= 0.0:
@@ -2141,9 +2673,16 @@ class GazeboNavEnv(gym.Env):
             max_reapply = 4
         max_reapply = max(int(max_reapply), 0)
 
+        try:
+            shake_gate_timeout_sec = float(os.environ.get("TB3_RL_POST_RESET_SHAKE_GATE_TIMEOUT_SEC", "12.0") or 12.0)
+        except Exception:
+            shake_gate_timeout_sec = 12.0
+        shake_gate_timeout_sec = max(float(shake_gate_timeout_sec), 0.0)
+
         self.ros.get_logger().info(
             f"POST_RESET_STABILIZE | holding /cmd_vel=0 for {sec:.2f}s before episode start "
-            f"| stable_window={stable_window_sec:.2f}s max={max_sec:.2f}s max_reapply={max_reapply}"
+            f"| stable_window={stable_window_sec:.2f}s max={max_sec:.2f}s max_reapply={max_reapply} "
+            f"shake_gate_timeout={shake_gate_timeout_sec:.2f}s"
         )
 
         start = time.time()
@@ -2179,7 +2718,7 @@ class GazeboNavEnv(gym.Env):
                 num_spins=int(getattr(self, "post_reset_stabilize_spin_steps", 12)),
                 timeout_sec=0.002,
             )
-            reason = self._instantaneous_shake_reason()
+            reason = self._post_reset_shake_reason()
             last_reason = reason
             if reason == "none":
                 if stable_since is None:
@@ -2220,7 +2759,7 @@ class GazeboNavEnv(gym.Env):
                     num_spins=int(getattr(self, "post_reset_stabilize_spin_steps", 12)),
                     timeout_sec=0.002,
                 )
-                reason2 = self._instantaneous_shake_reason()
+                reason2 = self._post_reset_shake_reason()
                 last_reason = reason2
                 if reason2 == "none":
                     if second_stable_since is None:
@@ -2240,38 +2779,81 @@ class GazeboNavEnv(gym.Env):
 
             if last_reason != "none":
                 self.ros.get_logger().warn(
-                    "POST_RESET_STABILIZE_SOFT_CONTINUE | "
-                    f"shake={last_reason}; starting episode anyway to avoid reset deadlock"
+                    "POST_RESET_SHAKE_GATE | "
+                    f"shake={last_reason}; waiting until body is stable before episode start"
                 )
 
-        # One final quiet hold after the last pose reapply.
-        final_hold_start = time.time()
-        while time.time() - final_hold_start < 0.15:
+        # Hard no-shake gate.  Do not return reset() while the body is still
+        # tilted/bouncing/airborne.  This loop intentionally does not call
+        # _update_shake_restart_state(), so the next episode's shake counter
+        # starts from a clean zero after the stable window is observed.
+        gate_stable_since = None
+        gate_log_next = time.time()
+        gate_reapply_next = time.time() + 0.50
+        gate_reapply_count = 0
+        gate_start = time.time()
+        while True:
             self.ros.stop_robot()
-            self.ros.spin_steps(num_spins=8, timeout_sec=0.002)
-            time.sleep(0.02)
+            self.ros.spin_steps(
+                num_spins=int(getattr(self, "post_reset_stabilize_spin_steps", 12)),
+                timeout_sec=0.002,
+            )
+            reason = self._post_reset_shake_reason()
+            last_reason = reason
+            now = time.time()
+            if reason == "none":
+                if gate_stable_since is None:
+                    gate_stable_since = now
+                if now - gate_stable_since >= stable_window_sec:
+                    break
+            else:
+                gate_stable_since = None
+                if shake_gate_timeout_sec > 0.0 and now - gate_start >= shake_gate_timeout_sec:
+                    self.ros.stop_robot()
+                    msg = (
+                        "POST_RESET_SHAKE_GATE_TIMEOUT | "
+                        f"timeout={shake_gate_timeout_sec:.2f}s reason={reason} reapply={gate_reapply_count}/{max_reapply}. "
+                        "Retrying full reset instead of starting an unstable episode."
+                    )
+                    self.ros.get_logger().error(msg)
+                    raise RecoverableResetError(msg)
+                if now >= gate_log_next:
+                    self.ros.get_logger().warn(
+                        "POST_RESET_WAIT_NO_SHAKE | "
+                        f"reason={reason}; shake counter will remain reset until stable"
+                    )
+                    gate_log_next = now + 1.0
+                if (
+                    bool(getattr(self, "reset_hard_stabilize_reapply", True))
+                    and reset_pose is not None
+                    and self.reset_manager is not None
+                    and gate_reapply_count < max_reapply
+                    and now >= gate_reapply_next
+                ):
+                    try:
+                        self.reset_manager.reset_to_pose(reset_pose, timeout_sec=0.35)
+                        gate_reapply_count += 1
+                    except Exception:
+                        pass
+                    gate_reapply_next = time.time() + min(1.50, 0.50 + 0.10 * gate_reapply_count)
+            time.sleep(0.03)
 
         try:
-            reason = self._instantaneous_shake_reason()
-            if reason == "none":
-                self.shake_steps = 0
-                self._last_shake_active = False
-                self._last_shake_restart = False
-                self._last_shake_reason = "none"
-            else:
-                # Keep diagnostic state, but do not block reset() here.  If the
-                # instability is real, _update_shake_restart_state() can still end
-                # the episode after actual control steps.
-                self.shake_steps = max(int(getattr(self, "shake_steps", 0)), 1)
-                self._last_shake_active = True
-                self._last_shake_reason = reason
-                last_reason = reason
+            self.shake_steps = 0
+            self._last_shake_active = False
+            self._last_shake_restart = False
+            self._last_shake_reason = "none"
+            self._shake_last_wobble_reason = "none"
+            try:
+                self._shake_wobble_history.clear()
+            except Exception:
+                self._shake_wobble_history = deque(maxlen=int(getattr(self, "shake_wobble_window_steps", 8)))
         except Exception:
             pass
         self.ros.get_logger().info(
             "POST_RESET_STABILIZE_DONE | "
             f"scan={self.ros.scan is not None}, odom={self.ros.odom is not None}, "
-            f"slam_map={self.ros.slam_map is not None}, shake={last_reason}"
+            f"slam_map={self.ros.slam_map is not None}, shake=none, shake_counter=0"
         )
 
     def _post_reset_ready_metrics(self, map_stats: Optional[MapUpdateStats] = None) -> dict:
@@ -2602,7 +3184,6 @@ class GazeboNavEnv(gym.Env):
                 or float(metrics.get("known_ratio", 0.0)) >= float(getattr(self, "post_reset_ready_min_known_ratio", 0.0))
             )
             beams_ok = int(metrics.get("lidar_beams", 0)) >= int(getattr(self, "post_reset_ready_min_lidar_beams", 0))
-            slam_ok = str(metrics.get("slam_gate", "")).startswith("accepted") or str(metrics.get("slam_gate", "")) == "accepted"
             allow_conf_timeout = bool(int(os.environ.get("TB3_RL_POST_RESET_READY_ALLOW_CONFIDENCE_TIMEOUT", "1") or 1))
             if allow_conf_timeout and reason.startswith("confidence_warmup") and known_ok and beams_ok and bool(metrics.get("inside", False)):
                 self._last_post_reset_ready = True
@@ -2668,6 +3249,11 @@ class GazeboNavEnv(gym.Env):
         self._last_conf_rate_wall_time = 0.0
         self._last_conf_rate_step = -1
         self._last_conf_rate_ema = 0.0
+        self._last_direct_tf_pose_xy = None
+        self._last_direct_tf_pose_yaw = None
+        self._last_direct_tf_pose_wall = None
+        self._last_direct_tf_pose_frame = ""
+        self._last_direct_tf_pose_source = ""
         try:
             self._last_confidence_pose_warn_time = 0.0
         except Exception:
@@ -2783,6 +3369,17 @@ class GazeboNavEnv(gym.Env):
                         )
                     except Exception:
                         pass
+                # v133: SB3's VecEnv auto-resets inside the same step() call that
+                # produces done=True, so a wall-clock bracket measured only in the
+                # training callback (time-of-last-reset to time-of-done) silently
+                # includes the *next* episode's full reset (world reset, obstacle
+                # spawn, SLAM restart) inside the *previous* episode's "episode
+                # time" -- making fps and the supposedly reset-excluded sps read
+                # almost identical and both far too low. Mark the real start of
+                # this episode's stepping here (reset() finished, right before
+                # control returns to the agent) so step()/_step_impl can report a
+                # genuinely reset-free elapsed time in info.
+                self._episode_wall_start_time = time.time()
                 return obs, info
             except RecoverableResetError as exc:
                 last_exc = exc
@@ -2958,13 +3555,38 @@ class GazeboNavEnv(gym.Env):
             _reset_prof_t0 = 0.0
             _reset_prof_parts = {}
 
-            def _reset_prof_mark(name: str) -> None:
-                return
-
         self._map_live_update_paused = True
         self.episode_index += 1
 
         self.ros.stop_robot()
+        if self.world_reset_on_episode and self.sim_controller is not None:
+            try:
+                reset_ok = self.sim_controller.reset_world(
+                    mode=self.world_reset_mode,
+                    timeout_sec=float(self.world_reset_timeout_sec),
+                )
+                if reset_ok:
+                    self.ros.get_logger().info(
+                        "WORLD_RESET_APPLIED | "
+                        f"mode={self.world_reset_mode} timeout={self.world_reset_timeout_sec:.2f}s"
+                    )
+                else:
+                    self.ros.get_logger().warn(
+                        "WORLD_RESET_FAILED | "
+                        f"mode={self.world_reset_mode}; continuing with pose reset path"
+                    )
+            except Exception as exc:
+                self.ros.get_logger().warn(
+                    "WORLD_RESET_EXCEPTION | "
+                    f"mode={self.world_reset_mode} err={type(exc).__name__}:{exc}"
+                )
+            # A full world reset re-initializes every model/collision object in
+            # Gazebo (including random obstacles).  Immediately calling
+            # SetEntityPose for "burger" while that is still settling is what
+            # produces "Failed to reset pose for all discovered Gazebo robot
+            # candidates" -- give the sim a bit more time here instead of at
+            # the pose-reset service call itself.
+            self._advance_world_after_command(target_delta_sec=self.post_world_reset_settle_sec)
         self._advance_world_after_command(target_delta_sec=0.02)
 
         # 1) Burger를 episode 시작점으로 보낸다.
@@ -3042,9 +3664,15 @@ class GazeboNavEnv(gym.Env):
                 requested_y=reset_y,
                 reset_pose=None,
             )
-        _reset_prof_mark("pose_reset")
+        if _reset_prof_on:
+            _reset_prof_mark("pose_reset")
 
         self.current_reset_xy = np.array([reset_x, reset_y], dtype=np.float32)
+        _obstacles_t0 = time.perf_counter() if _reset_prof_on else 0.0
+        self._reset_random_episode_obstacles(reset_xy=self.current_reset_xy.copy())
+        if _reset_prof_on:
+            print(f"OBSTACLE_RESET_DIAG | {(time.perf_counter()-_obstacles_t0)*1000.0:.1f}ms", flush=True)
+            _reset_prof_mark("obstacle_reset")
 
         self.prev_action = np.zeros(2, dtype=np.float32)
         self.filtered_action = np.zeros(2, dtype=np.float32)
@@ -3075,12 +3703,17 @@ class GazeboNavEnv(gym.Env):
         self._recent_conf_update_window.clear()
         self._coverage_stall_slam_window.clear()
         self._coverage_stall_conf_window.clear()
+        self._coverage_stall_cov_window.clear()
+        self._coverage_stall_consecutive_hits = 0
+        self._coverage_stall_no_progress_steps = 0
         self._last_coverage_stall_terminal = False
         self._last_coverage_stall_active = False
         self._last_coverage_stall_reason = "reset"
         self._last_coverage_stall_slam_window = 0
         self._last_coverage_stall_conf_window = 0
+        self._last_coverage_stall_cov_window = 0.0
         self._last_coverage_stall_window_len = 0
+        self._last_coverage_stall_no_progress_steps = 0
         self._last_priority_clear_reward = 0.0
         self._last_priority_recheck_reward = 0.0
         self._last_priority_check_reward = 0.0
@@ -3138,6 +3771,7 @@ class GazeboNavEnv(gym.Env):
         self._last_lidar60_stamp_delta_sec = 0.0
         self._last_lidar60_raw_stamp_sec = -1.0
         self._last_r_confidence = 0.0
+        self._last_r_confidence_fill = 0.0
         self._last_r_slam = 0.0
         self._last_r_priority = 0.0
         self._last_r_wall = 0.0
@@ -3146,6 +3780,9 @@ class GazeboNavEnv(gym.Env):
         self._last_r_collision = 0.0
         self._last_r_step = 0.0
         self._last_reward_total = 0.0
+        self._last_confidence_fill_score = 0.0
+        self._last_confidence_fill_delta = 0.0
+        self._last_confidence_fill_hold = 0.0
         self.shake_steps = 0
         self._last_shake_active = False
         self._last_shake_restart = False
@@ -3155,12 +3792,19 @@ class GazeboNavEnv(gym.Env):
             self._shake_wobble_history.clear()
         except Exception:
             self._shake_wobble_history = deque(maxlen=int(getattr(self, "shake_wobble_window_steps", 8)))
+        self._velocity_spin_same_sign_steps = 0
+        self._velocity_spin_last_sign = 0
+        self._last_collision_global_min = 999.0
+        self._last_collision_front_min = 999.0
+        self._late_slam_recovery_logged = False
         self.nav2_stuck_steps = 0
         self.nav2_backup_cooldown_steps = 0
         self._last_nav2_stuck_active = False
         self._last_nav2_stuck_backup_triggered = False
         self._last_nav2_stuck_reason = "none"
         self._last_nav2_backup_status = "none"
+        self._nav2_stationary_samples.clear()
+        self._amcl_pose_odom_anchor = None
         self._last_lidar_valid_beams = 0
         self._last_lidar_nearest_detection = 999.0
         self._episode_start_wall_time = time.time()
@@ -3211,10 +3855,9 @@ class GazeboNavEnv(gym.Env):
         # self.safety_boundary_frame에서 실제 reset 후 pose로 잡는다.
         self._update_boundary_center_after_reset(requested_xy=self.current_reset_xy.copy())
 
-        # 2) SLAM reset is mandatory at every respawn.
-        #    The SLAM process itself is not restarted unless explicitly requested,
-        #    but the map state is cleared on every episode/reset so RViz layers and
-        #    Nav2 costmaps do not accumulate stale map->odom drift.
+        # 2) Optional SLAM reset after pose reset.  Scripts that train in a
+        # continuous map disable this so the episode reset does not destroy the
+        # mapper state or stall on Cartographer startup.
         self.ignore_slam_prior_this_episode = False
         self._episode_slam_transform_source = ""
         self._episode_slam_transform_target = ""
@@ -3222,7 +3865,12 @@ class GazeboNavEnv(gym.Env):
         self._slam_transform_cache_key = None
         self._slam_transform_cache_msg = None
         self._reset_confidence_pose_runtime_state()
-        should_reset_slam = bool(self.use_slam_map)
+        should_reset_slam = (
+            bool(self.use_slam_map)
+            and bool(self.reset_slam_on_reset)
+            and int(self.reset_slam_every_n_episodes) > 0
+            and (int(self.episode_index) % int(self.reset_slam_every_n_episodes) == 0)
+        )
 
         if should_reset_slam:
             slam_reset_ok = self._reset_slam_map_after_pose_reset()
@@ -3246,7 +3894,7 @@ class GazeboNavEnv(gym.Env):
         # filtered base_grid used by priority/path/CNN.
         now_wall = time.time()
         self._slam_map_min_wall_time = now_wall
-        self._slam_map_accept_after_wall_time = now_wall + self.slam_map_accept_delay_sec
+        self._slam_map_accept_after_wall_time = now_wall + min(self.slam_map_accept_delay_sec, 0.3)
         self._last_slam_gate_reason = "reset_delay"
         self._last_slam_map_age_sec = -1.0
         self._last_slam_map_delay_remaining_sec = self.slam_map_accept_delay_sec
@@ -3255,7 +3903,8 @@ class GazeboNavEnv(gym.Env):
             # Make the reset barrier explicit: do not let a policy observation be
             # generated from an old pre-reset map or from LiDAR-only fallback.
             self._strict_wait_for_accepted_slam_map(stage="after_slam_reset")
-        _reset_prof_mark("slam_reset")
+        if _reset_prof_on:
+            _reset_prof_mark("slam_reset")
 
         # 3) Nav2는 Gazebo pose reset 이전 episode의 goal/costmap 상태를 물고 있을 수 있다.
         #    reset마다 goal을 취소하고 costmap을 비워야 reset 후 ABORTED 루프가 줄어든다.
@@ -3285,7 +3934,8 @@ class GazeboNavEnv(gym.Env):
                 self.ros.get_logger().info(
                     "NAV2_RESET_READY | goal canceled, manual costmap clear disabled"
                 )
-        _reset_prof_mark("post_reset_stabilize")
+        if _reset_prof_on:
+            _reset_prof_mark("post_reset_stabilize")
 
         # 5) RL memory/confidence map도 전부 초기화하고 Burger가 중앙에 오도록 origin을 재설정한다.
         robot_pose = self._get_robot_pose2d()
@@ -3302,7 +3952,8 @@ class GazeboNavEnv(gym.Env):
         # this episode anchors real odometry to this episode's map pose.
         self._sync_exploration_canvas_to_current_slam(reason="after_exploration_reset", publish=True)
         self._reset_confidence_pose_runtime_state()
-        _reset_prof_mark("map_reset")
+        if _reset_prof_on:
+            _reset_prof_mark("map_reset")
 
         # 6) RESET 직후에는 바로 episode를 열지 않는다.
         #    SLAM /map이 reset 이후 실제로 채워지고, LiDAR/confidence/priority가
@@ -3314,7 +3965,8 @@ class GazeboNavEnv(gym.Env):
         self._sync_exploration_canvas_to_current_slam(reason="after_post_reset_ready", publish=True)
         self._last_live_map_update_wall = time.time()
         self._map_live_update_paused = False
-        _reset_prof_mark("ready_gate")
+        if _reset_prof_on:
+            _reset_prof_mark("ready_gate")
 
         obs = self._get_obs()
 
@@ -3324,20 +3976,26 @@ class GazeboNavEnv(gym.Env):
             fallen=self._check_fallen(),
             coverage_done=False,
         )
-        _reset_prof_mark("obs_info")
+        if _reset_prof_on:
+            _reset_prof_mark("obs_info")
 
         if _reset_prof_on:
             total = float(time.perf_counter() - _reset_prof_t0)
             _reset_prof_parts["total"] = total
-            order = ["pose_reset", "slam_reset", "post_reset_stabilize", "map_reset", "ready_gate", "obs_info", "total"]
+            order = ["pose_reset", "obstacle_reset", "slam_reset", "post_reset_stabilize", "map_reset", "ready_gate", "obs_info", "total"]
             txt = " ".join(
                 f"{k}={float(_reset_prof_parts.get(k, 0.0))*1000.0:.1f}ms"
                 for k in order if k in _reset_prof_parts
             )
-            self.ros.get_logger().warn(
+            profile_msg = (
                 "RESET_PROFILE | "
                 f"episode={self.episode_index} reason={self._last_terminal_reason} | {txt}"
             )
+            # QUIET_ALL_ROS_LOGS drops the logger's own warn() severity, which
+            # would otherwise silently swallow this diagnostic even with the
+            # profiler explicitly enabled. print() bypasses that.
+            print(profile_msg, flush=True)
+            self.ros.get_logger().warn(profile_msg)
 
         return obs, info
 
@@ -3939,6 +4597,9 @@ class GazeboNavEnv(gym.Env):
             info = {
                 "step_recovery": True,
                 "step_recovery_error": f"{type(exc).__name__}: {exc}",
+                "terminal_reason": "step_recovery",
+                "skip_store": True,
+                "velocity_safety_skip_store": True,
                 "TimeLimit.truncated": True,
             }
             try:
@@ -3977,6 +4638,7 @@ class GazeboNavEnv(gym.Env):
             return None
 
     def _step_impl(self, action):
+        self._map_update_call_count_this_step = 0
         if not hasattr(self, "_step_profiler_initialized"):
             raw = str(os.environ.get("TB3_RL_STEP_PROFILER", "0")).strip().lower()
             self._step_profiler_enabled = raw in {"1", "true", "yes", "on"}
@@ -3988,6 +4650,18 @@ class GazeboNavEnv(gym.Env):
                 self._step_profiler_slow_ms = max(float(os.environ.get("TB3_RL_STEP_PROFILER_SLOW_MS", "700")), 0.0)
             except Exception:
                 self._step_profiler_slow_ms = 700.0
+            raw_cprof = str(os.environ.get("TB3_RL_STEP_CPROFILE", "0")).strip().lower()
+            self._step_cprofile_enabled = raw_cprof in {"1", "true", "yes", "on"}
+            try:
+                self._step_cprofile_every_n = max(int(os.environ.get("TB3_RL_STEP_CPROFILE_EVERY_N", "200") or 200), 1)
+            except Exception:
+                self._step_cprofile_every_n = 200
+            raw_mprof = str(os.environ.get("TB3_RL_MAP_CPROFILE", "0")).strip().lower()
+            self._map_cprofile_enabled = raw_mprof in {"1", "true", "yes", "on"}
+            try:
+                self._map_cprofile_every_n = max(int(os.environ.get("TB3_RL_MAP_CPROFILE_EVERY_N", "150") or 150), 1)
+            except Exception:
+                self._map_cprofile_every_n = 150
             self._step_profiler_acc = {}
             self._step_profiler_count = 0
             self._step_profiler_initialized = True
@@ -4006,9 +4680,6 @@ class GazeboNavEnv(gym.Env):
         else:
             _prof_t0 = 0.0
             _prof_parts = {}
-
-            def _prof_mark(name: str) -> None:
-                return
 
         policy_action = np.asarray(action, dtype=np.float32)
         policy_action = np.clip(policy_action, self.action_space.low, self.action_space.high)
@@ -4030,9 +4701,29 @@ class GazeboNavEnv(gym.Env):
                 self._execute_nav2_goal_action(policy_action)
             )
         else:
-            executed_action, lidar_action_obstacle_distance, lidar_action_obstacle_score, lidar_front_obstacle_distance = (
-                self._execute_velocity_action(policy_action)
+            _cprof_on = (
+                bool(getattr(self, "_step_cprofile_enabled", False))
+                and (self.step_count % max(int(getattr(self, "_step_cprofile_every_n", 200)), 1) == 0)
             )
+            if _cprof_on:
+                import cProfile
+                import pstats
+                import io as _io
+                _cprof = cProfile.Profile()
+                _cprof.enable()
+                executed_action, lidar_action_obstacle_distance, lidar_action_obstacle_score, lidar_front_obstacle_distance = (
+                    self._execute_velocity_action(policy_action)
+                )
+                _cprof.disable()
+                _buf = _io.StringIO()
+                pstats.Stats(_cprof, stream=_buf).sort_stats("cumulative").print_stats(12)
+                self.ros.get_logger().warn(
+                    f"STEP_CPROFILE | step={self.step_count}\n{_buf.getvalue()}"
+                )
+            else:
+                executed_action, lidar_action_obstacle_distance, lidar_action_obstacle_score, lidar_front_obstacle_distance = (
+                    self._execute_velocity_action(policy_action)
+                )
 
         nav2_stuck_backup_triggered = False
         if self.action_mode == "nav2":
@@ -4045,7 +4736,17 @@ class GazeboNavEnv(gym.Env):
                 lidar_action_obstacle_score = max(float(lidar_action_obstacle_score), float(s_obs))
                 lidar_front_obstacle_distance = float(f_obs)
 
-        _prof_mark("action_execute")
+        if _prof_on:
+            _prof_mark("action_execute")
+            _prof_parts["gz_step"] = _prof_parts.get("gz_step", 0.0) + float(
+                getattr(self, "_last_advance_gz_step_sec", 0.0)
+            )
+            _prof_parts["wait_time_adv"] = _prof_parts.get("wait_time_adv", 0.0) + float(
+                getattr(self, "_last_advance_wait_time_adv_sec", 0.0)
+            )
+            _prof_parts["wait_sensor"] = _prof_parts.get("wait_sensor", 0.0) + float(
+                getattr(self, "_last_advance_wait_sensor_sec", 0.0)
+            )
 
         # Reward와 observation에는 policy raw action이 아니라 실제 controller가 수행한 cmd_vel 평균을 넣는다.
         # 이렇게 해야 path alignment / obstacle penalty가 실제 궤적 기준으로 계산된다.
@@ -4062,20 +4763,55 @@ class GazeboNavEnv(gym.Env):
         # This is the B-plan sync path: reward uses scan/pose deltas, not delayed
         # RViz /map publication timing.
         self._wait_for_action_synced_observation(action_prev_scan_wall, action_prev_odom_wall)
-        _prof_mark("wait_sync")
+        if _prof_on:
+            _prof_mark("wait_sync")
 
-        map_stats = self._update_exploration_map()
+        _mprof_on = (
+            bool(getattr(self, "_map_cprofile_enabled", False))
+            and (self.step_count % max(int(getattr(self, "_map_cprofile_every_n", 150)), 1) == 0)
+        )
+        if _mprof_on:
+            import cProfile
+            import pstats
+            import io as _io
+            _mcprof = cProfile.Profile()
+            _mcprof.enable()
+            map_stats = self._update_exploration_map()
+            _mcprof.disable()
+            _mbuf = _io.StringIO()
+            pstats.Stats(_mcprof, stream=_mbuf).sort_stats("cumulative").print_stats(15)
+            self.ros.get_logger().warn(
+                f"MAP_CPROFILE | step={self.step_count}\n{_mbuf.getvalue()}"
+            )
+        else:
+            map_stats = self._update_exploration_map()
+        if str(os.environ.get("TB3_RL_DEBUG_MAP_UPDATE_COUNT", "0")).strip().lower() in {"1", "true", "yes", "on"}:
+            every_n = 20
+            try:
+                every_n = max(int(os.environ.get("TB3_RL_DEBUG_MAP_UPDATE_COUNT_EVERY_N", "20")), 1)
+            except Exception:
+                pass
+            if self.step_count % every_n == 0:
+                self.ros.get_logger().warn(
+                    "MAP_UPDATE_COUNT | "
+                    f"step={self.step_count} calls_this_step={int(getattr(self, '_map_update_call_count_this_step', 0))} "
+                    f"expected={max(int(getattr(self, 'map_substeps_per_action', 1)), 1)} "
+                    f"lifetime_total={int(getattr(self, '_map_update_call_count', 0))}"
+                )
         self._update_explored_stall_steps(map_stats=map_stats, action=action_for_reward)
         self._update_confidence_stall_steps(map_stats=map_stats, action=action_for_reward)
         self._update_sustained_rotation_steps(action=action_for_reward)
         self._update_orbit_stall_steps(map_stats=map_stats, action=action_for_reward)
-        _prof_mark("map_update")
+        if _prof_on:
+            _prof_mark("map_update")
 
         collision = self._check_collision()
         fallen = self._check_fallen()
         boundary_out_of_bounds = self._check_out_of_bounds()
         map_bounds_restart = self._update_map_bounds_restart_state(map_stats)
-        out_of_bounds = bool(boundary_out_of_bounds or map_bounds_restart)
+        # Respect --terminate-on-out-of-bounds for geometric boundary checks.
+        # Map-bounds restart is a separate map-integrity guard and remains active.
+        out_of_bounds = bool(map_bounds_restart or (self.terminate_on_out_of_bounds and boundary_out_of_bounds))
         shake_restart = self._update_shake_restart_state()
         collision_like = bool(collision or out_of_bounds or shake_restart)
 
@@ -4083,6 +4819,8 @@ class GazeboNavEnv(gym.Env):
         priority_stuck_restart = self._update_priority_stuck_restart_state(map_stats)
         lidar_empty_restart = self._update_lidar_empty_restart_state()
         velocity_safety_terminal = bool(getattr(self, "_last_velocity_safety_terminal_triggered", False))
+        physical_collision_like = bool(collision or shake_restart)
+        physical_unsafe_terminal = bool(collision or fallen or shake_restart or velocity_safety_terminal)
         coverage_stall_terminal = False
 
         self._last_terminal_reason = "none"
@@ -4090,7 +4828,7 @@ class GazeboNavEnv(gym.Env):
         if collision:
             # Physical contact / near-contact must always end the episode.
             # Do not gate this on restart_on_collision; the user expects a reset
-            # and reward.py gives -200 when collision=True.
+            # and reward.py gives the physical terminal reward when collision=True.
             self._last_terminal_reason = "collision"
             self._last_collision_restart_requested = True
             self._handle_unsafe_terminal("collision")
@@ -4103,7 +4841,7 @@ class GazeboNavEnv(gym.Env):
             self._handle_unsafe_terminal(self._last_terminal_reason)
         elif fallen:
             # Roll/pitch fall or z-drop.  This is also an unsafe physical terminal
-            # with reward=-100 and a mandatory reset on the next Gym reset().
+            # with the physical terminal reward and a mandatory reset on the next Gym reset().
             self._last_terminal_reason = "fallen_or_drop"
             self._last_collision_restart_requested = True
             self._handle_unsafe_terminal("fallen_or_drop")
@@ -4152,15 +4890,12 @@ class GazeboNavEnv(gym.Env):
         elif velocity_safety_terminal:
             self._last_terminal_reason = "velocity_safety_terminal"
             self._last_collision_restart_requested = True
-            try:
-                self._cancel_nav2_goal_sync(reason="velocity_safety_terminal")
-            except Exception:
-                pass
-            self.ros.stop_robot()
+            self._handle_unsafe_terminal("velocity_safety_terminal")
         elif coverage_done:
             self._last_terminal_reason = "coverage_done"
 
-        _prof_mark("terminal_checks")
+        if _prof_on:
+            _prof_mark("terminal_checks")
 
         # Merge all priority clear/recheck events produced by the live 10Hz map
         # update timer while this waypoint was being executed.  Without this,
@@ -4172,6 +4907,15 @@ class GazeboNavEnv(gym.Env):
         # Reward의 action smoothness penalty는 실제로 수행된 controller command 기준으로 계산한다.
         prev_action_for_reward = self.prev_action.copy()
 
+        _confidence_fill_score = float(
+            np.clip(float(reward_map_stats.mean_confidence) / 100.0, 0.0, 1.0)
+            * (1.0 - float(np.clip(float(reward_map_stats.low_confidence_ratio), 0.0, 1.0)))
+        )
+        _confidence_fill_prev = float(getattr(self, "_last_confidence_fill_score", _confidence_fill_score))
+        if int(getattr(self, "step_count", 0)) <= 0:
+            _confidence_fill_prev = _confidence_fill_score
+        _confidence_fill_delta = float(_confidence_fill_score - _confidence_fill_prev)
+
         reward = compute_exploration_reward(
             new_known_cells=reward_map_stats.new_known_cells,
             coverage_delta=reward_map_stats.coverage_delta,
@@ -4180,7 +4924,7 @@ class GazeboNavEnv(gym.Env):
             robot_visit_count=reward_map_stats.robot_visit_count,
             action=action_for_reward,
             prev_action=prev_action_for_reward,
-            collision=collision_like,
+            collision=physical_collision_like,
             fallen=fallen,
             stale_refresh_cells=reward_map_stats.stale_refresh_cells,
             confidence_gain=reward_map_stats.confidence_gain,
@@ -4236,15 +4980,18 @@ class GazeboNavEnv(gym.Env):
             corridor_priority_reward_weight=self.corridor_priority_reward_weight,
             confidence_reward_weight=self.confidence_reward_weight,
         )
-        _prof_mark("reward_compute")
+        self._last_confidence_fill_delta = _confidence_fill_delta
+        self._last_confidence_fill_hold = float(_confidence_fill_score)
+        self._last_confidence_fill_score = float(_confidence_fill_score)
+        if _prof_on:
+            _prof_mark("reward_compute")
 
         # Delayed SLAM /map update bonus.  This is intentionally separate from
         # the immediate LiDAR/confidence reward: it credits unknown->known cells
         # that arrive later through slam_toolbox, but it is small/capped because
         # exact action credit is less precise than the post-action scan reward.
-        reward += self._compute_delayed_slam_map_update_reward(
-            reward_map_stats,
-            unsafe_terminal=bool(collision_like or fallen or lidar_empty_restart),
+        reward += self._compute_direct_slam_known_delta_reward(
+            unsafe_terminal=physical_unsafe_terminal,
         )
 
         # v113: terminate low-information episode tails. This runs after the
@@ -4254,7 +5001,7 @@ class GazeboNavEnv(gym.Env):
         if not bool(collision_like or fallen or coverage_done or priority_stuck_restart or lidar_empty_restart or velocity_safety_terminal):
             coverage_stall_terminal = self._update_coverage_stall_terminal_state(reward_map_stats)
             if coverage_stall_terminal:
-                reward += float(getattr(self, "coverage_stall_terminal_penalty", -1.0))
+                reward += 0.0
                 self._last_terminal_reason = "coverage_stall_terminal"
                 self._last_collision_restart_requested = False
                 try:
@@ -4288,9 +5035,9 @@ class GazeboNavEnv(gym.Env):
             )
 
         if priority_stuck_restart:
-            reward -= self.priority_stuck_restart_penalty
+            pass
         if nav2_stuck_backup_triggered:
-            reward -= float(getattr(self, "nav2_stuck_backup_penalty", 0.0))
+            pass
         if self.action_mode == "velocity" and float(getattr(self, "_last_velocity_safety_penalty", 0.0)) > 0.0:
             # v117: a forced safety backup/hold step is dropped from the replay
             # buffer (info.skip_store), so applying its penalty to THIS step's
@@ -4312,13 +5059,14 @@ class GazeboNavEnv(gym.Env):
         if shake_restart:
             reward -= float(getattr(self, "shake_restart_penalty", 100.0))
         if lidar_empty_restart:
-            reward = -float(self.lidar_empty_restart_penalty)
+            reward = max(float(reward), 0.0)
 
         # v119: compress positive total reward after all positive bonuses and
         # soft penalties have been combined.  Negative safety/terminal rewards
         # are left unchanged by _apply_positive_reward_log_compression().
         reward = self._apply_positive_reward_log_compression(reward)
-        _prof_mark("reward_post")
+        if _prof_on:
+            _prof_mark("reward_post")
 
         # v6: Time-limit/episode timeout is a neutral truncation, not a penalty.
         # Collision/fallen/drop/lidar-empty/stuck restarts can still terminate with
@@ -4346,15 +5094,19 @@ class GazeboNavEnv(gym.Env):
         self._episode_reward_sum += reward
         # v131: reward breakdown cache (approximate, based on dominant components)
         try:
-            _r_conf = float(reward_map_stats.confidence_gain) * float(getattr(self, "confidence_reward_weight", 1.0))
+            _conf_gain = max(float(reward_map_stats.confidence_gain), 0.0)
+            _conf_weight = max(float(getattr(self, "confidence_reward_weight", 1.0)), 0.0)
+            _r_conf = 0.30 * _conf_weight * float(np.clip(_conf_gain / 8.0, 0.0, 1.0))
+            _r_conf_fill = 0.0
             _r_slam = float(getattr(self, "_last_slam_map_update_reward", 0.0))
             _r_prio = float(getattr(self, "_last_priority_check_reward", 0.0))
-            _r_wall = -float(reward_map_stats.obstacle_proximity_score) if not self.disable_wall_proximity_penalty else 0.0
+            _r_wall = 0.0
             _r_safe_slow = -float(getattr(self, "_last_velocity_safety_penalty", 0.0)) if not bool(getattr(self, "_last_velocity_safety_terminal_triggered", False)) else 0.0
             _r_safe_term = -float(getattr(self, "velocity_safety_terminal_penalty", 0.0)) if bool(getattr(self, "_last_velocity_safety_terminal_triggered", False)) else 0.0
-            _r_coll = -100.0 if collision_like else 0.0
-            _r_step = -0.01
+            _r_coll = float(PHYSICAL_TERMINAL_REWARD) if bool(physical_collision_like or fallen) else 0.0
+            _r_step = 0.0
             self._last_r_confidence = float(_r_conf)
+            self._last_r_confidence_fill = float(_r_conf_fill)
             self._last_r_slam = float(_r_slam)
             self._last_r_priority = float(_r_prio)
             self._last_r_wall = float(_r_wall)
@@ -4415,7 +5167,8 @@ class GazeboNavEnv(gym.Env):
                 lidar_action_obstacle_score=lidar_action_obstacle_score,
                 lidar_front_obstacle_distance=lidar_front_obstacle_distance,
             )
-        _prof_mark("debug_publish")
+        if _prof_on:
+            _prof_mark("debug_publish")
 
         self.step_count += 1
 
@@ -4430,7 +5183,32 @@ class GazeboNavEnv(gym.Env):
         self.last_map_stats = map_stats
 
         obs = self._get_obs()
-        _prof_mark("obs_build")
+        if _prof_on:
+            _prof_mark("obs_build")
+
+        if (terminated or truncated) and self._last_terminal_reason == "none":
+            if truncated:
+                self._last_terminal_reason = "time_limit"
+            elif collision:
+                self._last_terminal_reason = "collision"
+            elif out_of_bounds:
+                self._last_terminal_reason = "out_of_bounds"
+            elif fallen:
+                self._last_terminal_reason = "fallen_or_drop"
+            elif shake_restart:
+                self._last_terminal_reason = "shake_restart"
+            elif coverage_done:
+                self._last_terminal_reason = "coverage_done"
+            elif coverage_stall_terminal:
+                self._last_terminal_reason = "coverage_stall_terminal"
+            elif priority_stuck_restart:
+                self._last_terminal_reason = "priority_stuck_restart"
+            elif lidar_empty_restart:
+                self._last_terminal_reason = "lidar_empty_restart"
+            elif velocity_safety_terminal:
+                self._last_terminal_reason = "velocity_safety_terminal"
+            else:
+                self._last_terminal_reason = "unknown_terminal"
 
         if terminated or truncated:
             self.ros.stop_robot()
@@ -4448,7 +5226,18 @@ class GazeboNavEnv(gym.Env):
             fallen=fallen,
             coverage_done=coverage_done,
         )
-        _prof_mark("info_build")
+        info["env_terminated"] = bool(terminated)
+        info["env_truncated"] = bool(truncated)
+        info["TimeLimit.truncated"] = bool(truncated and not terminated)
+        # v133: reset-free elapsed time since this episode's reset() actually
+        # returned, for a true "stepping only" sps in the training progress
+        # logger (see the comment in reset() for why the callback's own
+        # wall-clock bracket cannot be trusted for this).
+        info["episode_wall_sec"] = max(
+            float(time.time() - float(getattr(self, "_episode_wall_start_time", time.time()))), 0.0
+        )
+        if _prof_on:
+            _prof_mark("info_build")
 
         if _prof_on:
             total = float(time.perf_counter() - _prof_t0)
@@ -4463,7 +5252,8 @@ class GazeboNavEnv(gym.Env):
             should_log = (self._step_profiler_count % every_n == 0) or (total * 1000.0 >= slow_ms)
             if should_log:
                 order = [
-                    "action_execute", "wait_sync", "map_update", "terminal_checks",
+                    "action_execute", "gz_step", "wait_time_adv", "wait_sensor",
+                    "wait_sync", "map_update", "terminal_checks",
                     "reward_compute", "reward_post", "debug_publish", "obs_build",
                     "info_build", "total",
                 ]
@@ -4477,7 +5267,8 @@ class GazeboNavEnv(gym.Env):
                 self.ros.get_logger().warn(
                     "STEP_PROFILE | "
                     f"episode={self.episode_index} step={self.step_count} count={self._step_profiler_count} "
-                    f"term={self._last_terminal_reason} collision={collision} truncated={truncated} | "
+                    f"term={self._last_terminal_reason} collision={collision} truncated={truncated} "
+                    f"stale_sim_time_steps={getattr(self, '_world_step_stale_total', 0)} | "
                     f"last {last_txt} | avg {avg_txt}"
                 )
 
@@ -4493,6 +5284,8 @@ class GazeboNavEnv(gym.Env):
             recent_slam_new <= threshold AND recent_conf_updated <= threshold
 
         One progress source being alive is enough to keep the episode running.
+        To avoid over-eager resets on noisy windows, require N consecutive
+        stalled windows before firing the terminal.
         """
         self._last_coverage_stall_terminal = False
         self._last_coverage_stall_active = False
@@ -4500,31 +5293,64 @@ class GazeboNavEnv(gym.Env):
 
         slam_new = max(int(getattr(map_stats, "slam_update_new_known_cells", 0)), 0)
         conf_new = max(int(getattr(map_stats, "confidence_updated_cells", 0)), 0)
+        conf_gain = max(float(getattr(map_stats, "confidence_gain", 0.0)), 0.0)
+        cov_delta = max(float(getattr(map_stats, "coverage_delta", 0.0)), 0.0)
 
         if not bool(getattr(self, "coverage_stall_terminal", False)):
             self._last_coverage_stall_slam_window = int(sum(getattr(self, "_coverage_stall_slam_window", [])))
             self._last_coverage_stall_conf_window = int(sum(getattr(self, "_coverage_stall_conf_window", [])))
+            self._last_coverage_stall_cov_window = float(sum(getattr(self, "_coverage_stall_cov_window", [])))
             self._last_coverage_stall_window_len = int(len(getattr(self, "_coverage_stall_slam_window", [])))
             return False
 
         self._coverage_stall_slam_window.append(int(slam_new))
         self._coverage_stall_conf_window.append(int(conf_new))
+        self._coverage_stall_cov_window.append(float(cov_delta))
 
         slam_sum = int(sum(self._coverage_stall_slam_window))
         conf_sum = int(sum(self._coverage_stall_conf_window))
+        cov_sum = float(sum(self._coverage_stall_cov_window))
         win_len = int(min(len(self._coverage_stall_slam_window), len(self._coverage_stall_conf_window)))
         self._last_coverage_stall_slam_window = slam_sum
         self._last_coverage_stall_conf_window = conf_sum
+        self._last_coverage_stall_cov_window = cov_sum
         self._last_coverage_stall_window_len = win_len
+
+        hard_min_slam = int(getattr(self, "coverage_stall_hard_min_slam_new_cells", 0))
+        hard_min_conf = int(getattr(self, "coverage_stall_hard_min_confidence_updated_cells", 0))
+        hard_min_cov = float(getattr(self, "coverage_stall_hard_min_coverage_delta", 0.0))
+        hard_min_conf_gain = float(getattr(self, "coverage_stall_hard_min_confidence_gain", 0.02))
+        slam_progress = bool(int(slam_new) > hard_min_slam)
+        coverage_progress = bool(float(cov_delta) > hard_min_cov)
+        confidence_progress = bool(float(conf_gain) > hard_min_conf_gain and int(conf_new) > hard_min_conf)
+        hard_no_progress_now = not bool(slam_progress or coverage_progress or confidence_progress)
+        if hard_no_progress_now:
+            self._coverage_stall_no_progress_steps = int(getattr(self, "_coverage_stall_no_progress_steps", 0)) + 1
+        else:
+            self._coverage_stall_no_progress_steps = 0
+        self._last_coverage_stall_no_progress_steps = int(self._coverage_stall_no_progress_steps)
 
         step_after = int(getattr(self, "step_count", 0)) + 1
         start_steps = int(getattr(self, "coverage_stall_start_steps", 0))
         window_steps = int(getattr(self, "coverage_stall_window_steps", 1))
+        hard_steps = int(getattr(self, "coverage_stall_hard_no_progress_steps", 0))
+
+        if hard_steps > 0 and step_after >= start_steps and int(self._coverage_stall_no_progress_steps) >= hard_steps:
+            self._coverage_stall_consecutive_hits = max(int(getattr(self, "_coverage_stall_consecutive_hits", 0)), 1)
+            self._last_coverage_stall_active = True
+            self._last_coverage_stall_terminal = True
+            self._last_coverage_stall_reason = (
+                f"hard_no_progress:{int(self._coverage_stall_no_progress_steps)}/{hard_steps} "
+                f"(slam_step={slam_new},conf_cells={conf_new},conf_gain={conf_gain:.4f},cov_step={cov_delta:.4f})"
+            )
+            return True
 
         if step_after < start_steps:
+            self._coverage_stall_consecutive_hits = 0
             self._last_coverage_stall_reason = f"warmup:{step_after}/{start_steps}"
             return False
         if win_len < window_steps:
+            self._coverage_stall_consecutive_hits = 0
             self._last_coverage_stall_reason = f"window:{win_len}/{window_steps}"
             return False
 
@@ -4533,11 +5359,15 @@ class GazeboNavEnv(gym.Env):
         # so an unresolved active spot is progress-relevant even if SLAM/confidence
         # are flat.
         try:
-            if not bool(getattr(self, "disable_priority_map", False)):
+            if (
+                not bool(getattr(self, "disable_priority_map", False))
+                and not bool(getattr(self, "coverage_stall_ignore_priority_gate", False))
+            ):
                 prio = self.exploration_map._active_priority_grid()
                 prio_thr = max(float(getattr(self.exploration_map, "priority_clear_min_value", 5.0)), 1.0)
                 active_prio_cells = int(np.count_nonzero(np.asarray(prio) >= prio_thr))
                 if active_prio_cells > 0:
+                    self._coverage_stall_consecutive_hits = 0
                     self._last_coverage_stall_reason = f"priority_active:{active_prio_cells}"
                     return False
         except Exception:
@@ -4545,13 +5375,20 @@ class GazeboNavEnv(gym.Env):
 
         min_slam = int(getattr(self, "coverage_stall_min_slam_new_cells", 0))
         min_conf = int(getattr(self, "coverage_stall_min_confidence_updated_cells", 0))
-        active = bool(slam_sum <= min_slam and conf_sum <= min_conf)
+        min_cov = float(getattr(self, "coverage_stall_min_coverage_delta", 0.0))
+        stalled_now = bool(slam_sum <= min_slam and conf_sum <= min_conf and cov_sum <= min_cov)
+        if stalled_now:
+            self._coverage_stall_consecutive_hits = int(getattr(self, "_coverage_stall_consecutive_hits", 0)) + 1
+        else:
+            self._coverage_stall_consecutive_hits = 0
+        required_hits = int(getattr(self, "coverage_stall_required_consecutive_windows", 1))
+        active = bool(stalled_now and self._coverage_stall_consecutive_hits >= required_hits)
         self._last_coverage_stall_active = active
         self._last_coverage_stall_terminal = active
         self._last_coverage_stall_reason = (
-            f"stall:slam={slam_sum}<={min_slam},conf={conf_sum}<={min_conf}"
+            f"stall:slam={slam_sum}<={min_slam},conf={conf_sum}<={min_conf},cov={cov_sum:.4f}<={min_cov:.4f},hit={self._coverage_stall_consecutive_hits}/{required_hits}"
             if active else
-            f"progress:slam={slam_sum}>{min_slam} or conf={conf_sum}>{min_conf}"
+            f"progress:slam={slam_sum}>{min_slam} or conf={conf_sum}>{min_conf} or cov={cov_sum:.4f}>{min_cov:.4f} (hit={self._coverage_stall_consecutive_hits}/{required_hits})"
         )
         return active
 
@@ -4759,6 +5596,54 @@ class GazeboNavEnv(gym.Env):
         self._last_velocity_forward_assist = False
         self._last_velocity_spin_breaker = False
 
+        fast_passthrough = (
+            not bool(getattr(self, "velocity_safety_backup", True))
+            and not bool(getattr(self, "velocity_safety_slowdown", True))
+            and not bool(getattr(self, "velocity_safety_terminal", False))
+            and not bool(getattr(self, "velocity_spin_breaker", False))
+            and float(getattr(self, "velocity_forward_assist_mps", 0.0)) <= 0.0
+            and bool(getattr(self, "disable_wall_proximity_penalty", False))
+        )
+        if fast_passthrough:
+            cmd = action.astype(np.float32).copy()
+            self._last_velocity_command_limited = False
+            self._last_velocity_command_limit_reason = "none"
+            linear_limit = float(getattr(self, "velocity_command_linear_limit", self.max_linear_speed))
+            angular_limit = float(getattr(self, "velocity_command_angular_limit", self.max_angular_speed))
+            if linear_limit < float(self.max_linear_speed) - 1e-6 or angular_limit < float(self.max_angular_speed) - 1e-6:
+                before = cmd.copy()
+                cmd[0] = float(np.clip(float(cmd[0]), 0.0, linear_limit))
+                cmd[1] = float(np.clip(float(cmd[1]), -angular_limit, angular_limit))
+                if abs(float(before[0]) - float(cmd[0])) > 1e-6 or abs(float(before[1]) - float(cmd[1])) > 1e-6:
+                    self._last_velocity_command_limited = True
+                    self._last_velocity_command_limit_reason = (
+                        f"cmd_limit old=({float(before[0]):+.3f},{float(before[1]):+.3f}) "
+                        f"limit=({linear_limit:.3f},{angular_limit:.3f})"
+                    )
+            deadband_reasons: list[str] = []
+            linear_deadband = max(float(getattr(self, "linear_deadband", 0.015)), 0.0)
+            angular_deadband = max(float(getattr(self, "angular_deadband", 0.04)), 0.0)
+            if 0.0 < float(cmd[0]) < linear_deadband:
+                old_v = float(cmd[0])
+                cmd[0] = 0.0
+                deadband_reasons.append(f"v_deadband:{old_v:.3f}<{linear_deadband:.3f}")
+            if 0.0 < abs(float(cmd[1])) < angular_deadband:
+                old_w = float(cmd[1])
+                cmd[1] = 0.0
+                deadband_reasons.append(f"w_deadband:{old_w:+.3f}<{angular_deadband:.3f}")
+            if deadband_reasons:
+                self._last_velocity_command_limited = True
+                prev_reason = str(getattr(self, "_last_velocity_command_limit_reason", "none") or "none")
+                suffix = ",".join(deadband_reasons)
+                self._last_velocity_command_limit_reason = suffix if prev_reason == "none" else f"{prev_reason};{suffix}"
+
+            self._last_velocity_safety_executed_v = float(cmd[0])
+            self._last_velocity_safety_executed_w = float(cmd[1])
+            self.ros.publish_cmd_vel(float(cmd[0]), float(cmd[1]))
+            self.ros.spin_steps(num_spins=1, timeout_sec=0.0)
+            self._advance_world_after_command(target_delta_sec=self.control_dt)
+            return cmd.astype(np.float32), 999.0, 0.0, 999.0
+
         # Cooldown prevents repeated new backup starts.  It must not consume the
         # already-started sticky backup lock; otherwise the policy can re-enter
         # and cancel the escape before the robot has physically moved backward.
@@ -4849,6 +5734,22 @@ class GazeboNavEnv(gym.Env):
                     f"cmd_limit old=({float(before[0]):+.3f},{float(before[1]):+.3f}) "
                     f"limit=({linear_limit:.3f},{angular_limit:.3f})"
                 )
+        deadband_reasons: list[str] = []
+        linear_deadband = max(float(getattr(self, "linear_deadband", 0.015)), 0.0)
+        angular_deadband = max(float(getattr(self, "angular_deadband", 0.04)), 0.0)
+        if 0.0 < float(cmd[0]) < linear_deadband:
+            old_v = float(cmd[0])
+            cmd[0] = 0.0
+            deadband_reasons.append(f"v_deadband:{old_v:.3f}<{linear_deadband:.3f}")
+        if 0.0 < abs(float(cmd[1])) < angular_deadband:
+            old_w = float(cmd[1])
+            cmd[1] = 0.0
+            deadband_reasons.append(f"w_deadband:{old_w:+.3f}<{angular_deadband:.3f}")
+        if deadband_reasons:
+            self._last_velocity_command_limited = True
+            prev_reason = str(getattr(self, "_last_velocity_command_limit_reason", "none") or "none")
+            suffix = ",".join(deadband_reasons)
+            self._last_velocity_command_limit_reason = suffix if prev_reason == "none" else f"{prev_reason};{suffix}"
         forward = float(cmd[0])
         angular = float(cmd[1])
         # Safety backup must be causally tied to a meaningful forward policy command.
@@ -4894,11 +5795,6 @@ class GazeboNavEnv(gym.Env):
         #   - If backup is unavailable, let the policy command pass through so
         #     the normal collision/terminal reward, not a hidden command clamp,
         #     provides the learning signal.
-        can_backup = (
-            bool(getattr(self, "velocity_safety_backup", True))
-            and float(safety_rear_min) > rear_warn_dist
-        )
-
         cooldown_active = int(getattr(self, "velocity_safety_cooldown_steps", 0)) > 0
         rear_ok = float(safety_rear_min) > rear_warn_dist
 
@@ -6244,8 +7140,6 @@ class GazeboNavEnv(gym.Env):
         action = np.asarray(policy_action, dtype=np.float32)
         if action.size < 2:
             action = np.pad(action, (0, 2 - action.size), mode="constant")
-        a0 = float(np.clip(action[0], 0.0, 1.0))
-        a1 = float(np.clip(action[1], -1.0, 1.0))
 
         # 1) Use path-conditioned waypoint only when the path is actually reachable.
         if self.waypoint_action_type == "path" and stats is not None and bool(getattr(stats, "target_reachable", False)):
@@ -6341,6 +7235,62 @@ class GazeboNavEnv(gym.Env):
 
         self.ros.get_logger().warn(" | ".join(parts))
 
+    def _brake_after_unsafe_terminal(self, reason: str) -> None:
+        try:
+            cycles = max(int(os.environ.get("TB3_RL_UNSAFE_TERMINAL_BRAKE_CYCLES", "3") or 3), 1)
+        except Exception:
+            cycles = 3
+        try:
+            settle_sec = float(os.environ.get("TB3_RL_UNSAFE_TERMINAL_BRAKE_SETTLE_SEC", "0.05") or 0.05)
+        except Exception:
+            settle_sec = 0.05
+        settle_sec = float(np.clip(settle_sec, 0.0, max(float(getattr(self, "control_dt", 0.12)), 0.01)))
+        sim_steps = max(
+            int(round(settle_sec / max(float(getattr(self, "physics_step_size", 0.01)), 1e-6))),
+            1,
+        )
+        sim_steps = min(sim_steps, max(int(getattr(self, "sim_steps_per_action", sim_steps)), 1))
+
+        for _ in range(cycles):
+            try:
+                self.ros.publish_cmd_vel(0.0, 0.0)
+            except Exception:
+                pass
+            try:
+                self.ros.spin_steps(num_spins=4, timeout_sec=0.001)
+            except Exception:
+                pass
+            if bool(getattr(self, "use_world_step", False)) and self.sim_controller is not None:
+                try:
+                    ok = self.sim_controller.step(sim_steps, timeout_sec=0.75)
+                    if not ok:
+                        self.ros.spin_steps(num_spins=8, timeout_sec=0.001)
+                except Exception as exc:
+                    try:
+                        self.ros.get_logger().warn(
+                            f"UNSAFE_TERMINAL_BRAKE_STEP_FAILED | reason={reason} | {type(exc).__name__}:{exc}"
+                        )
+                    except Exception:
+                        pass
+                try:
+                    self.ros.spin_steps(num_spins=5, timeout_sec=0.0)
+                except Exception:
+                    pass
+            elif settle_sec > 0.0:
+                deadline = time.monotonic() + settle_sec
+                while rclpy.ok() and time.monotonic() < deadline:
+                    remaining = max(deadline - time.monotonic(), 0.0)
+                    try:
+                        self.ros.spin_steps(num_spins=1, timeout_sec=min(remaining, 0.005))
+                    except Exception:
+                        pass
+                    if remaining > 0.001:
+                        time.sleep(min(remaining, 0.001))
+        try:
+            self.ros.stop_robot()
+        except Exception:
+            pass
+
     def _handle_unsafe_terminal(self, reason: str) -> None:
         """Prepare a clean next episode after collision-like unsafe states.
 
@@ -6352,7 +7302,7 @@ class GazeboNavEnv(gym.Env):
         self.ros.get_logger().warn(
             f"Unsafe terminal state detected: {reason}. Stopping robot and preparing reset."
         )
-        self.ros.stop_robot()
+        self._brake_after_unsafe_terminal(reason)
 
         if self.action_mode == "nav2":
             if self.collision_cancel_nav2_goal:
@@ -6360,7 +7310,7 @@ class GazeboNavEnv(gym.Env):
             if self.collision_clear_nav2_costmaps:
                 self._clear_nav2_costmaps(wait_timeout_sec=0.35)
 
-        self.ros.spin_steps(num_spins=5, timeout_sec=0.001)
+        self.ros.spin_steps(num_spins=8, timeout_sec=0.001)
 
     def _handle_collision_terminal(self) -> None:
         """Backward-compatible wrapper."""
@@ -6539,7 +7489,7 @@ class GazeboNavEnv(gym.Env):
 
         # Keep the rest of the upstream file intact.  Use a deterministic tmp name
         # so repeated resets do not create unbounded files.
-        out = Path("/tmp") / f"turtlebot3_rl_nav2_stamped_params_{os.getpid()}.yaml"
+        out = Path(tempfile.gettempdir()) / f"turtlebot3_rl_nav2_stamped_params_{os.getpid()}.yaml"
         try:
             out.write_text(text)
         except Exception as exc:
@@ -6576,7 +7526,7 @@ class GazeboNavEnv(gym.Env):
         elif self.nav2_params_file:
             cmd.append(f"params_file:={self.nav2_params_file}")
 
-        self._nav2_log_path = f"/tmp/turtlebot3_rl_nav2_{os.getpid()}.log"
+        self._nav2_log_path = str(Path(tempfile.gettempdir()) / f"turtlebot3_rl_nav2_{os.getpid()}.log")
         self.ros.get_logger().warn(
             "Nav2 motion server is not available. Starting Nav2 internally:\n"
             + " ".join(cmd)
@@ -7922,23 +8872,15 @@ class GazeboNavEnv(gym.Env):
             not in {"0", "false", "no", "off", "disable", "disabled"}
         )
         if no_priority_overlay:
-            prio_score = prio_gain = prio_clear = prio_recheck = target_prio = 0.0
             target_type = str(getattr(map_stats, "target_type", "none"))
             if target_type == "priority_gap":
                 target_type = "none"
         else:
-            prio_score = fnum(getattr(map_stats, "priority_score", 0.0), 0.0)
-            prio_gain = fnum(getattr(map_stats, "priority_gain", 0.0), 0.0)
-            prio_clear = fnum(getattr(map_stats, "priority_clear_gain", 0.0), 0.0)
-            prio_recheck = fnum(getattr(map_stats, "priority_rechecked_gain", 0.0), 0.0)
             target_type = str(getattr(map_stats, "target_type", "none"))
-            target_prio = fnum(getattr(map_stats, "target_priority", 0.0), 0.0)
 
         l_empty_steps = int(getattr(self, "lidar_empty_steps", 0))
         l_empty_timeout = int(getattr(self, "lidar_empty_timeout_steps", 0))
         valid_beams = int(getattr(self, "_last_lidar_valid_beams", 0))
-        p_steps = 0 if no_priority_overlay else int(getattr(self, "priority_stuck_steps", 0))
-        p_limit = 0 if no_priority_overlay else int(getattr(self, "priority_stuck_restart_steps", 0))
         safety_reason = str(getattr(self, "_last_velocity_safety_reason", "none"))
         safety_pen = fnum(getattr(self, "_last_velocity_safety_penalty", 0.0), 0.0)
         safety_cd = int(getattr(self, "velocity_safety_cooldown_steps", 0))
@@ -7969,6 +8911,54 @@ class GazeboNavEnv(gym.Env):
             stale_marker.type = stale_type
             stale_marker.action = Marker.DELETE
             arr.markers.append(stale_marker)
+
+        g_only_debug = str(os.environ.get("TB3_RL_G_ONLY_DEBUG", "0") or "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if g_only_debug:
+            for stale_id, stale_type in ((1, Marker.ARROW), (2, Marker.ARROW), (3, Marker.ARROW)):
+                stale_marker = Marker()
+                stale_marker.header.frame_id = frame_id
+                stale_marker.header.stamp = stamp
+                stale_marker.ns = "rl_velocity_debug"
+                stale_marker.id = int(stale_id)
+                stale_marker.type = stale_type
+                stale_marker.action = Marker.DELETE
+                arr.markers.append(stale_marker)
+
+            r_conf = fnum(getattr(self, "_last_r_confidence", 0.0), 0.0)
+            r_prio = fnum(getattr(self, "_last_r_priority", 0.0), 0.0)
+            r_wall = fnum(getattr(self, "_last_r_wall", 0.0), 0.0)
+            r_safe = fnum(getattr(self, "_last_r_safety_slow", 0.0), 0.0) + fnum(getattr(self, "_last_r_safety_terminal", 0.0), 0.0)
+            r_coll = fnum(getattr(self, "_last_r_collision", 0.0), 0.0)
+            conf_gain = fnum(getattr(map_stats, "confidence_gain", 0.0), 0.0)
+            text = Marker()
+            text.header.frame_id = frame_id
+            text.header.stamp = stamp
+            text.ns = "rl_velocity_debug"
+            text.id = 0
+            text.type = Marker.TEXT_VIEW_FACING
+            text.action = Marker.ADD
+            text.pose.orientation.w = 1.0
+            text.pose.position.x = float(robot_xy_overlay[0])
+            text.pose.position.y = float(robot_xy_overlay[1])
+            text.pose.position.z = 1.05
+            text.scale.z = 0.22
+            self._set_marker_color(text, 0.80, 1.00, 0.25, 0.98)
+            text.text = (
+                f"G DEBUG step={int(self.step_count)} term={term}\n"
+                f"r={reward:+.3f}  G={g_return:+.2f}  Gsum={g_sum:+.1f}  Gema={g_ema:+.3f}  R{r_window_n}={r_window:+.2f}  gamma={self.reward_gamma:.3f}\n"
+                f"Rparts conf={r_conf:+.3f} slam={slam_r:+.3f} prio={r_prio:+.3f} wall={r_wall:+.3f} safe={r_safe:+.3f} coll={r_coll:+.1f}\n"
+                f"confGain={conf_gain:.3f} confCells={conf_updated_cells} conf/s={conf_rate_ema:.1f} meanConf={conf:.1f} low={low:.1f}%\n"
+                f"slamNew={slam_new_known} slamReason={str(getattr(self, '_last_slam_map_update_reward_reason', 'none'))} "
+                f"slamGate={slam_gate} mapAge={map_age:.1f}s"
+            )
+            arr.markers.append(text)
+            self.waypoint_marker_pub.publish(arr)
+            return
 
         text = Marker()
         text.header.frame_id = frame_id
@@ -8293,7 +9283,7 @@ class GazeboNavEnv(gym.Env):
         samples = samples[-48:]
         path_len = 0.0
         yaw_accum = 0.0
-        for a, b in zip(samples[:-1], samples[1:]):
+        for a, b in zip(samples[:-1], samples[1:], strict=False):
             dx = float(b[1]) - float(a[1])
             dy = float(b[2]) - float(a[2])
             ds = math.hypot(dx, dy)
@@ -8381,14 +9371,73 @@ class GazeboNavEnv(gym.Env):
         """No-op. Kept only for CLI/API compatibility."""
         return np.asarray(action, dtype=np.float32).copy()
 
-    def _advance_world_after_command(self, target_delta_sec: float):
+    def _advance_world_after_command(
+        self,
+        target_delta_sec: float,
+        override_sim_steps: Optional[int] = None,
+        _is_substep: bool = False,
+    ):
+        # v133: map_substeps_per_action > 1 decouples the confidence-map
+        # sampling rate from the SAC decision rate. The user wants confidence
+        # painted at the original fine control_dt (dense) while the agent
+        # still only picks a new action once per *_is_substep=False* call
+        # (coarser, cheaper safety-shield/gradient-update cadence). This
+        # applies uniformly to every call site that advances a full
+        # control_dt (main step, backup recovery, spin-breaker, ...) since
+        # they all represent "one control_dt of physics happened" -- painting
+        # more densely during those is harmless, just more thorough.
+        substeps = max(int(getattr(self, "map_substeps_per_action", 1)), 1)
+        if (
+            not _is_substep
+            and substeps > 1
+            and override_sim_steps is None
+            and abs(float(target_delta_sec) - float(self.control_dt)) < 1e-6
+        ):
+            sub_dt = float(self.control_dt) / float(substeps)
+            sub_steps_count = max(int(round(float(self.sim_steps_per_action) / float(substeps))), 1)
+            for sub_i in range(substeps):
+                self._advance_world_after_command(
+                    target_delta_sec=sub_dt,
+                    override_sim_steps=sub_steps_count,
+                    _is_substep=True,
+                )
+                if sub_i < substeps - 1:
+                    try:
+                        self._update_exploration_map()
+                    except Exception:
+                        pass
+                    # v133: no early break on collision/fallen here. A real hit
+                    # is still caught by _step_impl's own check right after this
+                    # whole loop returns (the wall does not move away), but a
+                    # transient/noisy read here used to truncate this step to
+                    # sub_dt worth of movement instead of the full control_dt --
+                    # different steps then covered different amounts of ground
+                    # for the same action, which looked like stutter/gaps in the
+                    # confidence trail. Always run every sub-tick.
+            return
+
         prev_sim_time = self.ros.get_sim_time_sec()
         prev_odom_stamp = self.ros.get_odom_stamp_sec()
         prev_scan_wall = self.ros.last_scan_time
         prev_odom_wall = self.ros.last_odom_time
 
+        # v133: split out where the time inside action_execute actually goes
+        # (gz-transport multi_step round trip vs the two post-step wait/poll
+        # loops), gated behind the same STEP_PROFILER flag so it costs nothing
+        # when off. This tells us whether the wait is genuinely I/O-bound
+        # (a candidate for overlapping with other work) or CPU-bound polling.
+        _prof_on = bool(getattr(self, "_step_profiler_enabled", False))
+        _t0 = time.perf_counter() if _prof_on else 0.0
+
         if self.use_world_step and self.sim_controller is not None:
-            ok = self.sim_controller.step(self.sim_steps_per_action)
+            ok = self.sim_controller.step(
+                int(override_sim_steps) if override_sim_steps is not None else self.sim_steps_per_action
+            )
+            if _prof_on:
+                _t1 = time.perf_counter()
+                self._last_advance_gz_step_sec = _t1 - _t0
+            else:
+                _t1 = 0.0
 
             if not ok:
                 self.ros.get_logger().warn(
@@ -8399,24 +9448,43 @@ class GazeboNavEnv(gym.Env):
 
             target_fraction = self.world_step_target_fraction
             time_advanced = True
+            target_delta = max(float(target_delta_sec) * float(target_fraction), 1e-4)
             if target_fraction > 0.0:
                 time_advanced = self.ros.wait_for_time_advance(
                     start_sim_time_sec=prev_sim_time,
                     start_odom_stamp_sec=prev_odom_stamp,
-                    target_delta_sec=max(float(target_delta_sec) * target_fraction, 1e-4),
+                    target_delta_sec=target_delta,
                     timeout_wall_sec=self.world_step_wait_timeout_sec,
                 )
+                if not time_advanced and self.world_step_contract_wait_sec > 0.0:
+                    # Enforce the sim-time control contract before the next action.
+                    # If Gazebo/RViz/SLAM cannot keep up, wall-clock throughput drops,
+                    # but each env step still represents the requested simulated dt.
+                    time_advanced = self.ros.wait_for_time_advance(
+                        start_sim_time_sec=prev_sim_time,
+                        start_odom_stamp_sec=prev_odom_stamp,
+                        target_delta_sec=target_delta,
+                        timeout_wall_sec=self.world_step_contract_wait_sec,
+                    )
+            if _prof_on:
+                _t2 = time.perf_counter()
+                self._last_advance_wait_time_adv_sec = _t2 - _t1
+            else:
+                _t2 = 0.0
 
             sensor_updated = self.ros.wait_for_new_sensor_frame(
                 prev_scan_wall_time=prev_scan_wall,
                 prev_odom_wall_time=prev_odom_wall,
                 timeout_wall_sec=self.world_step_sensor_timeout_sec,
             )
+            if _prof_on:
+                self._last_advance_wait_sensor_sec = time.perf_counter() - _t2
 
             if time_advanced or sensor_updated:
                 self._world_step_stale_count = 0
             else:
                 self._world_step_stale_count += 1
+                self._world_step_stale_total = int(getattr(self, "_world_step_stale_total", 0)) + 1
                 if self.step_count % self.world_step_stale_warn_every_n == 0:
                     self.ros.get_logger().warn(
                         "Gazebo multi_step returned before clock/odom/sensor callbacks advanced. "
@@ -8480,8 +9548,19 @@ class GazeboNavEnv(gym.Env):
                 self._last_realtime_step_wall_elapsed_sec = float(time.monotonic() - start_wall)
 
     def close(self):
+        self._map_live_update_paused = True
         self._clear_waypoint_visualization()
         self.ros.stop_robot()
+
+        for timer_attr in ("_map_live_update_timer", "_amcl_pose_tf_timer"):
+            timer = getattr(self, timer_attr, None)
+            if timer is not None:
+                try:
+                    timer.cancel()
+                    self.ros.destroy_timer(timer)
+                except Exception:
+                    pass
+                setattr(self, timer_attr, None)
 
         if self.sim_controller is not None and hasattr(self.sim_controller, "close"):
             self.sim_controller.close()
@@ -8489,13 +9568,27 @@ class GazeboNavEnv(gym.Env):
         if self.reset_manager is not None and hasattr(self.reset_manager, "close"):
             self.reset_manager.close()
 
+        nav2_log = getattr(self, "_nav2_log_handle", None)
+        if nav2_log is not None:
+            try:
+                nav2_log.close()
+            except Exception:
+                pass
+            self._nav2_log_handle = None
+
         if self.nav2_proc is not None and self.nav2_proc.poll() is None:
             self.ros.get_logger().info("Stopping internal Nav2 process...")
-            self.nav2_proc.terminate()
             try:
-                self.nav2_proc.wait(timeout=2.0)
+                os.killpg(os.getpgid(self.nav2_proc.pid), signal.SIGTERM)
+            except Exception:
+                self.nav2_proc.terminate()
+            try:
+                self.nav2_proc.wait(timeout=3.0)
             except subprocess.TimeoutExpired:
-                self.nav2_proc.kill()
+                try:
+                    os.killpg(os.getpgid(self.nav2_proc.pid), signal.SIGKILL)
+                except Exception:
+                    self.nav2_proc.kill()
         self.nav2_proc = None
 
     def _log_reset_pose_truth(
@@ -8566,23 +9659,41 @@ class GazeboNavEnv(gym.Env):
         if not hasattr(self.ros, "reset_slam_mapping"):
             return False
 
+        _diag_on = str(os.environ.get("TB3_RL_RESET_PROFILER", "0")).strip().lower() in {"1", "true", "yes", "on"}
+        _diag_t0 = time.perf_counter() if _diag_on else 0.0
+
         ok = self.ros.reset_slam_mapping(
             timeout_sec=self.slam_reset_timeout_sec,
             allow_process_restart=self.restart_slam_on_reset,
         )
+        if _diag_on:
+            print(f"SLAM_RESET_DIAG | reset_slam_mapping={  (time.perf_counter()-_diag_t0)*1000.0:.1f}ms ok={ok} map_ready={self.ros.slam_map is not None}", flush=True)
 
-        # Gazebo world가 paused 상태일 수 있으므로, SLAM 재시작 후 scan/odom/map이
-        # 들어오도록 physics를 조금 전진시킨다.
-        for _ in range(self.slam_reset_warmup_steps):
-            self._advance_world_after_command(
-                target_delta_sec=min(self.control_dt, 0.05)
-            )
+        # Gazebo world는 lockstep/paused라 물리 시간이 명시적으로 전진해야만 새
+        # /scan, /tf가 나온다. reset_slam_mapping()과 wait_for_slam_map_ready()의
+        # 대기 루프는 real-time만 폴링하고 world를 전진시키지 않으므로, world가
+        # 멈춰있는 동안은 map이 나올 수 없고 그냥 timeout까지 실시간을 낭비한다
+        # (RESET_PROFILE로 확인된 20~50초 slam_reset 병목의 원인). 여기서 직접
+        # timeout까지 world를 계속 전진시키면서 map을 기다린다.
+        _diag_t1 = time.perf_counter() if _diag_on else 0.0
+        deadline = time.time() + max(float(self.slam_reset_timeout_sec), 1.0)
+        step_sec = max(float(self.control_dt), 0.05)
+        max_iters = max(int(self.slam_reset_warmup_steps), 1) * 20
+        iters = 0
+        while self.ros.slam_map is None and time.time() < deadline and iters < max_iters:
+            _iter_t0 = time.perf_counter() if _diag_on else 0.0
+            self._advance_world_after_command(target_delta_sec=step_sec)
             self.ros.spin_steps(num_spins=10, timeout_sec=0.001)
-            if self.ros.slam_map is not None:
-                return True
+            if _diag_on and iters < 5:
+                print(f"SLAM_RESET_DIAG | wait_iter={iters} advance_call={(time.perf_counter()-_iter_t0)*1000.0:.1f}ms map_ready={self.ros.slam_map is not None}", flush=True)
+            iters += 1
 
-        if self.ros.slam_map is None:
-            self.ros.wait_for_slam_map_ready(timeout_sec=self.slam_reset_timeout_sec)
+        if _diag_on:
+            print(
+                f"SLAM_RESET_DIAG | wait_loop_total={(time.perf_counter()-_diag_t1)*1000.0:.1f}ms "
+                f"iters={iters} map_ready={self.ros.slam_map is not None}",
+                flush=True,
+            )
 
         return bool(ok and self.ros.slam_map is not None)
 
@@ -8932,24 +10043,24 @@ class GazeboNavEnv(gym.Env):
                 buffer_fallback = str(os.environ.get("TB3_RL_CONFIDENCE_TF_BUFFER_FALLBACK", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
                 max_age = float(os.environ.get("TB3_RL_MANUAL_TF_MAX_AGE_SEC", "5.0") or 5.0)
 
-                def _lookup_tf_buffer():
+                def _lookup_tf_buffer(_source_frame=source_frame):
                     if not hasattr(self.ros, "get_frame_pose2d"):
                         return None
                     return self.ros.get_frame_pose2d(
                         target_frame=target_frame,
-                        source_frame=source_frame,
+                        source_frame=_source_frame,
                         stamp=None,
                         timeout_sec=0.05,
                         allow_latest_fallback=True,
                     )
 
-                def _lookup_manual():
+                def _lookup_manual(_source_frame=source_frame, _max_age=max_age):
                     if not hasattr(self.ros, "get_frame_pose2d_manual"):
                         return None
                     return self.ros.get_frame_pose2d_manual(
                         target_frame=target_frame,
-                        source_frame=source_frame,
-                        max_age_sec=max_age,
+                        source_frame=_source_frame,
+                        max_age_sec=_max_age,
                     )
 
                 if prefer_tf_buffer:
@@ -10218,10 +11329,8 @@ class GazeboNavEnv(gym.Env):
             if not (np.all(np.isfinite(rxy)) and np.all(np.isfinite(sxy)) and math.isfinite(ryaw) and math.isfinite(syaw)):
                 return
 
-            unified_now = bool(
-                isinstance(getattr(self, "_confidence_unified_xy", None), np.ndarray)
-                and getattr(self, "_confidence_unified_xy").size >= 2
-            )
+            _uxy = getattr(self, "_confidence_unified_xy", None)
+            unified_now = bool(isinstance(_uxy, np.ndarray) and _uxy.size >= 2)
             single_cube = self._scan_bool_env("TB3_RL_CONFIDENCE_SINGLE_CUBE_MARKER", True)
             if unified_now and single_cube:
                 arr = MarkerArray()
@@ -10377,10 +11486,8 @@ class GazeboNavEnv(gym.Env):
             # base_footprint cube is meaningful here (it must coincide exactly with
             # the sphere).  The base_link/base_scan cubes are at rigid offsets and
             # only add visual confusion in unified mode, so they are dropped.
-            unified_now = bool(
-                isinstance(getattr(self, "_confidence_unified_xy", None), np.ndarray)
-                and getattr(self, "_confidence_unified_xy").size >= 2
-            )
+            _uxy = getattr(self, "_confidence_unified_xy", None)
+            unified_now = bool(isinstance(_uxy, np.ndarray) and _uxy.size >= 2)
             if unified_now:
                 compare_frames = [
                     ("base_footprint", 20, (0.0, 1.0, 0.0, 0.95), 0.24),
@@ -10735,7 +11842,6 @@ class GazeboNavEnv(gym.Env):
             return
         try:
             raw_header = getattr(raw_scan_msg, "header", None)
-            raw_stamp = getattr(raw_header, "stamp", None)
             raw_scan_frame = str(getattr(raw_header, "frame_id", "") or "").strip().lstrip("/")
             if not raw_scan_frame:
                 raw_scan_frame = str(os.environ.get("TB3_RL_SCAN_FRAME", "base_scan") or "base_scan").strip().lstrip("/") or "base_scan"
@@ -10931,37 +12037,34 @@ class GazeboNavEnv(gym.Env):
             # Do not crash; build obs from stale data but mark it in info
             pass
 
-        # v131: cache raw scan sector values (bin0=front, independent of publish throttle)
-        try:
-            scan_msg_raw = self.ros.scan
-            _r_raw = np.asarray(getattr(scan_msg_raw, "ranges", []) or [], dtype=np.float32)
-            _angle_min_raw = float(getattr(scan_msg_raw, "angle_min", 0.0) or 0.0)
-            _angle_inc_raw = float(getattr(scan_msg_raw, "angle_increment", 0.0) or 0.0)
-            if _r_raw.size > 0 and _angle_inc_raw > 0.0:
-                _angles_raw = _angle_min_raw + np.arange(_r_raw.size, dtype=np.float32) * _angle_inc_raw
-                _range_min_r = float(getattr(scan_msg_raw, "range_min", 0.12) or 0.12)
-                _range_max_r = float(getattr(scan_msg_raw, "range_max", 3.5) or 3.5)
-                _r_raw = np.clip(np.where(np.isfinite(_r_raw), _r_raw, _range_max_r), _range_min_r, _range_max_r)
+        # v132: raw scan sector values - compute only every 10 steps, but keep
+        # the sectors angle-based so diagnostics match the LaserScan frame.
+        if self.step_count % 10 == 0:
+            try:
+                scan_msg_raw = self.ros.scan
+                _r_raw = np.asarray(getattr(scan_msg_raw, "ranges", []) or [], dtype=np.float32)
+                _n = _r_raw.size
+                if _n > 0:
+                    _range_max_r = float(getattr(scan_msg_raw, "range_max", 3.5) or 3.5)
+                    _r_raw = np.where(np.isfinite(_r_raw), _r_raw, _range_max_r)
+                    _angle_min = float(getattr(scan_msg_raw, "angle_min", 0.0) or 0.0)
+                    _angle_inc = float(getattr(scan_msg_raw, "angle_increment", 0.0) or 0.0)
+                    _angles = _angle_min + np.arange(_n, dtype=np.float32) * _angle_inc
+                    _angles = np.arctan2(np.sin(_angles), np.cos(_angles))
 
-                def _sector_min(center_rad, half_rad):
-                    diff = np.abs(np.arctan2(np.sin(_angles_raw - center_rad), np.cos(_angles_raw - center_rad)))
-                    mask = diff <= half_rad
-                    return float(np.min(_r_raw[mask])) if np.any(mask) else 999.0
+                    def _sector_min(center_rad: float) -> float:
+                        delta = np.arctan2(np.sin(_angles - center_rad), np.cos(_angles - center_rad))
+                        mask = np.abs(delta) <= (math.pi / 4.0)
+                        return float(np.min(_r_raw[mask])) if np.any(mask) else 999.0
 
-                hw = math.radians(30.0)
-                self._last_raw_scan_front = _sector_min(0.0, hw)
-                self._last_raw_scan_left = _sector_min(math.pi / 2.0, hw)
-                self._last_raw_scan_rear = _sector_min(math.pi, hw)
-                self._last_raw_scan_right = _sector_min(-math.pi / 2.0, hw)
-        except Exception:
-            pass
+                    self._last_raw_scan_front = _sector_min(0.0)
+                    self._last_raw_scan_left = _sector_min(math.pi / 2.0)
+                    self._last_raw_scan_rear = _sector_min(math.pi)
+                    self._last_raw_scan_right = _sector_min(-math.pi / 2.0)
+            except Exception:
+                pass
 
-        # v131: TF pose availability
-        try:
-            _pose_check = self._get_robot_pose2d()
-            self._last_tf_pose_ok = _pose_check is not None
-        except Exception:
-            self._last_tf_pose_ok = False
+        self._last_tf_pose_ok = self._get_robot_pose2d() is not None
 
         stats = self.last_map_stats
 
@@ -11122,13 +12225,20 @@ class GazeboNavEnv(gym.Env):
         if self.ros.scan is None:
             return False
 
-        ranges = np.asarray(self.ros.scan.ranges, dtype=np.float32)
-        ranges = np.nan_to_num(
-            ranges,
-            nan=10.0,
-            posinf=10.0,
-            neginf=0.0,
-        )
+        scan_time = self.ros.last_scan_time
+        if scan_time != self._cached_collision_scan_time:
+            ranges = np.asarray(self.ros.scan.ranges, dtype=np.float32)
+            ranges = np.nan_to_num(
+                ranges,
+                nan=10.0,
+                posinf=10.0,
+                neginf=0.0,
+            )
+            self._cached_collision_scan = ranges
+            self._cached_collision_scan_time = scan_time
+        else:
+            ranges = self._cached_collision_scan
+
         finite = ranges[np.isfinite(ranges)]
         global_min = float(np.min(finite)) if finite.size else 10.0
         front_min = self._scan_min_distance_in_sector(
@@ -11201,8 +12311,7 @@ class GazeboNavEnv(gym.Env):
             # Treat z-deviation from reset_z as diagnostic only by default; only
             # hard-fail it when explicitly requested.  The absolute ground range
             # check above still catches airborne/fallen states.
-            z_dev_strict = str(os.environ.get("TB3_RL_SHAKE_Z_DEV_STRICT", "0")).strip().lower() in {"1", "true", "yes", "on"}
-            if z_dev_strict and body_z is not None and z_dev >= float(getattr(self, "shake_z_deviation_threshold", 0.05)):
+            if self._shake_z_dev_strict and body_z is not None and z_dev >= float(getattr(self, "shake_z_deviation_threshold", 0.05)):
                 return f"body_z_dev:{z_dev:.3f}"
             ang_xy = math.hypot(float(wx), float(wy))
             if ang_xy >= float(getattr(self, "shake_angular_xy_threshold", 0.70)):
@@ -11211,6 +12320,80 @@ class GazeboNavEnv(gym.Env):
                 return f"body_vz:{float(vz):.3f}"
         except Exception as exc:
             return f"shake_check_error:{type(exc).__name__}"
+        return "none"
+
+    def _post_reset_shake_reason(self) -> str:
+        """Physical shake check used only before starting a fresh episode.
+
+        A reset pose can leave Burger with a small static pitch on wheel contact.
+        That should not count as ongoing shake unless it exceeds the post-reset
+        threshold or is accompanied by vertical/angular motion.
+        """
+        if not bool(getattr(self, "shake_restart", True)):
+            return "none"
+        try:
+            rpy = None
+            if hasattr(self.ros, "get_body_roll_pitch_yaw"):
+                rpy = self.ros.get_body_roll_pitch_yaw()
+            if rpy is None:
+                rpy = self.ros.get_roll_pitch_yaw()
+            roll = pitch = 0.0
+            if rpy is not None:
+                roll, pitch, _ = rpy
+            tilt = max(abs(float(roll)), abs(float(pitch)))
+
+            try:
+                tilt_threshold = float(os.environ.get("TB3_RL_POST_RESET_TILT_THRESHOLD", "") or "nan")
+            except Exception:
+                tilt_threshold = float("nan")
+            if not math.isfinite(tilt_threshold):
+                base_tilt = float(getattr(self, "shake_tilt_threshold", 0.12))
+                tilt_threshold = max(base_tilt, 0.18)
+
+            wx = wy = 0.0
+            if hasattr(self.ros, "get_body_angular_xy"):
+                wx, wy = self.ros.get_body_angular_xy()
+            elif self.ros.odom is not None:
+                twist = self.ros.odom.twist.twist
+                wx = float(getattr(twist.angular, "x", 0.0))
+                wy = float(getattr(twist.angular, "y", 0.0))
+
+            vz = 0.0
+            if hasattr(self.ros, "get_body_vertical_velocity"):
+                vz = self.ros.get_body_vertical_velocity()
+            elif self.ros.odom is not None:
+                vz = float(getattr(self.ros.odom.twist.twist.linear, "z", 0.0))
+
+            yaw_rate = 0.0
+            if self.ros.odom is not None:
+                yaw_rate = float(getattr(self.ros.odom.twist.twist.angular, "z", 0.0))
+
+            body_z = None
+            if hasattr(self.ros, "get_body_z"):
+                body_z = self.ros.get_body_z()
+            elif self.ros.odom is not None:
+                body_z = float(self.ros.odom.pose.pose.position.z)
+
+            z_min = float(getattr(self, "shake_ground_min_z", -0.02))
+            z_max = float(getattr(self, "shake_ground_max_z", 0.13))
+
+            if tilt >= tilt_threshold:
+                return f"post_reset_tilt:roll={roll:.3f},pitch={pitch:.3f},thr={tilt_threshold:.3f}"
+            if body_z is not None and (float(body_z) < z_min or float(body_z) > z_max):
+                return f"body_z:{float(body_z):.3f}[{z_min:.2f},{z_max:.2f}]"
+            ang_xy = math.hypot(float(wx), float(wy))
+            if ang_xy >= float(getattr(self, "shake_angular_xy_threshold", 0.70)):
+                return f"body_ang_xy:{ang_xy:.3f}"
+            if abs(float(vz)) >= float(getattr(self, "shake_linear_z_threshold", 0.08)):
+                return f"body_vz:{float(vz):.3f}"
+            try:
+                post_reset_yaw_thr = float(os.environ.get("TB3_RL_POST_RESET_YAW_RATE_THRESHOLD", "0.90") or 0.90)
+            except Exception:
+                post_reset_yaw_thr = 0.90
+            if post_reset_yaw_thr > 0.0 and abs(float(yaw_rate)) >= post_reset_yaw_thr:
+                return f"post_reset_yaw_rate:{float(yaw_rate):.3f},thr={post_reset_yaw_thr:.3f}"
+        except Exception as exc:
+            return f"post_reset_shake_check_error:{type(exc).__name__}"
         return "none"
 
     def _update_yaw_wobble_reason(self) -> str:
@@ -11223,6 +12406,18 @@ class GazeboNavEnv(gym.Env):
         only when the motion is persistent enough to be unsafe or useless.
         """
         if not bool(getattr(self, "shake_yaw_wobble", True)):
+            return "none"
+
+        step_count = int(getattr(self, "step_count", 0))
+        grace_steps = int(getattr(self, "shake_yaw_wobble_grace_steps", 0))
+        if step_count < grace_steps:
+            hist = getattr(self, "_shake_wobble_history", None)
+            try:
+                if hist is not None:
+                    hist.clear()
+            except Exception:
+                self._shake_wobble_history = deque(maxlen=int(getattr(self, "shake_wobble_window_steps", 8)))
+            self._shake_last_wobble_reason = f"grace:{step_count}/{grace_steps}"
             return "none"
 
         try:
@@ -11287,7 +12482,7 @@ class GazeboNavEnv(gym.Env):
 
         net_disp = math.hypot(float(samples[-1][1]) - float(samples[0][1]), float(samples[-1][2]) - float(samples[0][2]))
         yaw_accum = 0.0
-        for a, b in zip(samples[:-1], samples[1:]):
+        for a, b in zip(samples[:-1], samples[1:], strict=False):
             dyaw = self._normalize_angle(float(b[3]) - float(a[3]))
             if math.isfinite(dyaw):
                 yaw_accum += abs(dyaw)
@@ -11465,7 +12660,7 @@ class GazeboNavEnv(gym.Env):
 
     def _update_boundary_center_after_reset(self, requested_xy: np.ndarray) -> None:
         # Give /odom callbacks a short chance to reflect the Gazebo teleport.
-        self.ros.spin_steps(num_spins=12, timeout_sec=0.01)
+        self.ros.spin_steps(num_spins=12, timeout_sec=0.001)
         pose = self._get_robot_pose2d(frame_id=self.safety_boundary_frame)
         if pose is not None:
             xy, _ = pose
@@ -11783,6 +12978,89 @@ class GazeboNavEnv(gym.Env):
         self._last_reward_log_compress_delta = out - r
         return out
 
+    def _compute_direct_slam_known_delta_reward(self, unsafe_terminal: bool = False) -> float:
+        """Per-step SLAM map update reward based on full cell-diff vs previous map snapshot.
+
+        Counts ALL cells that changed value between the current /map and the snapshot
+        stored at the previous map publication (including probability updates to already-
+        known cells, not just newly-discovered unknown→known transitions).
+        Stamp-key dedup avoids re-comparing the same map object on every RL step.
+        """
+        self._last_slam_map_update_reward = 0.0
+        self._last_slam_map_update_reward_raw = 0.0
+        self._last_slam_map_update_reward_reason = "disabled"
+        if not bool(getattr(self, "slam_map_update_reward", False)):
+            return 0.0
+        if unsafe_terminal:
+            self._last_slam_map_update_reward_reason = "unsafe_terminal"
+            return 0.0
+        if int(getattr(self, "step_count", 0)) < int(getattr(self, "slam_map_update_reward_grace_steps", 10)):
+            self._last_slam_map_update_reward_reason = "grace"
+            return 0.0
+        if not bool(getattr(self, "_last_post_reset_ready", True)):
+            self._last_slam_map_update_reward_reason = "post_reset_not_ready"
+            return 0.0
+        slam_map = getattr(self.ros, "slam_map", None)
+        if slam_map is None:
+            self._last_slam_map_update_reward_reason = "no_slam_map"
+            return 0.0
+        last_map_wall = getattr(self.ros, "last_slam_map_time", None)
+        if last_map_wall is None or float(last_map_wall) < float(getattr(self, "_slam_map_min_wall_time", 0.0)):
+            self._last_slam_map_update_reward_reason = "pre_reset_map"
+            return 0.0
+        try:
+            hdr = slam_map.header
+            stamp_nsec = int(hdr.stamp.sec) * 1_000_000_000 + int(hdr.stamp.nanosec)
+            w = int(slam_map.info.width)
+            h = int(slam_map.info.height)
+            stamp_key = (stamp_nsec, w, h)
+
+            prev_stamp_key = getattr(self, "_direct_slam_stamp_key", None)
+            prev_map_data: Optional[np.ndarray] = getattr(self, "_direct_slam_prev_map_data", None)
+
+            if prev_map_data is None or prev_stamp_key is None:
+                self._direct_slam_stamp_key = stamp_key
+                self._direct_slam_prev_map_data = np.asarray(slam_map.data, dtype=np.int8).copy()
+                self._last_slam_map_update_reward_reason = "init"
+                return 0.0
+
+            if stamp_key == prev_stamp_key:
+                self._last_slam_map_update_reward_reason = "no_new_known"
+                return 0.0
+
+            cur_data = np.asarray(slam_map.data, dtype=np.int8)
+            cur_size = cur_data.shape[0]
+            prev_size = prev_map_data.shape[0]
+
+            if cur_size == prev_size:
+                changed_cells = int(np.count_nonzero(cur_data != prev_map_data))
+            else:
+                min_size = min(cur_size, prev_size)
+                changed_cells = int(np.count_nonzero(cur_data[:min_size] != prev_map_data[:min_size]))
+                if cur_size > prev_size:
+                    changed_cells += int(np.count_nonzero(cur_data[min_size:] >= 0))
+
+            self._direct_slam_stamp_key = stamp_key
+            self._direct_slam_prev_map_data = cur_data.copy()
+
+            if changed_cells <= 0:
+                self._last_slam_map_update_reward_reason = "no_new_known"
+                return 0.0
+
+            norm = max(float(getattr(self, "slam_map_update_reward_norm_cells", 80.0)), 1.0)
+            cap = max(float(getattr(self, "slam_map_update_reward_cap", 1.0)), 0.0)
+            weight = max(float(getattr(self, "slam_map_update_reward_weight", 0.20)), 0.0)
+            raw = float(np.clip(float(changed_cells) / norm, 0.0, cap))
+            bonus = float(weight * raw)
+            self._last_slam_map_update_reward_raw = raw
+            self._last_slam_map_update_reward = bonus
+            self._last_slam_map_update_reward_reason = "new_known"
+            self._episode_slam_map_update_reward += bonus
+            return bonus
+        except Exception:
+            self._last_slam_map_update_reward_reason = "error"
+            return 0.0
+
     def _compute_delayed_slam_map_update_reward(self, stats: MapUpdateStats, unsafe_terminal: bool = False) -> float:
         """Small capped bonus for delayed SLAM /map unknown->known updates.
 
@@ -11894,6 +13172,13 @@ class GazeboNavEnv(gym.Env):
         from SAC steps, these events must be buffered until step() computes the
         reward for the currently active waypoint/action.
         """
+        if bool(getattr(self, "disable_priority_map", False)):
+            self._pending_priority_cleared_cells = 0
+            self._pending_priority_clear_gain = 0.0
+            self._pending_priority_rechecked_cells = 0
+            self._pending_priority_rechecked_gain = 0.0
+            self._pending_priority_update_count = 0
+            return
         if stats is None:
             return
         cleared_cells = max(int(getattr(stats, "priority_cleared_cells", 0)), 0)
@@ -11932,6 +13217,16 @@ class GazeboNavEnv(gym.Env):
         current_clear_gain = max(float(getattr(map_stats, "priority_clear_gain", 0.0)), 0.0)
         current_rechecked = max(int(getattr(map_stats, "priority_rechecked_cells", 0)), 0)
         current_recheck_gain = max(float(getattr(map_stats, "priority_rechecked_gain", 0.0)), 0.0)
+        if bool(getattr(self, "disable_priority_map", False)):
+            pending_cleared = 0
+            pending_clear_gain = 0.0
+            pending_rechecked = 0
+            pending_recheck_gain = 0.0
+            pending_updates = 0
+            current_cleared = 0
+            current_clear_gain = 0.0
+            current_rechecked = 0
+            current_recheck_gain = 0.0
 
         total_cleared = current_cleared + pending_cleared
         total_clear_gain = current_clear_gain + pending_clear_gain
@@ -12007,16 +13302,18 @@ class GazeboNavEnv(gym.Env):
         the internal priority/confidence state update every ~map_live_update_period_sec
         instead of only when env.step() returns with a new waypoint.
         """
-        if self._map_live_update_paused or self._map_live_update_busy:
+        if self._map_live_update_paused:
             return
-        if self.ros.scan is None or self.ros.odom is None:
+        if not self._map_update_lock.acquire(blocking=False):
             return
-        now = time.time()
-        if self.map_live_update_period_sec > 0.0:
-            if now - self._last_live_map_update_wall < 0.80 * self.map_live_update_period_sec:
-                return
-        self._map_live_update_busy = True
         try:
+            if self.ros.scan is None or self.ros.odom is None:
+                return
+            now = time.time()
+            if self.map_live_update_period_sec > 0.0:
+                if now - self._last_live_map_update_wall < 0.80 * self.map_live_update_period_sec:
+                    return
+            self._map_live_update_busy = True
             prev_stats = self.last_map_stats
             stats = self._update_exploration_map()
             # Accumulate every timer-generated priority clear/recheck event.
@@ -12032,11 +13329,13 @@ class GazeboNavEnv(gym.Env):
             self._last_live_map_update_count += 1
         except Exception as exc:
             # Do not kill training because an RViz/debug refresh failed. Throttle.
+            now = time.time()
             if now - self._last_live_map_update_error_wall > 2.0:
                 self._last_live_map_update_error_wall = now
                 self.ros.get_logger().warn(f"LIVE_MAP_UPDATE_FAILED | err={exc}")
         finally:
             self._map_live_update_busy = False
+            self._map_update_lock.release()
 
     def _wait_for_action_synced_observation(
         self,
@@ -12255,14 +13554,19 @@ class GazeboNavEnv(gym.Env):
         # failure mode: the robot is training in an uninformative outside-map
         # state.  Do not wait until max_episode_steps.
         try:
-            no_target = str(getattr(map_stats, "target_type", "none")) in {"none", "unknown", ""}
-            no_prio = float(getattr(map_stats, "priority_score", 0.0)) <= 1e-5
-            no_delta = abs(float(getattr(map_stats, "coverage_delta", 0.0))) <= 1e-6 and float(getattr(map_stats, "confidence_gain", 0.0)) <= 1e-6
-            very_stale = float(getattr(map_stats, "stale_ratio", 0.0)) >= 0.98
-            soft_bad = bool(soft_bad or (no_target and no_prio and no_delta and very_stale))
-            if soft_bad and reason == "ok":
-                reason = "no_map_reward_signal"
-                self._last_map_bounds_reason = reason
+            emap = getattr(self, "exploration_map", None)
+            fast_no_priority = bool(getattr(emap, "fast_no_priority_stats", False)) and bool(
+                getattr(emap, "disable_priority_map", False)
+            )
+            if not fast_no_priority:
+                no_target = str(getattr(map_stats, "target_type", "none")) in {"none", "unknown", ""}
+                no_prio = float(getattr(map_stats, "priority_score", 0.0)) <= 1e-5
+                no_delta = abs(float(getattr(map_stats, "coverage_delta", 0.0))) <= 1e-6 and float(getattr(map_stats, "confidence_gain", 0.0)) <= 1e-6
+                very_stale = float(getattr(map_stats, "stale_ratio", 0.0)) >= 0.98
+                soft_bad = bool(soft_bad or (no_target and no_prio and no_delta and very_stale))
+                if soft_bad and reason == "ok":
+                    reason = "no_map_reward_signal"
+                    self._last_map_bounds_reason = reason
         except Exception:
             pass
 
@@ -12320,6 +13624,7 @@ class GazeboNavEnv(gym.Env):
           - grid:       latest accepted /map metadata
         """
         if self.ros.scan is None or self.ros.odom is None:
+            self._last_confidence_pose_ok = False
             return self.last_map_stats
 
         # v8 pose anchor rule:
@@ -12331,8 +13636,41 @@ class GazeboNavEnv(gym.Env):
         #     to force TF(map -> base_footprint) on every confidence update.
         pose_pack = self._get_confidence_update_pose2d()
         if pose_pack is None:
-            return self.last_map_stats
-        robot_xy, robot_yaw, sensor_xy, sensor_yaw, confidence_pose_mode = pose_pack
+            emap = getattr(self, "exploration_map", None)
+            fallback_frame = str(
+                (getattr(emap, "frame_id", "") if emap is not None else "")
+                or getattr(self, "pose_frame", "odom")
+                or "odom"
+            ).strip().lstrip("/")
+            if not fallback_frame:
+                fallback_frame = "odom"
+            map_locked = (
+                emap is not None
+                and str(getattr(emap, "frame_id", "")).strip().lstrip("/") == str(getattr(self, "map_frame", "map") or "map").strip().lstrip("/")
+                and getattr(self.ros, "slam_map", None) is not None
+            )
+            # If TF-based confidence pose is temporarily unavailable, returning
+            # last_map_stats here can freeze confidence/coverage at zero for long
+            # periods (no map update -> only terminal penalties).  Allow odom
+            # fallback by default so training keeps receiving information deltas.
+            allow_odom_fallback = str(
+                os.environ.get("TB3_RL_CONFIDENCE_ALLOW_ODOM_FALLBACK_WHEN_TF_MISSING", "1")
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            if map_locked and not allow_odom_fallback:
+                self._last_confidence_pose_ok = False
+                return self.last_map_stats
+            pose_fallback = self._get_robot_pose2d(frame_id=fallback_frame)
+            if pose_fallback is None:
+                self._last_confidence_pose_ok = False
+                return self.last_map_stats
+            robot_xy, robot_yaw = pose_fallback
+            sensor_xy = robot_xy.copy()
+            sensor_yaw = robot_yaw
+            confidence_pose_mode = f"{fallback_frame}_fallback"
+            self._last_confidence_pose_ok = True
+        else:
+            robot_xy, robot_yaw, sensor_xy, sensor_yaw, confidence_pose_mode = pose_pack
+            self._last_confidence_pose_ok = True
 
         # Record the exact base pose that confidence/priority were painted at.
         # The map-bounds restart check must evaluate the robot against the SAME
@@ -12397,7 +13735,7 @@ class GazeboNavEnv(gym.Env):
             return self.last_map_stats
 
         try:
-            if str(os.environ.get("TB3_RL_FORCE_MAP_PUBLISH_EVERY_UPDATE", "0")).strip().lower() in {"1", "true", "yes", "on"}:
+            if self._force_map_publish_every_update:
                 self.exploration_map.publish()
         except Exception:
             pass
@@ -12415,6 +13753,9 @@ class GazeboNavEnv(gym.Env):
         This fixes the failure mode where /rl_confidence_map keeps being painted
         around the first-step pose while the RViz robot has already moved/rotated.
         """
+        if str(os.environ.get("TB3_RL_DEBUG_MAP_UPDATE_COUNT", "0")).strip().lower() in {"1", "true", "yes", "on"}:
+            self._map_update_call_count = int(getattr(self, "_map_update_call_count", 0)) + 1
+            self._map_update_call_count_this_step = int(getattr(self, "_map_update_call_count_this_step", 0)) + 1
         return self._update_exploration_map_with_unified_tf()
 
     @staticmethod
@@ -12453,12 +13794,18 @@ class GazeboNavEnv(gym.Env):
             range_max if np.isfinite(range_max) else max_considered_range,
         )
 
-        idx = np.arange(ranges.size, dtype=np.float32)
-        angles = angle_min + idx * angle_increment
-        angle_error = np.arctan2(
-            np.sin(angles - float(center_angle)),
-            np.cos(angles - float(center_angle)),
-        )
+        # Cache angles array per scan geometry to avoid repeated trig allocation.
+        n = ranges.size
+        geo_key = (round(angle_min, 6), round(angle_increment, 9), n)
+        if geo_key not in _SCAN_ANGLES_CACHE:
+            idx = np.arange(n, dtype=np.float32)
+            _SCAN_ANGLES_CACHE[geo_key] = angle_min + idx * angle_increment
+            if len(_SCAN_ANGLES_CACHE) > 4:  # prevent unbounded growth
+                _SCAN_ANGLES_CACHE.clear()
+        angles = _SCAN_ANGLES_CACHE[geo_key]
+
+        # Use modulo instead of arctan2 for angle diff (faster).
+        angle_error = (angles - float(center_angle) + np.pi) % (2.0 * np.pi) - np.pi
 
         valid = np.isfinite(ranges) & (ranges >= max(range_min, 0.03)) & (ranges <= usable_max)
         sector = np.abs(angle_error) <= float(half_width_rad)
@@ -12651,8 +13998,6 @@ class GazeboNavEnv(gym.Env):
             priority_score_norm = float(np.clip(float(getattr(map_stats, "priority_score", 0.0)), 0.0, 1.0))
             priority_clear_gain = float(getattr(map_stats, "priority_clear_gain", 0.0))
             priority_cleared_cells = int(getattr(map_stats, "priority_cleared_cells", 0))
-            priority_rechecked_gain = float(getattr(map_stats, "priority_rechecked_gain", 0.0))
-            priority_rechecked_cells = int(getattr(map_stats, "priority_rechecked_cells", 0))
         except Exception:
             return 0.0, 0.0, 0.0
 
@@ -12673,12 +14018,8 @@ class GazeboNavEnv(gym.Env):
         clear_reward += 0.0015 * corridor_priority_weight * float(max(priority_cleared_cells, 0))
         clear_reward = min(float(clear_reward), 5.0)
 
-        # v114: recheck is no longer a positive reward path.
-        recheck_reward = -min(
-            0.35,
-            0.003 * max(float(priority_rechecked_gain), 0.0)
-            + 0.00008 * min(max(int(priority_rechecked_cells), 0), 400),
-        ) if (priority_rechecked_gain > 0.0 or priority_rechecked_cells > 0) else 0.0
+        # Recheck is no longer penalized; keep telemetry neutral too.
+        recheck_reward = 0.0
 
         total = float(clear_reward + recheck_reward)
         return float(clear_reward), float(recheck_reward), total
@@ -12691,291 +14032,305 @@ class GazeboNavEnv(gym.Env):
         coverage_done: bool,
     ) -> dict:
         priority_direction_error, priority_direction_alignment, priority_direction_signed = self._current_action_priority_error(map_stats)
-        return {
-            "coverage_ratio": float(map_stats.coverage_ratio),
-            "episode_reward_sum": float(getattr(self, "_episode_reward_sum", 0.0)),
-            "episode_discounted_return": float(getattr(self, "_episode_discounted_return", 0.0)),
-            "episode_live_discounted_return": float(getattr(self, "_episode_discounted_return", 0.0)),
-            "episode_start_discounted_return": float(getattr(self, "_episode_start_discounted_return", 0.0)),
-            "episode_reward_ema": float(getattr(self, "_episode_reward_ema", 0.0)),
-            "recent_reward_window_sum": float(sum(getattr(self, "_recent_reward_window", []))),
-            "recent_slam_new_cells": int(sum(getattr(self, "_recent_slam_new_window", []))),
-            "recent_confidence_updated_cells": int(sum(getattr(self, "_recent_conf_update_window", []))),
-            "coverage_stall_terminal_enabled": bool(getattr(self, "coverage_stall_terminal", False)),
-            "coverage_stall_terminal": bool(getattr(self, "_last_coverage_stall_terminal", False)),
-            "coverage_stall_active": bool(getattr(self, "_last_coverage_stall_active", False)),
-            "coverage_stall_reason": str(getattr(self, "_last_coverage_stall_reason", "none")),
-            "coverage_stall_window_steps": int(getattr(self, "coverage_stall_window_steps", 0)),
-            "coverage_stall_window_len": int(getattr(self, "_last_coverage_stall_window_len", 0)),
-            "coverage_stall_slam_new_cells": int(getattr(self, "_last_coverage_stall_slam_window", 0)),
-            "coverage_stall_confidence_updated_cells": int(getattr(self, "_last_coverage_stall_conf_window", 0)),
-            "coverage_stall_min_slam_new_cells": int(getattr(self, "coverage_stall_min_slam_new_cells", 0)),
-            "coverage_stall_min_confidence_updated_cells": int(getattr(self, "coverage_stall_min_confidence_updated_cells", 0)),
-            "coverage_stall_terminal_penalty": float(getattr(self, "coverage_stall_terminal_penalty", 0.0)),
-            "reward_window_n": int(getattr(self, "_reward_window_n", 100)),
-            "reward_gamma": float(getattr(self, "reward_gamma", 0.99)),
-            "coverage_delta": float(map_stats.coverage_delta),
-            "new_known_cells": int(map_stats.new_known_cells),
-            "known_cells": int(map_stats.known_cells),
-            "frontier_count": int(map_stats.frontier_count),
-            "frontier_distance": float(map_stats.frontier_distance),
-            "frontier_angle": float(map_stats.frontier_angle),
-            "robot_visit_count": int(map_stats.robot_visit_count),
-            "explored_stall_steps": int(self.explored_stall_steps),
-            "confidence_stall_steps": int(getattr(self, "confidence_stall_steps", 0)),
-            "sustained_rotation_steps": int(getattr(self, "sustained_rotation_steps", 0)),
-            "orbit_stall_steps": int(getattr(self, "orbit_stall_steps", 0)),
-            "orbit_path_efficiency": float(getattr(self, "_last_orbit_path_efficiency", 1.0)),
-            "orbit_path_length": float(getattr(self, "_last_orbit_path_length", 0.0)),
-            "orbit_net_displacement": float(getattr(self, "_last_orbit_net_displacement", 0.0)),
-            "orbit_yaw_accum": float(getattr(self, "_last_orbit_yaw_accum", 0.0)),
-            "orbit_reason": str(getattr(self, "_last_orbit_reason", "none")),
-            "mean_confidence": float(map_stats.mean_confidence),
-            "stale_known_cells": int(map_stats.stale_known_cells),
-            "stale_ratio": float(map_stats.stale_ratio),
-            "low_confidence_cells": int(map_stats.low_confidence_cells),
-            "low_confidence_ratio": float(map_stats.low_confidence_ratio),
-            "stale_refresh_cells": int(map_stats.stale_refresh_cells),
-            "confidence_gain": float(map_stats.confidence_gain),
-            "confidence_observed_cells": int(getattr(map_stats, "confidence_observed_cells", 0)),
-            "confidence_updated_cells": int(getattr(map_stats, "confidence_updated_cells", 0)),
-            "last_confidence_observed_cells": int(getattr(getattr(self, "exploration_map", None), "_last_confidence_observed_cells", 0)),
-            "last_confidence_updated_cells": int(getattr(getattr(self, "exploration_map", None), "_last_confidence_updated_cells", 0)),
-            "last_confidence_gain_cells": float(getattr(getattr(self, "exploration_map", None), "_last_confidence_gain_cells", 0.0)),
-            "target_priority": float(map_stats.target_priority),
-            "target_type": str(map_stats.target_type),
-            "target_switched": bool(map_stats.target_switched),
-            "target_lock_age": int(map_stats.target_lock_age),
-            "priority_stuck_steps": int(getattr(self, "priority_stuck_steps", 0)),
-            "priority_stuck_restart_steps": int(getattr(self, "priority_stuck_restart_steps", 0)),
-            "priority_stuck_active": bool(getattr(self, "_last_priority_stuck_active", False)),
-            "priority_stuck_restart": bool(getattr(self, "_last_priority_stuck_restart", False)),
-            "priority_stuck_reason": str(getattr(self, "_last_priority_stuck_reason", "none")),
-            "lidar_empty_steps": int(getattr(self, "lidar_empty_steps", 0)),
-            "lidar_empty_timeout_steps": int(getattr(self, "lidar_empty_timeout_steps", 0)),
-            "lidar_empty_active": bool(getattr(self, "_last_lidar_empty_active", False)),
-            "lidar_empty_restart": bool(getattr(self, "_last_lidar_empty_restart", False)),
-            "lidar_empty_reason": str(getattr(self, "_last_lidar_empty_reason", "none")),
-            "nav2_stuck_steps": int(getattr(self, "nav2_stuck_steps", 0)),
-            "nav2_stuck_backup_steps": int(getattr(self, "nav2_stuck_backup_steps", 0)),
-            "nav2_stuck_active": bool(getattr(self, "_last_nav2_stuck_active", False)),
-            "nav2_stuck_backup_triggered": bool(getattr(self, "_last_nav2_stuck_backup_triggered", False)),
-            "nav2_stuck_reason": str(getattr(self, "_last_nav2_stuck_reason", "none")),
-            "nav2_backup_status": str(getattr(self, "_last_nav2_backup_status", "none")),
-            "lidar_valid_beams": int(getattr(self, "_last_lidar_valid_beams", 0)),
-            "lidar_nearest_detection": float(getattr(self, "_last_lidar_nearest_detection", 999.0)),
-            "target_reachable": bool(map_stats.target_reachable),
-            "disable_path_reward": True,
-            "path_reward_enabled": False,
-            "path_distance": 0.0,
-            "path_angle": 0.0,
-            "path_progress": 0.0,
-            "alternative_path_count": 0,
-            "alternative_path_angles": (),
-            "priority_direction_error": float(priority_direction_error),
-            "priority_direction_alignment": float(priority_direction_alignment),
-            "priority_direction_signed": float(priority_direction_signed),
-            "action_mode": str(self.action_mode),
-            "policy_action_0": float(self.raw_action[0]) if self.raw_action.size > 0 else 0.0,
-            "policy_action_1": float(self.raw_action[1]) if self.raw_action.size > 1 else 0.0,
-            "executed_linear_x": float(self.prev_action[0]) if self.prev_action.size > 0 else 0.0,
-            "executed_angular_z": float(self.prev_action[1]) if self.prev_action.size > 1 else 0.0,
-            "velocity_spin_breaker": bool(getattr(self, "_last_velocity_spin_breaker", False)),
-            "velocity_spin_same_sign_steps": int(getattr(self, "_velocity_spin_same_sign_steps", 0)),
-            "waypoint_local_x": float(self._last_waypoint_local[0]),
-            "waypoint_local_y": float(self._last_waypoint_local[1]),
-            "waypoint_world_x": float(self._last_waypoint_world[0]),
-            "waypoint_world_y": float(self._last_waypoint_world[1]),
-            "waypoint_distance": float(self._last_waypoint_distance),
-            "waypoint_angle": float(self._last_waypoint_angle),
-            "waypoint_action_type": str(self._last_waypoint_action_type),
-            "waypoint_lateral_offset": float(self._last_waypoint_lateral_offset),
-            "waypoint_heading_delta": float(self._last_waypoint_heading_delta),
-            "waypoint_reached": bool(self._last_waypoint_reached),
-            "waypoint_timed_out": bool(self._last_waypoint_timed_out),
-            "waypoint_timeout_sec": float(self.waypoint_timeout_sec),
-            "waypoint_final_error": float(self._last_waypoint_final_error),
-            "controller_steps": int(self._last_controller_steps),
-            "nav2_goal_accepted": bool(getattr(self, "_last_nav2_goal_accepted", False)),
-            "nav2_status": int(getattr(self, "_last_nav2_status", -1)),
-            "nav2_status_name": str(getattr(self, "_last_nav2_status_name", "none")),
-            "nav2_goal_source": str(getattr(self, "_last_nav2_goal_source", "none")),
-            "nav2_goal_valid": bool(getattr(self, "_last_nav2_goal_valid", False)),
-            "nav2_goal_validation": str(getattr(self, "_last_nav2_goal_validation", "none")),
-            "nav2_moved_distance": float(getattr(self, "_last_nav2_moved_distance", 0.0)),
-            "nav2_replan_distance_m": float(getattr(self, "nav2_replan_distance_m", 0.0)),
-            "slam_local_known_ratio": float(getattr(self, "_last_slam_local_known_ratio", 1.0)),
-            "slam_front_known_ratio": float(getattr(self, "_last_slam_front_known_ratio", 1.0)),
-            "slam_fresh_score": float(getattr(self, "_last_slam_fresh_score", 1.0)),
-            "slam_local_linear_score": float(getattr(self, "_last_slam_local_linear_score", 1.0)),
-            "slam_front_linear_score": float(getattr(self, "_last_slam_front_linear_score", 1.0)),
-            "slam_fresh_linear_score": float(getattr(self, "_last_slam_fresh_linear_score", 1.0)),
-            "slam_quality_score": float(getattr(self, "_last_slam_quality_score", 1.0)),
-            "slam_speed_raw_scale": float(getattr(self, "_last_slam_speed_raw_scale", 1.0)),
-            "slam_speed_scale": float(getattr(self, "_last_slam_speed_scale", 1.0)),
-            "slam_speed_limit": float(getattr(self, "_last_slam_speed_limit", self.max_linear_speed)),
-            "priority_score": float(map_stats.priority_score),
-            "priority_gain": float(map_stats.priority_gain),
-            "priority_cleared_cells": int(map_stats.priority_cleared_cells),
-            "priority_clear_gain": float(map_stats.priority_clear_gain),
-            "priority_step_cleared_cells": int(getattr(self, "_last_step_priority_cleared_cells", int(map_stats.priority_cleared_cells))),
-            "priority_step_clear_gain": float(getattr(self, "_last_step_priority_clear_gain", float(map_stats.priority_clear_gain))),
-            "priority_live_cleared_cells": int(getattr(self, "_last_pending_priority_cleared_cells", 0)),
-            "priority_live_clear_gain": float(getattr(self, "_last_pending_priority_clear_gain", 0.0)),
-            "priority_live_update_count": int(getattr(self, "_last_pending_priority_update_count", 0)),
-            "episode_priority_cleared_cells": int(getattr(self, "_episode_priority_cleared_cells", 0)),
-            "episode_priority_clear_gain": float(getattr(self, "_episode_priority_clear_gain", 0.0)),
-            "priority_clear_reward": float(getattr(self, "_last_priority_clear_reward", 0.0)),
-            "priority_recheck_reward": float(getattr(self, "_last_priority_recheck_reward", 0.0)),
-            "priority_check_reward": float(getattr(self, "_last_priority_check_reward", 0.0)),
-            "episode_priority_clear_reward": float(getattr(self, "_episode_priority_clear_reward", 0.0)),
-            "episode_priority_recheck_reward": float(getattr(self, "_episode_priority_recheck_reward", 0.0)),
-            "episode_priority_check_reward": float(getattr(self, "_episode_priority_check_reward", 0.0)),
-            "priority_invalidated_cells": int(getattr(map_stats, 'priority_invalidated_cells', 0)),
-            "priority_invalidated_gain": float(getattr(map_stats, 'priority_invalidated_gain', 0.0)),
-            "priority_rechecked_cells": int(getattr(map_stats, 'priority_rechecked_cells', 0)),
-            "priority_rechecked_gain": float(getattr(map_stats, 'priority_rechecked_gain', 0.0)),
-            "priority_step_rechecked_cells": int(getattr(self, "_last_step_priority_rechecked_cells", int(getattr(map_stats, 'priority_rechecked_cells', 0)))),
-            "priority_step_rechecked_gain": float(getattr(self, "_last_step_priority_rechecked_gain", float(getattr(map_stats, 'priority_rechecked_gain', 0.0)))),
-            "priority_live_rechecked_cells": int(getattr(self, "_last_pending_priority_rechecked_cells", 0)),
-            "priority_live_rechecked_gain": float(getattr(self, "_last_pending_priority_rechecked_gain", 0.0)),
-            "episode_priority_rechecked_cells": int(getattr(self, "_episode_priority_rechecked_cells", 0)),
-            "episode_priority_rechecked_gain": float(getattr(self, "_episode_priority_rechecked_gain", 0.0)),
-            "wall_support_score": float(map_stats.wall_support_score),
-            "open_space_score": float(map_stats.open_space_score),
-            "nearest_obstacle_distance": float(map_stats.nearest_obstacle_distance),
-            "obstacle_proximity_score": float(map_stats.obstacle_proximity_score),
-            "lidar_action_obstacle_distance": float(getattr(self, "_last_lidar_action_obstacle_distance", 999.0)),
-            "lidar_action_obstacle_score": float(getattr(self, "_last_lidar_action_obstacle_score", 0.0)),
-            "lidar_front_obstacle_distance": float(getattr(self, "_last_lidar_front_obstacle_distance", 999.0)),
-            "velocity_safety_backup_triggered": bool(getattr(self, "_last_velocity_safety_backup_triggered", False)),
-            "velocity_safety_terminal_triggered": bool(getattr(self, "_last_velocity_safety_terminal_triggered", False)),
-            "velocity_safety_terminal_distance": float(getattr(self, "_last_velocity_safety_terminal_distance", 999.0)),
-            "velocity_safety_terminal_threshold": float(getattr(self, "_last_velocity_safety_terminal_threshold", 0.0)),
-            "velocity_safety_terminal_penalty": float(getattr(self, "velocity_safety_terminal_penalty", 0.0)),
-            "velocity_safety_blocked": bool(getattr(self, "_last_velocity_safety_blocked", False)),
-            "velocity_safety_slowdown": float(getattr(self, "_last_velocity_safety_slowdown", 1.0)),
-            "velocity_safety_slowdown_risk": float(getattr(self, "_last_velocity_safety_slowdown_risk", 0.0)),
-            "velocity_safety_policy_v": float(getattr(self, "_last_velocity_safety_policy_v", 0.0)),
-            "velocity_safety_executed_v": float(getattr(self, "_last_velocity_safety_executed_v", 0.0)),
-            "velocity_safety_penalty": float(getattr(self, "_last_velocity_safety_penalty", 0.0)),
-            "velocity_safety_reason": str(getattr(self, "_last_velocity_safety_reason", "none")),
-            "velocity_safety_cooldown_steps": int(getattr(self, "velocity_safety_cooldown_steps", 0)),
-            "shake_steps": int(getattr(self, "shake_steps", 0)),
-            "shake_restart_steps": int(getattr(self, "shake_restart_steps_limit", 0)),
-            "shake_active": bool(getattr(self, "_last_shake_active", False)),
-            "shake_restart": bool(getattr(self, "_last_shake_restart", False)),
-            "shake_reason": str(getattr(self, "_last_shake_reason", "none")),
-            "collision": bool(collision),
-            "out_of_bounds": bool(getattr(self, "_last_out_of_bounds", False)),
-            "out_of_bounds_reason": str(getattr(self, "_last_out_of_bounds_reason", "none")),
-            "out_of_bounds_radius": float(getattr(self, "_last_out_of_bounds_radius", 0.0)),
-            "out_of_bounds_x": float(getattr(self, "_last_out_of_bounds_x", 0.0)),
-            "out_of_bounds_y": float(getattr(self, "_last_out_of_bounds_y", 0.0)),
-            "out_of_bounds_z": float(getattr(self, "_last_out_of_bounds_z", 0.0)),
-            "safety_boundary_frame": str(getattr(self, "safety_boundary_frame", "odom")),
-            "safety_boundary_center_x": float(getattr(self, "current_boundary_center_xy", np.zeros(2))[0]),
-            "safety_boundary_center_y": float(getattr(self, "current_boundary_center_xy", np.zeros(2))[1]),
-            "reset_target_x": float(getattr(self, "current_reset_xy", np.zeros(2))[0]),
-            "reset_target_y": float(getattr(self, "current_reset_xy", np.zeros(2))[1]),
-            "restart_on_collision": bool(self.restart_on_collision),
-            "collision_restart_requested": bool(self._last_collision_restart_requested),
-            "terminal_reason": str(self._last_terminal_reason),
-            "fallen": bool(fallen),
-            "fallen_reason": str(getattr(self, "_last_fallen_reason", "none")),
-            "collision_global_min": float(getattr(self, "_last_collision_global_min", 999.0)),
-            "collision_front_min": float(getattr(self, "_last_collision_front_min", 999.0)),
-            "coverage_done": bool(coverage_done),
-            "step_count": int(self.step_count),
-            "sim_time": self._safe_sim_time(),
-            "episode_index": int(getattr(self, "episode_index", 0)),
-            "use_slam_map": bool(self.use_slam_map),
-            "map_frame": str(self.map_frame),
-            "pose_frame": str(self.pose_frame),
-            "reset_slam_on_reset": bool(self.reset_slam_on_reset),
-            "reset_slam_every_n_episodes": int(self.reset_slam_every_n_episodes),
-            "slam_map_available": bool(self.ros.slam_map is not None),
-            "slam_map_gate": str(self._last_slam_gate_reason),
-            "slam_map_age_sec": float(self._last_slam_map_age_sec),
-            "slam_map_delay_remaining_sec": float(self._last_slam_map_delay_remaining_sec),
-            "post_reset_ready": bool(getattr(self, "_last_post_reset_ready", False)),
-            "post_reset_ready_reason": str(getattr(self, "_last_post_reset_ready_reason", "none")),
-            "post_reset_ready_known_ratio": float(getattr(self, "_last_post_reset_ready_known_ratio", 0.0)),
-            "post_reset_ready_known_cells": int(getattr(self, "_last_post_reset_ready_known_cells", 0)),
-            "post_reset_ready_lidar_beams": int(getattr(self, "_last_post_reset_ready_lidar_beams", 0)),
-            "post_reset_ready_priority": float(getattr(self, "_last_post_reset_ready_priority", 0.0)),
-            "action_sync_ok": bool(getattr(self, "_last_action_sync_ok", False)),
-            "action_sync_reason": str(getattr(self, "_last_action_sync_reason", "none")),
-            "action_sync_wait_sec": float(getattr(self, "_last_action_sync_wait_sec", 0.0)),
-            "action_sync_scan_fresh": bool(getattr(self, "_last_action_sync_scan_fresh", False)),
-            "action_sync_odom_fresh": bool(getattr(self, "_last_action_sync_odom_fresh", False)),
-            "map_bounds_restart": bool(getattr(self, "_last_map_bounds_restart", False)),
-            "map_bounds_reason": str(getattr(self, "_last_map_bounds_reason", "none")),
-            "map_bounds_bad_steps": int(getattr(self, "map_bounds_bad_steps", 0)),
-            "map_bounds_local_known_ratio": float(getattr(self, "_last_map_bounds_local_known_ratio", 0.0)),
-            "map_bounds_local_known_cells": int(getattr(self, "_last_map_bounds_local_known_cells", 0)),
-            "slam_update_new_known_cells": int(getattr(map_stats, "slam_update_new_known_cells", 0)),
-            "slam_update_new_free_cells": int(getattr(map_stats, "slam_update_new_free_cells", 0)),
-            "slam_update_new_occupied_cells": int(getattr(map_stats, "slam_update_new_occupied_cells", 0)),
-            "slam_update_expand_known_cells": int(getattr(map_stats, "slam_update_expand_known_cells", 0)),
-            "slam_map_update_reward": float(getattr(self, "_last_slam_map_update_reward", 0.0)),
-            "slam_map_update_reward_raw": float(getattr(self, "_last_slam_map_update_reward_raw", 0.0)),
-            "slam_map_update_reward_reason": str(getattr(self, "_last_slam_map_update_reward_reason", "none")),
-            "slam_map_update_reward_episode": float(getattr(self, "_episode_slam_map_update_reward", 0.0)),
-            "slam_live_update_new_known_cells": int(getattr(self, "_last_pending_slam_update_new_known_cells", 0)),
-            "slam_live_update_count": int(getattr(self, "_last_pending_slam_update_count", 0)),
-            "debug_input_map": bool(self.debug_input_map and self.use_map_cnn),
-            "debug_input_map_published": bool(getattr(self, "_last_debug_input_map_published", False)),
-            "debug_input_map_topic_prefix": str(getattr(self, "debug_input_map_topic_prefix", "")),
-            "debug_input_map_frame_id": str(getattr(self, "debug_input_map_frame_id", "")),
-            # v117: when a forced safety backup/hold ran this step, mark the
-            # transition so the custom replay buffer skips storing it.  SAC must
-            # not learn from forced-recovery motion that the policy did not choose.
-            "skip_store": bool(getattr(self, "_last_velocity_safety_skip_store", False)),
-            "velocity_safety_skip_store": bool(getattr(self, "_last_velocity_safety_skip_store", False)),
-            # v131: environment invariants and diagnostic fields
-            "step_index": int(self.step_count),
-            "scan_age_sec": float(getattr(self, "_last_scan_age_sec", -1.0)),
-            "scan_stamp_sec": float(getattr(self, "_last_scan_stamp_sec", -1.0)),
-            "odom_age_sec": float(getattr(self, "_last_odom_age_sec", -1.0)),
-            "map_age_sec": float(getattr(self, "_last_slam_map_age_sec", -1.0)),
-            "obs_stale": bool(getattr(self, "_last_obs_stale", False)),
-            "scan_stale": bool(getattr(self, "_last_scan_stale", False)),
-            "map_stale": bool(
-                float(getattr(self, "_last_slam_map_age_sec", 0.0)) > float(getattr(self, "slam_map_max_age_sec", 3.0))
-                if float(getattr(self, "_last_slam_map_age_sec", -1.0)) >= 0.0 else False
-            ),
-            "tf_pose_ok": bool(getattr(self, "_last_tf_pose_ok", False)),
-            "confidence_pose_ok": bool(getattr(self, "_last_confidence_pose_ok", False)),
-            "confidence_update_called": bool(getattr(self, "_last_confidence_update_called", False)),
-            "confidence_pose_source": str(getattr(self, "_last_confidence_pose_source_v131", "none")),
-            "confidence_update_reason_if_zero": str(getattr(self, "_last_confidence_update_reason_if_zero", "none")),
-            "policy_scan_front": float(getattr(self, "_last_policy_scan_front", 999.0)),
-            "policy_scan_left": float(getattr(self, "_last_policy_scan_left", 999.0)),
-            "policy_scan_rear": float(getattr(self, "_last_policy_scan_rear", 999.0)),
-            "policy_scan_right": float(getattr(self, "_last_policy_scan_right", 999.0)),
-            "raw_scan_front": float(getattr(self, "_last_raw_scan_front", 999.0)),
-            "raw_scan_left": float(getattr(self, "_last_raw_scan_left", 999.0)),
-            "raw_scan_rear": float(getattr(self, "_last_raw_scan_rear", 999.0)),
-            "raw_scan_right": float(getattr(self, "_last_raw_scan_right", 999.0)),
-            "lidar60_stamp_delta_sec": float(getattr(self, "_last_lidar60_stamp_delta_sec", 0.0)),
-            "velocity_safety_terminal": bool(getattr(self, "_last_velocity_safety_terminal_triggered", False)),
-            "velocity_safety_distance": float(getattr(self, "_last_velocity_safety_terminal_distance", 999.0)),
-            "executed_v": float(getattr(self, "_last_velocity_safety_executed_v", 0.0)),
-            "executed_w": float(getattr(self, "_last_velocity_safety_executed_w", 0.0)),
-            "policy_v": float(getattr(self, "_last_velocity_safety_policy_v", 0.0)),
-            "policy_w": float(getattr(self, "_last_velocity_safety_policy_w", 0.0)),
-            # v131: reward breakdown
-            "r_confidence": float(getattr(self, "_last_r_confidence", 0.0)),
-            "r_slam": float(getattr(self, "_last_r_slam", 0.0)),
-            "r_priority": float(getattr(self, "_last_r_priority", 0.0)),
-            "r_wall": float(getattr(self, "_last_r_wall", 0.0)),
-            "r_safety_slow": float(getattr(self, "_last_r_safety_slow", 0.0)),
-            "r_safety_terminal": float(getattr(self, "_last_r_safety_terminal", 0.0)),
-            "r_collision": float(getattr(self, "_last_r_collision", 0.0)),
-            "r_step": float(getattr(self, "_last_r_step", 0.0)),
-            "reward_total": float(getattr(self, "_last_reward_total", 0.0)),
-        }
+        info = {}
+        self._info_dict = info
+        info["coverage_ratio"] = float(map_stats.coverage_ratio)
+        info["episode_reward_sum"] = float(getattr(self, "_episode_reward_sum", 0.0))
+        info["episode_discounted_return"] = float(getattr(self, "_episode_discounted_return", 0.0))
+        info["episode_live_discounted_return"] = float(getattr(self, "_episode_discounted_return", 0.0))
+        info["episode_start_discounted_return"] = float(getattr(self, "_episode_start_discounted_return", 0.0))
+        info["episode_reward_ema"] = float(getattr(self, "_episode_reward_ema", 0.0))
+        info["recent_reward_window_sum"] = float(sum(getattr(self, "_recent_reward_window", [])))
+        info["recent_slam_new_cells"] = int(sum(getattr(self, "_recent_slam_new_window", [])))
+        info["recent_confidence_updated_cells"] = int(sum(getattr(self, "_recent_conf_update_window", [])))
+        info["coverage_stall_terminal_enabled"] = bool(getattr(self, "coverage_stall_terminal", False))
+        info["coverage_stall_terminal"] = bool(getattr(self, "_last_coverage_stall_terminal", False))
+        info["coverage_stall_active"] = bool(getattr(self, "_last_coverage_stall_active", False))
+        info["coverage_stall_reason"] = str(getattr(self, "_last_coverage_stall_reason", "none"))
+        info["coverage_stall_window_steps"] = int(getattr(self, "coverage_stall_window_steps", 0))
+        info["coverage_stall_window_len"] = int(getattr(self, "_last_coverage_stall_window_len", 0))
+        info["coverage_stall_slam_new_cells"] = int(getattr(self, "_last_coverage_stall_slam_window", 0))
+        info["coverage_stall_confidence_updated_cells"] = int(getattr(self, "_last_coverage_stall_conf_window", 0))
+        info["coverage_stall_coverage_delta"] = float(getattr(self, "_last_coverage_stall_cov_window", 0.0))
+        info["coverage_stall_no_progress_steps"] = int(getattr(self, "_last_coverage_stall_no_progress_steps", 0))
+        info["coverage_stall_hard_no_progress_steps"] = int(getattr(self, "coverage_stall_hard_no_progress_steps", 0))
+        info["coverage_stall_hard_min_confidence_gain"] = float(getattr(self, "coverage_stall_hard_min_confidence_gain", 0.0))
+        info["coverage_stall_min_slam_new_cells"] = int(getattr(self, "coverage_stall_min_slam_new_cells", 0))
+        info["coverage_stall_min_confidence_updated_cells"] = int(getattr(self, "coverage_stall_min_confidence_updated_cells", 0))
+        info["coverage_stall_min_coverage_delta"] = float(getattr(self, "coverage_stall_min_coverage_delta", 0.0))
+        info["coverage_stall_required_consecutive_windows"] = int(getattr(self, "coverage_stall_required_consecutive_windows", 1))
+        info["coverage_stall_consecutive_hits"] = int(getattr(self, "_coverage_stall_consecutive_hits", 0))
+        info["coverage_stall_terminal_penalty"] = float(getattr(self, "coverage_stall_terminal_penalty", 0.0))
+        info["reward_window_n"] = int(getattr(self, "_reward_window_n", 100))
+        info["reward_gamma"] = float(getattr(self, "reward_gamma", 0.99))
+        info["coverage_delta"] = float(map_stats.coverage_delta)
+        info["new_known_cells"] = int(map_stats.new_known_cells)
+        info["known_cells"] = int(map_stats.known_cells)
+        info["frontier_count"] = int(map_stats.frontier_count)
+        info["frontier_distance"] = float(map_stats.frontier_distance)
+        info["frontier_angle"] = float(map_stats.frontier_angle)
+        info["robot_visit_count"] = int(map_stats.robot_visit_count)
+        info["explored_stall_steps"] = int(self.explored_stall_steps)
+        info["confidence_stall_steps"] = int(getattr(self, "confidence_stall_steps", 0))
+        info["sustained_rotation_steps"] = int(getattr(self, "sustained_rotation_steps", 0))
+        info["orbit_stall_steps"] = int(getattr(self, "orbit_stall_steps", 0))
+        info["orbit_path_efficiency"] = float(getattr(self, "_last_orbit_path_efficiency", 1.0))
+        info["orbit_path_length"] = float(getattr(self, "_last_orbit_path_length", 0.0))
+        info["orbit_net_displacement"] = float(getattr(self, "_last_orbit_net_displacement", 0.0))
+        info["orbit_yaw_accum"] = float(getattr(self, "_last_orbit_yaw_accum", 0.0))
+        info["orbit_reason"] = str(getattr(self, "_last_orbit_reason", "none"))
+        info["mean_confidence"] = float(map_stats.mean_confidence)
+        info["stale_known_cells"] = int(map_stats.stale_known_cells)
+        info["stale_ratio"] = float(map_stats.stale_ratio)
+        info["low_confidence_cells"] = int(map_stats.low_confidence_cells)
+        info["low_confidence_ratio"] = float(map_stats.low_confidence_ratio)
+        info["stale_refresh_cells"] = int(map_stats.stale_refresh_cells)
+        info["confidence_gain"] = float(map_stats.confidence_gain)
+        info["confidence_fill_delta"] = float(getattr(self, "_last_confidence_fill_delta", 0.0))
+        info["confidence_fill_hold"] = float(getattr(self, "_last_confidence_fill_hold", 0.0))
+        info["confidence_observed_cells"] = int(getattr(map_stats, "confidence_observed_cells", 0))
+        info["confidence_updated_cells"] = int(getattr(map_stats, "confidence_updated_cells", 0))
+        info["last_confidence_observed_cells"] = int(getattr(getattr(self, "exploration_map", None), "_last_confidence_observed_cells", 0))
+        info["last_confidence_updated_cells"] = int(getattr(getattr(self, "exploration_map", None), "_last_confidence_updated_cells", 0))
+        info["last_confidence_gain_cells"] = float(getattr(getattr(self, "exploration_map", None), "_last_confidence_gain_cells", 0.0))
+        info["confidence_lidar_blocked_beams"] = int(getattr(getattr(self, "exploration_map", None), "_last_confidence_lidar_blocked_beams", 0))
+        info["confidence_lidar_guarded_cells"] = int(getattr(getattr(self, "exploration_map", None), "_last_confidence_lidar_guarded_cells", 0))
+        info["confidence_endpoint_skips"] = int(getattr(getattr(self, "exploration_map", None), "_last_confidence_endpoint_confidence_skips", 0))
+        info["target_priority"] = float(map_stats.target_priority)
+        info["target_type"] = str(map_stats.target_type)
+        info["target_switched"] = bool(map_stats.target_switched)
+        info["target_lock_age"] = int(map_stats.target_lock_age)
+        info["priority_stuck_steps"] = int(getattr(self, "priority_stuck_steps", 0))
+        info["priority_stuck_restart_steps"] = int(getattr(self, "priority_stuck_restart_steps", 0))
+        info["priority_stuck_active"] = bool(getattr(self, "_last_priority_stuck_active", False))
+        info["priority_stuck_restart"] = bool(getattr(self, "_last_priority_stuck_restart", False))
+        info["priority_stuck_reason"] = str(getattr(self, "_last_priority_stuck_reason", "none"))
+        info["lidar_empty_steps"] = int(getattr(self, "lidar_empty_steps", 0))
+        info["lidar_empty_timeout_steps"] = int(getattr(self, "lidar_empty_timeout_steps", 0))
+        info["lidar_empty_active"] = bool(getattr(self, "_last_lidar_empty_active", False))
+        info["lidar_empty_restart"] = bool(getattr(self, "_last_lidar_empty_restart", False))
+        info["lidar_empty_reason"] = str(getattr(self, "_last_lidar_empty_reason", "none"))
+        info["nav2_stuck_steps"] = int(getattr(self, "nav2_stuck_steps", 0))
+        info["nav2_stuck_backup_steps"] = int(getattr(self, "nav2_stuck_backup_steps", 0))
+        info["nav2_stuck_active"] = bool(getattr(self, "_last_nav2_stuck_active", False))
+        info["nav2_stuck_backup_triggered"] = bool(getattr(self, "_last_nav2_stuck_backup_triggered", False))
+        info["nav2_stuck_reason"] = str(getattr(self, "_last_nav2_stuck_reason", "none"))
+        info["nav2_backup_status"] = str(getattr(self, "_last_nav2_backup_status", "none"))
+        info["lidar_valid_beams"] = int(getattr(self, "_last_lidar_valid_beams", 0))
+        info["lidar_nearest_detection"] = float(getattr(self, "_last_lidar_nearest_detection", 999.0))
+        info["target_reachable"] = bool(map_stats.target_reachable)
+        info["disable_path_reward"] = True
+        info["path_reward_enabled"] = False
+        info["path_distance"] = 0.0
+        info["path_angle"] = 0.0
+        info["path_progress"] = 0.0
+        info["alternative_path_count"] = 0
+        info["alternative_path_angles"] = ()
+        info["priority_direction_error"] = float(priority_direction_error)
+        info["priority_direction_alignment"] = float(priority_direction_alignment)
+        info["priority_direction_signed"] = float(priority_direction_signed)
+        info["action_mode"] = str(self.action_mode)
+        info["policy_action_0"] = float(self.raw_action[0]) if self.raw_action.size > 0 else 0.0
+        info["policy_action_1"] = float(self.raw_action[1]) if self.raw_action.size > 1 else 0.0
+        info["executed_linear_x"] = float(self.prev_action[0]) if self.prev_action.size > 0 else 0.0
+        info["executed_angular_z"] = float(self.prev_action[1]) if self.prev_action.size > 1 else 0.0
+        info["velocity_spin_breaker"] = bool(getattr(self, "_last_velocity_spin_breaker", False))
+        info["velocity_spin_same_sign_steps"] = int(getattr(self, "_velocity_spin_same_sign_steps", 0))
+        info["waypoint_local_x"] = float(self._last_waypoint_local[0])
+        info["waypoint_local_y"] = float(self._last_waypoint_local[1])
+        info["waypoint_world_x"] = float(self._last_waypoint_world[0])
+        info["waypoint_world_y"] = float(self._last_waypoint_world[1])
+        info["waypoint_distance"] = float(self._last_waypoint_distance)
+        info["waypoint_angle"] = float(self._last_waypoint_angle)
+        info["waypoint_action_type"] = str(self._last_waypoint_action_type)
+        info["waypoint_lateral_offset"] = float(self._last_waypoint_lateral_offset)
+        info["waypoint_heading_delta"] = float(self._last_waypoint_heading_delta)
+        info["waypoint_reached"] = bool(self._last_waypoint_reached)
+        info["waypoint_timed_out"] = bool(self._last_waypoint_timed_out)
+        info["waypoint_timeout_sec"] = float(self.waypoint_timeout_sec)
+        info["waypoint_final_error"] = float(self._last_waypoint_final_error)
+        info["controller_steps"] = int(self._last_controller_steps)
+        info["nav2_goal_accepted"] = bool(getattr(self, "_last_nav2_goal_accepted", False))
+        info["nav2_status"] = int(getattr(self, "_last_nav2_status", -1))
+        info["nav2_status_name"] = str(getattr(self, "_last_nav2_status_name", "none"))
+        info["nav2_goal_source"] = str(getattr(self, "_last_nav2_goal_source", "none"))
+        info["nav2_goal_valid"] = bool(getattr(self, "_last_nav2_goal_valid", False))
+        info["nav2_goal_validation"] = str(getattr(self, "_last_nav2_goal_validation", "none"))
+        info["nav2_moved_distance"] = float(getattr(self, "_last_nav2_moved_distance", 0.0))
+        info["nav2_replan_distance_m"] = float(getattr(self, "nav2_replan_distance_m", 0.0))
+        info["slam_local_known_ratio"] = float(getattr(self, "_last_slam_local_known_ratio", 1.0))
+        info["slam_front_known_ratio"] = float(getattr(self, "_last_slam_front_known_ratio", 1.0))
+        info["slam_fresh_score"] = float(getattr(self, "_last_slam_fresh_score", 1.0))
+        info["slam_local_linear_score"] = float(getattr(self, "_last_slam_local_linear_score", 1.0))
+        info["slam_front_linear_score"] = float(getattr(self, "_last_slam_front_linear_score", 1.0))
+        info["slam_fresh_linear_score"] = float(getattr(self, "_last_slam_fresh_linear_score", 1.0))
+        info["slam_quality_score"] = float(getattr(self, "_last_slam_quality_score", 1.0))
+        info["slam_speed_raw_scale"] = float(getattr(self, "_last_slam_speed_raw_scale", 1.0))
+        info["slam_speed_scale"] = float(getattr(self, "_last_slam_speed_scale", 1.0))
+        info["slam_speed_limit"] = float(getattr(self, "_last_slam_speed_limit", self.max_linear_speed))
+        info["priority_score"] = float(map_stats.priority_score)
+        info["priority_gain"] = float(map_stats.priority_gain)
+        info["priority_cleared_cells"] = int(map_stats.priority_cleared_cells)
+        info["priority_clear_gain"] = float(map_stats.priority_clear_gain)
+        info["priority_step_cleared_cells"] = int(getattr(self, "_last_step_priority_cleared_cells", int(map_stats.priority_cleared_cells)))
+        info["priority_step_clear_gain"] = float(getattr(self, "_last_step_priority_clear_gain", float(map_stats.priority_clear_gain)))
+        info["priority_live_cleared_cells"] = int(getattr(self, "_last_pending_priority_cleared_cells", 0))
+        info["priority_live_clear_gain"] = float(getattr(self, "_last_pending_priority_clear_gain", 0.0))
+        info["priority_live_update_count"] = int(getattr(self, "_last_pending_priority_update_count", 0))
+        info["episode_priority_cleared_cells"] = int(getattr(self, "_episode_priority_cleared_cells", 0))
+        info["episode_priority_clear_gain"] = float(getattr(self, "_episode_priority_clear_gain", 0.0))
+        info["priority_clear_reward"] = float(getattr(self, "_last_priority_clear_reward", 0.0))
+        info["priority_recheck_reward"] = float(getattr(self, "_last_priority_recheck_reward", 0.0))
+        info["priority_check_reward"] = float(getattr(self, "_last_priority_check_reward", 0.0))
+        info["episode_priority_clear_reward"] = float(getattr(self, "_episode_priority_clear_reward", 0.0))
+        info["episode_priority_recheck_reward"] = float(getattr(self, "_episode_priority_recheck_reward", 0.0))
+        info["episode_priority_check_reward"] = float(getattr(self, "_episode_priority_check_reward", 0.0))
+        info["priority_invalidated_cells"] = int(getattr(map_stats, "priority_invalidated_cells", 0))
+        info["priority_invalidated_gain"] = float(getattr(map_stats, "priority_invalidated_gain", 0.0))
+        info["priority_rechecked_cells"] = int(getattr(map_stats, "priority_rechecked_cells", 0))
+        info["priority_rechecked_gain"] = float(getattr(map_stats, "priority_rechecked_gain", 0.0))
+        info["priority_step_rechecked_cells"] = int(getattr(self, "_last_step_priority_rechecked_cells", int(getattr(map_stats, "priority_rechecked_cells", 0))))
+        info["priority_step_rechecked_gain"] = float(getattr(self, "_last_step_priority_rechecked_gain", float(getattr(map_stats, "priority_rechecked_gain", 0.0))))
+        info["priority_live_rechecked_cells"] = int(getattr(self, "_last_pending_priority_rechecked_cells", 0))
+        info["priority_live_rechecked_gain"] = float(getattr(self, "_last_pending_priority_rechecked_gain", 0.0))
+        info["episode_priority_rechecked_cells"] = int(getattr(self, "_episode_priority_rechecked_cells", 0))
+        info["episode_priority_rechecked_gain"] = float(getattr(self, "_episode_priority_rechecked_gain", 0.0))
+        info["wall_support_score"] = float(map_stats.wall_support_score)
+        info["open_space_score"] = float(map_stats.open_space_score)
+        info["nearest_obstacle_distance"] = float(map_stats.nearest_obstacle_distance)
+        info["obstacle_proximity_score"] = float(map_stats.obstacle_proximity_score)
+        info["lidar_action_obstacle_distance"] = float(getattr(self, "_last_lidar_action_obstacle_distance", 999.0))
+        info["lidar_action_obstacle_score"] = float(getattr(self, "_last_lidar_action_obstacle_score", 0.0))
+        info["lidar_front_obstacle_distance"] = float(getattr(self, "_last_lidar_front_obstacle_distance", 999.0))
+        info["velocity_safety_backup_triggered"] = bool(getattr(self, "_last_velocity_safety_backup_triggered", False))
+        info["velocity_safety_terminal_triggered"] = bool(getattr(self, "_last_velocity_safety_terminal_triggered", False))
+        info["velocity_safety_terminal_distance"] = float(getattr(self, "_last_velocity_safety_terminal_distance", 999.0))
+        info["velocity_safety_terminal_threshold"] = float(getattr(self, "_last_velocity_safety_terminal_threshold", 0.0))
+        info["velocity_safety_terminal_penalty"] = float(getattr(self, "velocity_safety_terminal_penalty", 0.0))
+        info["velocity_safety_blocked"] = bool(getattr(self, "_last_velocity_safety_blocked", False))
+        info["velocity_safety_slowdown"] = float(getattr(self, "_last_velocity_safety_slowdown", 1.0))
+        info["velocity_safety_slowdown_risk"] = float(getattr(self, "_last_velocity_safety_slowdown_risk", 0.0))
+        info["velocity_safety_policy_v"] = float(getattr(self, "_last_velocity_safety_policy_v", 0.0))
+        info["velocity_safety_executed_v"] = float(getattr(self, "_last_velocity_safety_executed_v", 0.0))
+        info["velocity_safety_penalty"] = float(getattr(self, "_last_velocity_safety_penalty", 0.0))
+        info["velocity_safety_reason"] = str(getattr(self, "_last_velocity_safety_reason", "none"))
+        info["velocity_safety_cooldown_steps"] = int(getattr(self, "velocity_safety_cooldown_steps", 0))
+        info["shake_steps"] = int(getattr(self, "shake_steps", 0))
+        info["shake_restart_limit"] = int(getattr(self, "shake_restart_steps_limit", 0))
+        info["shake_active"] = bool(getattr(self, "_last_shake_active", False))
+        info["shake_restart"] = bool(getattr(self, "_last_shake_restart", False))
+        info["shake_reason"] = str(getattr(self, "_last_shake_reason", "none"))
+        info["collision"] = bool(collision)
+        info["out_of_bounds"] = bool(getattr(self, "_last_out_of_bounds", False))
+        info["out_of_bounds_reason"] = str(getattr(self, "_last_out_of_bounds_reason", "none"))
+        info["out_of_bounds_radius"] = float(getattr(self, "_last_out_of_bounds_radius", 0.0))
+        info["out_of_bounds_x"] = float(getattr(self, "_last_out_of_bounds_x", 0.0))
+        info["out_of_bounds_y"] = float(getattr(self, "_last_out_of_bounds_y", 0.0))
+        info["out_of_bounds_z"] = float(getattr(self, "_last_out_of_bounds_z", 0.0))
+        info["safety_boundary_frame"] = str(getattr(self, "safety_boundary_frame", "odom"))
+        info["safety_boundary_center_x"] = float(getattr(self, "current_boundary_center_xy", np.zeros(2))[0])
+        info["safety_boundary_center_y"] = float(getattr(self, "current_boundary_center_xy", np.zeros(2))[1])
+        info["reset_target_x"] = float(getattr(self, "current_reset_xy", np.zeros(2))[0])
+        info["reset_target_y"] = float(getattr(self, "current_reset_xy", np.zeros(2))[1])
+        info["restart_on_collision"] = bool(self.restart_on_collision)
+        info["collision_restart_requested"] = bool(self._last_collision_restart_requested)
+        info["terminal_reason"] = str(self._last_terminal_reason)
+        info["fallen"] = bool(fallen)
+        info["fallen_reason"] = str(getattr(self, "_last_fallen_reason", "none"))
+        info["collision_global_min"] = float(getattr(self, "_last_collision_global_min", 999.0))
+        info["collision_front_min"] = float(getattr(self, "_last_collision_front_min", 999.0))
+        info["coverage_done"] = bool(coverage_done)
+        info["step_count"] = int(self.step_count)
+        info["sim_time"] = self._safe_sim_time()
+        info["episode_index"] = int(getattr(self, "episode_index", 0))
+        info["use_slam_map"] = bool(self.use_slam_map)
+        info["map_frame"] = str(self.map_frame)
+        info["pose_frame"] = str(self.pose_frame)
+        info["reset_slam_on_reset"] = bool(self.reset_slam_on_reset)
+        info["reset_slam_every_n_episodes"] = int(self.reset_slam_every_n_episodes)
+        info["slam_map_available"] = bool(self.ros.slam_map is not None)
+        info["slam_map_gate"] = str(self._last_slam_gate_reason)
+        info["slam_map_age_sec"] = float(self._last_slam_map_age_sec)
+        info["slam_map_delay_remaining_sec"] = float(self._last_slam_map_delay_remaining_sec)
+        info["post_reset_ready"] = bool(getattr(self, "_last_post_reset_ready", False))
+        info["post_reset_ready_reason"] = str(getattr(self, "_last_post_reset_ready_reason", "none"))
+        info["post_reset_ready_known_ratio"] = float(getattr(self, "_last_post_reset_ready_known_ratio", 0.0))
+        info["post_reset_ready_known_cells"] = int(getattr(self, "_last_post_reset_ready_known_cells", 0))
+        info["post_reset_ready_lidar_beams"] = int(getattr(self, "_last_post_reset_ready_lidar_beams", 0))
+        info["post_reset_ready_priority"] = float(getattr(self, "_last_post_reset_ready_priority", 0.0))
+        info["action_sync_ok"] = bool(getattr(self, "_last_action_sync_ok", False))
+        info["action_sync_reason"] = str(getattr(self, "_last_action_sync_reason", "none"))
+        info["action_sync_wait_sec"] = float(getattr(self, "_last_action_sync_wait_sec", 0.0))
+        info["action_sync_scan_fresh"] = bool(getattr(self, "_last_action_sync_scan_fresh", False))
+        info["action_sync_odom_fresh"] = bool(getattr(self, "_last_action_sync_odom_fresh", False))
+        info["map_bounds_restart"] = bool(getattr(self, "_last_map_bounds_restart", False))
+        info["map_bounds_reason"] = str(getattr(self, "_last_map_bounds_reason", "none"))
+        info["map_bounds_bad_steps"] = int(getattr(self, "map_bounds_bad_steps", 0))
+        info["map_bounds_local_known_ratio"] = float(getattr(self, "_last_map_bounds_local_known_ratio", 0.0))
+        info["map_bounds_local_known_cells"] = int(getattr(self, "_last_map_bounds_local_known_cells", 0))
+        info["slam_update_new_known_cells"] = int(getattr(map_stats, "slam_update_new_known_cells", 0))
+        info["slam_update_new_free_cells"] = int(getattr(map_stats, "slam_update_new_free_cells", 0))
+        info["slam_update_new_occupied_cells"] = int(getattr(map_stats, "slam_update_new_occupied_cells", 0))
+        info["slam_update_expand_known_cells"] = int(getattr(map_stats, "slam_update_expand_known_cells", 0))
+        info["slam_map_update_reward"] = float(getattr(self, "_last_slam_map_update_reward", 0.0))
+        info["slam_map_update_reward_raw"] = float(getattr(self, "_last_slam_map_update_reward_raw", 0.0))
+        info["slam_map_update_reward_reason"] = str(getattr(self, "_last_slam_map_update_reward_reason", "none"))
+        info["slam_map_update_reward_episode"] = float(getattr(self, "_episode_slam_map_update_reward", 0.0))
+        info["slam_live_update_new_known_cells"] = int(getattr(self, "_last_pending_slam_update_new_known_cells", 0))
+        info["slam_live_update_count"] = int(getattr(self, "_last_pending_slam_update_count", 0))
+        info["debug_input_map"] = bool(self.debug_input_map and self.use_map_cnn)
+        info["debug_input_map_published"] = bool(getattr(self, "_last_debug_input_map_published", False))
+        info["debug_input_map_topic_prefix"] = str(getattr(self, "debug_input_map_topic_prefix", ""))
+        info["debug_input_map_frame_id"] = str(getattr(self, "debug_input_map_frame_id", ""))
+        # v117: when a forced safety backup/hold ran this step, mark the
+        # transition so the custom replay buffer skips storing it.  SAC must
+        # not learn from forced-recovery motion that the policy did not choose.
+        info["skip_store"] = bool(getattr(self, "_last_velocity_safety_skip_store", False))
+        info["velocity_safety_skip_store"] = bool(getattr(self, "_last_velocity_safety_skip_store", False))
+        # v131: environment invariants and diagnostic fields
+        info["step_index"] = int(self.step_count)
+        info["scan_age_sec"] = float(getattr(self, "_last_scan_age_sec", -1.0))
+        info["scan_stamp_sec"] = float(getattr(self, "_last_scan_stamp_sec", -1.0))
+        info["odom_age_sec"] = float(getattr(self, "_last_odom_age_sec", -1.0))
+        info["map_age_sec"] = float(getattr(self, "_last_slam_map_age_sec", -1.0))
+        info["obs_stale"] = bool(getattr(self, "_last_obs_stale", False))
+        info["scan_stale"] = bool(getattr(self, "_last_scan_stale", False))
+        info["map_stale"] = bool(
+            float(getattr(self, "_last_slam_map_age_sec", 0.0)) > float(getattr(self, "slam_map_max_age_sec", 3.0))
+            if float(getattr(self, "_last_slam_map_age_sec", -1.0)) >= 0.0 else False
+        )
+        info["tf_pose_ok"] = bool(getattr(self, "_last_tf_pose_ok", False))
+        info["confidence_pose_ok"] = bool(getattr(self, "_last_confidence_pose_ok", False))
+        info["confidence_update_called"] = bool(getattr(self, "_last_confidence_update_called", False))
+        info["confidence_pose_source"] = str(getattr(self, "_last_confidence_pose_source_v131", "none"))
+        info["confidence_update_reason_if_zero"] = str(getattr(self, "_last_confidence_update_reason_if_zero", "none"))
+        info["policy_scan_front"] = float(getattr(self, "_last_policy_scan_front", 999.0))
+        info["policy_scan_left"] = float(getattr(self, "_last_policy_scan_left", 999.0))
+        info["policy_scan_rear"] = float(getattr(self, "_last_policy_scan_rear", 999.0))
+        info["policy_scan_right"] = float(getattr(self, "_last_policy_scan_right", 999.0))
+        info["raw_scan_front"] = float(getattr(self, "_last_raw_scan_front", 999.0))
+        info["raw_scan_left"] = float(getattr(self, "_last_raw_scan_left", 999.0))
+        info["raw_scan_rear"] = float(getattr(self, "_last_raw_scan_rear", 999.0))
+        info["raw_scan_right"] = float(getattr(self, "_last_raw_scan_right", 999.0))
+        info["lidar60_stamp_delta_sec"] = float(getattr(self, "_last_lidar60_stamp_delta_sec", 0.0))
+        info["velocity_safety_terminal"] = bool(getattr(self, "_last_velocity_safety_terminal_triggered", False))
+        info["velocity_safety_distance"] = float(getattr(self, "_last_velocity_safety_terminal_distance", 999.0))
+        info["executed_v"] = float(getattr(self, "_last_velocity_safety_executed_v", 0.0))
+        info["executed_w"] = float(getattr(self, "_last_velocity_safety_executed_w", 0.0))
+        info["policy_v"] = float(getattr(self, "_last_velocity_safety_policy_v", 0.0))
+        info["policy_w"] = float(getattr(self, "_last_velocity_safety_policy_w", 0.0))
+        # v131: reward breakdown
+        info["r_confidence"] = float(getattr(self, "_last_r_confidence", 0.0))
+        info["r_confidence_fill"] = float(getattr(self, "_last_r_confidence_fill", 0.0))
+        info["r_slam"] = float(getattr(self, "_last_r_slam", 0.0))
+        info["r_priority"] = float(getattr(self, "_last_r_priority", 0.0))
+        info["r_wall"] = float(getattr(self, "_last_r_wall", 0.0))
+        info["r_safety_slow"] = float(getattr(self, "_last_r_safety_slow", 0.0))
+        info["r_safety_terminal"] = float(getattr(self, "_last_r_safety_terminal", 0.0))
+        info["r_collision"] = float(getattr(self, "_last_r_collision", 0.0))
+        info["r_step"] = float(getattr(self, "_last_r_step", 0.0))
+        info["reward_total"] = float(getattr(self, "_last_reward_total", 0.0))
+        return info
 
     @staticmethod
     def _empty_map_stats() -> MapUpdateStats:

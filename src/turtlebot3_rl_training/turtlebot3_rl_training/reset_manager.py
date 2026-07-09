@@ -3,6 +3,7 @@ import os
 import random
 import re
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -67,6 +68,20 @@ class ResetManager:
         self._last_candidate_order_log: tuple[str, ...] = ()
         self._stale_pose_warned_entities: set[str] = set()
         self._unverified_pose_warned_entities: set[str] = set()
+
+        # Persistent `gz topic -e` subscriber for pose verification. Spawning a
+        # brand-new `gz topic -e` process per poll (the old approach) opens a
+        # fresh Gazebo Transport discovery participant every time; over a long
+        # training run (SLAM/world reset every episode, pose verification
+        # polling every 50ms) that is tens of thousands of short-lived
+        # participants, which degrades Gazebo Transport discovery until the
+        # whole `gz sim` process is restarted -- exactly the "restarting
+        # Gazebo fixes it" symptom. One long-lived subscriber avoids the leak.
+        self._pose_echo_proc: Optional[subprocess.Popen] = None
+        self._pose_echo_thread: Optional[threading.Thread] = None
+        self._pose_echo_lock = threading.Lock()
+        self._pose_echo_buffer: str = ""
+        self._pose_echo_world: Optional[str] = None
 
         self.node.get_logger().info(f"Reset service     : {self.set_pose_service}")
         self.node.get_logger().info(f"Reset entity hint : {self.entity_name}")
@@ -380,6 +395,13 @@ class ResetManager:
             f'orientation {{ x: {qx:.9f} y: {qy:.9f} z: {qz:.9f} w: {qw:.9f} }}'
         )
 
+        # v133: the ephemeral "gz service" CLI process is itself a gz-transport
+        # node.  Under episode-reset CPU load (world reset + Cartographer
+        # restart), Gazebo's actual reply can take longer than this timeout;
+        # if the CLI process gives up and exits first, Gazebo's later send()
+        # to that now-dead endpoint logs "NodeShared::RecvSrvRequest() error
+        # sending response: Host unreachable" on the Gazebo side.  Give the
+        # CLI more slack so it is still alive to receive the reply.
         commands = [
             [
                 "gz",
@@ -391,7 +413,7 @@ class ResetManager:
                 "--reptype",
                 "gz.msgs.Boolean",
                 "--timeout",
-                "2000",
+                "4000",
                 "--req",
                 req,
             ],
@@ -405,7 +427,7 @@ class ResetManager:
                 "--reptype",
                 "ignition.msgs.Boolean",
                 "--timeout",
-                "2000",
+                "4000",
                 "--req",
                 req,
             ],
@@ -418,7 +440,7 @@ class ResetManager:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
-                    timeout=3.0,
+                    timeout=5.0,
                     check=False,
                 )
             except Exception:
@@ -674,55 +696,96 @@ class ResetManager:
             time.sleep(0.05)
         return None
 
-    def _read_gazebo_pose(self, entity_name: str) -> Optional[ResetPose]:
+    def _ensure_pose_echo_stream(self) -> bool:
+        """Start (or restart, if it died) the one long-lived pose/info subscriber."""
         world = self._world_name_from_service()
-        topic = f"/world/{world}/pose/info"
-        escaped = re.escape(entity_name)
+        if (
+            self._pose_echo_proc is not None
+            and self._pose_echo_world == world
+            and self._pose_echo_proc.poll() is None
+        ):
+            return True
 
-        commands = [
-            ["timeout", "1", "gz", "topic", "-e", "-t", topic],
-            ["timeout", "1", "ign", "topic", "-e", "-t", topic],
-        ]
-
-        for cmd in commands:
+        if self._pose_echo_proc is not None:
             try:
-                completed = subprocess.run(
-                    cmd,
+                self._pose_echo_proc.kill()
+            except Exception:
+                pass
+            self._pose_echo_proc = None
+
+        topic = f"/world/{world}/pose/info"
+        for exe in ("gz", "ign"):
+            try:
+                proc = subprocess.Popen(
+                    [exe, "topic", "-e", "-t", topic],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
                     text=True,
-                    timeout=2.0,
-                    check=False,
+                    bufsize=1,
                 )
             except Exception:
                 continue
 
-            text = completed.stdout or ""
-            if not text:
-                continue
-
-            # gz pose/info는 pose { name: "..." position { x: ... y: ... z: ... } } 반복 구조다.
-            pattern = (
-                r'name:\s*"' + escaped + r'"'
-                r'.{0,2500}?position\s*\{\s*'
-                r'x:\s*([-+0-9.eE]+)\s*'
-                r'y:\s*([-+0-9.eE]+)\s*'
-                r'z:\s*([-+0-9.eE]+)'
+            with self._pose_echo_lock:
+                self._pose_echo_buffer = ""
+            self._pose_echo_proc = proc
+            self._pose_echo_world = world
+            thread = threading.Thread(
+                target=self._pose_echo_reader_loop, args=(proc,), daemon=True
             )
-            m = re.search(pattern, text, flags=re.DOTALL)
-            if not m:
-                continue
+            thread.start()
+            self._pose_echo_thread = thread
+            return True
 
-            try:
-                x = float(m.group(1))
-                y = float(m.group(2))
-                z = float(m.group(3))
-            except Exception:
-                continue
+        return False
 
-            return ResetPose(x=x, y=y, z=z, yaw=0.0)
+    def _pose_echo_reader_loop(self, proc: subprocess.Popen) -> None:
+        try:
+            for line in proc.stdout:
+                with self._pose_echo_lock:
+                    self._pose_echo_buffer += line
+                    # pose/info republishes on every world tick (~30KB/message
+                    # at ~50-60Hz in this house world with ~170+ objects), so
+                    # keep several full messages of tail instead of a couple
+                    # KB -- too tight a cap can truncate mid-message and drop
+                    # the "burger" entry until the next tick.
+                    if len(self._pose_echo_buffer) > 400000:
+                        self._pose_echo_buffer = self._pose_echo_buffer[-200000:]
+        except Exception:
+            pass
 
-        return None
+    def _read_gazebo_pose(self, entity_name: str) -> Optional[ResetPose]:
+        if not self._ensure_pose_echo_stream():
+            return None
+
+        escaped = re.escape(entity_name)
+        # gz pose/info는 pose { name: "..." position { x: ... y: ... z: ... } } 반복 구조다.
+        pattern = (
+            r'name:\s*"' + escaped + r'"'
+            r'.{0,2500}?position\s*\{\s*'
+            r'x:\s*([-+0-9.eE]+)\s*'
+            r'y:\s*([-+0-9.eE]+)\s*'
+            r'z:\s*([-+0-9.eE]+)'
+        )
+        with self._pose_echo_lock:
+            text = self._pose_echo_buffer
+
+        # Take the last match so a stale earlier block in the buffer tail
+        # cannot shadow the most recent pose.
+        last_match = None
+        for last_match in re.finditer(pattern, text, flags=re.DOTALL):
+            pass
+        if last_match is None:
+            return None
+
+        try:
+            x = float(last_match.group(1))
+            y = float(last_match.group(2))
+            z = float(last_match.group(3))
+        except Exception:
+            return None
+
+        return ResetPose(x=x, y=y, z=z, yaw=0.0)
 
     @staticmethod
     def _format_pose(pose: Optional[ResetPose]) -> str:
@@ -869,6 +932,15 @@ class ResetManager:
         return out
 
     def close(self):
+        if self._pose_echo_proc is not None and self._pose_echo_proc.poll() is None:
+            self.node.get_logger().info("Stopping persistent pose/info subscriber...")
+            try:
+                self._pose_echo_proc.kill()
+                self._pose_echo_proc.wait(timeout=1.0)
+            except Exception:
+                pass
+        self._pose_echo_proc = None
+
         if self.bridge_proc is None:
             return
 
