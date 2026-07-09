@@ -60,6 +60,7 @@ class State(Enum):
     WAIT_MAP = auto()
     WAIT_AMCL_ACTIVE = auto()
     WAIT_SCAN = auto()
+    WAIT_ODOM = auto()
     WAIT_TF = auto()
     CHECK_LOCALIZATION_QUALITY = auto()
     SPIN = auto()
@@ -88,11 +89,16 @@ class GlobalLocalizeKickstart(Node):
         self.declare_parameter('ready_topic', 'localization_ready')
 
         self.declare_parameter('spin_enabled', True)
+        self.declare_parameter('require_valid_map', True)
+        self.declare_parameter('min_known_map_cells', 100)
+        self.declare_parameter('require_scan_before_spin', True)
+        self.declare_parameter('require_odom_before_spin', True)
+        self.declare_parameter('require_amcl_before_spin', True)
         self.declare_parameter('spin_speed_rad_s', 0.35)
-        self.declare_parameter('spin_target_angle_rad', 2.0 * math.pi)
-        self.declare_parameter('spin_margin_rad', 0.35)
-        self.declare_parameter('spin_timeout_sec', 25.0)
-        self.declare_parameter('settle_duration_sec', 1.5)
+        self.declare_parameter('spin_target_angle_rad', 6.45)
+        self.declare_parameter('spin_margin_rad', 0.0)
+        self.declare_parameter('spin_timeout_sec', 30.0)
+        self.declare_parameter('settle_duration_sec', 2.0)
         # 좌우 바퀴 응답이 비대칭인 로봇은 angular.z 만 명령해도 제자리
         # 회전이 아니라 호를 그리며 실제로 이동한다 -- "제자리" 스핀이라는
         # 전제가 깨지므로, odom 상 시작 위치에서 이 이상 벗어나면 spin을
@@ -107,6 +113,7 @@ class GlobalLocalizeKickstart(Node):
         self.declare_parameter('max_spin_retries', 2)
         self.declare_parameter('amcl_active_poll_period_sec', 1.0)
         self.declare_parameter('max_scan_age_sec', 1.0)
+        self.declare_parameter('max_odom_age_sec', 1.0)
         self.declare_parameter('tick_period_sec', 0.1)
 
         get = self.get_parameter
@@ -123,6 +130,11 @@ class GlobalLocalizeKickstart(Node):
         self.ready_topic = str(get('ready_topic').value)
 
         self.spin_enabled = bool(get('spin_enabled').value)
+        self.require_valid_map = bool(get('require_valid_map').value)
+        self.min_known_map_cells = max(0, int(get('min_known_map_cells').value))
+        self.require_scan_before_spin = bool(get('require_scan_before_spin').value)
+        self.require_odom_before_spin = bool(get('require_odom_before_spin').value)
+        self.require_amcl_before_spin = bool(get('require_amcl_before_spin').value)
         self.spin_speed = abs(float(get('spin_speed_rad_s').value))
         self.spin_target_angle = max(0.0, float(get('spin_target_angle_rad').value))
         self.spin_margin = max(0.0, float(get('spin_margin_rad').value))
@@ -144,6 +156,7 @@ class GlobalLocalizeKickstart(Node):
             0.1, float(get('amcl_active_poll_period_sec').value)
         )
         self.max_scan_age_sec = max(0.05, float(get('max_scan_age_sec').value))
+        self.max_odom_age_sec = max(0.05, float(get('max_odom_age_sec').value))
         self.tick_period_sec = max(0.02, float(get('tick_period_sec').value))
 
         latched_qos = QoSProfile(
@@ -188,9 +201,11 @@ class GlobalLocalizeKickstart(Node):
         self._last_amcl_poll_wall = 0.0
 
         self.last_scan_wall: Optional[float] = None
+        self.last_odom_wall: Optional[float] = None
         self.last_odom_yaw: Optional[float] = None
         self.last_odom_xy: Optional[tuple] = None
         self.spin_start_xy: Optional[tuple] = None
+        self.spin_direction = 1.0
         self.accumulated_yaw = 0.0
         self._last_progress_octant = -1
         self.spin_start_wall = 0.0
@@ -209,7 +224,10 @@ class GlobalLocalizeKickstart(Node):
             f'odom_topic={self.odom_topic} '
             f'spin_enabled={self.spin_enabled} spin_speed={self.spin_speed:.2f}rad/s '
             f'target={self.spin_target_angle + self.spin_margin:.2f}rad '
-            f'max_spin_retries={self.max_spin_retries}'
+            f'max_spin_retries={self.max_spin_retries} '
+            f'require_valid_map={self.require_valid_map} '
+            f'min_known_map_cells={self.min_known_map_cells} '
+            f'cmd_vel_type={"TwistStamped" if self.use_stamped else "Twist"}'
         )
 
     def _now(self) -> float:
@@ -218,8 +236,29 @@ class GlobalLocalizeKickstart(Node):
     # -- subscriptions ----------------------------------------------------
 
     def _on_map(self, msg: OccupancyGrid) -> None:
-        if msg.info.width > 0 and msg.info.height > 0:
-            self.map_received = True
+        width = int(msg.info.width)
+        height = int(msg.info.height)
+        cell_count = width * height
+        valid_shape = width > 0 and height > 0 and len(msg.data) == cell_count
+        known_cells = sum(1 for cell in msg.data if int(cell) != -1) if valid_shape else 0
+        valid = valid_shape and (
+            not self.require_valid_map
+            or known_cells >= self.min_known_map_cells
+        )
+        if not valid:
+            self.get_logger().info(
+                'GLOBAL_LOCALIZE_WAIT_MAP | invalid/empty map '
+                f'width={width} height={height} data={len(msg.data)} '
+                f'known={known_cells}/{self.min_known_map_cells}',
+                throttle_duration_sec=5.0,
+            )
+            return
+        if not self.map_received:
+            self.get_logger().warning(
+                'GLOBAL_LOCALIZE_VALID_MAP_RECEIVED | '
+                f'width={width} height={height} known={known_cells}'
+            )
+        self.map_received = True
 
     def _on_scan(self, _msg: LaserScan) -> None:
         self.last_scan_wall = self._now()
@@ -233,6 +272,7 @@ class GlobalLocalizeKickstart(Node):
         self.last_odom_xy = (
             msg.pose.pose.position.x, msg.pose.pose.position.y,
         )
+        self.last_odom_wall = self._now()
 
     def _on_amcl_pose(self, msg: PoseWithCovarianceStamped) -> None:
         cov = msg.pose.covariance
@@ -250,9 +290,18 @@ class GlobalLocalizeKickstart(Node):
     # -- shared helpers -----------------------------------------------------
 
     def _scan_fresh(self) -> bool:
+        if not self.require_scan_before_spin:
+            return True
         if self.last_scan_wall is None:
             return False
         return (self._now() - self.last_scan_wall) <= self.max_scan_age_sec
+
+    def _odom_fresh(self) -> bool:
+        if not self.require_odom_before_spin:
+            return True
+        if self.last_odom_wall is None or self.last_odom_yaw is None:
+            return False
+        return (self._now() - self.last_odom_wall) <= self.max_odom_age_sec
 
     def _tf_ok(self) -> bool:
         try:
@@ -341,6 +390,9 @@ class GlobalLocalizeKickstart(Node):
         )
 
     def _tick_wait_amcl_active(self) -> None:
+        if not self.require_amcl_before_spin:
+            self._transition(State.WAIT_SCAN)
+            return
         now = self._now()
         if now - self._last_amcl_poll_wall < self.amcl_active_poll_period_sec:
             return
@@ -370,10 +422,19 @@ class GlobalLocalizeKickstart(Node):
 
     def _tick_wait_scan(self) -> None:
         if self._scan_fresh():
-            self._transition(State.WAIT_TF)
+            self._transition(State.WAIT_ODOM)
             return
         self.get_logger().info(
             f'GLOBAL_LOCALIZE_WAIT_SCAN | no fresh scan on {self.scan_topic}',
+            throttle_duration_sec=5.0,
+        )
+
+    def _tick_wait_odom(self) -> None:
+        if self._odom_fresh():
+            self._transition(State.WAIT_TF)
+            return
+        self.get_logger().info(
+            f'GLOBAL_LOCALIZE_WAIT_ODOM | no fresh odom/yaw on {self.odom_topic}',
             throttle_duration_sec=5.0,
         )
 
@@ -432,22 +493,35 @@ class GlobalLocalizeKickstart(Node):
             f'GLOBAL_LOCALIZE_REINITIALIZED | attempt={self.total_attempts}'
         )
         self.accumulated_yaw = 0.0
-        self.last_odom_yaw = None
         self.spin_start_xy = self.last_odom_xy
+        self.spin_direction = 1.0 if self.total_attempts % 2 == 1 else -1.0
         self._last_progress_octant = -1
         self.spin_start_wall = self._now()
         if not self.spin_enabled:
             self.settle_start_wall = self._now()
             self._transition(State.SETTLE)
             return
+        self.get_logger().warning(
+            'GLOBAL_LOCALIZE_SPIN_START | '
+            f'attempt={self.total_attempts} '
+            f'direction={"ccw" if self.spin_direction > 0.0 else "cw"} '
+            f'cmd_vel={self.cmd_vel_topic} '
+            f'type={"TwistStamped" if self.use_stamped else "Twist"} '
+            f'target={math.degrees(self.spin_target_angle + self.spin_margin):.0f}deg'
+        )
         self._transition(State.SPIN)
 
     def _tick_spin(self) -> None:
-        if not self._scan_fresh() or not self._tf_ok():
+        if not self._scan_fresh() or not self._odom_fresh() or not self._tf_ok():
             self._publish_twist(0.0)
-            fallback = State.WAIT_SCAN if not self._scan_fresh() else State.WAIT_TF
+            if not self._scan_fresh():
+                fallback = State.WAIT_SCAN
+            elif not self._odom_fresh():
+                fallback = State.WAIT_ODOM
+            else:
+                fallback = State.WAIT_TF
             self.get_logger().warning(
-                'GLOBAL_LOCALIZE_SPIN_PAUSED | scan/TF dropped out mid-spin, '
+                'GLOBAL_LOCALIZE_SPIN_PAUSED | scan/odom/TF dropped out mid-spin, '
                 f'falling back to {fallback.name} (not counted as a failed attempt)'
             )
             self._transition(fallback)
@@ -504,7 +578,7 @@ class GlobalLocalizeKickstart(Node):
                 f'{math.degrees(self.accumulated_yaw):.0f}/'
                 f'{math.degrees(target):.0f}deg'
             )
-        self._publish_twist(self.spin_speed)
+        self._publish_twist(self.spin_direction * self.spin_speed)
 
     def _tick_settle(self) -> None:
         self._publish_twist(0.0)

@@ -63,6 +63,10 @@ def generate_launch_description():
             if simulation
             else localization_scan_topic.perform(context).strip() or '/scan'
         )
+        auto_localize_enabled = (
+            not cartographer_owned
+            and launch_bool(auto_localize.perform(context))
+        )
 
         nav2_params = RewrittenYaml(
             source_file=os.path.join(
@@ -127,7 +131,7 @@ def generate_launch_description():
                 respawn_delay=3.0,
             )
 
-            auto = launch_bool(auto_localize.perform(context))
+            auto = auto_localize_enabled
             initial_pose = {
                 'x': float(initial_x.perform(context)),
                 'y': float(initial_y.perform(context)),
@@ -191,12 +195,24 @@ def generate_launch_description():
                         # 벌어져서 "제자리" spin 이 실제로는 호를 그리며
                         # 이동한다 -- 낮은 회전 속도로 그 영향을 줄임.
                         'spin_speed_rad_s': 0.25,
+                        'spin_target_angle_rad': 6.45,
+                        'spin_timeout_sec': 30.0,
+                        'settle_duration_sec': 2.0,
                         'spin_max_drift_m': 0.35,
+                        'require_valid_map': True,
+                        'min_known_map_cells': 100,
+                        'require_scan_before_spin': True,
+                        'require_odom_before_spin': True,
+                        'require_amcl_before_spin': True,
+                        'max_scan_age_sec': 1.0,
+                        'max_odom_age_sec': 1.0,
                         'cmd_vel_topic': '/cmd_vel',
                         'use_stamped_cmd_vel': True,
                         'amcl_pose_topic': '/amcl_pose',
                         'localization_cov_xy_threshold': 0.35,
                         'localization_cov_yaw_threshold': 0.25,
+                        'localization_stable_duration_sec': 1.5,
+                        'max_spin_retries': 2,
                     }],
                     env=process_env,
                     respawn=True,
@@ -336,6 +352,10 @@ def generate_launch_description():
                     'nav_delay_sec': nav_delay_sec,
                     'lifecycle_delay_sec': lifecycle_delay_sec,
                     'goal_delay_sec': goal_delay_sec,
+                    'require_localization_ready': (
+                        'true' if auto_localize_enabled else 'false'
+                    ),
+                    'localization_ready_topic': '/localization_ready',
                 }.items(),
             )
 
@@ -349,9 +369,10 @@ def generate_launch_description():
                 'require_follower_pose': launch_bool(
                     require_follower_pose.perform(context)
                 ),
-                # Do not hold Nav2 goals behind the localization spin; AMCL can
-                # keep refining while the robot starts moving.
-                'require_localization_ready': False,
+                # External-map AMCL must physically spin first. Holding the
+                # coordinator prevents it from publishing leader/member goals
+                # while global_localize_kickstart owns /cmd_vel.
+                'require_localization_ready': auto_localize_enabled,
             }],
             env=process_env,
             respawn=True,

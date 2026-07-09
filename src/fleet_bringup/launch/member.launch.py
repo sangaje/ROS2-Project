@@ -209,11 +209,23 @@ def generate_launch_description():
                 parameters=[{
                     'spin_enabled': True,
                     'spin_speed_rad_s': 0.35,
+                    'spin_target_angle_rad': 6.45,
+                    'spin_timeout_sec': 30.0,
+                    'settle_duration_sec': 2.0,
+                    'require_valid_map': True,
+                    'min_known_map_cells': 100,
+                    'require_scan_before_spin': True,
+                    'require_odom_before_spin': True,
+                    'require_amcl_before_spin': True,
+                    'max_scan_age_sec': 1.0,
+                    'max_odom_age_sec': 1.0,
                     'cmd_vel_topic': '/cmd_vel',
                     'use_stamped_cmd_vel': True,
                     'amcl_pose_topic': '/amcl_pose',
                     'localization_cov_xy_threshold': 0.35,
                     'localization_cov_yaw_threshold': 0.25,
+                    'localization_stable_duration_sec': 1.5,
+                    'max_spin_retries': 2,
                 }],
                 env=process_env,
                 respawn=True,
@@ -232,6 +244,10 @@ def generate_launch_description():
                 'goal_proxy_name': 'member_coord_goal',
                 'nav_delay_sec': '8.0',
                 'lifecycle_delay_sec': '12.0',
+                'require_localization_ready': (
+                    'true' if amcl_enabled and auto else 'false'
+                ),
+                'localization_ready_topic': '/localization_ready',
             }.items(),
         )
 

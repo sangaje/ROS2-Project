@@ -15,6 +15,8 @@ from lifecycle_msgs.msg import State
 from lifecycle_msgs.srv import GetState
 from nav2_msgs.action import NavigateToPose
 from nav2_msgs.srv import ManageLifecycleNodes
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from std_msgs.msg import Bool
 
 
 def _safe_declare(node: Node, name: str, default):
@@ -78,6 +80,12 @@ class PoseToNav2Action(Node):
         self.lifecycle_retry_sec = max(
             0.5, float(_safe_declare(self, 'lifecycle_retry_sec', 2.0))
         )
+        self.require_localization_ready = bool(
+            _safe_declare(self, 'require_localization_ready', False)
+        )
+        self.localization_ready_topic = self._abs(str(
+            _safe_declare(self, 'localization_ready_topic', '/localization_ready')
+        ))
 
         self.client: ActionClient = ActionClient(
             self, NavigateToPose, self.navigate_action
@@ -94,6 +102,20 @@ class PoseToNav2Action(Node):
             self._on_goal_pose,
             10,
         )
+        self.localization_ready = False
+        if self.require_localization_ready:
+            latched_qos = QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                history=HistoryPolicy.KEEP_LAST,
+            )
+            self.create_subscription(
+                Bool,
+                self.localization_ready_topic,
+                self._on_localization_ready,
+                latched_qos,
+            )
         self.current_goal_handle = None
         self.current_goal_id = 0
         self.pending_goal: Optional[PoseStamped] = None
@@ -112,7 +134,9 @@ class PoseToNav2Action(Node):
             f'in={self.goal_pose_topic} action={self.navigate_action} '
             f'frame={self.default_frame_id} '
             f'cancel_previous={self.cancel_previous_goal} '
-            f'wait_lifecycle={self.wait_for_lifecycle_active}'
+            f'wait_lifecycle={self.wait_for_lifecycle_active} '
+            f'require_localization_ready={self.require_localization_ready} '
+            f'localization_ready_topic={self.localization_ready_topic}'
         )
 
     @staticmethod
@@ -132,6 +156,16 @@ class PoseToNav2Action(Node):
         self.retry_not_before = -1.0e9
         self._try_send_pending()
 
+    def _on_localization_ready(self, msg: Bool) -> None:
+        previous = self.localization_ready
+        self.localization_ready = bool(msg.data)
+        if self.localization_ready and not previous:
+            self.get_logger().warn(
+                f'LOCALIZATION_READY_FOR_NAV2_GOALS | topic={self.localization_ready_topic}'
+            )
+            self.retry_not_before = -1.0e9
+            self._try_send_pending()
+
     def _try_send_pending(self) -> None:
         if self.pending_goal is None:
             return
@@ -139,6 +173,8 @@ class PoseToNav2Action(Node):
         if now < self.retry_not_before:
             return
         if self._nav2_lifecycle_blocks_send(now):
+            return
+        if self._localization_blocks_send(now):
             return
         if not self.client.server_is_ready():
             if now - self.last_wait_log_time >= 5.0:
@@ -189,6 +225,17 @@ class PoseToNav2Action(Node):
                 sent_goal=deepcopy(goal.pose),
             )
         )
+
+    def _localization_blocks_send(self, now: float) -> bool:
+        if not self.require_localization_ready or self.localization_ready:
+            return False
+        if now - self.last_wait_log_time >= 5.0:
+            self.get_logger().warn(
+                'NAV2_GOAL_HELD_FOR_LOCALIZATION | '
+                f'waiting for {self.localization_ready_topic}=true | latest goal retained'
+            )
+            self.last_wait_log_time = now
+        return True
 
     def _nav2_lifecycle_blocks_send(self, now: float) -> bool:
         if not self.wait_for_lifecycle_active:

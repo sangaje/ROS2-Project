@@ -87,7 +87,9 @@ def launch_setup(context, *args, **kwargs):
             package='omx_aim', executable='waffle_node', name='waffle_node',
             output='screen',
             parameters=[{
-                'require_amcl_ready': False,
+                'require_amcl_ready': True,
+                'require_localization_ready': True,
+                'localization_ready_topic': '/localization_ready',
             }],
         ),
         Node(
