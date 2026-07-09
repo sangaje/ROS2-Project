@@ -64,6 +64,10 @@ class LeaderShadowFollow(Node):
         self.declare_parameter('follower_scout_pose_topic', '/burger_pose')
         self.declare_parameter('leader_goal_topic', '/fleet/leader_coord_goal')
         self.declare_parameter('leader_cancel_topic', '/fleet/leader_nav_cancel')
+        self.declare_parameter(
+            'controller_set_parameters_service',
+            '/controller_server/set_parameters',
+        )
         self.declare_parameter('map_topic', '/map')
         self.declare_parameter('failover_state_topic', '/failover/state')
         self.declare_parameter('active_scout_id_topic', '/failover/active_scout_id')
@@ -104,6 +108,9 @@ class LeaderShadowFollow(Node):
         self.follower_pose_topic = str(get('follower_scout_pose_topic').value)
         self.leader_goal_topic = str(get('leader_goal_topic').value)
         self.leader_cancel_topic = str(get('leader_cancel_topic').value)
+        self.controller_set_parameters_service = str(
+            get('controller_set_parameters_service').value
+        )
         self.map_topic = str(get('map_topic').value)
         self.failover_state_topic = str(get('failover_state_topic').value)
         self.active_scout_id_topic = str(get('active_scout_id_topic').value)
@@ -169,7 +176,7 @@ class LeaderShadowFollow(Node):
             self.create_subscription(LaserScan, self.scan_topic, self._on_scan, 10)
 
         self.controller_client = self.create_client(
-            SetParameters, '/controller_server/set_parameters'
+            SetParameters, self.controller_set_parameters_service
         )
 
         self.mode = LeaderMode.IDLE
@@ -202,7 +209,8 @@ class LeaderShadowFollow(Node):
             '[LEADER_SHADOW] READY | '
             f'enabled={self.enabled} scout={self.original_scout_id}:{self.active_pose_topic} '
             f'follower_scout={self.follower_robot_name}:{self.follower_pose_topic} '
-            f'distance={self.follow_distance:.2f}m fov={self.scan_fov_deg:.1f}deg'
+            f'distance={self.follow_distance:.2f}m fov={self.scan_fov_deg:.1f}deg '
+            f'controller_service={self.controller_set_parameters_service}'
         )
 
     def _now(self) -> float:

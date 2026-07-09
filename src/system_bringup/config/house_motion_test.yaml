@@ -1,0 +1,107 @@
+simulation:
+  use_sim_time: true
+  scenario: house
+  robot_count: 3
+
+features:
+  risk_map: false
+  yolo: false
+  camera_perception: false
+  failover: true
+  yield: true
+  localization_spin: true
+
+robots:
+  leader:
+    model: waffle_pi
+    namespace: leader
+    pose_topic: /leader_pose
+    goal_topic: /fleet/leader_coord_goal
+    spawn:
+      x: -2.80
+      y: 0.96
+      yaw: 0.0
+  field_a:
+    model: burger
+    namespace: field_a
+    robot_name: scout22
+    initial_role: ACTIVE_SCOUT
+    pose_topic: /member_pose
+    goal_topic: /member_goal_pose
+    spawn:
+      x: 5.00
+      y: 0.86
+      yaw: 3.14159
+  field_b:
+    model: burger
+    namespace: field_b
+    robot_name: follower21
+    initial_role: FOLLOWER
+    pose_topic: /burger_pose
+    goal_topic: /burger_goal_pose
+    spawn:
+      x: 1.20
+      y: -1.60
+      yaw: 1.5708
+
+leader:
+  mode: shadow_follow
+  shadow_distance_m: 2.8
+  shadow_stop_distance_m: 2.2
+  shadow_resume_distance_m: 3.0
+  shadow_far_distance_m: 4.5
+  max_linear_vel: 0.12
+  max_angular_vel: 0.35
+  scan_enabled: true
+  scan_fov_deg: 60.0
+  scan_update_rate_hz: 10.0
+  scan_timeout_sec: 1.0
+
+field_runtime:
+  follow_distance_m: 0.70
+  follow_goal_period_sec: 1.0
+  follow_goal_update_distance_m: 0.25
+  recovery_arrival_tolerance_m: 0.40
+
+exploration:
+  package: region_mapper
+  executable: region_nav2_explorer_node
+  map_topic: /map
+  region_map_topic: /slam_region_graph/region_map
+  auto_start: true
+
+failover:
+  scout_liveness_timeout_sec: 2.0
+  scout_failure_confirm_sec: 0.5
+  scout_pose_timeout_sec: 5.0
+  leader_recovery_standoff_m: 0.7
+  leader_failure_arrival_tolerance_m: 0.8
+  follower_recovery_standoff_m: 0.15
+
+localization:
+  initial_spin_enabled: true
+  spin_speed_rad_s: 0.35
+  spin_target_angle_rad: 6.45
+  spin_timeout_sec: 30.0
+  max_spin_retries: 2
+  max_xy_covariance: 0.35
+  max_yaw_covariance: 0.25
+
+yield:
+  enabled: true
+  minimum_robot_separation_m: 0.48
+  evasion_offset_m: 0.42
+  evasion_offset_max_m: 0.72
+  motion_trigger_distance_m: 0.90
+  cooldown_sec: 4.0
+
+nav2:
+  controller_frequency: 20.0
+  planner_frequency: 2.0
+  max_vel_x: 0.22
+  max_vel_theta: 1.0
+  acceleration_x: 1.2
+  acceleration_theta: 2.2
+  local_costmap_size_m: 5.0
+  inflation_radius_m: 0.28
+  robot_radius_m: 0.16
