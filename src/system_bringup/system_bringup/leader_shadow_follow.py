@@ -194,7 +194,13 @@ class LeaderShadowFollow(Node):
 
         self.heading: Optional[float] = None
         self.previous_scout_sample: Optional[Tuple[float, Point2]] = None
-        self.shadow_active = False
+        # True from the start: the leader should shadow the scout right
+        # away, not only once it has already wandered resume_distance_m
+        # away. With this False, "shadow_active" could only ever flip on
+        # via the resume-distance branch below, which never fires if the
+        # scout starts anywhere closer than that (the common case indoors)
+        # -- the leader would never begin following at all.
+        self.shadow_active = True
         self.last_goal: Optional[PoseStamped] = None
         self.last_goal_wall = -1.0e9
         self.last_nominal_target: Optional[Point2] = None
