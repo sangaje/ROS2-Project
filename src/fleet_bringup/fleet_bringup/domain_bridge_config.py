@@ -150,6 +150,10 @@ def write_fleet_bridge_configs(
             'std_msgs/msg/String',
             profile=qos(durability='transient_local', depth=1),
         ),
+        '/fleet/field_robot_role_cmd': topic(
+            'std_msgs/msg/String',
+            profile=qos(durability='transient_local', depth=1),
+        ),
         '/fleet/robot_poses': topic(
             'geometry_msgs/msg/PoseArray',
             profile=qos(depth=5),
@@ -200,6 +204,10 @@ def write_fleet_bridge_configs(
             profile=qos(durability='transient_local', depth=1),
         ),
         '/fleet/scout_takeover_status': topic(
+            'std_msgs/msg/String',
+            profile=qos(durability='transient_local', depth=1),
+        ),
+        '/fleet/field_robot_status': topic(
             'std_msgs/msg/String',
             profile=qos(durability='transient_local', depth=1),
         ),
@@ -279,6 +287,10 @@ def write_member_bridge_configs(
             'std_msgs/msg/String',
             profile=qos(durability='transient_local', depth=1),
         ),
+        '/fleet/field_robot_role_cmd': topic(
+            'std_msgs/msg/String',
+            profile=qos(durability='transient_local', depth=1),
+        ),
         '/fleet/robot_poses': topic(
             'geometry_msgs/msg/PoseArray',
             profile=qos(depth=5),
@@ -303,6 +315,10 @@ def write_member_bridge_configs(
             profile=qos(reliability='best_effort', durability='volatile', depth=5),
         ),
         '/fleet/scout_takeover_status': topic(
+            'std_msgs/msg/String',
+            profile=qos(durability='transient_local', depth=1),
+        ),
+        '/fleet/field_robot_status': topic(
             'std_msgs/msg/String',
             profile=qos(durability='transient_local', depth=1),
         ),
@@ -416,7 +432,15 @@ def write_leader_to_pc_bridge_config(
             'std_msgs/msg/String',
             profile=qos(durability='transient_local', depth=1),
         ),
+        '/fleet/field_robot_role_cmd': topic(
+            'std_msgs/msg/String',
+            profile=qos(durability='transient_local', depth=1),
+        ),
         '/fleet/scout_takeover_status': topic(
+            'std_msgs/msg/String',
+            profile=qos(durability='transient_local', depth=1),
+        ),
+        '/fleet/field_robot_status': topic(
             'std_msgs/msg/String',
             profile=qos(durability='transient_local', depth=1),
         ),

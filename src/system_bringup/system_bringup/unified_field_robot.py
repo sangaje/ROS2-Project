@@ -1,0 +1,532 @@
+#!/usr/bin/env python3
+"""Unified runtime for non-leader field robots.
+
+Follower and scout are the same robot runtime with different role-selected
+goal sources:
+
+* FOLLOWER -> follow leader pose with Nav2.
+* ACTIVE_SCOUT -> publish active-scout heartbeat and run exploration command.
+* RECOVERY_NAVIGATING -> cancel the previous role and navigate to failure pose.
+* LOCALIZATION_SPIN -> own cmd_vel until AMCL covariance is good enough.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import shlex
+import signal
+import subprocess
+from copy import deepcopy
+from enum import Enum
+from functools import partial
+from typing import Optional
+
+import rclpy
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist, TwistStamped
+from nav2_msgs.action import NavigateToPose
+from nav_msgs.msg import Odometry
+from rclpy.action import ActionClient
+from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from std_msgs.msg import String
+
+
+class Role(Enum):
+    IDLE = 'IDLE'
+    FOLLOWER = 'FOLLOWER'
+    ACTIVE_SCOUT = 'ACTIVE_SCOUT'
+    RECOVERY_NAVIGATING = 'RECOVERY_NAVIGATING'
+    ARRIVED_AT_FAILURE_POSE = 'ARRIVED_AT_FAILURE_POSE'
+    LOCALIZATION_CHECK = 'LOCALIZATION_CHECK'
+    LOCALIZATION_SPIN = 'LOCALIZATION_SPIN'
+    FAILED = 'FAILED'
+
+
+def yaw_from_quaternion(q) -> float:
+    siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    return math.atan2(siny_cosp, cosy_cosp)
+
+
+def quaternion_from_yaw(yaw: float) -> tuple[float, float, float, float]:
+    return (0.0, 0.0, math.sin(0.5 * yaw), math.cos(0.5 * yaw))
+
+
+def wrap_angle(angle: float) -> float:
+    return math.atan2(math.sin(angle), math.cos(angle))
+
+
+def normalize_role(raw: str) -> Role:
+    key = raw.strip().upper()
+    aliases = {
+        'FOLLOWING': 'FOLLOWER',
+        'SCOUT': 'ACTIVE_SCOUT',
+        'ACTIVE_SCOUT_EXPLORING': 'ACTIVE_SCOUT',
+        'RECOVERY': 'RECOVERY_NAVIGATING',
+    }
+    key = aliases.get(key, key)
+    return Role[key] if key in Role.__members__ else Role.IDLE
+
+
+class UnifiedFieldRobot(Node):
+    def __init__(self) -> None:
+        super().__init__('unified_field_robot')
+
+        self.declare_parameter('robot_name', 'field_robot')
+        self.declare_parameter('initial_role', 'IDLE')
+        self.declare_parameter('enable_follow_mode', True)
+        self.declare_parameter('enable_scout_mode', True)
+        self.declare_parameter('enable_recovery_mode', True)
+        self.declare_parameter('enable_localization_spin', True)
+        self.declare_parameter('enable_exploration', True)
+        self.declare_parameter('leader_pose_topic', '/leader_pose')
+        self.declare_parameter('self_pose_topic', '/burger_pose')
+        self.declare_parameter('role_command_topic', '/fleet/field_robot_role_cmd')
+        self.declare_parameter('fleet_role_topic', '/fleet/scout_role')
+        self.declare_parameter('status_topic', '/fleet/field_robot_status')
+        self.declare_parameter('legacy_takeover_status_topic', '/fleet/scout_takeover_status')
+        self.declare_parameter('active_scout_heartbeat_topic', '/scout/signal')
+        self.declare_parameter('navigate_action', '/navigate_to_pose')
+        self.declare_parameter('cmd_vel_topic', '/cmd_vel')
+        self.declare_parameter('use_stamped_cmd_vel', True)
+        self.declare_parameter('amcl_pose_topic', '/amcl_pose')
+        self.declare_parameter('odom_topic', '/odom')
+        self.declare_parameter('follow_distance_m', 0.70)
+        self.declare_parameter('follow_goal_period_sec', 1.0)
+        self.declare_parameter('follow_goal_update_distance_m', 0.25)
+        self.declare_parameter('recovery_arrival_tolerance_m', 0.40)
+        self.declare_parameter('max_xy_covariance', 0.35)
+        self.declare_parameter('max_yaw_covariance', 0.25)
+        self.declare_parameter('max_amcl_pose_age_sec', 3.0)
+        self.declare_parameter('spin_speed_rad_s', 0.35)
+        self.declare_parameter('spin_target_angle_rad', 6.45)
+        self.declare_parameter('spin_timeout_sec', 30.0)
+        self.declare_parameter('settle_duration_sec', 2.0)
+        self.declare_parameter('max_spin_retries', 2)
+        self.declare_parameter('heartbeat_period_sec', 0.5)
+        self.declare_parameter('exploration_command', '')
+
+        get = self.get_parameter
+        self.robot_name = str(get('robot_name').value)
+        self.role = normalize_role(str(get('initial_role').value))
+        self.enable_follow = bool(get('enable_follow_mode').value)
+        self.enable_scout = bool(get('enable_scout_mode').value)
+        self.enable_recovery = bool(get('enable_recovery_mode').value)
+        self.enable_spin = bool(get('enable_localization_spin').value)
+        self.enable_exploration = bool(get('enable_exploration').value)
+        self.leader_pose_topic = str(get('leader_pose_topic').value)
+        self.self_pose_topic = str(get('self_pose_topic').value)
+        self.role_command_topic = str(get('role_command_topic').value)
+        self.fleet_role_topic = str(get('fleet_role_topic').value)
+        self.status_topic = str(get('status_topic').value)
+        self.legacy_status_topic = str(get('legacy_takeover_status_topic').value)
+        self.heartbeat_topic = str(get('active_scout_heartbeat_topic').value)
+        self.navigate_action = str(get('navigate_action').value)
+        self.cmd_vel_topic = str(get('cmd_vel_topic').value)
+        self.use_stamped = bool(get('use_stamped_cmd_vel').value)
+        self.amcl_pose_topic = str(get('amcl_pose_topic').value)
+        self.odom_topic = str(get('odom_topic').value)
+        self.follow_distance = max(0.1, float(get('follow_distance_m').value))
+        self.follow_goal_period = max(0.2, float(get('follow_goal_period_sec').value))
+        self.follow_update_distance = max(0.05, float(get('follow_goal_update_distance_m').value))
+        self.arrival_tolerance = max(0.05, float(get('recovery_arrival_tolerance_m').value))
+        self.max_xy_cov = max(0.0, float(get('max_xy_covariance').value))
+        self.max_yaw_cov = max(0.0, float(get('max_yaw_covariance').value))
+        self.max_amcl_age = max(0.1, float(get('max_amcl_pose_age_sec').value))
+        self.spin_speed = abs(float(get('spin_speed_rad_s').value))
+        self.spin_target = max(0.0, float(get('spin_target_angle_rad').value))
+        self.spin_timeout = max(1.0, float(get('spin_timeout_sec').value))
+        self.settle_duration = max(0.0, float(get('settle_duration_sec').value))
+        self.max_spin_retries = max(0, int(get('max_spin_retries').value))
+        self.heartbeat_period = max(0.1, float(get('heartbeat_period_sec').value))
+        self.exploration_command = str(get('exploration_command').value).strip()
+
+        latched_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+        self.status_pub = self.create_publisher(String, self.status_topic, latched_qos)
+        self.legacy_status_pub = self.create_publisher(String, self.legacy_status_topic, latched_qos)
+        self.role_pub = self.create_publisher(String, f'/{self.robot_name}/role', latched_qos)
+        self.heartbeat_pub = self.create_publisher(String, self.heartbeat_topic, 10)
+        if self.use_stamped:
+            self.cmd_pub = self.create_publisher(TwistStamped, self.cmd_vel_topic, 10)
+        else:
+            self.cmd_pub = self.create_publisher(Twist, self.cmd_vel_topic, 10)
+
+        self.nav_client = ActionClient(self, NavigateToPose, self.navigate_action)
+        self.create_subscription(String, self.role_command_topic, self._on_role_command, latched_qos)
+        self.create_subscription(String, self.fleet_role_topic, self._on_fleet_role, latched_qos)
+        self.create_subscription(PoseStamped, self.leader_pose_topic, self._on_leader_pose, 10)
+        self.create_subscription(PoseStamped, self.self_pose_topic, self._on_self_pose, 10)
+        self.create_subscription(PoseWithCovarianceStamped, self.amcl_pose_topic, self._on_amcl, 10)
+        self.create_subscription(Odometry, self.odom_topic, self._on_odom, 10)
+
+        self.epoch = 0
+        self.goal_epoch = 0
+        self.active_goal_handle = None
+        self.leader_pose: Optional[PoseStamped] = None
+        self.self_pose: Optional[PoseStamped] = None
+        self.last_follow_goal_xy: Optional[tuple[float, float]] = None
+        self.last_follow_goal_wall = -1.0e9
+        self.recovery_target: Optional[PoseStamped] = None
+        self.last_amcl_wall: Optional[float] = None
+        self.xy_cov = float('inf')
+        self.yaw_cov = float('inf')
+        self.last_odom_yaw: Optional[float] = None
+        self.accumulated_yaw = 0.0
+        self.spin_start_wall = 0.0
+        self.settle_start_wall = 0.0
+        self.spin_attempt = 0
+        self.spin_direction = 1.0
+        self.exploration_process: Optional[subprocess.Popen] = None
+        self.heartbeat_seq = 0
+
+        self.create_timer(0.1, self._tick)
+        self.create_timer(self.heartbeat_period, self._publish_heartbeat)
+        self._enter_role(self.role, reason='startup')
+        self.get_logger().warning(
+            'UNIFIED_FIELD_ROBOT_READY | '
+            f'robot={self.robot_name} role={self.role.value} '
+            f'nav={self.navigate_action} cmd_vel={self.cmd_vel_topic}'
+        )
+
+    def _now(self) -> float:
+        return self.get_clock().now().nanoseconds * 1.0e-9
+
+    def _on_leader_pose(self, msg: PoseStamped) -> None:
+        self.leader_pose = msg
+
+    def _on_self_pose(self, msg: PoseStamped) -> None:
+        self.self_pose = msg
+
+    def _on_amcl(self, msg: PoseWithCovarianceStamped) -> None:
+        cov = msg.pose.covariance
+        self.xy_cov = max(abs(float(cov[0])), abs(float(cov[7])))
+        self.yaw_cov = abs(float(cov[35]))
+        self.last_amcl_wall = self._now()
+
+    def _on_odom(self, msg: Odometry) -> None:
+        yaw = yaw_from_quaternion(msg.pose.pose.orientation)
+        if self.role == Role.LOCALIZATION_SPIN and self.last_odom_yaw is not None:
+            self.accumulated_yaw += abs(wrap_angle(yaw - self.last_odom_yaw))
+        self.last_odom_yaw = yaw
+
+    def _on_fleet_role(self, msg: String) -> None:
+        try:
+            data = json.loads(msg.data)
+        except json.JSONDecodeError:
+            return
+        active = str(data.get('active_scout_id', ''))
+        epoch = int(data.get('epoch', 0))
+        if active != self.robot_name and epoch >= self.epoch and self.role == Role.ACTIVE_SCOUT:
+            self.epoch = epoch
+            self._enter_role(Role.IDLE, reason='higher_epoch_not_active')
+
+    def _on_role_command(self, msg: String) -> None:
+        try:
+            data = json.loads(msg.data)
+        except json.JSONDecodeError:
+            self.get_logger().warning(f'ROLE_COMMAND_BAD_JSON | {msg.data!r}')
+            return
+        target = str(data.get('robot', ''))
+        if target and target != self.robot_name:
+            return
+        epoch = int(data.get('epoch', self.epoch))
+        if epoch < self.epoch:
+            self.get_logger().warning(
+                f'ROLE_COMMAND_OLD_EPOCH | got={epoch} current={self.epoch}'
+            )
+            return
+        role = normalize_role(str(data.get('role', data.get('command', 'IDLE'))))
+        self.epoch = epoch
+        if role == Role.RECOVERY_NAVIGATING:
+            target_pose = self._pose_from_json(data.get('target_pose') or data.get('failure_pose'))
+            if target_pose is None:
+                self._enter_role(Role.FAILED, reason='recovery_without_target')
+                return
+            self.recovery_target = target_pose
+        self._enter_role(role, reason='role_command')
+
+    def _tick(self) -> None:
+        if self.role == Role.FOLLOWER:
+            self._tick_follow()
+        elif self.role == Role.RECOVERY_NAVIGATING:
+            self._tick_recovery()
+        elif self.role == Role.LOCALIZATION_CHECK:
+            self._tick_localization_check()
+        elif self.role == Role.LOCALIZATION_SPIN:
+            self._tick_spin()
+        self._publish_status()
+
+    def _tick_follow(self) -> None:
+        if not self.enable_follow or self.leader_pose is None:
+            return
+        now = self._now()
+        if now - self.last_follow_goal_wall < self.follow_goal_period:
+            return
+        yaw = yaw_from_quaternion(self.leader_pose.pose.orientation)
+        goal = self._copy_pose(self.leader_pose)
+        goal.pose.position.x -= self.follow_distance * math.cos(yaw)
+        goal.pose.position.y -= self.follow_distance * math.sin(yaw)
+        xy = (goal.pose.position.x, goal.pose.position.y)
+        if self.last_follow_goal_xy is not None:
+            if math.hypot(xy[0] - self.last_follow_goal_xy[0], xy[1] - self.last_follow_goal_xy[1]) < self.follow_update_distance:
+                return
+        self._send_nav_goal(goal, source='FOLLOW')
+        self.last_follow_goal_xy = xy
+        self.last_follow_goal_wall = now
+
+    def _tick_recovery(self) -> None:
+        if self.recovery_target is None:
+            self._enter_role(Role.FAILED, reason='missing_recovery_target')
+            return
+        if self.active_goal_handle is None:
+            self._send_nav_goal(self.recovery_target, source='RECOVERY')
+        if self._at_pose(self.recovery_target):
+            self._enter_role(Role.ARRIVED_AT_FAILURE_POSE, reason='arrival_distance')
+            self._enter_role(Role.LOCALIZATION_CHECK, reason='arrived')
+
+    def _tick_localization_check(self) -> None:
+        self.get_logger().warning(
+            'FIELD_LOCALIZATION_CHECK | '
+            f'xy_cov={self.xy_cov:.4f} yaw_cov={self.yaw_cov:.4f}',
+            throttle_duration_sec=2.0,
+        )
+        if self._localization_ok():
+            self._enter_role(Role.ACTIVE_SCOUT, reason='localization_ok')
+            return
+        if not self.enable_spin or self.spin_attempt > self.max_spin_retries:
+            self._enter_role(Role.FAILED, reason='localization_failed')
+            return
+        self._start_spin()
+
+    def _start_spin(self) -> None:
+        self.spin_attempt += 1
+        self.spin_direction = 1.0 if self.spin_attempt % 2 == 1 else -1.0
+        self.accumulated_yaw = 0.0
+        self.spin_start_wall = self._now()
+        self._enter_role(Role.LOCALIZATION_SPIN, reason='amcl_covariance')
+
+    def _tick_spin(self) -> None:
+        elapsed = self._now() - self.spin_start_wall
+        if self.accumulated_yaw >= self.spin_target:
+            self._publish_twist(0.0)
+            self.settle_start_wall = self._now()
+            self._enter_role(Role.LOCALIZATION_CHECK, reason='spin_complete')
+            return
+        if elapsed >= self.spin_timeout:
+            self._publish_twist(0.0)
+            self._enter_role(Role.LOCALIZATION_CHECK, reason='spin_timeout')
+            return
+        self._publish_twist(self.spin_direction * self.spin_speed)
+
+    def _enter_role(self, role: Role, reason: str) -> None:
+        if role == self.role and reason != 'startup':
+            return
+        old = self.role
+        if role != Role.FOLLOWER:
+            self.last_follow_goal_xy = None
+        if old in (Role.FOLLOWER, Role.ACTIVE_SCOUT, Role.RECOVERY_NAVIGATING) and role != old:
+            self._cancel_goal(f'role_change_{old.value}_to_{role.value}')
+        if old == Role.ACTIVE_SCOUT and role != Role.ACTIVE_SCOUT:
+            self._stop_exploration(f'role_change_to_{role.value}')
+        self.role = role
+        if role == Role.ACTIVE_SCOUT:
+            self._start_exploration()
+        self.get_logger().warning(
+            f'FIELD_ROLE_TRANSITION | robot={self.robot_name} '
+            f'{old.value}->{role.value} reason={reason} epoch={self.epoch}'
+        )
+        self._publish_status()
+
+    def _send_nav_goal(self, pose: PoseStamped, source: str) -> None:
+        if not self.nav_client.server_is_ready():
+            self.get_logger().warning(
+                f'FIELD_NAV2_WAIT | source={source} action={self.navigate_action}',
+                throttle_duration_sec=5.0,
+            )
+            return
+        self._cancel_goal(f'new_{source}_goal')
+        goal = NavigateToPose.Goal()
+        goal.pose = deepcopy(pose)
+        goal.pose.header.frame_id = goal.pose.header.frame_id or 'map'
+        goal.pose.header.stamp = self.get_clock().now().to_msg()
+        self.goal_epoch += 1
+        goal_id = self.goal_epoch
+        future = self.nav_client.send_goal_async(goal)
+        future.add_done_callback(partial(self._goal_response_cb, goal_id=goal_id, source=source))
+        self.get_logger().warning(
+            f'FIELD_NAV_GOAL_SENT | source={source} '
+            f'x={goal.pose.pose.position.x:.3f} y={goal.pose.pose.position.y:.3f}'
+        )
+
+    def _goal_response_cb(self, future, goal_id: int, source: str) -> None:
+        try:
+            handle = future.result()
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warning(f'FIELD_NAV_GOAL_ERROR | source={source} {exc}')
+            return
+        if goal_id != self.goal_epoch:
+            handle.cancel_goal_async()
+            return
+        if not handle.accepted:
+            self.get_logger().warning(f'FIELD_NAV_GOAL_REJECTED | source={source}')
+            return
+        self.active_goal_handle = handle
+        result_future = handle.get_result_async()
+        result_future.add_done_callback(partial(self._goal_result_cb, goal_id=goal_id, source=source))
+
+    def _goal_result_cb(self, future, goal_id: int, source: str) -> None:
+        if goal_id == self.goal_epoch:
+            self.active_goal_handle = None
+        try:
+            result = future.result()
+            status = result.status
+        except Exception:  # noqa: BLE001
+            status = 'exception'
+        self.get_logger().warning(f'FIELD_NAV_RESULT | source={source} status={status}')
+        if source == 'RECOVERY' and self.role == Role.RECOVERY_NAVIGATING:
+            self._enter_role(Role.ARRIVED_AT_FAILURE_POSE, reason='nav2_result')
+            self._enter_role(Role.LOCALIZATION_CHECK, reason='recovery_done')
+
+    def _cancel_goal(self, reason: str) -> None:
+        handle = self.active_goal_handle
+        self.active_goal_handle = None
+        if handle is None:
+            return
+        try:
+            handle.cancel_goal_async()
+            self.get_logger().warning(f'FIELD_NAV_CANCEL | reason={reason}')
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warning(f'FIELD_NAV_CANCEL_ERROR | reason={reason} {exc}')
+
+    def _localization_ok(self) -> bool:
+        if self.last_amcl_wall is None:
+            return False
+        if self._now() - self.last_amcl_wall > self.max_amcl_age:
+            return False
+        return self.xy_cov <= self.max_xy_cov and self.yaw_cov <= self.max_yaw_cov
+
+    def _at_pose(self, target: PoseStamped) -> bool:
+        if self.self_pose is None:
+            return False
+        dx = self.self_pose.pose.position.x - target.pose.position.x
+        dy = self.self_pose.pose.position.y - target.pose.position.y
+        return math.hypot(dx, dy) <= self.arrival_tolerance
+
+    def _start_exploration(self) -> None:
+        if not self.enable_scout or not self.enable_exploration or not self.exploration_command:
+            return
+        if self.exploration_process is not None and self.exploration_process.poll() is None:
+            return
+        self.exploration_process = subprocess.Popen(shlex.split(self.exploration_command))
+        self.get_logger().warning(f'FIELD_EXPLORATION_STARTED | {self.exploration_command}')
+
+    def _stop_exploration(self, reason: str) -> None:
+        process = self.exploration_process
+        if process is None or process.poll() is not None:
+            return
+        process.send_signal(signal.SIGINT)
+        self.exploration_process = None
+        self.get_logger().warning(f'FIELD_EXPLORATION_STOPPED | reason={reason}')
+
+    def _publish_heartbeat(self) -> None:
+        if self.role != Role.ACTIVE_SCOUT:
+            return
+        self.heartbeat_seq += 1
+        msg = String()
+        msg.data = json.dumps({
+            'robot': self.robot_name,
+            'role': self.role.value,
+            'epoch': self.epoch,
+            'seq': self.heartbeat_seq,
+            'stamp_sec': self._now(),
+        }, sort_keys=True)
+        self.heartbeat_pub.publish(msg)
+
+    def _publish_status(self) -> None:
+        data = {
+            'robot': self.robot_name,
+            'epoch': self.epoch,
+            'role': self.role.value,
+            'status': self.role.value,
+            'xy_cov': None if math.isinf(self.xy_cov) else self.xy_cov,
+            'yaw_cov': None if math.isinf(self.yaw_cov) else self.yaw_cov,
+        }
+        msg = String()
+        msg.data = json.dumps(data, sort_keys=True)
+        self.status_pub.publish(msg)
+        self.legacy_status_pub.publish(msg)
+        role_msg = String()
+        role_msg.data = self.role.value
+        self.role_pub.publish(role_msg)
+
+    def _publish_twist(self, angular_z: float) -> None:
+        if self.use_stamped:
+            msg = TwistStamped()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = 'base_footprint'
+            msg.twist.angular.z = angular_z
+            self.cmd_pub.publish(msg)
+        else:
+            msg = Twist()
+            msg.angular.z = angular_z
+            self.cmd_pub.publish(msg)
+
+    def _copy_pose(self, pose: PoseStamped) -> PoseStamped:
+        msg = PoseStamped()
+        msg.header.frame_id = pose.header.frame_id or 'map'
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.pose = deepcopy(pose.pose)
+        return msg
+
+    def _pose_from_json(self, data) -> Optional[PoseStamped]:
+        if not isinstance(data, dict):
+            return None
+        try:
+            x = float(data['x'])
+            y = float(data['y'])
+            yaw = float(data.get('yaw', 0.0))
+        except (KeyError, TypeError, ValueError):
+            return None
+        msg = PoseStamped()
+        msg.header.frame_id = str(data.get('frame_id', 'map'))
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.pose.position.x = x
+        msg.pose.position.y = y
+        qx, qy, qz, qw = quaternion_from_yaw(yaw)
+        msg.pose.orientation.x = qx
+        msg.pose.orientation.y = qy
+        msg.pose.orientation.z = qz
+        msg.pose.orientation.w = qw
+        return msg
+
+    def destroy_node(self) -> None:
+        try:
+            self._publish_twist(0.0)
+            self._stop_exploration('node_shutdown')
+            self._cancel_goal('node_shutdown')
+        except Exception:  # noqa: BLE001
+            pass
+        super().destroy_node()
+
+
+def main(args=None) -> None:
+    rclpy.init(args=args)
+    node = UnifiedFieldRobot()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

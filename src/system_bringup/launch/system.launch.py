@@ -203,6 +203,12 @@ def generate_launch_description():
             fleet_launch_args['auto_localize'] = (
                 auto_localize.perform(context)
             )
+        if (
+            role_value == 'scout'
+            and fleet_role_value == 'follower'
+            and launch_bool(enable_scout_failover.perform(context))
+        ):
+            fleet_launch_args['start_legacy_follower'] = 'false'
         if fleet_role_value in ('follower', 'member'):
             fleet_launch_args['main_domain_id'] = str(main_domain)
             fleet_launch_args['forward_map_to_main'] = (
@@ -264,25 +270,12 @@ def generate_launch_description():
                 if fleet_role_value == 'follower'
                 else active_scout_robot_name.perform(context)
             )
-            if fleet_role_value == 'member':
-                actions.append(TimerAction(
-                    period=2.0,
-                    actions=[Node(
-                        package='multi',
-                        executable='robot_signal',
-                        name='scout_robot_signal',
-                        output='screen',
-                        parameters=[{
-                            'robot_name': 'scout',
-                            'peer_robots': [],
-                            'publish_signal': True,
-                            'signal_period_sec': 0.5,
-                        }],
-                        env=process_env,
-                        respawn=True,
-                        respawn_delay=3.0,
-                    )],
-                ))
+            initial_field_role = (
+                'FOLLOWER' if fleet_role_value == 'follower' else 'ACTIVE_SCOUT'
+            )
+            self_pose_topic = (
+                '/burger_pose' if fleet_role_value == 'follower' else '/member_pose'
+            )
             takeover_command = takeover_exploration_command.perform(context).strip()
             if not takeover_command:
                 takeover_command_parts = [
@@ -302,18 +295,28 @@ def generate_launch_description():
                 period=2.5,
                 actions=[Node(
                     package='system_bringup',
-                    executable='scout_takeover_agent',
-                    name='scout_takeover_agent',
+                    executable='unified_field_robot',
+                    name='unified_field_robot',
                     output='screen',
                     parameters=[{
                         'robot_name': local_robot_name,
-                        'enable_localization_spin_on_takeover': launch_bool(
+                        'initial_role': initial_field_role,
+                        'enable_follow_mode': True,
+                        'enable_scout_mode': True,
+                        'enable_recovery_mode': True,
+                        'enable_localization_spin': launch_bool(
                             enable_localization_spin_on_takeover.perform(context)
                         ),
-                        'enable_exploration_after_takeover': launch_bool(
+                        'enable_exploration': launch_bool(
                             enable_exploration_after_takeover.perform(context)
                         ),
                         'exploration_command': takeover_command,
+                        'leader_pose_topic': '/leader_pose',
+                        'self_pose_topic': self_pose_topic,
+                        'follow_distance_m': 0.70,
+                        'recovery_arrival_tolerance_m': float(
+                            scout_takeover_arrival_tolerance_m.perform(context)
+                        ),
                         'cmd_vel_topic': '/cmd_vel',
                         'use_stamped_cmd_vel': True,
                     }],

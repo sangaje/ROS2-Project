@@ -4,8 +4,8 @@
 This node keeps system_bringup as the orchestration root.  It watches the
 current active scout's bridged heartbeat and map-frame pose, freezes the last
 fresh pose on failure, sends leader/follower recovery goals through the
-existing fleet goal topics, pauses follower follow mode, and publishes a
-single epoch-based takeover command for the follower-side agent.
+existing fleet goal topics, pauses follower follow mode, and publishes an
+epoch-based recovery role command to the unified field robot runtime.
 """
 
 from __future__ import annotations
@@ -56,10 +56,9 @@ class ScoutFailoverCoordinator(Node):
         self.declare_parameter('leader_pose_topic', '/leader_pose')
         self.declare_parameter('follower_pose_topic', '/burger_pose')
         self.declare_parameter('leader_goal_topic', '/fleet/leader_coord_goal')
-        self.declare_parameter('follower_goal_topic', '/burger_goal_pose')
         self.declare_parameter('follow_command_topic', '/fleet/follow_command')
-        self.declare_parameter('takeover_topic', '/fleet/scout_takeover')
-        self.declare_parameter('takeover_status_topic', '/fleet/scout_takeover_status')
+        self.declare_parameter('role_command_topic', '/fleet/field_robot_role_cmd')
+        self.declare_parameter('field_robot_status_topic', '/fleet/field_robot_status')
         self.declare_parameter('role_topic', '/fleet/scout_role')
         self.declare_parameter('scout_liveness_timeout_sec', 2.0)
         self.declare_parameter('scout_failure_confirm_sec', 0.5)
@@ -70,7 +69,6 @@ class ScoutFailoverCoordinator(Node):
         self.declare_parameter('scout_takeover_arrival_tolerance_m', 0.40)
         self.declare_parameter('recovery_goal_republish_sec', 2.0)
         self.declare_parameter('max_recovery_goal_republishes', 5)
-        self.declare_parameter('takeover_command_republish_sec', 2.0)
 
         get = self.get_parameter
         self.enabled = bool(get('enable_scout_failover').value)
@@ -83,10 +81,9 @@ class ScoutFailoverCoordinator(Node):
         self.leader_pose_topic = str(get('leader_pose_topic').value)
         self.follower_pose_topic = str(get('follower_pose_topic').value)
         self.leader_goal_topic = str(get('leader_goal_topic').value)
-        self.follower_goal_topic = str(get('follower_goal_topic').value)
         self.follow_command_topic = str(get('follow_command_topic').value)
-        self.takeover_topic = str(get('takeover_topic').value)
-        self.takeover_status_topic = str(get('takeover_status_topic').value)
+        self.role_command_topic = str(get('role_command_topic').value)
+        self.field_robot_status_topic = str(get('field_robot_status_topic').value)
         self.role_topic = str(get('role_topic').value)
         self.liveness_timeout = max(0.2, float(get('scout_liveness_timeout_sec').value))
         self.confirm_sec = max(0.0, float(get('scout_failure_confirm_sec').value))
@@ -101,9 +98,6 @@ class ScoutFailoverCoordinator(Node):
         self.max_goal_republishes = max(
             1, int(get('max_recovery_goal_republishes').value)
         )
-        self.takeover_republish_sec = max(
-            0.5, float(get('takeover_command_republish_sec').value)
-        )
 
         latched_qos = QoSProfile(
             depth=1,
@@ -113,9 +107,8 @@ class ScoutFailoverCoordinator(Node):
         )
 
         self.leader_goal_pub = self.create_publisher(PoseStamped, self.leader_goal_topic, 10)
-        self.follower_goal_pub = self.create_publisher(PoseStamped, self.follower_goal_topic, 10)
         self.follow_command_pub = self.create_publisher(String, self.follow_command_topic, latched_qos)
-        self.takeover_pub = self.create_publisher(String, self.takeover_topic, latched_qos)
+        self.role_command_pub = self.create_publisher(String, self.role_command_topic, latched_qos)
         self.role_pub = self.create_publisher(String, self.role_topic, latched_qos)
         self.state_pub = self.create_publisher(String, '/failover/state', latched_qos)
         self.active_scout_pub = self.create_publisher(String, '/failover/active_scout_id', latched_qos)
@@ -128,7 +121,7 @@ class ScoutFailoverCoordinator(Node):
         self.create_subscription(PoseStamped, self.scout_pose_topic, self._on_scout_pose, 10)
         self.create_subscription(PoseStamped, self.leader_pose_topic, self._on_leader_pose, 10)
         self.create_subscription(PoseStamped, self.follower_pose_topic, self._on_follower_pose, 10)
-        self.create_subscription(String, self.takeover_status_topic, self._on_takeover_status, 10)
+        self.create_subscription(String, self.field_robot_status_topic, self._on_field_status, 10)
 
         self.state = FailoverState.NORMAL_OPERATION
         self.start_wall = self._now()
@@ -142,7 +135,6 @@ class ScoutFailoverCoordinator(Node):
         self.scout_epoch = 0
         self.recovery_goal_publish_count = 0
         self.last_recovery_goal_wall = -1.0e9
-        self.last_takeover_command_wall = -1.0e9
         self.leader_goal: Optional[PoseStamped] = None
         self.follower_goal: Optional[PoseStamped] = None
 
@@ -187,7 +179,7 @@ class ScoutFailoverCoordinator(Node):
     def _on_follower_pose(self, msg: PoseStamped) -> None:
         self.follower_pose = msg
 
-    def _on_takeover_status(self, msg: String) -> None:
+    def _on_field_status(self, msg: String) -> None:
         try:
             data = json.loads(msg.data)
         except json.JSONDecodeError:
@@ -221,9 +213,6 @@ class ScoutFailoverCoordinator(Node):
             FailoverState.RECOVERY_NAVIGATING,
         ):
             self._recovery_loop()
-        elif self.state == FailoverState.FOLLOWER_SCOUT_TAKEOVER:
-            self._publish_takeover_command()
-
     def _check_liveness(self) -> None:
         if self.last_liveness_wall is None:
             self.get_logger().info(
@@ -307,7 +296,7 @@ class ScoutFailoverCoordinator(Node):
         )
         if should_publish:
             self.leader_goal_pub.publish(self.leader_goal)
-            self.follower_goal_pub.publish(self.follower_goal)
+            self._publish_recovery_role_command()
             self.recovery_goal_publish_count += 1
             self.last_recovery_goal_wall = now
             self.get_logger().warning(
@@ -316,7 +305,7 @@ class ScoutFailoverCoordinator(Node):
                 f'y={self.leader_goal.pose.position.y:.3f}'
             )
             self.get_logger().warning(
-                '[FAILOVER] FOLLOWER_RECOVERY_GOAL_SENT | '
+                '[FAILOVER] FOLLOWER_RECOVERY_ROLE_SENT | '
                 f'x={self.follower_goal.pose.position.x:.3f} '
                 f'y={self.follower_goal.pose.position.y:.3f}'
             )
@@ -325,8 +314,6 @@ class ScoutFailoverCoordinator(Node):
         if self._follower_arrived():
             self.get_logger().warning('[FAILOVER] FOLLOWER_ARRIVED')
             self._transition(FailoverState.FOLLOWER_SCOUT_TAKEOVER)
-            self._publish_takeover_command(force=True)
-
     def _follower_arrived(self) -> bool:
         if self.follower_pose is None or self.failure_pose is None:
             return False
@@ -334,17 +321,20 @@ class ScoutFailoverCoordinator(Node):
         dy = self.follower_pose.pose.position.y - self.failure_pose.pose.position.y
         return math.hypot(dx, dy) <= self.arrival_tolerance
 
-    def _publish_takeover_command(self, force: bool = False) -> None:
-        if self.failure_pose is None:
-            return
-        now = self._now()
-        if not force and now - self.last_takeover_command_wall < self.takeover_republish_sec:
+    def _publish_recovery_role_command(self) -> None:
+        if self.follower_goal is None or self.failure_pose is None:
             return
         data = {
-            'command': 'TAKEOVER_SCOUT',
+            'role': 'RECOVERY_NAVIGATING',
             'epoch': self.scout_epoch,
             'robot': self.follower_name,
             'previous_scout': self.original_scout_id,
+            'target_pose': {
+                'frame_id': 'map',
+                'x': self.follower_goal.pose.position.x,
+                'y': self.follower_goal.pose.position.y,
+                'yaw': yaw_from_quaternion(self.follower_goal.pose.orientation),
+            },
             'failure_pose': {
                 'frame_id': 'map',
                 'x': self.failure_pose.pose.position.x,
@@ -354,11 +344,10 @@ class ScoutFailoverCoordinator(Node):
         }
         msg = String()
         msg.data = json.dumps(data, sort_keys=True)
-        self.takeover_pub.publish(msg)
-        self.last_takeover_command_wall = now
+        self.role_command_pub.publish(msg)
         self.get_logger().warning(
-            '[FAILOVER] FOLLOWER_PROMOTED_TO_SCOUT | '
-            f'command_sent epoch={self.scout_epoch} robot={self.follower_name}'
+            '[FAILOVER] FIELD_ROLE_COMMAND | '
+            f'role=RECOVERY_NAVIGATING epoch={self.scout_epoch} robot={self.follower_name}'
         )
 
     def _transition(self, new_state: FailoverState) -> None:

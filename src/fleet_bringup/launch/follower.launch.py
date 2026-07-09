@@ -43,6 +43,7 @@ def generate_launch_description():
     hardware_param_file = LaunchConfiguration('hardware_param_file')
     forward_map_to_main = LaunchConfiguration('forward_map_to_main')
     follow_distance = LaunchConfiguration('follow_distance')
+    start_legacy_follower = LaunchConfiguration('start_legacy_follower')
     initial_x = LaunchConfiguration('follower_initial_x')
     initial_y = LaunchConfiguration('follower_initial_y')
     initial_yaw = LaunchConfiguration('follower_initial_yaw')
@@ -373,6 +374,10 @@ def generate_launch_description():
             bridge_t, relay_t, amcl_t, localization_t, kickstart_t,
             nav_t, lifecycle_t, behavior_t,
         ) = timing
+        behavior_nodes = [goal_proxy]
+        if launch_bool(start_legacy_follower.perform(context)):
+            behavior_nodes.append(follower)
+
         actions.extend([
             LogInfo(msg=[
                 'LEADER_EGRESS_BRIDGE | source_domain=', str(main_domain),
@@ -386,7 +391,7 @@ def generate_launch_description():
             TimerAction(period=relay_t, actions=relay_nodes + [follower_pose]),
             TimerAction(period=nav_t, actions=navigation),
             TimerAction(period=lifecycle_t, actions=[navigation_lifecycle]),
-            TimerAction(period=behavior_t, actions=[goal_proxy, follower]),
+            TimerAction(period=behavior_t, actions=behavior_nodes),
         ])
         if amcl is not None:
             actions.append(TimerAction(
@@ -452,6 +457,15 @@ def generate_launch_description():
             'follow_distance',
             default_value='0.70',
             description='Desired distance behind the leader in metres.',
+        ),
+        DeclareLaunchArgument(
+            'start_legacy_follower',
+            default_value='true',
+            choices=['true', 'false'],
+            description=(
+                'Start fleet_follower. Set false when system_bringup '
+                'unified_field_robot owns FOLLOWER mode.'
+            ),
         ),
         DeclareLaunchArgument('follower_initial_x', default_value='-0.70'),
         DeclareLaunchArgument('follower_initial_y', default_value='0.0'),
