@@ -237,7 +237,14 @@ def generate_launch_description():
             launch_arguments={
                 'domain_id': str(member_domain),
                 'start_robot_bringup': start_robot_bringup.perform(context),
-                'hardware_param_file': hardware_param_file.perform(context),
+                'hardware_param_file': (
+                    hardware_param_file.perform(context)
+                    or os.path.join(
+                        package_share,
+                        'config',
+                        'turtlebot3_burger_stamped_cmd_vel.yaml',
+                    )
+                ),
                 'nav2_params_file': nav2_params,
                 'start_nav2': start_nav2.perform(context),
                 'goal_pose_topic': '/member_goal_pose',

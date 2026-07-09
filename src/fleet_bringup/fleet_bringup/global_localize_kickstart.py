@@ -20,7 +20,7 @@ State machine:
        through to blind reinit if no scout pose shows up in time -- never
        gated on covariance or a stable map->odom TF, since both can depend
        on this seed in the first place)
-      -> WAIT_SCAN -> WAIT_TF
+      -> WAIT_SCAN -> WAIT_ODOM
       -> CHECK_LOCALIZATION_QUALITY (skips the spin only on a re-entry that
          is already converged -- never on a true first pass, since AMCL's
          seeded set_initial_pose covariance can look artificially good
@@ -638,7 +638,9 @@ class GlobalLocalizeKickstart(Node):
 
     def _tick_wait_odom(self) -> None:
         if self._odom_fresh():
-            self._transition(State.WAIT_TF)
+            # Do not gate the initial spin on map->base TF. AMCL often needs
+            # this very rotation before that transform becomes trustworthy.
+            self._transition(State.CHECK_LOCALIZATION_QUALITY)
             return
         self.get_logger().info(
             f'GLOBAL_LOCALIZE_WAIT_ODOM | no fresh odom/yaw on {self.odom_topic}',
@@ -735,16 +737,14 @@ class GlobalLocalizeKickstart(Node):
         self._transition(State.SPIN)
 
     def _tick_spin(self) -> None:
-        if not self._scan_fresh() or not self._odom_fresh() or not self._tf_ok():
+        if not self._scan_fresh() or not self._odom_fresh():
             self._publish_twist(0.0)
             if not self._scan_fresh():
                 fallback = State.WAIT_SCAN
-            elif not self._odom_fresh():
-                fallback = State.WAIT_ODOM
             else:
-                fallback = State.WAIT_TF
+                fallback = State.WAIT_ODOM
             self.get_logger().warning(
-                'GLOBAL_LOCALIZE_SPIN_PAUSED | scan/odom/TF dropped out mid-spin, '
+                'GLOBAL_LOCALIZE_SPIN_PAUSED | scan/odom dropped out mid-spin, '
                 f'falling back to {fallback.name} (not counted as a failed attempt)'
             )
             self._transition(fallback)

@@ -358,6 +358,10 @@ def generate_launch_description():
         elif launch_bool(start_robot_bringup.perform(context)):
             robot_launch_args = {'use_sim_time': 'false', 'namespace': ''}
             param_file = hardware_param_file.perform(context)
+            if not param_file:
+                param_file = os.path.join(
+                    package_share, 'config', 'turtlebot3_burger_stamped_cmd_vel.yaml'
+                )
             if param_file:
                 robot_launch_args['tb3_param_dir'] = param_file
             actions.append(IncludeLaunchDescription(
