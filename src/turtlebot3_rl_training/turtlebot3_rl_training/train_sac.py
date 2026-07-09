@@ -1,11 +1,14 @@
 import argparse
 import atexit
 import os
-import signal
 import subprocess
+import sys
 import time
 import math
 import re
+import types
+import warnings
+import zipfile
 from collections import deque
 from pathlib import Path
 from typing import Optional
@@ -16,6 +19,19 @@ from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 from stable_baselines3.common.buffers import DictReplayBuffer
 from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.utils import get_schedule_fn
+from turtlebot3_rl_training.feature_extractor import MapVectorFeatureExtractor
+from turtlebot3_rl_training.gazebo_nav_env import GazeboNavEnv
+from turtlebot3_rl_training.ros_interface import TurtleBot3RosInterface
+
+# v133: SB3's own get_schedule_fn()/constant_fn() deprecation warnings fire on
+# every run regardless of our code; they are library-internal noise, not
+# something we can fix here, and clutter the quiet "[SAC] ..." progress output
+# the user wants. Placed *after* all imports (some packages reset the warnings
+# filter list as a side effect of import) so nothing downstream can silently
+# undo this.
+warnings.filterwarnings("ignore", message=".*get_schedule_fn.*deprecated.*")
+warnings.filterwarnings("ignore", message=".*constant_fn.*deprecated.*")
 
 
 
@@ -33,6 +49,176 @@ def _terminate_process(proc: Optional[subprocess.Popen], label: str = "process")
             proc.kill()
         except Exception:
             pass
+
+
+def _reset_sac_entropy_coefficient(model: SAC, ent_coef: Optional[float], logger=None) -> bool:
+    if ent_coef is None:
+        return False
+    value = float(ent_coef)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError("--sac-reset-ent-coef must be a finite positive value")
+
+    try:
+        import torch as th
+    except Exception as exc:
+        raise RuntimeError(f"torch import failed while resetting SAC entropy coefficient: {exc}") from exc
+
+    if getattr(model, "log_ent_coef", None) is not None:
+        with th.no_grad():
+            target = th.log(th.ones_like(model.log_ent_coef.data) * value)
+            model.log_ent_coef.data.copy_(target)
+        optimizer = getattr(model, "ent_coef_optimizer", None)
+        if optimizer is not None:
+            optimizer.state.clear()
+        if logger is not None:
+            logger.info(f"SAC_ENT_COEF_RESET | learned alpha reset to {value:.6f}; optimizer state cleared")
+        return True
+
+    if getattr(model, "ent_coef_tensor", None) is not None:
+        model.ent_coef_tensor = th.tensor(value, device=getattr(model, "device", "cpu"))
+        model.ent_coef = value
+        if logger is not None:
+            logger.info(f"SAC_ENT_COEF_RESET | fixed alpha set to {value:.6f}")
+        return True
+
+    if logger is not None:
+        logger.warn("SAC_ENT_COEF_RESET_SKIPPED | model has no entropy coefficient attribute to reset")
+    return False
+
+def _reset_sac_critics(model: SAC, logger=None) -> bool:
+    """Reinitialize SAC critics while keeping the loaded actor/extractor setup."""
+    policy = getattr(model, "policy", None)
+    critic = getattr(policy, "critic", None) if policy is not None else None
+    critic_target = getattr(policy, "critic_target", None) if policy is not None else None
+    if critic is None:
+        if logger is not None:
+            logger.warn("SAC_CRITIC_RESET_SKIPPED | model policy has no critic")
+        return False
+
+    def _reset_module(module) -> None:
+        reset = getattr(module, "reset_parameters", None)
+        if callable(reset):
+            reset()
+
+    try:
+        critic.apply(_reset_module)
+        if critic_target is not None:
+            critic_target.load_state_dict(critic.state_dict())
+        optimizer = getattr(critic, "optimizer", None)
+        if optimizer is not None:
+            optimizer.state.clear()
+        if logger is not None:
+            logger.warn("SAC_CRITIC_RESET | critic and critic_target reinitialized; actor kept")
+        return True
+    except Exception as exc:
+        if logger is not None:
+            logger.warn(f"SAC_CRITIC_RESET_FAILED | {type(exc).__name__}: {exc}")
+        return False
+
+
+def _install_warmup_action_mixer(
+    model: SAC,
+    *,
+    warmup_steps: int,
+    zero_linear_prob: float,
+    random_prob: float,
+    noise_prob: float,
+    noise_std: float,
+    logger=None,
+) -> bool:
+    steps = max(int(warmup_steps), 0)
+    zero_linear_probability = min(max(float(zero_linear_prob), 0.0), 1.0)
+    random_probability = min(max(float(random_prob), 0.0), max(1.0 - zero_linear_probability, 0.0))
+    noise_probability = min(max(float(noise_prob), 0.0), max(1.0 - zero_linear_probability - random_probability, 0.0))
+    std = max(float(noise_std), 0.0)
+    if steps <= 0 or (zero_linear_probability <= 0.0 and random_probability <= 0.0 and (noise_probability <= 0.0 or std <= 0.0)):
+        return False
+
+    try:
+        import numpy as np
+    except Exception as exc:
+        raise RuntimeError(f"numpy import failed while installing warmup action mixer: {exc}") from exc
+
+    original_sample_action = getattr(model, "_tb3_original_sample_action", None)
+    if original_sample_action is None:
+        original_sample_action = model._sample_action
+        model._tb3_original_sample_action = original_sample_action
+
+    rng = np.random.default_rng()
+    start_timesteps = int(getattr(model, "num_timesteps", 0))
+    model._tb3_warmup_action_start_timesteps = start_timesteps
+    model._tb3_warmup_action_steps = steps
+    model._tb3_warmup_action_zero_linear_prob = zero_linear_probability
+    model._tb3_warmup_action_random_prob = random_probability
+    model._tb3_warmup_action_noise_prob = noise_probability
+    model._tb3_warmup_action_noise_std = std
+    model._tb3_warmup_action_zero_linear_count = 0
+    model._tb3_warmup_action_random_count = 0
+    model._tb3_warmup_action_noise_count = 0
+    model._tb3_last_warmup_action_source = "policy"
+
+    def _sample_action_with_warmup(self, learning_starts: int, action_noise=None, n_envs: int = 1):
+        action, buffer_action = original_sample_action(learning_starts, action_noise, n_envs)
+        elapsed = int(getattr(self, "num_timesteps", 0)) - int(getattr(self, "_tb3_warmup_action_start_timesteps", 0))
+        if elapsed < 0 or elapsed >= int(getattr(self, "_tb3_warmup_action_steps", 0)):
+            self._tb3_last_warmup_action_source = "policy"
+            return action, buffer_action
+
+        action_arr = np.asarray(action).copy()
+        buffer_arr = np.asarray(buffer_action).copy()
+        env_count = max(int(n_envs), 1)
+        draws = rng.random(env_count)
+        zero_linear_prob_now = float(getattr(self, "_tb3_warmup_action_zero_linear_prob", 0.0))
+        random_cutoff = zero_linear_prob_now + float(getattr(self, "_tb3_warmup_action_random_prob", 0.0))
+        noise_cutoff = random_cutoff + float(getattr(self, "_tb3_warmup_action_noise_prob", 0.0))
+        zero_linear_mask = draws < zero_linear_prob_now
+        random_mask = (draws >= zero_linear_prob_now) & (draws < random_cutoff)
+        noisy_mask = (draws >= random_cutoff) & (draws < noise_cutoff)
+
+        if np.any(zero_linear_mask):
+            sampled_action = np.asarray([self.action_space.sample() for _ in range(env_count)], dtype=np.float32)
+            sampled_action[:, 0] = 0.0
+            sampled_buffer_action = self.policy.scale_action(sampled_action)
+            action_arr[zero_linear_mask] = sampled_action[zero_linear_mask]
+            buffer_arr[zero_linear_mask] = sampled_buffer_action[zero_linear_mask]
+            self._tb3_warmup_action_zero_linear_count = int(getattr(self, "_tb3_warmup_action_zero_linear_count", 0)) + int(np.count_nonzero(zero_linear_mask))
+
+        if np.any(random_mask):
+            sampled_action = np.asarray([self.action_space.sample() for _ in range(env_count)], dtype=np.float32)
+            sampled_buffer_action = self.policy.scale_action(sampled_action)
+            action_arr[random_mask] = sampled_action[random_mask]
+            buffer_arr[random_mask] = sampled_buffer_action[random_mask]
+            self._tb3_warmup_action_random_count = int(getattr(self, "_tb3_warmup_action_random_count", 0)) + int(np.count_nonzero(random_mask))
+
+        if np.any(noisy_mask):
+            noise = rng.normal(0.0, float(getattr(self, "_tb3_warmup_action_noise_std", 0.0)), size=buffer_arr[noisy_mask].shape)
+            noisy_buffer_action = np.clip(buffer_arr[noisy_mask] + noise, -1.0, 1.0)
+            buffer_arr[noisy_mask] = noisy_buffer_action
+            action_arr[noisy_mask] = self.policy.unscale_action(noisy_buffer_action)
+            self._tb3_warmup_action_noise_count = int(getattr(self, "_tb3_warmup_action_noise_count", 0)) + int(np.count_nonzero(noisy_mask))
+
+        if np.count_nonzero([np.any(zero_linear_mask), np.any(random_mask), np.any(noisy_mask)]) > 1:
+            self._tb3_last_warmup_action_source = "mixed"
+        elif np.any(zero_linear_mask):
+            self._tb3_last_warmup_action_source = "zero_linear"
+        elif np.any(random_mask):
+            self._tb3_last_warmup_action_source = "random"
+        elif np.any(noisy_mask):
+            self._tb3_last_warmup_action_source = "noisy"
+        else:
+            self._tb3_last_warmup_action_source = "policy"
+
+        return action_arr, buffer_arr
+
+    model._sample_action = types.MethodType(_sample_action_with_warmup, model)
+    if logger is not None:
+        logger.info(
+            "WARMUP_ACTION_MIXER | "
+            f"resume_start={start_timesteps} steps={steps} "
+            f"zero_linear_prob={zero_linear_probability:.3f} "
+            f"random_prob={random_probability:.3f} noise_prob={noise_probability:.3f} noise_std={std:.3f}"
+        )
+    return True
 
 
 def _start_gazebo_if_requested(cli_args) -> Optional[subprocess.Popen]:
@@ -85,6 +271,87 @@ def _start_gazebo_if_requested(cli_args) -> Optional[subprocess.Popen]:
     return proc
 
 
+def _scan_geometry_counts(scan_msg, *, max_valid_range_m: float = 3.35) -> tuple[int, int, float]:
+    try:
+        ranges = list(getattr(scan_msg, "ranges", []) or [])
+    except Exception:
+        ranges = []
+    total = len(ranges)
+    if total <= 0:
+        return 0, 0, 999.0
+
+    try:
+        range_min = max(float(getattr(scan_msg, "range_min", 0.05) or 0.05), 0.0)
+    except Exception:
+        range_min = 0.05
+    try:
+        range_max = float(getattr(scan_msg, "range_max", 3.5) or 3.5)
+    except Exception:
+        range_max = 3.5
+    max_valid = min(float(max_valid_range_m), max(range_max - 0.05, range_min + 1e-3))
+
+    valid = 0
+    nearest = 999.0
+    for value in ranges:
+        try:
+            r = float(value)
+        except Exception:
+            continue
+        if not math.isfinite(r):
+            continue
+        nearest = min(nearest, r)
+        if range_min <= r <= max_valid:
+            valid += 1
+    return int(valid), int(total), float(nearest)
+
+
+def _wait_for_training_geometry_ready(ros, cli_args) -> bool:
+    """Reject non-trainable startup states such as an empty plane world.
+
+    /scan and /odom existing is not enough for this exploration task.  The reward
+    depends on obstacle/frontier/SLAM geometry; if almost every LiDAR ray is
+    max-range, the agent receives mostly stall penalties and learns nonsense.
+    """
+    if not bool(getattr(cli_args, "startup_require_training_geometry", True)):
+        return True
+
+    timeout_sec = max(float(getattr(cli_args, "startup_geometry_wait_sec", 8.0)), 0.0)
+    min_beams = max(int(getattr(cli_args, "startup_min_obstacle_beams", 20)), 1)
+    max_valid_range = max(float(getattr(cli_args, "startup_max_valid_lidar_range_m", 3.35)), 0.1)
+    start = time.time()
+    last_counts = (0, 0, 999.0)
+
+    while time.time() - start <= timeout_sec:
+        rclpy.spin_once(ros, timeout_sec=0.05)
+        scan = getattr(ros, "scan", None)
+        if scan is not None:
+            last_counts = _scan_geometry_counts(scan, max_valid_range_m=max_valid_range)
+            valid, total, nearest = last_counts
+            if total > 0 and valid >= min_beams:
+                print(
+                    "[TRAIN STARTUP] LiDAR geometry OK: "
+                    f"valid_obstacle_beams={valid}/{total}, nearest={nearest:.3f}m",
+                    flush=True,
+                )
+                return True
+        time.sleep(0.05)
+
+    valid, total, nearest = last_counts
+    print(
+        "\n[TRAIN STARTUP ERROR] LiDAR sees too little obstacle geometry for exploration training.\n"
+        f"  valid_obstacle_beams={valid}/{total}, nearest={nearest:.3f}m, required>={min_beams}\n"
+        "This usually means Gazebo is running an empty plane world or the robot spawned outside the training map.\n"
+        "Use terminal 1 with the RL training world:\n"
+        "  cd ~/Desktop/ROS2_Project\n"
+        "  bash run_gazebo.sh\n"
+        "The default simulator world should print:\n"
+        "  world: .../src/turtlebot3_rl_training/world/training_house.sdf\n"
+        "To bypass this guard only for diagnostics, pass --no-startup-require-training-geometry.\n",
+        flush=True,
+    )
+    return False
+
+
 def _model_step_from_name(path: Path) -> int:
     match = re.search(r"_(\d+)_steps(?:\.zip)?$", path.stem)
     if match:
@@ -95,11 +362,78 @@ def _model_step_from_name(path: Path) -> int:
         return -1
 
 
+def _is_valid_zip_model(path: Path) -> bool:
+    try:
+        if not path.is_file() or path.stat().st_size <= 0:
+            return False
+        with zipfile.ZipFile(path) as archive:
+            return archive.testzip() is None
+    except Exception:
+        return False
+
+
+def _sb3_zip_path(base_path: Path) -> Path:
+    path = Path(base_path)
+    if path.suffix == ".zip":
+        return path
+    return Path(str(path) + ".zip")
+
+
+def _detach_warmup_action_mixer_for_save(model) -> dict:
+    """Temporarily remove runtime monkey-patched methods before SB3/cloudpickle save."""
+    state = {}
+    model_dict = getattr(model, "__dict__", None)
+    if not isinstance(model_dict, dict):
+        return state
+    for attr in ("_sample_action", "_tb3_original_sample_action"):
+        if attr in model_dict:
+            state[attr] = model_dict.pop(attr)
+    return state
+
+
+def _restore_warmup_action_mixer_after_save(model, state: dict) -> None:
+    for attr, value in state.items():
+        try:
+            setattr(model, attr, value)
+        except Exception:
+            pass
+
+
+def _safe_save_sac_model(model, base_path: Path, logger=None) -> Path:
+    """Save an SB3 model through a validated temp zip before replacing target."""
+    target_base = Path(base_path)
+    target_zip = _sb3_zip_path(target_base)
+    target_zip.parent.mkdir(parents=True, exist_ok=True)
+    tmp_zip = target_zip.parent / f".{target_zip.stem}.tmp_{os.getpid()}_{int(time.time() * 1000)}.zip"
+    warmup_state = _detach_warmup_action_mixer_for_save(model)
+    try:
+        model.save(str(tmp_zip))
+        if not _is_valid_zip_model(tmp_zip):
+            size = tmp_zip.stat().st_size if tmp_zip.exists() else -1
+            raise IOError(f"temporary model zip is invalid: {tmp_zip} size={size}")
+        os.replace(tmp_zip, target_zip)
+        return target_zip
+    except BaseException:
+        try:
+            if tmp_zip.exists() and not _is_valid_zip_model(tmp_zip):
+                tmp_zip.unlink()
+        except Exception:
+            pass
+        raise
+    finally:
+        _restore_warmup_action_mixer_after_save(model, warmup_state)
+        try:
+            if tmp_zip.exists() and tmp_zip != target_zip:
+                tmp_zip.unlink()
+        except Exception:
+            pass
+
+
 def _find_latest_sac_model(model_dir: Path) -> Optional[Path]:
     candidates = []
     for pattern in ("sac_turtlebot3_burger_checkpoint_*_steps.zip", "sac_turtlebot3_burger.zip"):
         candidates.extend(model_dir.glob(pattern))
-    candidates = [p for p in candidates if p.is_file()]
+    candidates = [p for p in candidates if _is_valid_zip_model(p)]
     if not candidates:
         return None
     return max(candidates, key=lambda p: (_model_step_from_name(p), p.stat().st_mtime))
@@ -124,10 +458,6 @@ def _guess_replay_buffer_path(model_path: Path, model_dir: Path) -> Optional[Pat
     if not candidates:
         return None
     return max(candidates, key=lambda p: (_model_step_from_name(p), p.stat().st_mtime))
-
-from turtlebot3_rl_training.feature_extractor import MapVectorFeatureExtractor
-from turtlebot3_rl_training.gazebo_nav_env import GazeboNavEnv
-from turtlebot3_rl_training.ros_interface import TurtleBot3RosInterface
 
 try:
     from turtlebot3_rl_training.process_cleanup import (
@@ -473,8 +803,6 @@ class RotatingCheckpointCallback(CheckpointCallback):
             model_files = list(save_dir.glob(model_glob))
         except Exception:
             return
-        if len(model_files) <= self.keep_last:
-            return
 
         def _step_of(p: Path) -> int:
             m = re.search(r"_(\d+)_steps\.zip$", p.name)
@@ -485,13 +813,8 @@ class RotatingCheckpointCallback(CheckpointCallback):
             except Exception:
                 return -1
 
-        # Newest first; keep the first keep_last, delete the rest.
-        model_files.sort(key=_step_of, reverse=True)
-        to_delete = model_files[self.keep_last:]
-
-        for model_path in to_delete:
+        def _unlink_checkpoint_group(model_path: Path) -> None:
             step = _step_of(model_path)
-            # Remove the model zip and any sidecar files saved for the same step.
             sidecars = [
                 model_path,
                 save_dir / f"{prefix}_replay_buffer_{step}_steps.pkl",
@@ -501,7 +824,6 @@ class RotatingCheckpointCallback(CheckpointCallback):
                 try:
                     f.unlink(missing_ok=True)  # py3.8+: never raises if absent
                 except TypeError:
-                    # Older Python without missing_ok: guard manually.
                     try:
                         if f.exists():
                             f.unlink()
@@ -509,6 +831,30 @@ class RotatingCheckpointCallback(CheckpointCallback):
                         pass
                 except Exception:
                     pass
+
+        valid_model_files = []
+        for model_path in model_files:
+            if _is_valid_zip_model(model_path):
+                valid_model_files.append(model_path)
+                continue
+            _unlink_checkpoint_group(model_path)
+            try:
+                if self.verbose:
+                    print(f"[CKPT ROTATE] removed invalid checkpoint {model_path.name}", flush=True)
+            except Exception:
+                pass
+
+        if len(valid_model_files) <= self.keep_last:
+            return
+
+        # Newest first; keep the first keep_last, delete the rest.
+        valid_model_files.sort(key=_step_of, reverse=True)
+        to_delete = valid_model_files[self.keep_last:]
+
+        for model_path in to_delete:
+            step = _step_of(model_path)
+            # Remove the model zip and any sidecar files saved for the same step.
+            _unlink_checkpoint_group(model_path)
             try:
                 if self.verbose:
                     print(f"[CKPT ROTATE] removed old checkpoint step={step}", flush=True)
@@ -517,7 +863,15 @@ class RotatingCheckpointCallback(CheckpointCallback):
 
     def _on_step(self) -> bool:
         # Run the normal periodic save first, then prune.
-        result = super()._on_step()
+        warmup_state = {}
+        save_due = bool(self.save_freq > 0 and (self.n_calls % self.save_freq == 0))
+        if save_due:
+            warmup_state = _detach_warmup_action_mixer_for_save(getattr(self, "model", None))
+        try:
+            result = super()._on_step()
+        finally:
+            if warmup_state:
+                _restore_warmup_action_mixer_after_save(getattr(self, "model", None), warmup_state)
         try:
             if self.save_freq > 0 and (self.n_calls % self.save_freq == 0):
                 self._prune_old_checkpoints()
@@ -525,6 +879,49 @@ class RotatingCheckpointCallback(CheckpointCallback):
             # Pruning must never crash training.
             pass
         return result
+
+
+class EntropyCoefficientFloorCallback(BaseCallback):
+    """Keep learned SAC alpha above a configured floor during fine-tuning."""
+
+    def __init__(self, min_ent_coef: Optional[float], verbose: int = 0):
+        super().__init__(verbose=verbose)
+        self.min_ent_coef = None if min_ent_coef is None else max(float(min_ent_coef), 0.0)
+        self.clamp_count = 0
+
+    def _clamp_entropy_coefficient(self) -> None:
+        if self.min_ent_coef is None or self.min_ent_coef <= 0.0:
+            return
+        log_ent_coef = getattr(self.model, "log_ent_coef", None)
+        if log_ent_coef is None:
+            return
+        try:
+            import torch as th
+            with th.no_grad():
+                min_log = th.log(th.as_tensor(self.min_ent_coef, device=log_ent_coef.device, dtype=log_ent_coef.dtype))
+                if bool(th.any(log_ent_coef.data < min_log)):
+                    log_ent_coef.data.copy_(th.maximum(log_ent_coef.data, min_log.expand_as(log_ent_coef.data)))
+                    self.clamp_count += 1
+                    if self.verbose > 0 and (self.clamp_count == 1 or self.clamp_count % 1000 == 0):
+                        print(
+                            f"[SAC ENTROPY] clamped alpha floor={self.min_ent_coef:.6f} count={self.clamp_count}",
+                            flush=True,
+                        )
+        except Exception:
+            return
+
+    def _on_training_start(self) -> None:
+        self._clamp_entropy_coefficient()
+
+    def _on_rollout_start(self) -> None:
+        self._clamp_entropy_coefficient()
+
+    def _on_step(self) -> bool:
+        try:
+            self._clamp_entropy_coefficient()
+        except Exception:
+            return True
+        return True
 
 
 class DebugCallback(BaseCallback):
@@ -664,6 +1061,8 @@ class TrainingProgressCallback(BaseCallback):
         self.recent_episode_steps_per_wall_sec = deque(maxlen=self.window_size)
         self.recent_episode_steps_per_sim_sec = deque(maxlen=self.window_size)
         self.recent_terminal_reasons = deque(maxlen=self.window_size)
+        self.recent_policy_w = deque(maxlen=max(self.print_freq, 100))
+        self.recent_executed_w = deque(maxlen=max(self.print_freq, 100))
         self._current_episode_reward = 0.0
         self._current_episode_len = 0
         self._episode_start_wall_time = 0.0
@@ -677,6 +1076,10 @@ class TrainingProgressCallback(BaseCallback):
         self._csv_rows_since_flush = 0
         self._pbar = None
         self._last_pbar_n = 0
+        self._current_ep_safety_terminal_count = 0
+        self._current_ep_collision_count = 0
+        self._last_ep_safety_terminal_count = 0
+        self._last_ep_collision_count = 0
 
     @staticmethod
     def _fmt_duration(seconds: float) -> str:
@@ -713,6 +1116,18 @@ class TrainingProgressCallback(BaseCallback):
             pass
         return ""
 
+    @staticmethod
+    def _turn_balance(values, deadband: float = 0.04) -> tuple[float, float, float, float]:
+        vals = [float(v) for v in values if math.isfinite(float(v))]
+        if not vals:
+            return float("nan"), float("nan"), float("nan"), float("nan")
+        total = float(len(vals))
+        left = sum(1 for v in vals if v > deadband) / total
+        right = sum(1 for v in vals if v < -deadband) / total
+        zero = sum(1 for v in vals if abs(v) <= deadband) / total
+        mean_w = sum(vals) / total
+        return left, right, zero, mean_w
+
     def _on_training_start(self) -> None:
         self.start_wall_time = time.time()
         self._episode_start_wall_time = self.start_wall_time
@@ -723,15 +1138,19 @@ class TrainingProgressCallback(BaseCallback):
         if self.csv_path:
             path = Path(self.csv_path).expanduser()
             path.parent.mkdir(parents=True, exist_ok=True)
-            self._csv_file = path.open("w", encoding="utf-8")
-            self._csv_file.write(
+            csv_header = (
                 "timesteps,progress_percent,fps,elapsed_sec,eta_sec,"
                 "actor_loss,critic_loss,ent_coef_loss,ent_coef,learning_rate,"
                 "mean_episode_reward,mean_episode_length,last_episode_wall_sec,"
                 "last_episode_sps_wall,last_episode_sim_sec,last_episode_sps_sim,"
                 "mean_episode_sps_wall,mean_episode_sps_sim,last_reward,last_done,"
-                "terminal_reason,coverage_ratio,confidence_gain,confidence_updated_cells,"
+                "terminal_reason,coverage_ratio,confidence_gain,confidence_fill_delta,confidence_fill_hold,confidence_updated_cells,"
                 "confidence_observed_cells,priority_score,collision,fallen,out_of_bounds,"
+                "coverage_stall_terminal,coverage_stall_active,coverage_stall_reason,"
+                "coverage_stall_window_steps,coverage_stall_window_len,"
+                "coverage_stall_slam_new_cells,coverage_stall_confidence_updated_cells,"
+                "coverage_stall_coverage_delta,coverage_stall_consecutive_hits,"
+                "coverage_stall_no_progress_steps,coverage_stall_hard_no_progress_steps,"
                 "step_recovery,"
                 "scan_age_sec,odom_age_sec,map_age_sec,obs_stale,scan_stale,map_stale,"
                 "tf_pose_ok,confidence_pose_ok,"
@@ -740,10 +1159,23 @@ class TrainingProgressCallback(BaseCallback):
                 "lidar60_stamp_delta_sec,"
                 "velocity_safety_terminal,velocity_safety_distance,"
                 "executed_v,executed_w,policy_v,policy_w,"
-                "r_confidence,r_slam,r_priority,r_wall,"
+                "r_confidence,r_confidence_fill,r_slam,r_priority,r_wall,"
                 "r_safety_slow,r_safety_terminal,r_collision,r_step,reward_total,"
                 "safety_terminal_count_ep,collision_count_ep\n"
             )
+            append_mode = path.exists() and path.stat().st_size > 0
+            if append_mode:
+                try:
+                    first_line = path.open("r", encoding="utf-8").readline()
+                except Exception:
+                    first_line = ""
+                if first_line and first_line != csv_header:
+                    rotated = path.with_suffix(path.suffix + f".legacy_{int(time.time())}")
+                    path.rename(rotated)
+                    append_mode = False
+            self._csv_file = path.open("a" if append_mode else "w", encoding="utf-8")
+            if not append_mode:
+                self._csv_file.write(csv_header)
             self._csv_file.flush()
 
         if self.progress_style == "tqdm":
@@ -762,6 +1194,28 @@ class TrainingProgressCallback(BaseCallback):
             except Exception:
                 self._pbar = None
                 self.progress_style = "line"
+
+        self._rich_live = None
+        if self.progress_style == "block" and sys.stdout.isatty():
+            # v133: a fixed dashboard window that updates in place. Manual
+            # multi-line ANSI cursor-up/erase was tried first and reverted --
+            # it silently assumes nothing else writes to stdout between our
+            # own prints (checkpoint-save messages, warnings, etc. all break
+            # that assumption and leave stale lines behind). rich.live.Live
+            # is built to handle exactly this correctly.
+            try:
+                from rich.live import Live  # type: ignore
+                self._rich_live = Live("", refresh_per_second=4, transient=False)
+                self._rich_live.start()
+            except Exception:
+                self._rich_live = None
+
+    def _on_training_end(self) -> None:
+        if getattr(self, "_rich_live", None) is not None:
+            try:
+                self._rich_live.stop()
+            except Exception:
+                pass
 
     def _on_step(self) -> bool:
         rewards = self.locals.get("rewards", [])
@@ -791,12 +1245,34 @@ class TrainingProgressCallback(BaseCallback):
         if info.get("collision", False):
             self._current_ep_collision_count = int(getattr(self, "_current_ep_collision_count", 0)) + 1
 
+        try:
+            self.recent_policy_w.append(float(info.get("policy_w", 0.0)))
+            self.recent_executed_w.append(float(info.get("executed_w", 0.0)))
+        except Exception:
+            pass
+
         if done:
             episode_info = info.get("episode", {}) if isinstance(info, dict) else {}
             ep_reward = float(episode_info.get("r", self._current_episode_reward))
             ep_len = int(episode_info.get("l", self._current_episode_len))
 
-            ep_wall_sec = max(time.time() - float(self._episode_start_wall_time or self.start_wall_time), 1e-6)
+            # v133: prefer the env's own reset-free timestamp (info["episode_wall_sec"],
+            # set in gazebo_nav_env.py from when reset() actually returned). The
+            # naive alternative -- time.time() - self._episode_start_wall_time --
+            # is contaminated: SB3's VecEnv auto-resets inside the same step()
+            # call that returns done=True, so that bracket silently includes the
+            # *next* episode's full reset (world reset, obstacle spawn, SLAM
+            # restart), making both fps and this "sps" read almost identical and
+            # far too low.
+            _env_ep_wall_sec = float("nan")
+            try:
+                _env_ep_wall_sec = float(info.get("episode_wall_sec", float("nan")))
+            except Exception:
+                pass
+            if math.isfinite(_env_ep_wall_sec) and _env_ep_wall_sec >= 0.0:
+                ep_wall_sec = max(_env_ep_wall_sec, 1e-6)
+            else:
+                ep_wall_sec = max(time.time() - float(self._episode_start_wall_time or self.start_wall_time), 1e-6)
             ep_sps_wall = float(ep_len) / ep_wall_sec if ep_len > 0 else 0.0
             ep_sim_sec = float("nan")
             ep_sps_sim = float("nan")
@@ -851,43 +1327,66 @@ class TrainingProgressCallback(BaseCallback):
             self._episode_start_wall_time = time.time()
             self._episode_start_sim_time = None
 
-        elapsed = max(time.time() - self.start_wall_time, 1e-6)
         trained_steps = max(int(self.num_timesteps) - self.start_timesteps, 0)
-        progress = min(trained_steps / max(self.requested_total_timesteps, 1), 1.0)
-        fps = trained_steps / elapsed if trained_steps > 0 else 0.0
-        remaining = max(self.requested_total_timesteps - trained_steps, 0)
-        eta = remaining / fps if fps > 1e-6 else 0.0
-
-        mean_ep_reward = (
-            sum(self.recent_episode_rewards) / len(self.recent_episode_rewards)
-            if self.recent_episode_rewards else float("nan")
-        )
-        mean_ep_len = (
-            sum(self.recent_episode_lengths) / len(self.recent_episode_lengths)
-            if self.recent_episode_lengths else float("nan")
-        )
-        mean_ep_sps_wall = (
-            sum(self.recent_episode_steps_per_wall_sec) / len(self.recent_episode_steps_per_wall_sec)
-            if self.recent_episode_steps_per_wall_sec else float("nan")
-        )
-        mean_ep_sps_sim = (
-            sum(self.recent_episode_steps_per_sim_sec) / len(self.recent_episode_steps_per_sim_sec)
-            if self.recent_episode_steps_per_sim_sec else float("nan")
-        )
         terminal_reason = str(info.get("terminal_reason", "none"))
+        if done and terminal_reason == "none":
+            if bool(info.get("step_recovery", False)):
+                terminal_reason = "step_recovery"
+            elif bool(info.get("TimeLimit.truncated", False)):
+                terminal_reason = "time_limit"
+            else:
+                terminal_reason = "done_unknown"
 
-        actor_loss = self._logger_value("train/actor_loss")
-        critic_loss = self._logger_value("train/critic_loss")
-        ent_coef_loss = self._logger_value("train/ent_coef_loss")
-        ent_coef = self._logger_value("train/ent_coef")
-        learning_rate = self._logger_value("train/learning_rate")
-
+        # v133: was episode-end-only for a while (see git history) on the
+        # theory that per-step CSV/print I/O was contributing to a disk-full
+        # crash. The actual cause turned out to be cartographer's own
+        # untracked glog files (fixed separately with GLOG_logtostderr), so
+        # that's no longer a reason to hide per-step Q-loss/progress visibility.
         should_emit = (
             trained_steps == 1
             or trained_steps % self.print_freq == 0
             or trained_steps >= self.requested_total_timesteps
             or done
         )
+
+        if should_emit:
+            elapsed = max(time.time() - self.start_wall_time, 1e-6)
+            progress = min(trained_steps / max(self.requested_total_timesteps, 1), 1.0)
+            fps = trained_steps / elapsed if trained_steps > 0 else 0.0
+            remaining = max(self.requested_total_timesteps - trained_steps, 0)
+            eta = remaining / fps if fps > 1e-6 else 0.0
+
+            mean_ep_reward = (
+                sum(self.recent_episode_rewards) / len(self.recent_episode_rewards)
+                if self.recent_episode_rewards else float("nan")
+            )
+            mean_ep_len = (
+                sum(self.recent_episode_lengths) / len(self.recent_episode_lengths)
+                if self.recent_episode_lengths else float("nan")
+            )
+            mean_ep_sps_wall = (
+                sum(self.recent_episode_steps_per_wall_sec) / len(self.recent_episode_steps_per_wall_sec)
+                if self.recent_episode_steps_per_wall_sec else float("nan")
+            )
+            mean_ep_sps_sim = (
+                sum(self.recent_episode_steps_per_sim_sec) / len(self.recent_episode_steps_per_sim_sec)
+                if self.recent_episode_steps_per_sim_sec else float("nan")
+            )
+
+            actor_loss = self._logger_value("train/actor_loss")
+            critic_loss = self._logger_value("train/critic_loss")
+            ent_coef_loss = self._logger_value("train/ent_coef_loss")
+            ent_coef = self._logger_value("train/ent_coef")
+            try:
+                log_ent_coef = getattr(self.model, "log_ent_coef", None)
+                if log_ent_coef is not None:
+                    ent_coef = float(log_ent_coef.detach().exp().mean().item())
+                elif getattr(self.model, "ent_coef_tensor", None) is not None:
+                    ent_coef = float(self.model.ent_coef_tensor.detach().mean().item())
+            except Exception:
+                pass
+            learning_rate = self._logger_value("train/learning_rate")
+            exec_left, exec_right, exec_zero, exec_mean_w = self._turn_balance(self.recent_executed_w)
 
         if self.progress_style == "tqdm" and self._pbar is not None:
             delta = trained_steps - int(self._last_pbar_n)
@@ -900,13 +1399,11 @@ class TrainingProgressCallback(BaseCallback):
                     "Qloss": "nan" if not math.isfinite(critic_loss) else f"{critic_loss:.2f}",
                     "Aloss": "nan" if not math.isfinite(actor_loss) else f"{actor_loss:.2f}",
                     "epR": "nan" if not math.isfinite(mean_ep_reward) else f"{mean_ep_reward:.1f}",
+                    "wL/R": "nan" if not math.isfinite(exec_left) else f"{exec_left:.2f}/{exec_right:.2f}",
                     "conf": int(info.get("confidence_updated_cells", 0)),
                     "term": terminal_reason[:14],
                 })
         elif self.progress_style == "block" and should_emit:
-            # Multi-line block mode is intentionally not a live-overwriting tqdm
-            # line.  It is easier to read in narrow terminals and survives copied
-            # logs, while CSV remains the authoritative dense history.
             def _num(x: float, width: int = 8, prec: int = 3) -> str:
                 try:
                     if math.isfinite(float(x)):
@@ -915,8 +1412,7 @@ class TrainingProgressCallback(BaseCallback):
                     pass
                 return "nan".rjust(width)
 
-            print(
-                "\n"
+            block_text = (
                 f"[SAC] {progress * 100.0:6.2f}%  step={trained_steps}/{self.requested_total_timesteps}  "
                 f"fps={fps:6.2f}  eta={self._fmt_duration(eta)}\n"
                 f"      loss: Q={_num(critic_loss)}  actor={_num(actor_loss)}  "
@@ -929,11 +1425,21 @@ class TrainingProgressCallback(BaseCallback):
                 f"recent={int(info.get('recent_confidence_updated_cells', 0)):6d}  "
                 f"conf_gain={float(info.get('confidence_gain', 0.0)):7.3f}  "
                 f"cov={float(info.get('coverage_ratio', -1.0)):6.3f}  "
-                f"term={terminal_reason}  err={bool(info.get('step_recovery', False))}",
-                flush=True,
+                f"term={terminal_reason}  err={bool(info.get('step_recovery', False))}\n"
+                f"      act : policy=({float(info.get('policy_v', 0.0)):+.3f},{float(info.get('policy_w', 0.0)):+.3f})  "
+                f"exec=({float(info.get('executed_v', 0.0)):+.3f},{float(info.get('executed_w', 0.0)):+.3f})  "
+                f"w_recent L/R/Z={exec_left:4.2f}/{exec_right:4.2f}/{exec_zero:4.2f}  "
+                f"mean_w={exec_mean_w:+.3f}"
             )
+            if getattr(self, "_rich_live", None) is not None:
+                try:
+                    self._rich_live.update(block_text)
+                except Exception:
+                    print(block_text, flush=True)
+            else:
+                print(block_text, flush=True)
         elif self.progress_style == "line" and should_emit:
-            print(
+            line_text = (
                 "[SAC] "
                 f"{progress * 100.0:6.2f}% "
                 f"step={trained_steps}/{self.requested_total_timesteps} "
@@ -943,10 +1449,24 @@ class TrainingProgressCallback(BaseCallback):
                 f"sps={mean_ep_sps_wall:5.2f} r={reward:+7.3f} "
                 f"conf={int(info.get('confidence_updated_cells', 0))}/{int(info.get('confidence_observed_cells', 0))} "
                 f"cov={float(info.get('coverage_ratio', -1.0)):.3f} "
+                f"p=({float(info.get('policy_v', 0.0)):+.2f},{float(info.get('policy_w', 0.0)):+.2f}) "
+                f"e=({float(info.get('executed_v', 0.0)):+.2f},{float(info.get('executed_w', 0.0)):+.2f}) "
+                f"wL/R/Z={exec_left:.2f}/{exec_right:.2f}/{exec_zero:.2f} "
                 f"term={terminal_reason} "
-                f"err={bool(info.get('step_recovery', False))}",
-                flush=True,
+                f"err={bool(info.get('step_recovery', False))}"
             )
+            if sys.stdout.isatty():
+                # \r + pad-to-previous-length is a single-line overwrite that
+                # every terminal handles the same way (unlike multi-line
+                # cursor-up, which depends on the terminal's own tracked
+                # cursor position and breaks under `make`/multiplexers).
+                prev_len = int(getattr(self, "_line_prev_len", 0))
+                pad = max(prev_len - len(line_text), 0)
+                sys.stdout.write("\r" + line_text + (" " * pad))
+                sys.stdout.flush()
+                self._line_prev_len = len(line_text)
+            else:
+                print(line_text, flush=True)
 
         if self._csv_file is not None and should_emit:
             self._csv_file.write(
@@ -963,12 +1483,25 @@ class TrainingProgressCallback(BaseCallback):
                 f"{reward:.6f},{int(done)},"
                 f"{terminal_reason},{float(info.get('coverage_ratio', -1.0)):.6f},"
                 f"{float(info.get('confidence_gain', 0.0)):.6f},"
+                f"{float(info.get('confidence_fill_delta', 0.0)):.6f},"
+                f"{float(info.get('confidence_fill_hold', 0.0)):.6f},"
                 f"{int(info.get('confidence_updated_cells', 0))},"
                 f"{int(info.get('confidence_observed_cells', 0))},"
                 f"{float(info.get('priority_score', -1.0)):.6f},"
                 f"{int(bool(info.get('collision', False)))},"
                 f"{int(bool(info.get('fallen', False)))},"
                 f"{int(bool(info.get('out_of_bounds', False)))},"
+                f"{int(bool(info.get('coverage_stall_terminal', False)))},"
+                f"{int(bool(info.get('coverage_stall_active', False)))},"
+                f"{str(info.get('coverage_stall_reason', 'none')).replace(',', ';')},"
+                f"{int(info.get('coverage_stall_window_steps', 0))},"
+                f"{int(info.get('coverage_stall_window_len', 0))},"
+                f"{int(info.get('coverage_stall_slam_new_cells', 0))},"
+                f"{int(info.get('coverage_stall_confidence_updated_cells', 0))},"
+                f"{self._finite_or_blank(float(info.get('coverage_stall_coverage_delta', 0.0)))},"
+                f"{int(info.get('coverage_stall_consecutive_hits', 0))},"
+                f"{int(info.get('coverage_stall_no_progress_steps', 0))},"
+                f"{int(info.get('coverage_stall_hard_no_progress_steps', 0))},"
                 f"{int(bool(info.get('step_recovery', False)))},"
                 f"{self._finite_or_blank(float(info.get('scan_age_sec', -1.0)))},"
                 f"{self._finite_or_blank(float(info.get('odom_age_sec', -1.0)))},"
@@ -994,6 +1527,7 @@ class TrainingProgressCallback(BaseCallback):
                 f"{self._finite_or_blank(float(info.get('policy_v', 0.0)))},"
                 f"{self._finite_or_blank(float(info.get('policy_w', 0.0)))},"
                 f"{self._finite_or_blank(float(info.get('r_confidence', 0.0)))},"
+                f"{self._finite_or_blank(float(info.get('r_confidence_fill', 0.0)))},"
                 f"{self._finite_or_blank(float(info.get('r_slam', 0.0)))},"
                 f"{self._finite_or_blank(float(info.get('r_priority', 0.0)))},"
                 f"{self._finite_or_blank(float(info.get('r_wall', 0.0)))},"
@@ -1210,8 +1744,40 @@ def parse_args():
     parser.add_argument("--learning-starts", type=int, default=1_000)
     parser.add_argument("--buffer-size", type=int, default=100_000)
     parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--sac-learning-rate", type=float, default=3e-4)
     # SAC discount factor. 0.995 gives a longer planning horizon than the old hard-coded 0.99.
     parser.add_argument("--sac-gamma", type=float, default=0.995)
+    parser.add_argument("--sac-target-entropy", type=float, default=None)
+    parser.add_argument("--sac-reset-ent-coef", type=float, default=None)
+    parser.add_argument("--sac-min-ent-coef", type=float, default=None)
+    parser.add_argument(
+        "--sac-use-sde",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use generalized State-Dependent Exploration (gSDE) instead of per-step i.i.d. "
+        "Gaussian action noise. At control_dt~0.1s, independent noise averages out over an "
+        "episode (law of large numbers) and barely changes the macro-trajectory; gSDE holds a "
+        "state-dependent noise matrix fixed for --sac-sde-sample-freq steps so exploration "
+        "actually produces different trajectories. Only takes effect when starting a new model "
+        "(architecture differs from non-SDE checkpoints, so it cannot be toggled on --load-model).",
+    )
+    parser.add_argument(
+        "--sac-sde-sample-freq",
+        type=int,
+        default=32,
+        help="Steps between gSDE noise matrix resamples. SB3's own default (-1) resamples once "
+        "per collect_rollouts() call, which is only --train-freq-steps long (4-32 in this repo's "
+        "profiles) -- too short to fix the law-of-large-numbers washout this flag exists for. "
+        "Default here (32 steps, ~4s at control_dt=0.12s) is a fixed 'maneuver-length' window "
+        "decoupled from train_freq, long enough to produce a different trajectory but short "
+        "enough to recover from a bad noise draw before it turns into a sustained collision "
+        "course. Ignored unless --sac-use-sde is set.",
+    )
+    parser.add_argument("--warmup-action-steps", type=int, default=0)
+    parser.add_argument("--warmup-action-zero-linear-prob", type=float, default=0.0)
+    parser.add_argument("--warmup-action-random-prob", type=float, default=0.0)
+    parser.add_argument("--warmup-action-noise-prob", type=float, default=0.0)
+    parser.add_argument("--warmup-action-noise-std", type=float, default=0.25)
     # Gamma used only for episode discounted-return diagnostics in the environment overlay/log.
     parser.add_argument("--reward-gamma", type=float, default=0.995)
     parser.add_argument("--control-dt", type=float, default=0.12)
@@ -1221,7 +1787,7 @@ def parse_args():
     parser.add_argument("--namespace", type=str, default="")
     parser.add_argument("--cmd-vel-topic", type=str, default="cmd_vel")
 
-    parser.add_argument("--entity-name", type=str, default="turtlebot3_burger")
+    parser.add_argument("--entity-name", type=str, default=os.environ.get("TB3_RL_ENTITY_NAME", "burger"))
     parser.add_argument(
         "--set-pose-service",
         type=str,
@@ -1246,6 +1812,15 @@ def parse_args():
     parser.add_argument("--gazebo-startup-wait-sec", type=float, default=5.0)
     parser.add_argument("--gazebo-sensor-wait-timeout-sec", type=float, default=45.0)
     parser.add_argument("--gazebo-show-output", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--startup-require-training-geometry",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Before training, require LiDAR to see enough non-max-range obstacle geometry.",
+    )
+    parser.add_argument("--startup-geometry-wait-sec", type=float, default=8.0)
+    parser.add_argument("--startup-min-obstacle-beams", type=int, default=20)
+    parser.add_argument("--startup-max-valid-lidar-range-m", type=float, default=3.35)
     parser.add_argument(
         "--gazebo-extra-arg",
         action="append",
@@ -1536,9 +2111,10 @@ def parse_args():
     parser.add_argument("--map-bounds-min-local-known-ratio", type=float, default=0.04)
     parser.add_argument("--map-bounds-min-local-known-cells", type=int, default=12)
     parser.add_argument("--map-bounds-grace-steps", type=int, default=8)
-    parser.add_argument("--map-bounds-restart-penalty", type=float, default=100.0)
+    parser.add_argument("--map-bounds-restart-penalty", type=float, default=0.0)
     parser.add_argument("--slam-map-max-age-sec", type=float, default=3.0)
     # Strict SLAM map gating shared with eval_policy. Defaults are disabled for training unless explicitly enabled.
+    parser.add_argument("--no-mandatory-slam-reset-policy", dest="no_mandatory_slam_reset_policy", action="store_true", default=False)
     parser.add_argument("--strict-slam-map-required", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--strict-slam-map-wait-timeout-sec", type=float, default=30.0)
     parser.add_argument("--strict-slam-map-retry-interval-sec", type=float, default=0.50)
@@ -1579,20 +2155,20 @@ def parse_args():
     parser.add_argument("--priority-stuck-score-threshold", type=float, default=0.15)
     parser.add_argument("--priority-stuck-clear-gain-threshold", type=float, default=0.03)
     parser.add_argument("--priority-stuck-info-gain-threshold", type=float, default=0.0005)
-    parser.add_argument("--priority-stuck-restart-penalty", type=float, default=45.0)
+    parser.add_argument("--priority-stuck-restart-penalty", type=float, default=0.0)
 
     parser.add_argument("--lidar-empty-restart", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--lidar-empty-timeout-sec",
         type=float,
         default=2.5,
-        help="Restart with -100 if LiDAR has no valid finite hit below --lidar-empty-max-valid-range-m for this long.",
+        help="Restart if LiDAR has no valid finite hit below --lidar-empty-max-valid-range-m for this long.",
     )
     parser.add_argument("--lidar-empty-grace-sec", type=float, default=1.0)
     parser.add_argument("--lidar-empty-min-valid-range-m", type=float, default=0.12)
     parser.add_argument("--lidar-empty-max-valid-range-m", type=float, default=3.35)
     parser.add_argument("--lidar-empty-min-valid-beams", type=int, default=2)
-    parser.add_argument("--lidar-empty-restart-penalty", type=float, default=100.0)
+    parser.add_argument("--lidar-empty-restart-penalty", type=float, default=0.0)
 
     # v113: soft terminal for low-information episode tails.
     parser.add_argument("--coverage-stall-terminal", action=argparse.BooleanOptionalAction, default=False)
@@ -1600,7 +2176,9 @@ def parse_args():
     parser.add_argument("--coverage-stall-window-steps", type=int, default=500)
     parser.add_argument("--coverage-stall-min-slam-new-cells", type=int, default=5)
     parser.add_argument("--coverage-stall-min-confidence-updated-cells", type=int, default=30)
-    parser.add_argument("--coverage-stall-terminal-penalty", type=float, default=-1.0)
+    parser.add_argument("--coverage-stall-min-coverage-delta", type=float, default=0.002)
+    parser.add_argument("--coverage-stall-required-consecutive-windows", type=int, default=2)
+    parser.add_argument("--coverage-stall-terminal-penalty", type=float, default=0.0)
 
     # Pure velocity SAC safety shield.  Used only when --action-mode velocity.
     # Policy action remains forward-only; the shield may publish a short reverse
@@ -1650,6 +2228,7 @@ def parse_args():
     parser.add_argument("--shake-ground-max-z", type=float, default=0.13)
     parser.add_argument("--shake-leaky-decay", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--shake-yaw-wobble", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--shake-yaw-wobble-grace-steps", type=int, default=80)
     parser.add_argument("--shake-yaw-rate-threshold", type=float, default=0.24)
     parser.add_argument("--shake-cmd-flip-threshold", type=float, default=0.16)
     parser.add_argument("--shake-wobble-window-steps", type=int, default=8)
@@ -1678,7 +2257,7 @@ def parse_args():
     parser.add_argument("--nav2-stuck-backup-speed-mps", type=float, default=0.07)
     parser.add_argument("--nav2-stuck-backup-timeout-sec", type=float, default=4.0)
     parser.add_argument("--nav2-stuck-backup-cooldown-sec", type=float, default=5.0)
-    parser.add_argument("--nav2-stuck-backup-penalty", type=float, default=3.0)
+    parser.add_argument("--nav2-stuck-backup-penalty", type=float, default=0.0)
 
     # CNN map observation.
     parser.add_argument("--use-map-cnn", action=argparse.BooleanOptionalAction, default=True)
@@ -1706,6 +2285,8 @@ def parse_args():
     parser.add_argument("--seen-confidence-floor", type=float, default=80.0)
     parser.add_argument("--confidence-decay-per-step", type=float, default=0.0)
     parser.add_argument("--confidence-reward-weight", type=float, default=1.0)
+    parser.add_argument("--confidence-fill-reward-weight", type=float, default=0.0)
+    parser.add_argument("--confidence-fill-hold-weight", type=float, default=0.0)
     parser.add_argument("--slam-map-update-reward", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--slam-map-update-reward-weight", type=float, default=0.65)
     parser.add_argument("--slam-map-update-reward-norm-cells", type=float, default=50.0)
@@ -1790,6 +2371,7 @@ def parse_args():
     parser.add_argument("--load-replay-buffer", type=str, default="")
     parser.add_argument("--resume-latest", action=argparse.BooleanOptionalAction, default=False, help="Load the newest SAC checkpoint/final model from --model-dir if --load-model is not given.")
     parser.add_argument("--resume-replay-buffer", action=argparse.BooleanOptionalAction, default=True, help="When resuming, auto-load the matching replay buffer if present.")
+    parser.add_argument("--sac-reset-critics", action=argparse.BooleanOptionalAction, default=False, help="When loading a model, reinitialize SAC critics/targets but keep the actor. Useful after reward/action-execution changes.")
     parser.add_argument("--continue-timesteps", action=argparse.BooleanOptionalAction, default=True)
 
     parsed_args, _ = parser.parse_known_args()
@@ -1814,7 +2396,8 @@ def parse_args():
     parsed_args = _apply_training_profile(parsed_args)
     parsed_args = _apply_rviz_origin_policy(parsed_args)
     parsed_args = _force_nav2_only_policy(parsed_args)
-    parsed_args = _force_mandatory_slam_reset_policy(parsed_args)
+    if not bool(getattr(parsed_args, "no_mandatory_slam_reset_policy", False)):
+        parsed_args = _force_mandatory_slam_reset_policy(parsed_args)
     parsed_args = _force_odom_coordinate_policy(parsed_args)
     parsed_args = _force_no_priority_policy(parsed_args)
     return parsed_args
@@ -1882,9 +2465,26 @@ def main(args=None):
 
     sensor_wait_timeout = max(10.0, float(getattr(cli_args, "gazebo_sensor_wait_timeout_sec", 45.0)))
     if not ros.wait_for_sensor_ready(timeout_sec=sensor_wait_timeout):
+        if not bool(getattr(cli_args, "auto_start_gazebo", False)):
+            print(
+                "\n[TRAIN STARTUP ERROR] /scan and /odom were not received.\n"
+                "This training process no longer starts Gazebo by default.\n"
+                "Start the simulator in a separate terminal first:\n"
+                "  cd ~/Desktop/ROS2_Project\n"
+                "  bash run_gazebo.sh\n"
+                "Then start training in another terminal:\n"
+                "  cd ~/Desktop/ROS2_Project\n"
+                "  bash run_train.sh\n",
+                flush=True,
+            )
         ros.destroy_node()
         rclpy.shutdown()
         _terminate_process(gazebo_proc, "Gazebo")
+        return
+
+    if not _wait_for_training_geometry_ready(ros, cli_args):
+        ros.destroy_node()
+        rclpy.shutdown()
         _terminate_process(gazebo_proc, "Gazebo")
         return
 
@@ -1943,6 +2543,8 @@ def main(args=None):
             else cli_args.corridor_priority_reward_weight
         ),
         confidence_reward_weight=cli_args.confidence_reward_weight,
+        confidence_fill_reward_weight=cli_args.confidence_fill_reward_weight,
+        confidence_fill_hold_weight=cli_args.confidence_fill_hold_weight,
         slam_map_update_reward=cli_args.slam_map_update_reward,
         slam_map_update_reward_weight=cli_args.slam_map_update_reward_weight,
         slam_map_update_reward_norm_cells=cli_args.slam_map_update_reward_norm_cells,
@@ -2151,6 +2753,8 @@ def main(args=None):
         coverage_stall_window_steps=cli_args.coverage_stall_window_steps,
         coverage_stall_min_slam_new_cells=cli_args.coverage_stall_min_slam_new_cells,
         coverage_stall_min_confidence_updated_cells=cli_args.coverage_stall_min_confidence_updated_cells,
+        coverage_stall_min_coverage_delta=cli_args.coverage_stall_min_coverage_delta,
+        coverage_stall_required_consecutive_windows=cli_args.coverage_stall_required_consecutive_windows,
         coverage_stall_terminal_penalty=cli_args.coverage_stall_terminal_penalty,
         velocity_safety_backup=cli_args.velocity_safety_backup,
         velocity_safety_trigger_distance_m=cli_args.velocity_safety_trigger_distance_m,
@@ -2190,6 +2794,7 @@ def main(args=None):
         shake_ground_max_z=cli_args.shake_ground_max_z,
         shake_leaky_decay=cli_args.shake_leaky_decay,
         shake_yaw_wobble=cli_args.shake_yaw_wobble,
+        shake_yaw_wobble_grace_steps=cli_args.shake_yaw_wobble_grace_steps,
         shake_yaw_rate_threshold=cli_args.shake_yaw_rate_threshold,
         shake_cmd_flip_threshold=cli_args.shake_cmd_flip_threshold,
         shake_wobble_window_steps=cli_args.shake_wobble_window_steps,
@@ -2262,6 +2867,23 @@ def main(args=None):
             cli_args.load_model = str(latest_model)
             ros.get_logger().info(f"RESUME_LATEST | selected model={latest_model}")
 
+    if str(cli_args.load_model).strip():
+        requested_model = Path(cli_args.load_model).expanduser()
+        if not _is_valid_zip_model(requested_model):
+            fallback_model = _find_latest_sac_model(model_dir)
+            if fallback_model is not None and fallback_model != requested_model:
+                ros.get_logger().warn(
+                    "LOAD_MODEL_INVALID | "
+                    f"requested={requested_model} is empty/corrupt; using fallback={fallback_model}"
+                )
+                cli_args.load_model = str(fallback_model)
+            else:
+                ros.get_logger().error(
+                    "LOAD_MODEL_INVALID | "
+                    f"requested={requested_model} is empty/corrupt and no valid fallback exists; starting a new model"
+                )
+                cli_args.load_model = ""
+
     if cli_args.load_model and bool(getattr(cli_args, "resume_replay_buffer", True)) and not str(cli_args.load_replay_buffer).strip():
         guessed_rb = _guess_replay_buffer_path(Path(cli_args.load_model).expanduser(), model_dir)
         if guessed_rb is not None:
@@ -2280,6 +2902,27 @@ def main(args=None):
             weight_decay=float(cli_args.policy_weight_decay),
         ),
     )
+
+    action_dim = int(math.prod(env.action_space.shape)) if hasattr(env.action_space, "shape") else 2
+    effective_target_entropy = cli_args.sac_target_entropy
+    if bool(getattr(cli_args, "sac_use_sde", False)) and not cli_args.load_model:
+        # gSDE freezes a state-dependent noise matrix for sde_sample_freq steps instead of
+        # resampling i.i.d. noise every step. The whole point is to make the existing entropy
+        # budget translate into real trajectory diversity instead of self-cancelling jitter --
+        # not to also cut that budget. So leave target_entropy at the standard SB3 default
+        # (-action_dim); the only gSDE-specific safety knob here is use_expln=True, which keeps
+        # the state-dependent noise scale from growing unbounded as latent features grow during
+        # training (SB3's documented recommendation when use_sde=True).
+        policy_kwargs.update(use_expln=True)
+        if effective_target_entropy is None:
+            ros.get_logger().info(
+                "SAC_SDE_TARGET_ENTROPY | --sac-use-sde is on: keeping standard "
+                f"target_entropy=auto ({-float(action_dim):.2f}) -- gSDE makes the same entropy "
+                "budget more effective (correlated noise over "
+                f"{cli_args.sac_sde_sample_freq} steps instead of self-cancelling i.i.d. noise), "
+                "not a reason to explore less. policy_kwargs.use_expln=True bounds noise growth. "
+                "Override with --sac-target-entropy if you want to tune this explicitly."
+            )
 
     policy_name = "MlpPolicy"
 
@@ -2307,7 +2950,14 @@ def main(args=None):
         f"priority={cli_args.rl_priority_topic or '(off)'} filtered_slam={cli_args.rl_filtered_slam_topic or '(off)'} | "
         f"timesteps={cli_args.timesteps} model_dir={cli_args.model_dir} | "
         f"train_freq={cli_args.train_freq_steps} grad_steps={cli_args.gradient_steps} | "
+        f"lr={float(cli_args.sac_learning_rate):.6f} "
         f"sac_gamma={max(0.0, min(0.9999, float(cli_args.sac_gamma))):.4f} "
+        f"target_entropy={effective_target_entropy if effective_target_entropy is not None else 'auto'} "
+        f"reset_alpha={cli_args.sac_reset_ent_coef if cli_args.sac_reset_ent_coef is not None else 'off'} "
+        f"warmup_mix=({int(cli_args.warmup_action_steps)},"
+        f"rand={float(cli_args.warmup_action_random_prob):.2f},"
+        f"noise={float(cli_args.warmup_action_noise_prob):.2f},"
+        f"std={float(cli_args.warmup_action_noise_std):.2f}) "
         f"reward_gamma={max(0.0, min(0.9999, float(cli_args.reward_gamma))):.4f} | "
         f"cmd_limit=({float(getattr(cli_args, 'velocity_command_linear_limit', 0.0)):.3f},"
         f"{float(getattr(cli_args, 'velocity_command_angular_limit', 0.0)):.3f}) | "
@@ -2338,6 +2988,11 @@ def main(args=None):
         f"load_model={cli_args.load_model or '(new)'}, "
         f"load_replay_buffer={cli_args.load_replay_buffer or '(none)'}, "
         f"continue_timesteps={cli_args.continue_timesteps}, "
+        f"target_entropy={effective_target_entropy if effective_target_entropy is not None else 'auto'}, "
+        f"reset_alpha={cli_args.sac_reset_ent_coef if cli_args.sac_reset_ent_coef is not None else 'off'}, "
+        f"min_alpha={cli_args.sac_min_ent_coef if cli_args.sac_min_ent_coef is not None else 'off'}, "
+        f"lr={float(cli_args.sac_learning_rate):.6f}, "
+        f"warmup_actions={int(cli_args.warmup_action_steps)}, "
         f"weight_decay={cli_args.policy_weight_decay}"
     )
 
@@ -2427,6 +3082,13 @@ def main(args=None):
             device=sac_device,
             custom_objects={"replay_buffer_class": SkipStoreDictReplayBuffer},
         )
+        if bool(getattr(cli_args, "sac_use_sde", False)) and not bool(getattr(model, "use_sde", False)):
+            ros.get_logger().warn(
+                "SAC_USE_SDE_IGNORED | --sac-use-sde was requested but the loaded checkpoint "
+                "was trained without gSDE. gSDE changes the actor's log_std parameter shape, so "
+                "it cannot be toggled on a resumed model without breaking the loaded weights. "
+                "Start a fresh model (no --load-model) to train with gSDE."
+            )
         # Ensure the skip-store buffer class sticks even if the loaded checkpoint
         # recorded the default DictReplayBuffer.  If the buffer is (re)created
         # later it will use our subclass.
@@ -2458,9 +3120,13 @@ def main(args=None):
             pass
         model.gradient_steps = max(int(cli_args.gradient_steps), 0)
         model.batch_size = int(cli_args.batch_size)
-        model.learning_starts = min(int(cli_args.learning_starts), int(getattr(model, "learning_starts", cli_args.learning_starts)))
+        model.learning_starts = max(int(cli_args.learning_starts), 0)
+        model.learning_rate = float(cli_args.sac_learning_rate)
+        model.lr_schedule = get_schedule_fn(float(cli_args.sac_learning_rate))
         # Allow longer-horizon fine-tuning even when loading an existing SAC checkpoint.
         model.gamma = max(0.0, min(0.9999, float(cli_args.sac_gamma)))
+        if cli_args.sac_target_entropy is not None:
+            model.target_entropy = float(cli_args.sac_target_entropy)
 
         # Reward-only 변경은 policy 구조를 바꾸지 않으므로 env만 교체해서 이어 학습 가능하다.
         # 단, replay buffer는 SAC.save()에 포함되지 않는다. 저장해 둔 buffer가 있으면 별도로 로드한다.
@@ -2480,7 +3146,7 @@ def main(args=None):
         model = SAC(
             policy=policy_name,
             env=env,
-            learning_rate=3e-4,
+            learning_rate=float(cli_args.sac_learning_rate),
             buffer_size=cli_args.buffer_size,
             learning_starts=cli_args.learning_starts,
             batch_size=cli_args.batch_size,
@@ -2489,12 +3155,28 @@ def main(args=None):
             train_freq=(max(int(cli_args.train_freq_steps), 1), "step"),
             gradient_steps=max(int(cli_args.gradient_steps), 0),
             ent_coef="auto",
+            target_entropy=effective_target_entropy if effective_target_entropy is not None else "auto",
+            use_sde=bool(getattr(cli_args, "sac_use_sde", False)),
+            sde_sample_freq=int(getattr(cli_args, "sac_sde_sample_freq", -1)),
             verbose=int(getattr(cli_args, "sac_verbose", 0)),
             tensorboard_log=str(log_dir),
             policy_kwargs=policy_kwargs,
             device=sac_device,
             replay_buffer_class=SkipStoreDictReplayBuffer,
         )
+
+    if bool(getattr(cli_args, "sac_reset_critics", False)):
+        _reset_sac_critics(model, logger=ros.get_logger())
+    _reset_sac_entropy_coefficient(model, cli_args.sac_reset_ent_coef, logger=ros.get_logger())
+    _install_warmup_action_mixer(
+        model,
+        warmup_steps=cli_args.warmup_action_steps,
+        zero_linear_prob=cli_args.warmup_action_zero_linear_prob,
+        random_prob=cli_args.warmup_action_random_prob,
+        noise_prob=cli_args.warmup_action_noise_prob,
+        noise_std=cli_args.warmup_action_noise_std,
+        logger=ros.get_logger(),
+    )
 
     try:
         ros.get_logger().info(f"SAC_DEVICE_ACTIVE | device={getattr(model, 'device', 'unknown')}")
@@ -2536,21 +3218,53 @@ def main(args=None):
 
     try:
         callbacks = [checkpoint_callback]
+        if cli_args.sac_min_ent_coef is not None and float(cli_args.sac_min_ent_coef) > 0.0:
+            callbacks.append(EntropyCoefficientFloorCallback(cli_args.sac_min_ent_coef, verbose=1))
         if progress_callback is not None:
             callbacks.append(progress_callback)
         if cli_args.debug_print_freq > 0:
             callbacks.append(debug_callback)
+
+        if str(os.environ.get("TB3_RL_TIME_GRAD_UPDATE", "0")).strip().lower() in {"1", "true", "yes", "on"}:
+            _orig_train = model.train
+            _grad_update_stats = {"n": 0, "acc": 0.0}
+
+            def _timed_train(*_targs, **_tkwargs):
+                _t0 = time.perf_counter()
+                _result = _orig_train(*_targs, **_tkwargs)
+                _dt = time.perf_counter() - _t0
+                _grad_update_stats["n"] += 1
+                _grad_update_stats["acc"] += _dt
+                n = _grad_update_stats["n"]
+                if n % 5 == 0 or _dt > 0.5:
+                    ros.get_logger().warn(
+                        "GRAD_UPDATE_TIME | "
+                        f"call={n} last={_dt * 1000.0:.1f}ms avg={_grad_update_stats['acc'] / n * 1000.0:.1f}ms"
+                    )
+                return _result
+
+            model.train = _timed_train
 
         learn_error = None
         try:
             model.learn(
                 total_timesteps=cli_args.timesteps,
                 callback=callbacks,
-                log_interval=1,
+                log_interval=4,
                 reset_num_timesteps=not bool(cli_args.continue_timesteps),
             )
         except KeyboardInterrupt:
             learn_error = "KeyboardInterrupt"
+            # OffPolicyAlgorithm.learn() calls callback.on_training_end() only
+            # on a *normal* loop exit, not when an exception unwinds out of it
+            # -- so our rich.live.Live (if active) is never told to stop and
+            # would otherwise keep holding the terminal region while the
+            # emergency-save messages below try to print.
+            if progress_callback is not None and getattr(progress_callback, "_rich_live", None) is not None:
+                try:
+                    progress_callback._rich_live.stop()
+                except Exception:
+                    pass
             try:
                 ros.get_logger().warn(
                     "TRAINING_INTERRUPTED | KeyboardInterrupt received; saving emergency checkpoint."
@@ -2559,6 +3273,11 @@ def main(args=None):
                 pass
         except Exception as exc:
             learn_error = f"{type(exc).__name__}: {exc}"
+            if progress_callback is not None and getattr(progress_callback, "_rich_live", None) is not None:
+                try:
+                    progress_callback._rich_live.stop()
+                except Exception:
+                    pass
             try:
                 ros.get_logger().error(
                     f"TRAINING_ABORTED | learn() raised; saving emergency checkpoint | {learn_error}"
@@ -2570,8 +3289,8 @@ def main(args=None):
             # Best-effort emergency save so a long run is never lost on a late crash.
             try:
                 emergency_path = model_dir / "sac_turtlebot3_burger_emergency"
-                model.save(str(emergency_path))
-                ros.get_logger().info(f"Saved emergency model to {emergency_path}.zip")
+                emergency_zip = _safe_save_sac_model(model, emergency_path, logger=ros.get_logger())
+                ros.get_logger().info(f"Saved emergency model to {emergency_zip}")
                 if bool(cli_args.save_replay_buffer):
                     em_replay = model_dir / "sac_turtlebot3_burger_emergency_replay_buffer.pkl"
                     model.save_replay_buffer(str(em_replay))
@@ -2587,12 +3306,12 @@ def main(args=None):
         # retry once into a timestamped fallback path so a long run is never lost.
         save_path = model_dir / "sac_turtlebot3_burger"
         try:
-            model.save(str(save_path))
+            saved_zip = _safe_save_sac_model(model, save_path, logger=ros.get_logger())
             if bool(cli_args.save_replay_buffer):
                 replay_path = model_dir / "sac_turtlebot3_burger_replay_buffer.pkl"
                 model.save_replay_buffer(str(replay_path))
                 ros.get_logger().info(f"Saved replay buffer to {replay_path}")
-            ros.get_logger().info(f"Saved model to {save_path}.zip")
+            ros.get_logger().info(f"Saved model to {saved_zip}")
         except Exception as final_exc:
             try:
                 ros.get_logger().error(
@@ -2603,14 +3322,14 @@ def main(args=None):
             try:
                 import time as _t
                 fb = model_dir / f"sac_turtlebot3_burger_savefail_{int(_t.time())}"
-                model.save(str(fb))
-                ros.get_logger().info(f"Saved model to fallback {fb}.zip")
+                fb_zip = _safe_save_sac_model(model, fb, logger=ros.get_logger())
+                ros.get_logger().info(f"Saved model to fallback {fb_zip}")
             except Exception as fb_exc:
                 # Last resort: try the home directory so the weights are not lost.
                 try:
                     home_fb = Path.home() / f"sac_turtlebot3_burger_rescue_{int(time.time())}"
-                    model.save(str(home_fb))
-                    ros.get_logger().error(f"FINAL_SAVE_RESCUE | saved to {home_fb}.zip")
+                    home_fb_zip = _safe_save_sac_model(model, home_fb, logger=ros.get_logger())
+                    ros.get_logger().error(f"FINAL_SAVE_RESCUE | saved to {home_fb_zip}")
                 except Exception as rescue_exc:
                     try:
                         ros.get_logger().error(

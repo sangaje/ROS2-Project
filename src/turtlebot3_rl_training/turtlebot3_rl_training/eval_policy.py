@@ -1,7 +1,6 @@
 import argparse
 import atexit
 import os
-import signal
 import subprocess
 import time
 from pathlib import Path
@@ -10,6 +9,10 @@ from typing import Optional
 import numpy as np
 import rclpy
 from stable_baselines3 import SAC
+
+from turtlebot3_rl_training.feature_extractor import MapVectorFeatureExtractor
+from turtlebot3_rl_training.gazebo_nav_env import GazeboNavEnv
+from turtlebot3_rl_training.ros_interface import TurtleBot3RosInterface
 
 
 
@@ -77,10 +80,6 @@ def _start_gazebo_if_requested(cli_args) -> Optional[subprocess.Popen]:
     if wait_sec > 0.0:
         time.sleep(wait_sec)
     return proc
-
-from turtlebot3_rl_training.feature_extractor import MapVectorFeatureExtractor
-from turtlebot3_rl_training.gazebo_nav_env import GazeboNavEnv
-from turtlebot3_rl_training.ros_interface import TurtleBot3RosInterface
 
 try:
     from turtlebot3_rl_training.process_cleanup import (
@@ -734,6 +733,7 @@ def parse_args():
     parser.add_argument("--shake-ground-max-z", type=float, default=0.13)
     parser.add_argument("--shake-leaky-decay", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--shake-yaw-wobble", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--shake-yaw-wobble-grace-steps", type=int, default=80)
     parser.add_argument("--shake-yaw-rate-threshold", type=float, default=0.24)
     parser.add_argument("--shake-cmd-flip-threshold", type=float, default=0.16)
     parser.add_argument("--shake-wobble-window-steps", type=int, default=8)
@@ -1124,6 +1124,7 @@ def main(args=None):
         shake_ground_max_z=cli_args.shake_ground_max_z,
         shake_leaky_decay=cli_args.shake_leaky_decay,
         shake_yaw_wobble=cli_args.shake_yaw_wobble,
+        shake_yaw_wobble_grace_steps=cli_args.shake_yaw_wobble_grace_steps,
         shake_yaw_rate_threshold=cli_args.shake_yaw_rate_threshold,
         shake_cmd_flip_threshold=cli_args.shake_cmd_flip_threshold,
         shake_wobble_window_steps=cli_args.shake_wobble_window_steps,
