@@ -134,6 +134,39 @@ class GazeboSimController:
 
         return self._call(req, timeout_sec=timeout_sec)
 
+    def reset_world(self, mode: str = "all", timeout_sec: float = 3.0) -> bool:
+        """Request Gazebo world reset through ControlWorld.
+
+        mode:
+          - "all": reset time + models (equivalent to GUI reset world)
+          - "time_only": reset simulation time only
+          - "model_only": reset model poses/velocities only
+        """
+        if not self.wait_until_ready():
+            return False
+
+        req = ControlWorld.Request()
+        world_reset = getattr(req.world_control, "reset", None)
+        if world_reset is None:
+            self.node.get_logger().error(
+                "ControlWorld request has no world_control.reset field; cannot reset world"
+            )
+            return False
+
+        mode_norm = str(mode or "all").strip().lower()
+        try:
+            if mode_norm == "time_only":
+                world_reset.time_only = True
+            elif mode_norm == "model_only":
+                world_reset.model_only = True
+            else:
+                world_reset.all = True
+        except Exception as exc:
+            self.node.get_logger().error(f"Failed to configure world reset request: {exc}")
+            return False
+
+        return self._call(req, timeout_sec=timeout_sec)
+
     def _call(self, req: ControlWorld.Request, timeout_sec: float = 2.0) -> bool:
         future = self.client.call_async(req)
 
