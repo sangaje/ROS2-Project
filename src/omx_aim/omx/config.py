@@ -128,8 +128,8 @@ class PatrolConfig:
     target_scan_timeout_sec: float = 5.0
     boundary_scan_timeout_sec: float = 1.0
     boundary_aim_settle_sec: float = 0.05
-    scan_sweep_half_angle_deg: float = 35.0
-    scan_sweep_period_sec: float = 0.8
+    scan_sweep_half_angle_deg: float = 60.0
+    scan_sweep_period_sec: float = 5.0
     
 @dataclass
 class ViewPoseConfig:
