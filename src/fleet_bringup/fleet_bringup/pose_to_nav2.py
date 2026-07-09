@@ -7,6 +7,7 @@ from functools import partial
 from typing import Optional
 
 import rclpy
+from action_msgs.msg import GoalStatus
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.exceptions import ParameterAlreadyDeclaredException
@@ -80,6 +81,15 @@ class PoseToNav2Action(Node):
         self.lifecycle_retry_sec = max(
             0.5, float(_safe_declare(self, 'lifecycle_retry_sec', 2.0))
         )
+        self.retry_failed_results = bool(
+            _safe_declare(self, 'retry_failed_results', True)
+        )
+        self.max_result_retries = max(
+            0, int(_safe_declare(self, 'max_result_retries', 2))
+        )
+        self.result_retry_sec = max(
+            0.5, float(_safe_declare(self, 'result_retry_sec', 2.0))
+        )
         self.require_localization_ready = bool(
             _safe_declare(self, 'require_localization_ready', False)
         )
@@ -142,6 +152,7 @@ class PoseToNav2Action(Node):
         self.state_future = None
         self.startup_future = None
         self.last_lifecycle_start_time = -1.0e9
+        self.failed_result_retries = 0
         self.retry_timer = self.create_timer(0.25, self._try_send_pending)
 
         self.get_logger().info(
@@ -169,6 +180,7 @@ class PoseToNav2Action(Node):
         # Keep only the newest command while Nav2 is starting. Dropping a goal
         # here makes an RViz goal appear to vanish with no way to recover it.
         self.pending_goal = deepcopy(msg)
+        self.failed_result_retries = 0
         self.retry_not_before = -1.0e9
         self._try_send_pending()
 
@@ -400,11 +412,20 @@ class PoseToNav2Action(Node):
         self.current_goal_id = goal_id
         result_future = goal_handle.get_result_async()
         result_future.add_done_callback(
-            partial(self._result_cb, goal_id=goal_id)
+            partial(
+                self._result_cb,
+                goal_id=goal_id,
+                sent_goal=deepcopy(sent_goal),
+            )
         )
         self.get_logger().info('NAV2_GOAL_ACCEPTED')
 
-    def _result_cb(self, future, goal_id: int) -> None:
+    def _result_cb(
+        self,
+        future,
+        goal_id: int,
+        sent_goal: PoseStamped,
+    ) -> None:
         try:
             result = future.result()
         except Exception as exc:  # noqa: BLE001
@@ -414,6 +435,26 @@ class PoseToNav2Action(Node):
             self.current_goal_handle = None
             self.current_goal_id = 0
         self.get_logger().info(f'NAV2_GOAL_RESULT | status={result.status}')
+        if (
+            goal_id == self.goal_count
+            and result.status != GoalStatus.STATUS_SUCCEEDED
+            and self.retry_failed_results
+            and self.pending_goal is None
+            and self.failed_result_retries < self.max_result_retries
+        ):
+            self.failed_result_retries += 1
+            self.pending_goal = sent_goal
+            self.retry_not_before = (
+                self.get_clock().now().nanoseconds * 1.0e-9
+                + self.result_retry_sec
+            )
+            self.navigation_active = None
+            self.get_logger().warning(
+                'NAV2_GOAL_RESULT_RETRY_SCHEDULED | '
+                f'status={result.status} '
+                f'retry={self.failed_result_retries}/{self.max_result_retries} '
+                f'in={self.result_retry_sec:.1f}s'
+            )
 
     def _feedback_cb(self, feedback_msg) -> None:
         fb = feedback_msg.feedback
