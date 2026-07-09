@@ -45,6 +45,7 @@ def generate_launch_description():
     enable_cartographer = LaunchConfiguration('enable_cartographer')
     auto_localize = LaunchConfiguration('auto_localize')
     localization_scan_topic = LaunchConfiguration('localization_scan_topic')
+    hardware_param_file = LaunchConfiguration('hardware_param_file')
     initial_x = LaunchConfiguration('leader_initial_x')
     initial_y = LaunchConfiguration('leader_initial_y')
     initial_yaw = LaunchConfiguration('leader_initial_yaw')
@@ -67,6 +68,13 @@ def generate_launch_description():
             not cartographer_owned
             and launch_bool(auto_localize.perform(context))
         )
+        leader_hardware_param_file = hardware_param_file.perform(context).strip()
+        if not leader_hardware_param_file:
+            leader_hardware_param_file = os.path.join(
+                package_share,
+                'config',
+                'turtlebot3_waffle_pi_stamped_cmd_vel.yaml',
+            )
 
         nav2_params = RewrittenYaml(
             source_file=os.path.join(
@@ -368,6 +376,7 @@ def generate_launch_description():
                 launch_arguments={
                     'domain_id': domain,
                     'start_robot_bringup': start_robot_bringup.perform(context),
+                    'hardware_param_file': leader_hardware_param_file,
                     'start_nav2': start_nav2.perform(context),
                     'nav2_params_file': nav2_params,
                     'goal_pose_topic': '/fleet/leader_coord_goal',
@@ -609,6 +618,14 @@ def generate_launch_description():
                 'deadlock when optional OMX scan_processor (/scan_filtered) '
                 'is not running. Pass /scan_filtered only after verifying it '
                 'is publishing.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'hardware_param_file',
+            default_value='',
+            description=(
+                'Optional TurtleBot3 hardware params. Empty uses the '
+                'fleet_bringup Waffle Pi stamped /cmd_vel override.'
             ),
         ),
         DeclareLaunchArgument('leader_initial_x', default_value='0.0'),
