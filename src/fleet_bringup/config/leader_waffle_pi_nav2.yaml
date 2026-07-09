@@ -1,7 +1,9 @@
 # Waffle Pi leader Nav2 config.
 # Based on waffle_pi.yaml, adapted for the leader's external-map AMCL mode:
-# /map is supplied by the scout through domain_bridge -> map_relay, and
-# /scan_filtered is used to mask the OMX/self structure before localization.
+# /map is supplied by the scout through domain_bridge -> map_relay. The launch
+# file rewrites every LaserScan consumer to localization_scan_topic, which
+# defaults to raw /scan so AMCL can start even when optional /scan_filtered is
+# not running.
 
 amcl:
   ros__parameters:

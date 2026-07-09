@@ -598,11 +598,13 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'localization_scan_topic',
-            default_value='/scan_filtered',
+            default_value='/scan',
             description=(
                 'Real external-map leader mode: LaserScan topic consumed by '
-                'AMCL/Nav2. The Waffle OMX stack starts scan_processor, '
-                'which masks self-obstacles and republishes /scan_filtered.'
+                'AMCL/Nav2. Defaults to raw /scan so localization does not '
+                'deadlock when optional OMX scan_processor (/scan_filtered) '
+                'is not running. Pass /scan_filtered only after verifying it '
+                'is publishing.'
             ),
         ),
         DeclareLaunchArgument('leader_initial_x', default_value='0.0'),

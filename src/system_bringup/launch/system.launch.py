@@ -612,7 +612,7 @@ def generate_launch_description():
                             'enable_leader_continuous_scan': launch_bool(
                                 enable_leader_continuous_scan.perform(context)
                             ),
-                            'leader_scan_topic': '/scan_filtered',
+                            'leader_scan_topic': '/scan',
                             'leader_scan_fov_deg': float(
                                 leader_scan_fov_deg.perform(context)
                             ),

@@ -96,7 +96,7 @@ class LeaderShadowFollow(Node):
         self.declare_parameter('allow_unknown_shadow_target', False)
 
         self.declare_parameter('enable_leader_continuous_scan', True)
-        self.declare_parameter('leader_scan_topic', '/scan_filtered')
+        self.declare_parameter('leader_scan_topic', '/scan')
         self.declare_parameter('leader_scan_fov_deg', 60.0)
         self.declare_parameter('leader_scan_update_rate_hz', 10.0)
         self.declare_parameter('leader_scan_timeout_sec', 1.0)
