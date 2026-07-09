@@ -25,6 +25,8 @@ def _bare_node() -> GlobalLocalizeKickstart:
     node._member_pose_wall = None
     node._burger_pose = None
     node._burger_pose_wall = None
+    node._last_scout_pose = None
+    node._last_scout_pose_wall = None
     node._pending_seed_source = None
     node._pending_seed_age = None
     node._last_seed_wait_detail = ''
@@ -63,3 +65,17 @@ def test_scout_seed_prefers_active_follower_when_available():
     assert seed[1] == 0.8
     assert seed[2] == pytest.approx(-1.1)
     assert node._pending_seed_source == 'follower21'
+
+
+def test_scout_seed_can_fallback_to_latched_last_scout_pose():
+    node = _bare_node()
+    node._last_scout_pose = _pose(2.0, 0.5, 1.2)
+    node._last_scout_pose_wall = 98.0
+
+    seed = node._scout_seed_pose()
+
+    assert seed is not None
+    assert seed[0] == 2.0
+    assert seed[1] == 0.5
+    assert seed[2] == pytest.approx(1.2)
+    assert node._pending_seed_source == 'last_scout_pose'

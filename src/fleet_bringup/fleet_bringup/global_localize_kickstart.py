@@ -112,8 +112,9 @@ class GlobalLocalizeKickstart(Node):
         self.declare_parameter('follower_robot_name', 'follower21')
         self.declare_parameter('member_pose_topic', '/member_pose')
         self.declare_parameter('burger_pose_topic', '/burger_pose')
+        self.declare_parameter('last_scout_pose_topic', '/failover/last_scout_pose')
         self.declare_parameter('scout_pose_max_age_sec', 5.0)
-        self.declare_parameter('scout_pose_wait_timeout_sec', 8.0)
+        self.declare_parameter('scout_pose_wait_timeout_sec', 0.1)
         self.declare_parameter('initial_pose_topic', '/initialpose')
         self.declare_parameter('initial_pose_xy_std_m', 0.5)
         self.declare_parameter('initial_pose_yaw_std_deg', 25.0)
@@ -175,6 +176,7 @@ class GlobalLocalizeKickstart(Node):
         self.follower_robot_name = str(get('follower_robot_name').value)
         self.member_pose_topic = str(get('member_pose_topic').value)
         self.burger_pose_topic = str(get('burger_pose_topic').value)
+        self.last_scout_pose_topic = str(get('last_scout_pose_topic').value)
         self.scout_pose_max_age_sec = max(0.1, float(get('scout_pose_max_age_sec').value))
         self.scout_pose_wait_timeout_sec = max(
             0.1, float(get('scout_pose_wait_timeout_sec').value)
@@ -266,6 +268,9 @@ class GlobalLocalizeKickstart(Node):
         self.create_subscription(
             PoseStamped, self.burger_pose_topic, self._on_burger_pose, 10
         )
+        self.create_subscription(
+            PoseStamped, self.last_scout_pose_topic, self._on_last_scout_pose, latched_qos
+        )
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -300,6 +305,8 @@ class GlobalLocalizeKickstart(Node):
         self._member_pose_wall: Optional[float] = None
         self._burger_pose: Optional[PoseStamped] = None
         self._burger_pose_wall: Optional[float] = None
+        self._last_scout_pose: Optional[PoseStamped] = None
+        self._last_scout_pose_wall: Optional[float] = None
         self._scout_pose_wait_start: Optional[float] = None
         self._pending_seed_pose: Optional[tuple] = None
         self._pending_seed_source: Optional[str] = None
@@ -377,6 +384,10 @@ class GlobalLocalizeKickstart(Node):
     def _on_burger_pose(self, msg: PoseStamped) -> None:
         self._burger_pose = msg
         self._burger_pose_wall = self._now()
+
+    def _on_last_scout_pose(self, msg: PoseStamped) -> None:
+        self._last_scout_pose = msg
+        self._last_scout_pose_wall = self._now()
 
     def _on_amcl_pose(self, msg: PoseWithCovarianceStamped) -> None:
         cov = msg.pose.covariance
@@ -460,12 +471,17 @@ class GlobalLocalizeKickstart(Node):
             self._burger_pose,
             self._burger_pose_wall,
         )
+        last_scout = (
+            'last_scout_pose',
+            self._last_scout_pose,
+            self._last_scout_pose_wall,
+        )
         if self._active_scout_id == self.follower_robot_name:
-            ordered = (follower, member)
+            ordered = (follower, member, last_scout)
         elif self._active_scout_id == self.active_scout_robot_name:
-            ordered = (member, follower)
+            ordered = (member, last_scout, follower)
         else:
-            ordered = (member, follower)
+            ordered = (member, last_scout, follower)
 
         stale = []
         for source, pose, wall in ordered:
