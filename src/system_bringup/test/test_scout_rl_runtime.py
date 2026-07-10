@@ -224,6 +224,24 @@ def test_first_predict_exception_does_not_deactivate_active_scout():
     assert commands[0][1] == 0.0
 
 
+def test_command_watchdog_holds_and_retries_without_deactivating_active_scout():
+    runtime = ActiveScoutRLRuntime.__new__(ActiveScoutRLRuntime)
+    runtime.config = active_scout_config()
+    runtime._active = True
+    runtime._map_snapshot = object()
+    now = __import__('time').monotonic()
+    runtime._activated_at = now - runtime.config.command_timeout_sec - 0.1
+    runtime._last_command_at = now - runtime.config.command_timeout_sec - 0.1
+    runtime._warn_throttled = lambda message: None
+    holds = []
+    runtime._hold = holds.append
+
+    runtime._command_watchdog()
+
+    assert runtime.active is True
+    assert holds == ['command_timeout']
+
+
 def test_deployment_runtime_has_no_process_or_nondeterministic_predict_path():
     source = Path(__file__).parents[1] / 'system_bringup' / 'scout_rl_runtime.py'
     text = source.read_text(encoding='utf-8')

@@ -534,7 +534,10 @@ class ActiveScoutRLRuntime:
             and now - self._last_command_at > self.config.command_timeout_sec
         ):
             self._warn_throttled('SCOUT_RL_COMMAND_TIMEOUT')
-            self._stop('command_timeout')
+            # A delayed first map crop or predict must not revoke ACTIVE_SCOUT.
+            # Publish an explicit zero so no old action survives, then let the
+            # next timer tick retry with the newest sensor snapshot.
+            self._hold('command_timeout')
 
     def _hold(self, reason: str) -> None:
         """Keep the role active while a startup/transient data gate recovers."""
