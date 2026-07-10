@@ -10,8 +10,8 @@
     "max_scan_age_sec": 0.5,
     "max_map_age_sec": 3.0,
     "max_tf_age_sec": 0.5,
-    "max_inference_sec": 0.18,
-    "command_timeout_sec": 0.25,
+    "max_inference_sec": 1.0,
+    "command_timeout_sec": 1.5,
     "topics": {
       "scan": "/scan",
       "map": "/map",

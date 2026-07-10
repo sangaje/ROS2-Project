@@ -441,9 +441,7 @@ class ActiveScoutRLRuntime:
         if (
             not self._fresh(snapshot, now)
             or map_snapshot is None
-            or map_snapshot.scan_generation != snapshot.scan_generation
-            or map_snapshot.map_generation != snapshot.map_generation
-            or now - map_snapshot.updated_at > self.config.control_dt_sec
+            or now - map_snapshot.updated_at > self.config.max_scan_age_sec
         ):
             self._hold('waiting_for_coherent_observation')
             return
