@@ -59,10 +59,96 @@ from turtlebot3_rl_training.reward import (
 )
 from turtlebot3_rl_training.sim_controller import GazeboSimController
 
+
+class _ThreadSafeScanAnglesCache(dict):
+    """Defensive cache for scan-angle arrays shared across env/timer callbacks.
+
+    The cache key is ``(angle_min, angle_increment, beam_count)``. The RL
+    environment can read scan geometry from more than one callback path, while
+    the cache also performs bounded eviction. A check/get or iter/pop sequence
+    can therefore observe a key disappearing between two dict operations and
+    raise ``KeyError(key)`` from inside ``env.step()``.
+
+    Keep the existing dict-like API so current call sites do not change, but:
+      * serialize individual cache operations with an RLock;
+      * iterate over a key snapshot, so eviction iteration is mutation-safe;
+      * make eviction pop idempotent when another path already removed the key;
+      * rebuild a missing scan-angle entry on ``__getitem__`` instead of leaking
+        a transient cache miss into the Gymnasium episode boundary.
+
+    Rebuilding uses float64, matching NumPy's normal result for
+    ``angle_min + np.arange(n) * angle_increment`` and avoiding observation or
+    safety-threshold semantics changes.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def _rebuild(key):
+        try:
+            angle_min, angle_increment, beam_count = key
+            n = int(beam_count)
+            angle_min = float(angle_min)
+            angle_increment = float(angle_increment)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise KeyError(key) from exc
+
+        if n < 0 or not math.isfinite(angle_min) or not math.isfinite(angle_increment):
+            raise KeyError(key)
+
+        return angle_min + np.arange(n, dtype=np.float64) * angle_increment
+
+    def __contains__(self, key):
+        with self._lock:
+            return super().__contains__(key)
+
+    def __getitem__(self, key):
+        with self._lock:
+            try:
+                return super().__getitem__(key)
+            except KeyError:
+                # A concurrent bounded-eviction path may have removed the key
+                # after a prior membership check. Reconstruct deterministically.
+                value = self._rebuild(key)
+                super().__setitem__(key, value)
+                return value
+
+    def __setitem__(self, key, value):
+        with self._lock:
+            return super().__setitem__(key, value)
+
+    def get(self, key, default=None):
+        with self._lock:
+            return super().get(key, default)
+
+    def pop(self, key, *args):
+        with self._lock:
+            if args:
+                return super().pop(key, *args)
+            # Idempotent eviction: another callback may already have popped it.
+            return super().pop(key, None)
+
+    def clear(self):
+        with self._lock:
+            return super().clear()
+
+    def __len__(self):
+        with self._lock:
+            return super().__len__()
+
+    def __iter__(self):
+        # Never expose a live dict iterator to code that may race with insert/evict.
+        with self._lock:
+            keys_snapshot = tuple(super().keys())
+        return iter(keys_snapshot)
+
+
 # Module-level cache for pre-computed scan angle arrays keyed on scan geometry.
 # Avoids recomputing np.arange + angle_min + idx*angle_increment on every call
 # to _scan_min_distance_in_sector (which is called multiple times per step).
-_SCAN_ANGLES_CACHE: dict = {}
+_SCAN_ANGLES_CACHE: dict = _ThreadSafeScanAnglesCache()
 
 
 def _quiet_reset_logs() -> bool:
