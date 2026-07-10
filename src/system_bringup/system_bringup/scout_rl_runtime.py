@@ -205,6 +205,7 @@ class ActiveScoutRLRuntime:
         self._last_command_at = 0.0
         self._activated_at = 0.0
         self._last_error_at = 0.0
+        self._last_stop_reason = 'not_activated'
         self._model_error: Optional[str] = None
         self._sensor_group = ReentrantCallbackGroup()
         self._policy_group = MutuallyExclusiveCallbackGroup()
@@ -300,10 +301,15 @@ class ActiveScoutRLRuntime:
     def active(self) -> bool:
         return self._active
 
+    @property
+    def last_stop_reason(self) -> str:
+        return self._last_stop_reason
+
     def activate(self) -> None:
         self._reset_episode_state()
         self._active = self.ready
         self._activated_at = time.monotonic()
+        self._last_stop_reason = ''
         if not self.ready:
             self._stop('model_unavailable')
             self.node.get_logger().error(f'SCOUT_RL_UNAVAILABLE | {self._model_error}')
@@ -521,8 +527,11 @@ class ActiveScoutRLRuntime:
     def _stop(self, reason: str) -> None:
         was_active = self._active
         self._active = False
+        self._last_stop_reason = reason
         self._last_command_at = 0.0
         self.publish_command(0.0, 0.0)
+        if was_active:
+            self.node.get_logger().error(f'SCOUT_RL_STOP | reason={reason}')
         if was_active and self.on_stop is not None:
             self.on_stop(reason)
 

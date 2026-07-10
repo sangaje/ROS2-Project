@@ -762,6 +762,11 @@ class UnifiedFieldRobot(Node):
         if self.rl_runtime is None or self.role != Role.ACTIVE_SCOUT:
             return
         if self.require_localization_ready and not self.localization_ready:
+            self.get_logger().warning(
+                'SCOUT_RL_WAIT_LOCALIZATION | '
+                f'topic={self.localization_ready_topic}',
+                throttle_duration_sec=5.0,
+            )
             return
         if not self._nav_motion_quiesced():
             return
@@ -810,6 +815,7 @@ class UnifiedFieldRobot(Node):
         self.heartbeat_pub.publish(msg)
 
     def _publish_status(self) -> None:
+        runtime = self.rl_runtime
         data = {
             'robot': self.robot_name,
             'epoch': self.epoch,
@@ -822,6 +828,11 @@ class UnifiedFieldRobot(Node):
             'movement_started': self.movement_started,
             'xy_cov': None if math.isinf(self.xy_cov) else self.xy_cov,
             'yaw_cov': None if math.isinf(self.yaw_cov) else self.yaw_cov,
+            'rl_enabled': self.scout_rl_enabled,
+            'rl_active': bool(runtime is not None and runtime.active),
+            'rl_stop_reason': (
+                runtime.last_stop_reason if runtime is not None else 'disabled'
+            ),
         }
         msg = String()
         msg.data = json.dumps(data, sort_keys=True)
