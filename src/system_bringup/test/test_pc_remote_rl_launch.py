@@ -12,22 +12,14 @@ def _load_module():
     return module
 
 
-def test_cyclonedds_peer_config_disables_multicast_and_targets_scout_host():
+def test_module_loads_and_declares_only_domain_id():
     module = _load_module()
 
-    path = module._write_cyclonedds_peer_config('pi2.taile3321c.ts.net')
+    description = module.generate_launch_description()
 
-    text = path.read_text()
-    assert '<AllowMulticast>false</AllowMulticast>' in text
-    assert '<Peer address="pi2.taile3321c.ts.net"/>' in text
-
-
-def test_cyclonedds_peer_config_is_rewritten_for_a_different_host():
-    module = _load_module()
-    module._write_cyclonedds_peer_config('scout22.example.ts.net')
-
-    path = module._write_cyclonedds_peer_config('follower21.example.ts.net')
-
-    text = path.read_text()
-    assert 'scout22.example.ts.net' not in text
-    assert 'follower21.example.ts.net' in text
+    arg_names = {
+        entity.name
+        for entity in description.entities
+        if type(entity).__name__ == 'DeclareLaunchArgument'
+    }
+    assert arg_names == {'domain_id'}
