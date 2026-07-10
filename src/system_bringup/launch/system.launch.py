@@ -137,6 +137,7 @@ def generate_launch_description():
     enable_localization_spin_on_takeover = LaunchConfiguration(
         'enable_localization_spin_on_takeover'
     )
+    enable_exploration = LaunchConfiguration('enable_exploration')
     start_omx_aim = LaunchConfiguration('start_omx_aim')
     start_yolo_server = LaunchConfiguration('start_yolo_server')
     yolo_server_delay_sec = LaunchConfiguration('yolo_server_delay_sec')
@@ -305,8 +306,20 @@ def generate_launch_description():
                 or launch_bool(enable_scout_failover.perform(context))
             )
         ):
-            preflight_output = run_checkpoint_preflight()
-            actions.append(LogInfo(msg=[preflight_output]))
+            local_exploration = launch_bool(enable_exploration.perform(context))
+            field_env = dict(process_env)
+            if local_exploration:
+                preflight_output = run_checkpoint_preflight()
+                actions.append(LogInfo(msg=[preflight_output]))
+                field_env.update(SCOUT_RL_ENV)
+            else:
+                actions.append(LogInfo(msg=[
+                    'SYSTEM_BRINGUP | enable_exploration:=false -- this robot '
+                    'will NOT run its own RL inference subprocess. Run it '
+                    'remotely (e.g. system_bringup pc_remote_rl.launch.py) '
+                    'against this domain instead, or nothing will drive '
+                    '/cmd_vel while ACTIVE_SCOUT.'
+                ]))
             local_robot_name = (
                 follower_robot_name.perform(context)
                 if fleet_role_value == 'follower'
@@ -318,8 +331,6 @@ def generate_launch_description():
             self_pose_topic = (
                 '/burger_pose' if fleet_role_value == 'follower' else '/member_pose'
             )
-            field_env = dict(process_env)
-            field_env.update(SCOUT_RL_ENV)
             actions.append(TimerAction(
                 period=2.5,
                 actions=[Node(
@@ -336,8 +347,10 @@ def generate_launch_description():
                         'enable_localization_spin': launch_bool(
                             enable_localization_spin_on_takeover.perform(context)
                         ),
-                        'enable_exploration': True,
-                        'exploration_command': scout_rl_command(),
+                        'enable_exploration': local_exploration,
+                        'exploration_command': (
+                            scout_rl_command() if local_exploration else ''
+                        ),
                         'leader_pose_topic': '/leader_pose',
                         'self_pose_topic': self_pose_topic,
                         'require_localization_ready': not scout_owns_slam,
@@ -1212,6 +1225,20 @@ def generate_launch_description():
             default_value='true',
             choices=['true', 'false'],
             description='Follower-side takeover agent performs 360deg AMCL spin when covariance is poor.',
+        ),
+        DeclareLaunchArgument(
+            'enable_exploration',
+            default_value='true',
+            choices=['true', 'false'],
+            description=(
+                'Scout only (fleet_role:=member, or any role while '
+                'ACTIVE_SCOUT-eligible): run the RL inference subprocess on '
+                'this robot. Set false to let a remote process (e.g. '
+                'system_bringup pc_remote_rl.launch.py) drive /cmd_vel '
+                'instead -- this robot then skips the checkpoint preflight '
+                'and never spawns a local eval_policy, so it does not need '
+                'the checkpoint/venv present locally.'
+            ),
         ),
         DeclareLaunchArgument(
             'start_omx_aim',
