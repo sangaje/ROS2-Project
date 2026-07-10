@@ -102,7 +102,11 @@ def generate_launch_description():
             ]),
             ExecuteProcess(
                 cmd=command,
-                env=env,
+                # additional_env merges into the inherited environment.
+                # env= would replace it outright and drop PYTHONPATH (from
+                # `source install/setup.bash`), which is what actually makes
+                # turtlebot3_rl_training importable by the venv interpreter.
+                additional_env=env,
                 output='screen',
                 name='eval_policy_remote',
             ),
