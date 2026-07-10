@@ -45,6 +45,7 @@ def generate_launch_description():
     enable_cartographer = LaunchConfiguration('enable_cartographer')
     auto_localize = LaunchConfiguration('auto_localize')
     localization_scan_topic = LaunchConfiguration('localization_scan_topic')
+    hardware_param_file = LaunchConfiguration('hardware_param_file')
     initial_x = LaunchConfiguration('leader_initial_x')
     initial_y = LaunchConfiguration('leader_initial_y')
     initial_yaw = LaunchConfiguration('leader_initial_yaw')
@@ -63,6 +64,17 @@ def generate_launch_description():
             if simulation
             else localization_scan_topic.perform(context).strip() or '/scan'
         )
+        auto_localize_enabled = (
+            not cartographer_owned
+            and launch_bool(auto_localize.perform(context))
+        )
+        leader_hardware_param_file = hardware_param_file.perform(context).strip()
+        if not leader_hardware_param_file:
+            leader_hardware_param_file = os.path.join(
+                package_share,
+                'config',
+                'turtlebot3_waffle_pi_stamped_cmd_vel.yaml',
+            )
 
         nav2_params = RewrittenYaml(
             source_file=os.path.join(
@@ -127,7 +139,7 @@ def generate_launch_description():
                 respawn_delay=3.0,
             )
 
-            auto = launch_bool(auto_localize.perform(context))
+            auto = auto_localize_enabled
             initial_pose = {
                 'x': float(initial_x.perform(context)),
                 'y': float(initial_y.perform(context)),
@@ -186,17 +198,51 @@ def generate_launch_description():
                     output='screen',
                     parameters=[{
                         'scan_topic': scan_topic_value,
+                        # Seed AMCL's initial pose from the active scout's
+                        # known map-frame pose before spinning, instead of
+                        # blindly scattering particles across a still-sparse
+                        # shared map -- falls back to blind reinit if no
+                        # scout pose is available in time.
+                        'enable_scout_pose_seed': True,
+                        'active_scout_id_topic': '/failover/active_scout_id',
+                        'active_scout_robot_name': 'scout22',
+                        'follower_robot_name': 'follower21',
+                        'member_pose_topic': '/member_pose',
+                        'burger_pose_topic': '/burger_pose',
+                        'last_scout_pose_topic': '/failover/last_scout_pose',
+                        'scout_pose_max_age_sec': 8.0,
+                        'scout_pose_wait_timeout_sec': 2.0,
+                        'initial_pose_topic': '/initialpose',
+                        'initial_pose_xy_std_m': 1.0,
+                        'initial_pose_yaw_std_deg': 45.0,
+                        'initial_pose_settle_sec': 0.5,
+                        'allow_blind_global_reinit': False,
                         'spin_enabled': True,
                         # 좌우 바퀴 비대칭이 심할수록(고속 회전일수록) 더
                         # 벌어져서 "제자리" spin 이 실제로는 호를 그리며
                         # 이동한다 -- 낮은 회전 속도로 그 영향을 줄임.
                         'spin_speed_rad_s': 0.25,
+                        'spin_target_angle_rad': 7.10,
+                        'spin_timeout_sec': 35.0,
+                        'spin_sensor_dropout_grace_sec': 1.5,
+                        'settle_duration_sec': 3.0,
                         'spin_max_drift_m': 0.35,
+                        'require_valid_map': True,
+                        'min_known_map_cells': 100,
+                        'require_scan_before_spin': True,
+                        'require_odom_before_spin': True,
+                        'require_amcl_before_spin': True,
+                        'max_scan_age_sec': 1.2,
+                        'max_odom_age_sec': 1.2,
                         'cmd_vel_topic': '/cmd_vel',
                         'use_stamped_cmd_vel': True,
                         'amcl_pose_topic': '/amcl_pose',
-                        'localization_cov_xy_threshold': 0.35,
-                        'localization_cov_yaw_threshold': 0.25,
+                        'localization_cov_xy_threshold': 1.0,
+                        'localization_cov_yaw_threshold': 0.8,
+                        'localization_stable_duration_sec': 2.5,
+                        'localization_check_timeout_sec': 9.0,
+                        'max_spin_retries': 0,
+                        'force_spin_after_sec': 14.0,
                     }],
                     env=process_env,
                     respawn=True,
@@ -307,6 +353,7 @@ def generate_launch_description():
                     parameters=[{
                         'use_sim_time': simulation,
                         'goal_pose_topic': '/fleet/leader_coord_goal',
+                        'cancel_topic': '/fleet/leader_nav_cancel',
                     }],
                     env=process_env,
                 ),
@@ -329,13 +376,19 @@ def generate_launch_description():
                 launch_arguments={
                     'domain_id': domain,
                     'start_robot_bringup': start_robot_bringup.perform(context),
+                    'hardware_param_file': leader_hardware_param_file,
                     'start_nav2': start_nav2.perform(context),
                     'nav2_params_file': nav2_params,
                     'goal_pose_topic': '/fleet/leader_coord_goal',
+                    'cancel_topic': '/fleet/leader_nav_cancel',
                     'goal_proxy_name': 'leader_goal_arbiter_output',
                     'nav_delay_sec': nav_delay_sec,
                     'lifecycle_delay_sec': lifecycle_delay_sec,
                     'goal_delay_sec': goal_delay_sec,
+                    'require_localization_ready': (
+                        'true' if auto_localize_enabled else 'false'
+                    ),
+                    'localization_ready_topic': '/localization_ready',
                 }.items(),
             )
 
@@ -349,9 +402,10 @@ def generate_launch_description():
                 'require_follower_pose': launch_bool(
                     require_follower_pose.perform(context)
                 ),
-                # Do not hold Nav2 goals behind the localization spin; AMCL can
-                # keep refining while the robot starts moving.
-                'require_localization_ready': False,
+                # External-map AMCL must physically spin first. Holding the
+                # coordinator prevents it from publishing leader/member goals
+                # while global_localize_kickstart owns /cmd_vel.
+                'require_localization_ready': auto_localize_enabled,
             }],
             env=process_env,
             respawn=True,
@@ -527,12 +581,11 @@ def generate_launch_description():
             choices=['true', 'false'],
             description=(
                 'Whether a follower.launch.py robot is expected in this '
-                'fleet. When true (default) the coordinator holds the '
-                "leader in place until BOTH /leader_pose and /burger_pose "
-                'are fresh -- correct for a leader+follower fleet, but it '
-                'freezes the leader forever if no follower ever '
-                'publishes. Set false for a leader-only or '
-                'leader+member fleet with no follower robot.'
+                'fleet. When true (default) the coordinator monitors both '
+                '/leader_pose and /burger_pose for safety telemetry. Set '
+                'false for a leader-only or leader+member fleet with no '
+                'follower robot to suppress follower-pose wait warnings. '
+                'Direct Nav2 goal passthrough never publishes a hold goal.'
             ),
         ),
         DeclareLaunchArgument(
@@ -552,17 +605,27 @@ def generate_launch_description():
             choices=['true', 'false'],
             description=(
                 'Only used when enable_cartographer:=false. Let AMCL '
-                'start from leader_initial_x/y/yaw, then widen/refine via '
-                'reinitialize_global_localization.'
+                'start from a one-shot scout-pose /initialpose seed when '
+                'available, then refine via verified in-place spin.'
             ),
         ),
         DeclareLaunchArgument(
             'localization_scan_topic',
-            default_value='/scan_filtered',
+            default_value='/scan',
             description=(
                 'Real external-map leader mode: LaserScan topic consumed by '
-                'AMCL/Nav2. The Waffle OMX stack starts scan_processor, '
-                'which masks self-obstacles and republishes /scan_filtered.'
+                'AMCL/Nav2. Defaults to raw /scan so localization does not '
+                'deadlock when optional OMX scan_processor (/scan_filtered) '
+                'is not running. Pass /scan_filtered only after verifying it '
+                'is publishing.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'hardware_param_file',
+            default_value='',
+            description=(
+                'Optional TurtleBot3 hardware params. Empty uses the '
+                'fleet_bringup Waffle Pi stamped /cmd_vel override.'
             ),
         ),
         DeclareLaunchArgument('leader_initial_x', default_value='0.0'),

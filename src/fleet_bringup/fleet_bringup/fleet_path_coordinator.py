@@ -47,11 +47,13 @@ def quaternion_from_yaw(yaw: float):
 
 
 class FleetPathCoordinator(Node):
-    """Coordinate priority-preserving avoidance for leader and follower robots.
+    """Pass user goals through while publishing fleet-level safety telemetry.
 
-    The priority robot keeps its original Nav2 goal. Only the yielding robot
-    receives a short move-aside goal and later resumes its saved destination.
-    A sole moving robot has priority; the leader has priority when both move.
+    The coordinator used to insert short yield goals between a user goal and
+    Nav2. Real-robot tuning is now stable enough that Nav2 should receive the
+    clicked destination directly. This node therefore keeps the goal proxy and
+    diagnostics, but does not split paths or preempt Nav2 with generated
+    intermediate goals unless direct_goal_passthrough is explicitly disabled.
     """
 
     IDLE = 'IDLE'
@@ -93,6 +95,7 @@ class FleetPathCoordinator(Node):
         self.declare_parameter('require_follower_pose', True)
         self.declare_parameter('localization_ready_topic', '/localization_ready')
         self.declare_parameter('require_localization_ready', False)
+        self.declare_parameter('direct_goal_passthrough', True)
 
         self.declare_parameter('check_period_sec', 0.30)
         self.declare_parameter('pose_stale_sec', 1.5)
@@ -150,6 +153,9 @@ class FleetPathCoordinator(Node):
         )
         self.require_localization_ready = bool(
             get('require_localization_ready').value
+        )
+        self.direct_goal_passthrough = bool(
+            get('direct_goal_passthrough').value
         )
 
         self.check_period = max(0.1, float(get('check_period_sec').value))
@@ -236,11 +242,10 @@ class FleetPathCoordinator(Node):
         self.follower_hold_sent = False
         self.release_separation = self.motion_trigger_distance + 0.25
 
-        # Member: a third robot that never leads or follows. It only reports
-        # its pose and receives a short yield goal whenever the leader or
-        # follower gets close, then returns to where it was standing. It
-        # runs its own small state machine independent of the leader/
-        # follower one above so an unused member topic is a total no-op.
+        # Member: a third robot that never leads or follows. In direct Nav2
+        # mode it only reports pose for dashboards/warnings; the legacy member
+        # yield state machine below is skipped unless direct passthrough is
+        # explicitly disabled.
         self.member_pose: Optional[PoseStamped] = None
         self.member_pose_time = -1.0e9
         self.member_velocity: Point2 = (0.0, 0.0)
@@ -346,6 +351,7 @@ class FleetPathCoordinator(Node):
 
         self.get_logger().info(
             'PRIORITY_FLEET_COORDINATOR_READY | '
+            f'mode={"direct_nav" if self.direct_goal_passthrough else "yield_goals"} '
             f'leader_pose={self.leader_pose_topic} '
             f'follower_pose={self.follower_pose_topic} '
             f'member_pose={self.member_pose_topic} '
@@ -456,6 +462,11 @@ class FleetPathCoordinator(Node):
 
     def _leader_goal_cb(self, message: PoseStamped) -> None:
         self.leader_user_goal = self._copy_goal(message)
+        if self.direct_goal_passthrough:
+            self.leader_resume_goal = self._copy_goal(message)
+            self._publish_goal(self.leader_goal_pub, self.leader_user_goal)
+            self._publish_direct_status('leader goal passed through')
+            return
         if self.state in (self.IDLE, self.COOLDOWN):
             self._publish_goal(self.leader_goal_pub, self.leader_user_goal)
         else:
@@ -469,6 +480,13 @@ class FleetPathCoordinator(Node):
     def _follower_goal_cb(self, message: PoseStamped) -> None:
         self.follower_user_goal = self._copy_goal(message)
         self.follower_desired_following = False
+        if self.direct_goal_passthrough:
+            self.follower_follow_enabled = False
+            self.follower_resume_goal = self._copy_goal(message)
+            self._publish_follow_command('PAUSE', force=True)
+            self._publish_goal(self.follower_goal_pub, self.follower_user_goal)
+            self._publish_direct_status('burger goal passed through')
+            return
         if self.state in (self.IDLE, self.COOLDOWN):
             self.follower_follow_enabled = False
             self._publish_follow_command('PAUSE', force=True)
@@ -484,6 +502,17 @@ class FleetPathCoordinator(Node):
 
     def _follower_status_cb(self, message: Bool) -> None:
         self.follower_follow_enabled = bool(message.data)
+        if self.direct_goal_passthrough:
+            self.follower_desired_following = bool(message.data)
+            if (
+                not message.data
+                and self.follower_user_goal is not None
+            ):
+                self._publish_goal(
+                    self.follower_goal_pub,
+                    self.follower_user_goal,
+                )
+            return
         if (
             not message.data
             and self.priority_robot == self.LEADER
@@ -1177,6 +1206,103 @@ class FleetPathCoordinator(Node):
         self.get_logger().warning(f'FLEET_COORDINATION | {text}')
         self.last_status = text
 
+    def _publish_direct_status(self, detail: str) -> None:
+        text = f'DIRECT_NAV | {detail}'
+        if text == self.last_status:
+            return
+        message = String()
+        message.data = text
+        self.status_pub.publish(message)
+        self.get_logger().info(f'FLEET_COORDINATION | {text}')
+        self.last_status = text
+
+    def _clear_generated_goal_state(self) -> None:
+        self.state = self.IDLE
+        self.priority_robot = None
+        self.leader_evasion_goal = None
+        self.follower_evasion_goal = None
+        self.leader_resume_goal = self._copy_goal(
+            self.leader_user_goal
+        ) if self.leader_user_goal is not None else None
+        self.follower_resume_goal = self._copy_goal(
+            self.follower_user_goal
+        ) if self.follower_user_goal is not None else None
+        self.member_state = self.IDLE
+        self.member_evasion_goal = None
+        self.member_resume_pose = None
+        self.pose_hold_active = False
+        self.leader_hold_sent = False
+        self.follower_hold_sent = False
+
+    def _tick_direct_nav(self) -> None:
+        self._clear_generated_goal_state()
+
+        if self.leader_pose is None:
+            self._publish_safety_state(True)
+            self._publish_direct_status('waiting for leader pose')
+            return
+
+        if self.require_localization_ready and not self.localization_ready:
+            self._publish_safety_state(True)
+            self._publish_direct_status('waiting for localization')
+            now = self._now()
+            if now - self.last_pose_warning_log >= 5.0:
+                self.get_logger().warning(
+                    'FLEET_SAFETY_LOCALIZATION_NOT_READY | direct Nav2 goal '
+                    'passthrough remains active; no hold goal is published'
+                )
+                self.last_pose_warning_log = now
+            return
+
+        if not self.require_follower_pose and self.follower_pose is None:
+            self._republish_goals_to_new_consumers()
+            self._publish_safety_state(False)
+            self._publish_markers()
+            self._publish_direct_status('ready; no follower required')
+            return
+
+        if self.follower_pose is None:
+            self._publish_safety_state(True)
+            self._publish_direct_status('waiting for follower pose')
+            return
+
+        now = self._now()
+        if (
+            now - self.leader_pose_time > self.pose_stale
+            or now - self.follower_pose_time > self.pose_stale
+        ):
+            self._publish_safety_state(True)
+            self._publish_direct_status('pose stale; goals preserved')
+            if now - self.last_pose_warning_log >= 5.0:
+                self.get_logger().error(
+                    'FLEET_SAFETY_POSE_STALE | direct Nav2 goals are '
+                    'preserved; no replacement hold goal is published'
+                )
+                self.last_pose_warning_log = now
+            return
+
+        self._republish_goals_to_new_consumers()
+        separation = distance(
+            self._xy(self.leader_pose),
+            self._xy(self.follower_pose),
+        )
+        motion_risk, closest_distance, closest_time = self._motion_risk()
+        if motion_risk:
+            self.risk_observation_count += 1
+        else:
+            self.risk_observation_count = 0
+        warning = (
+            separation < self.minimum_separation
+            or self.risk_observation_count >= self.risk_confirmation_cycles
+        )
+        detail = (
+            f'ready; warning={warning} sep={separation:.2f}m '
+            f'closest={closest_distance:.2f}m in={closest_time:.1f}s'
+        )
+        self._publish_safety_state(warning)
+        self._publish_markers()
+        self._publish_direct_status(detail)
+
     def _capture_resume_goals(self) -> None:
         self.leader_resume_goal = (
             self._copy_goal(self.leader_user_goal)
@@ -1355,6 +1481,10 @@ class FleetPathCoordinator(Node):
             self.hazard_pose_pub.publish(hazard)
 
     def _tick(self) -> None:
+        if self.direct_goal_passthrough:
+            self._tick_direct_nav()
+            return
+
         self._tick_member()
 
         if self.leader_pose is None:

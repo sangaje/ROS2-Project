@@ -28,6 +28,11 @@ def generate_launch_description():
         DeclareLaunchArgument('max_frame_age_sec', default_value='1.5'),
         DeclareLaunchArgument('retry_open_period_sec', default_value='1.0'),
         DeclareLaunchArgument('publish_empty_detections', default_value='true'),
+        DeclareLaunchArgument('enable_role_gating', default_value='false'),
+        DeclareLaunchArgument('robot_name', default_value=''),
+        DeclareLaunchArgument('role_topic', default_value=''),
+        DeclareLaunchArgument('initial_role_active', default_value='true'),
+        DeclareLaunchArgument('active_roles', default_value='ACTIVE_SCOUT,SCOUT'),
         Node(
             package='flask_yolo_bridge',
             executable='opencv_camera_to_flask_yolo',
@@ -56,6 +61,11 @@ def generate_launch_description():
                 'max_frame_age_sec': LaunchConfiguration('max_frame_age_sec'),
                 'retry_open_period_sec': LaunchConfiguration('retry_open_period_sec'),
                 'publish_empty_detections': LaunchConfiguration('publish_empty_detections'),
+                'enable_role_gating': LaunchConfiguration('enable_role_gating'),
+                'robot_name': LaunchConfiguration('robot_name'),
+                'role_topic': LaunchConfiguration('role_topic'),
+                'initial_role_active': LaunchConfiguration('initial_role_active'),
+                'active_roles': LaunchConfiguration('active_roles'),
             }],
         ),
     ])

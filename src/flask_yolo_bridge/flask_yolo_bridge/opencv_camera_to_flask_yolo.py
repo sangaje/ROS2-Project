@@ -70,6 +70,31 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         )
         self.log_period_sec = float(self.declare_parameter('log_period_sec', 2.0).value)
         self.publish_empty_detections = self.declare_bool_parameter('publish_empty_detections', True)
+        self.enable_role_gating = self.declare_bool_parameter('enable_role_gating', False)
+        self.robot_name = str(self.declare_parameter('robot_name', '').value).strip()
+        self.role_topic = str(self.declare_parameter('role_topic', '').value).strip()
+        self.active_roles = {
+            item.strip().upper()
+            for item in str(
+                self.declare_parameter('active_roles', 'ACTIVE_SCOUT,SCOUT').value
+            ).split(',')
+            if item.strip()
+        }
+        self.camera_active = bool(
+            self.declare_bool_parameter('initial_role_active', True)
+        )
+        if not self.enable_role_gating:
+            self.camera_active = True
+        if self.enable_role_gating and not self.role_topic:
+            if self.robot_name:
+                self.role_topic = f'/{self.robot_name}/role'
+            else:
+                self.get_logger().warn(
+                    'OPENCV_CAMERA_ROLE_GATE_DISABLED | '
+                    'robot_name/role_topic missing'
+                )
+                self.enable_role_gating = False
+                self.camera_active = True
 
         self.pub = self.create_publisher(
             String,
@@ -81,6 +106,14 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
                 depth=1,
             ),
         )
+        if self.enable_role_gating:
+            role_qos = QoSProfile(
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=1,
+            )
+            self.create_subscription(String, self.role_topic, self.on_role, role_qos)
         self.http = requests.Session()
 
         self.frame_condition = threading.Condition()
@@ -108,7 +141,8 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
 
         self.cv2 = cv2
         self.cap = None
-        self.open_camera(log_success=False)
+        if self.camera_active:
+            self.open_camera(log_success=False)
 
         self.capture_thread = threading.Thread(
             target=self.capture_loop,
@@ -138,7 +172,37 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             f'connect_timeout={self.connect_timeout_sec:.2f}s read_timeout={self.read_timeout_sec:.2f}s '
             f'max_http_roundtrip={self.max_http_roundtrip_sec:.2f}s '
             f'max_frame_age={self.max_frame_age_sec:.2f}s '
+            f'role_gating={self.enable_role_gating} role_topic={self.role_topic or "none"} '
+            f'camera_active={self.camera_active} active_roles={sorted(self.active_roles)} '
             f'latest_frame_only=true ros_image_publish=false'
+        )
+
+    def on_role(self, msg: String):
+        raw = msg.data.strip()
+        role = raw
+        if raw.startswith('{'):
+            try:
+                payload = json.loads(raw)
+                role = str(payload.get('role', payload.get('status', raw)))
+            except json.JSONDecodeError:
+                role = raw
+        is_active = role.strip().upper() in self.active_roles
+        if is_active == self.camera_active:
+            return
+        self.camera_active = is_active
+        if not is_active:
+            self.close_camera()
+            with self.frame_condition:
+                self.latest_frame = None
+                self.sent_seq = self.latest_seq
+                self.frame_condition.notify_all()
+        else:
+            self.next_open_attempt_mono_sec = 0.0
+            with self.frame_condition:
+                self.frame_condition.notify_all()
+        self.get_logger().warning(
+            f'OPENCV_CAMERA_ROLE_GATE | role={role} active={self.camera_active} '
+            f'robot={self.robot_name or "unknown"}'
         )
 
     def camera_candidates(self):
@@ -237,6 +301,11 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
 
     def capture_loop(self):
         while not self.stop_threads:
+            if not self.camera_active:
+                if self.is_camera_open():
+                    self.close_camera()
+                time.sleep(0.1)
+                continue
             if not self.is_camera_open():
                 self.fail_count += 1
                 now = time.monotonic()
@@ -275,6 +344,9 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
     def wait_latest_frame(self, next_allowed: float):
         with self.frame_condition:
             while not self.stop_threads:
+                if not self.camera_active:
+                    self.frame_condition.wait(timeout=0.1)
+                    continue
                 now = time.monotonic()
                 if (
                     self.latest_frame is not None
@@ -315,6 +387,10 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         period = 1.0 / self.max_rate_hz if self.max_rate_hz > 0.0 else 0.0
         next_allowed = 0.0
         while not self.stop_threads:
+            if not self.camera_active:
+                time.sleep(0.1)
+                next_allowed = 0.0
+                continue
             frame, capture_sec, capture_mono_sec, seq = self.wait_latest_frame(next_allowed)
             if frame is None:
                 continue

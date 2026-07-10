@@ -26,3 +26,10 @@ def test_critical_launches_do_not_gate_on_process_exit():
 
     for path in CRITICAL_LAUNCHES:
         assert forbidden.isdisjoint(_names_used(path)), path
+
+
+def test_leader_localization_defaults_to_raw_scan():
+    text = (LAUNCH_DIR / 'leader.launch.py').read_text(encoding='utf-8')
+    assert "'localization_scan_topic'," in text
+    assert "default_value='/scan'" in text
+    assert "default_value='/scan_filtered'" not in text

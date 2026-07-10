@@ -10,6 +10,7 @@ def only_files(pattern):
 
 
 launch_files = only_files('launch/*.launch.py')
+config_files = only_files('config/*.yaml') + only_files('config/*.json')
 template_files = only_files('templates/*.html')
 static_files = only_files('static/*')
 
@@ -22,6 +23,7 @@ setup(
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml', 'README.md']),
         (os.path.join('share', package_name, 'launch'), launch_files),
+        (os.path.join('share', package_name, 'config'), config_files),
         (os.path.join('share', package_name, 'rviz'), only_files('rviz/*.rviz')),
         (os.path.join('share', package_name, 'templates'), template_files),
         (os.path.join('share', package_name, 'static'), static_files),
@@ -39,6 +41,9 @@ setup(
     entry_points={
         'console_scripts': [
             'leader_unified_dashboard = system_bringup.leader_unified_dashboard:main',
+            'leader_shadow_follow = system_bringup.leader_shadow_follow:main',
+            'scout_failover_coordinator = system_bringup.scout_failover_coordinator:main',
+            'unified_field_robot = system_bringup.unified_field_robot:main',
         ],
     },
 )

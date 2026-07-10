@@ -163,8 +163,13 @@ patrol:
   target_scan_timeout_sec: 5.0
   boundary_scan_timeout_sec: 0.35
   boundary_aim_settle_sec: 0.05
-  scan_sweep_half_angle_deg: 35.0
-  scan_sweep_period_sec: 0.8
+  # scan_sweep 는 매 half_period(=period_sec/2) 마다 목표 각도를 반대쪽
+  # 끝으로 그냥 뒤집는다 -- 서보가 실제로 그 끝까지 물리적으로 다 이동하기
+  # 전에 목표가 또 뒤집히면 중간에 방향이 꺾여서 절대 끝까지 못 간다.
+  # period_sec 를 넉넉하게 잡아야 좌우 끝까지 실제로 도달한다(실기에서
+  # 여전히 안 끝까지 가면 더 늘릴 것).
+  scan_sweep_half_angle_deg: 60.0
+  scan_sweep_period_sec: 5.0
   max_queue_size: 20
   duplicate_threshold_m: 0.3
   los_check_enabled: true

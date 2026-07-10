@@ -8,7 +8,7 @@
   domain_bridge는 일부러 안 들어있다 — 로컬라이제이션/브릿징 방식은
   역할마다 다르므로 이 파일을 include하는 쪽이 그 위에 얹는다.
 - `member.launch.py`: `base.launch.py` + domain_bridge + AMCL. 리더도
-  팔로워도 되지 않고, 코디네이터가 보내는 짧은 회피/복귀 목적지만
+  팔로워도 되지 않고, `/member_goal_pose`로 들어온 직접 Nav2 목적지를
   실행하는 범용 fleet 멤버. `follower.launch.py`가 여기서 한 단계 더
   나가는 개념이다.
 - `follower.launch.py`: domain_bridge, AMCL, Nav2, fleet follower
@@ -138,21 +138,18 @@ ros2 launch fleet_bringup follower.launch.py \
 ## 팔로워 없는 리더 (`require_follower_pose`)
 
 `leader.launch.py`의 코디네이터는 기본적으로(`require_follower_pose:=true`)
-`/leader_pose`와 `/burger_pose`(follower)가 둘 다 있어야 리더를 움직이게
-둔다 — follower가 아예 없는 fleet(예: 리더+멤버만 있는 구성)에서 이 기본값
-그대로 쓰면 `/burger_pose`가 영원히 안 들어오기 때문에 **리더가 첫 pose를
-받는 순간 그 자리에 정지 목적지를 박고 다시는 안 풀린다.** 실제로
-`follower.launch.py`를 쓰는 로봇이 이 fleet에 없다면 반드시
-`require_follower_pose:=false`로 꺼야 한다. 꺼도 멤버(`member.launch.py`)
-관련 회피/양보 로직은 완전히 별개 상태 머신이라 그대로 동작한다.
+`/leader_pose`와 `/burger_pose`(follower)를 모두 감시한다. follower가 아예
+없는 fleet(예: 리더+멤버만 있는 구성)에서는
+`require_follower_pose:=false`로 꺼서 `/burger_pose` 대기 경고를 줄일 수
+있다. direct Nav2 전달 모드에서는 follower pose가 없어도 코디네이터가
+현재 위치 hold goal을 발행하지 않는다.
 
-## 상호 회피
+## Nav2 목적지 전달
 
-중앙 코디네이터의 회피 판단은 Nav2 경로를 사용하지 않는다.
-`/leader_pose`와 `/burger_pose`의 상대 위치와 시간 변화를 이용해 실제
-속도와 미래 최근접 거리를 추정한다. 따라서 Nav2, 키보드 teleop, 직접
-`/cmd_vel` 제어 모두 같은 방식으로 감지된다. Nav2 path의 끝점은 회피 후
-원래 목적지를 복구하는 용도로만 사용한다.
+중앙 코디네이터는 이제 Nav2 경로를 나누거나 중간 회피 목적지를 만들지
+않는다. `/goal_pose`와 `/burger_user_goal`을 각각 최종 Nav2 목적지로 그대로
+전달하고, 로봇 사이 거리는 경고/대시보드 토픽으로만 알린다. 실제 경로
+회피와 장애물 처리는 각 로봇의 Nav2 파라미터와 costmap이 담당한다.
 
 - `/goal_pose`: 리더의 사용자 목적지
 - `/burger_user_goal`: Burger의 사용자 목적지
@@ -161,36 +158,27 @@ ros2 launch fleet_bringup follower.launch.py \
 - `/fleet/leader_coord_goal`: 코디네이터가 Nav2에 전달하는 리더 목적지
 - `/burger_goal_pose`: 코디네이터가 Nav2에 전달하는 Burger 목적지
 - `/fleet/robot_poses`: `[leader, follower]` 순서의 실시간 위치
-- `/fleet/collision_warning`: 현재 또는 예측 충돌 위험
-- `/fleet/hazard_pose`: 예상 충돌 지점
-- `/fleet/coordination_status`: 회피 상태와 통행 우선권
+- `/fleet/collision_warning`: 현재 또는 예측 충돌 위험 경고
+- `/fleet/hazard_pose`: 예상 위험 위치
+- `/fleet/coordination_status`: direct Nav2 전달 상태
 
-사용자 목적지는 코디네이터가 계속 보존한다. 우선권 로봇은 기존 Nav2
-목적지를 중단하지 않고 그대로 진행하며, 양보 로봇만 짧은 회피 목적지로
-이동했다가 상대가 통과하거나 멈추면 최신 사용자 목적지로 복귀한다.
-Nav2 액션 서버가 아직 준비되지 않았거나 재시작 중이어도 최신 목적지는
-폐기하지 않고 준비될 때까지 재시도한다.
+사용자 목적지는 코디네이터가 계속 보존하고 그대로 재발행한다. Pose/TF가
+잠깐 끊기더라도 코디네이터가 현재 위치 hold goal이나 회피 goal로 Nav2
+목적지를 덮어쓰지 않는다. Nav2 액션 서버가 아직 준비되지 않았거나 재시작
+중이어도 최신 목적지는 폐기하지 않고 준비될 때까지 재시도한다.
 
 이 안전 토픽은 leader domain에서 각 follower domain으로 브릿지된다.
 Follower LiDAR 토픽의 숫자는 follower의 `domain_id`에서 자동 생성된다.
 예를 들어 domain 31이면 `/follower31/scan`이다. 각 로봇 내부에서 Nav2가
 사용하는 `/scan`은 변경하지 않는다.
-한 대만 움직이면 움직이는 로봇이 우선이고, 두 대가 동시에 움직이면
-리더가 우선이다. follow 모드에서도 리더가 우선이며 Burger만 비킨다.
-두 로봇 중 하나의 위치가 1.5초 이상 갱신되지 않거나 안전거리가 확보되지
-않은 채 회피 시간이 끝나면 원래 목적지를 재개하지 않고 안전 정지 상태를
-유지한다.
+두 로봇 중 하나의 위치가 1.5초 이상 갱신되지 않으면 경고 상태를 발행하지만
+Nav2 목적지는 유지한다.
 
 ## 멤버 (member)
 
-멤버는 위 leader/follower 우선권 로직과는 완전히 분리된, 별도의 작은 상태
-머신으로 동작한다. `/member_pose`로 자기 위치만 보고하고, 리더나 팔로워 중
-하나가 가까워지거나(예측 충돌 포함) 접근하면 코디네이터가 `_yield_goal`과
-동일한 방식으로 짧은 회피 지점을 계산해 `/member_goal_pose`로 보낸다. 멤버는
-스스로 목적지를 만들지 않으므로, 위협이 사라지면 회피 직전에 서 있던
-자리로 그대로 복귀한다. 멤버가 없거나 `/member_pose`가 들어오지 않으면 이
-로직은 완전히 비활성 상태이며 기존 leader/follower 동작에는 아무 영향도
-주지 않는다.
+멤버는 `/member_pose`로 자기 위치를 보고하고, `/member_goal_pose`로 받은
+목적지를 Nav2가 그대로 수행한다. 기본 코디네이터 운용에서는 멤버에게도
+짧은 회피/복귀 목적지를 자동 생성하지 않는다.
 
 멤버 브리지는 공유 `/map`을 leader→member 방향으로만 받는다. 멤버가
 리스크맵 Cartographer를 갖는 구성이라도 로컬 `/map`을 member→leader로

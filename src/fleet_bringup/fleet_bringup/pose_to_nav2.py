@@ -7,6 +7,7 @@ from functools import partial
 from typing import Optional
 
 import rclpy
+from action_msgs.msg import GoalStatus
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.exceptions import ParameterAlreadyDeclaredException
@@ -15,6 +16,8 @@ from lifecycle_msgs.msg import State
 from lifecycle_msgs.srv import GetState
 from nav2_msgs.action import NavigateToPose
 from nav2_msgs.srv import ManageLifecycleNodes
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from std_msgs.msg import Bool
 
 
 def _safe_declare(node: Node, name: str, default):
@@ -78,6 +81,23 @@ class PoseToNav2Action(Node):
         self.lifecycle_retry_sec = max(
             0.5, float(_safe_declare(self, 'lifecycle_retry_sec', 2.0))
         )
+        self.retry_failed_results = bool(
+            _safe_declare(self, 'retry_failed_results', True)
+        )
+        self.max_result_retries = max(
+            0, int(_safe_declare(self, 'max_result_retries', 2))
+        )
+        self.result_retry_sec = max(
+            0.5, float(_safe_declare(self, 'result_retry_sec', 2.0))
+        )
+        self.require_localization_ready = bool(
+            _safe_declare(self, 'require_localization_ready', False)
+        )
+        self.localization_ready_topic = self._abs(str(
+            _safe_declare(self, 'localization_ready_topic', '/localization_ready')
+        ))
+        cancel_topic = str(_safe_declare(self, 'cancel_topic', '')).strip()
+        self.cancel_topic = self._abs(cancel_topic) if cancel_topic else ''
 
         self.client: ActionClient = ActionClient(
             self, NavigateToPose, self.navigate_action
@@ -94,6 +114,33 @@ class PoseToNav2Action(Node):
             self._on_goal_pose,
             10,
         )
+        self.localization_ready = False
+        if self.require_localization_ready:
+            latched_qos = QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                history=HistoryPolicy.KEEP_LAST,
+            )
+            self.create_subscription(
+                Bool,
+                self.localization_ready_topic,
+                self._on_localization_ready,
+                latched_qos,
+            )
+        if self.cancel_topic:
+            cancel_qos = QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                history=HistoryPolicy.KEEP_LAST,
+            )
+            self.create_subscription(
+                Bool,
+                self.cancel_topic,
+                self._on_cancel,
+                cancel_qos,
+            )
         self.current_goal_handle = None
         self.current_goal_id = 0
         self.pending_goal: Optional[PoseStamped] = None
@@ -105,6 +152,7 @@ class PoseToNav2Action(Node):
         self.state_future = None
         self.startup_future = None
         self.last_lifecycle_start_time = -1.0e9
+        self.failed_result_retries = 0
         self.retry_timer = self.create_timer(0.25, self._try_send_pending)
 
         self.get_logger().info(
@@ -112,7 +160,10 @@ class PoseToNav2Action(Node):
             f'in={self.goal_pose_topic} action={self.navigate_action} '
             f'frame={self.default_frame_id} '
             f'cancel_previous={self.cancel_previous_goal} '
-            f'wait_lifecycle={self.wait_for_lifecycle_active}'
+            f'wait_lifecycle={self.wait_for_lifecycle_active} '
+            f'require_localization_ready={self.require_localization_ready} '
+            f'localization_ready_topic={self.localization_ready_topic} '
+            f'cancel_topic={self.cancel_topic or "disabled"}'
         )
 
     @staticmethod
@@ -129,8 +180,36 @@ class PoseToNav2Action(Node):
         # Keep only the newest command while Nav2 is starting. Dropping a goal
         # here makes an RViz goal appear to vanish with no way to recover it.
         self.pending_goal = deepcopy(msg)
+        self.failed_result_retries = 0
         self.retry_not_before = -1.0e9
         self._try_send_pending()
+
+    def _on_localization_ready(self, msg: Bool) -> None:
+        previous = self.localization_ready
+        self.localization_ready = bool(msg.data)
+        if self.localization_ready and not previous:
+            self.get_logger().warn(
+                f'LOCALIZATION_READY_FOR_NAV2_GOALS | topic={self.localization_ready_topic}'
+            )
+            self.retry_not_before = -1.0e9
+            self._try_send_pending()
+
+    def _on_cancel(self, msg: Bool) -> None:
+        if not msg.data:
+            return
+        self.pending_goal = None
+        if self.current_goal_handle is None:
+            self.get_logger().info(
+                f'NAV2_GOAL_CANCEL_REQUEST_EMPTY | topic={self.cancel_topic}'
+            )
+            return
+        try:
+            self.current_goal_handle.cancel_goal_async()
+            self.get_logger().warn(
+                f'NAV2_GOAL_CANCEL_REQUESTED | topic={self.cancel_topic}'
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f'NAV2_GOAL_CANCEL_FAILED | {exc}')
 
     def _try_send_pending(self) -> None:
         if self.pending_goal is None:
@@ -139,6 +218,8 @@ class PoseToNav2Action(Node):
         if now < self.retry_not_before:
             return
         if self._nav2_lifecycle_blocks_send(now):
+            return
+        if self._localization_blocks_send(now):
             return
         if not self.client.server_is_ready():
             if now - self.last_wait_log_time >= 5.0:
@@ -189,6 +270,17 @@ class PoseToNav2Action(Node):
                 sent_goal=deepcopy(goal.pose),
             )
         )
+
+    def _localization_blocks_send(self, now: float) -> bool:
+        if not self.require_localization_ready or self.localization_ready:
+            return False
+        if now - self.last_wait_log_time >= 5.0:
+            self.get_logger().warn(
+                'NAV2_GOAL_HELD_FOR_LOCALIZATION | '
+                f'waiting for {self.localization_ready_topic}=true | latest goal retained'
+            )
+            self.last_wait_log_time = now
+        return True
 
     def _nav2_lifecycle_blocks_send(self, now: float) -> bool:
         if not self.wait_for_lifecycle_active:
@@ -320,11 +412,20 @@ class PoseToNav2Action(Node):
         self.current_goal_id = goal_id
         result_future = goal_handle.get_result_async()
         result_future.add_done_callback(
-            partial(self._result_cb, goal_id=goal_id)
+            partial(
+                self._result_cb,
+                goal_id=goal_id,
+                sent_goal=deepcopy(sent_goal),
+            )
         )
         self.get_logger().info('NAV2_GOAL_ACCEPTED')
 
-    def _result_cb(self, future, goal_id: int) -> None:
+    def _result_cb(
+        self,
+        future,
+        goal_id: int,
+        sent_goal: PoseStamped,
+    ) -> None:
         try:
             result = future.result()
         except Exception as exc:  # noqa: BLE001
@@ -334,6 +435,26 @@ class PoseToNav2Action(Node):
             self.current_goal_handle = None
             self.current_goal_id = 0
         self.get_logger().info(f'NAV2_GOAL_RESULT | status={result.status}')
+        if (
+            goal_id == self.goal_count
+            and result.status != GoalStatus.STATUS_SUCCEEDED
+            and self.retry_failed_results
+            and self.pending_goal is None
+            and self.failed_result_retries < self.max_result_retries
+        ):
+            self.failed_result_retries += 1
+            self.pending_goal = sent_goal
+            self.retry_not_before = (
+                self.get_clock().now().nanoseconds * 1.0e-9
+                + self.result_retry_sec
+            )
+            self.navigation_active = None
+            self.get_logger().warning(
+                'NAV2_GOAL_RESULT_RETRY_SCHEDULED | '
+                f'status={result.status} '
+                f'retry={self.failed_result_retries}/{self.max_result_retries} '
+                f'in={self.result_retry_sec:.1f}s'
+            )
 
     def _feedback_cb(self, feedback_msg) -> None:
         fb = feedback_msg.feedback

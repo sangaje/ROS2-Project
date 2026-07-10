@@ -47,8 +47,9 @@ from typing import Optional
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
-from std_msgs.msg import String, Empty
+from std_msgs.msg import Bool, String, Empty
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 
 try:
@@ -93,6 +94,7 @@ class WaffleNavNode(Node):
         self._last_amcl_pose_wall: Optional[float] = None
         self._amcl_ready = False
         self._amcl_cov_text = "no_amcl_pose"
+        self._localization_ready_flag = False
 
         # Nav2 액션 핸들
         self.current_goal_handle = None
@@ -115,14 +117,20 @@ class WaffleNavNode(Node):
         self._nav_server_timer = None
 
         self.declare_parameter('require_amcl_ready', False)
+        self.declare_parameter('require_localization_ready', False)
+        self.declare_parameter('localization_ready_topic', '/localization_ready')
         self.declare_parameter('amcl_pose_topic', '/amcl_pose')
         self.declare_parameter('max_amcl_pose_age_sec', 3.0)
         self.declare_parameter('max_xy_covariance', 2.00)
         self.declare_parameter('max_yaw_covariance', 1.50)
         self.declare_parameter('pending_goal_retry_period_sec', 0.5)
-        self.declare_parameter('max_pending_goal_age_sec', 60.0)
+        self.declare_parameter('max_pending_goal_age_sec', 300.0)
         self.require_amcl_ready = bool(
             self.get_parameter('require_amcl_ready').value)
+        self.require_localization_ready = bool(
+            self.get_parameter('require_localization_ready').value)
+        self.localization_ready_topic = str(
+            self.get_parameter('localization_ready_topic').value)
         self.amcl_pose_topic = str(
             self.get_parameter('amcl_pose_topic').value)
         self.max_amcl_pose_age_sec = float(
@@ -157,6 +165,19 @@ class WaffleNavNode(Node):
             self.on_amcl_pose,
             10,
         )
+        if self.require_localization_ready:
+            latched_qos = QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                history=HistoryPolicy.KEEP_LAST,
+            )
+            self.create_subscription(
+                Bool,
+                self.localization_ready_topic,
+                self.on_localization_ready,
+                latched_qos,
+            )
 
         # Publishers
         self.pub_result = self.create_publisher(
@@ -181,6 +202,9 @@ class WaffleNavNode(Node):
             f"topic={self.amcl_pose_topic} "
             f"xy_cov<={self.max_xy_covariance:.3f} "
             f"yaw_cov<={self.max_yaw_covariance:.3f}")
+        self.get_logger().info(
+            f"Localization spin gate: require={self.require_localization_ready} "
+            f"topic={self.localization_ready_topic}")
         self.get_logger().info("입력:")
         self.get_logger().info("  /omx/nav_goal    PoseStamped")
         self.get_logger().info("  /omx/nav_cancel  Empty")
@@ -242,8 +266,20 @@ class WaffleNavNode(Node):
                 f"AMCL pose confidence dropped ({self._amcl_cov_text})")
         self._amcl_ready = ready
 
+    def on_localization_ready(self, msg: Bool):
+        previous = self._localization_ready_flag
+        self._localization_ready_flag = bool(msg.data)
+        if self._localization_ready_flag and not previous:
+            self.get_logger().warn(
+                f"localization_ready 수신: {self.localization_ready_topic}=true")
+            self._try_send_pending_goal()
+
     def _localization_ready(self) -> bool:
-        if self.dry_run or not self.require_amcl_ready:
+        if self.dry_run:
+            return True
+        if self.require_localization_ready and not self._localization_ready_flag:
+            return False
+        if not self.require_amcl_ready:
             return True
         if not self._amcl_ready or self._last_amcl_pose_wall is None:
             return False
@@ -253,8 +289,14 @@ class WaffleNavNode(Node):
     def _queue_nav_goal(self, msg: PoseStamped, reason: str):
         self._pending_goal = msg
         self._pending_goal_received_wall = time.time()
+        spin_text = (
+            "ready"
+            if (not self.require_localization_ready or self._localization_ready_flag)
+            else "waiting_spin"
+        )
         self.get_logger().warn(
-            f"nav_goal 보류: {reason}. AMCL={self._amcl_cov_text}",
+            f"nav_goal 보류: {reason}. localization={spin_text} "
+            f"AMCL={self._amcl_cov_text}",
             throttle_duration_sec=2.0,
         )
 
@@ -282,7 +324,9 @@ class WaffleNavNode(Node):
             return
         if not self._localization_ready():
             self.get_logger().warn(
-                f"pending nav_goal 대기: AMCL not ready ({self._amcl_cov_text})",
+                "pending nav_goal 대기: localization/AMCL not ready "
+                f"(spin_ready={self._localization_ready_flag}, "
+                f"AMCL={self._amcl_cov_text})",
                 throttle_duration_sec=5.0,
             )
             return
@@ -323,7 +367,7 @@ class WaffleNavNode(Node):
                 msg, f"Nav2 액션 서버 '{self.action_name}' 준비 전")
             return
         if not self._localization_ready():
-            self._queue_nav_goal(msg, "AMCL localization 준비 전")
+            self._queue_nav_goal(msg, "localization spin/AMCL 준비 전")
             return
 
         self._send_nav_goal(msg)

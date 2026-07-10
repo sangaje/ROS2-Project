@@ -41,10 +41,13 @@ def generate_launch_description():
     nav2_params_file = LaunchConfiguration('nav2_params_file')
     start_nav2 = LaunchConfiguration('start_nav2')
     goal_pose_topic = LaunchConfiguration('goal_pose_topic')
+    cancel_topic = LaunchConfiguration('cancel_topic')
     goal_proxy_name = LaunchConfiguration('goal_proxy_name')
     nav_delay_sec = LaunchConfiguration('nav_delay_sec')
     lifecycle_delay_sec = LaunchConfiguration('lifecycle_delay_sec')
     goal_delay_sec = LaunchConfiguration('goal_delay_sec')
+    require_localization_ready = LaunchConfiguration('require_localization_ready')
+    localization_ready_topic = LaunchConfiguration('localization_ready_topic')
 
     def make_stack(context):
         process_env = clean_process_environment(domain_id.perform(context))
@@ -106,6 +109,11 @@ def generate_launch_description():
             parameters=[{
                 'use_sim_time': False,
                 'goal_pose_topic': goal_pose_topic.perform(context),
+                'cancel_topic': cancel_topic.perform(context),
+                'require_localization_ready': launch_bool(
+                    require_localization_ready.perform(context)
+                ),
+                'localization_ready_topic': localization_ready_topic.perform(context),
             }],
             env=process_env,
         )
@@ -202,6 +210,11 @@ def generate_launch_description():
             ),
         ),
         DeclareLaunchArgument('goal_pose_topic', default_value='/goal_pose'),
+        DeclareLaunchArgument(
+            'cancel_topic',
+            default_value='',
+            description='Optional std_msgs/Bool topic that cancels the current Nav2 action goal.',
+        ),
         DeclareLaunchArgument('goal_proxy_name', default_value='goal_arbiter'),
         DeclareLaunchArgument('nav_delay_sec', default_value='8.0'),
         DeclareLaunchArgument('lifecycle_delay_sec', default_value='12.0'),
@@ -213,6 +226,20 @@ def generate_launch_description():
                 'as lifecycle_delay_sec; override separately if the '
                 'caller wants the two staggered.'
             ),
+        ),
+        DeclareLaunchArgument(
+            'require_localization_ready',
+            default_value='false',
+            choices=['true', 'false'],
+            description=(
+                'Hold the Nav2 goal proxy until /localization_ready is true. '
+                'Used by leader/member AMCL kickstart so initial spin owns cmd_vel.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'localization_ready_topic',
+            default_value='/localization_ready',
+            description='Latched Bool topic published by global_localize_kickstart.',
         ),
         OpaqueFunction(function=make_stack),
     ])

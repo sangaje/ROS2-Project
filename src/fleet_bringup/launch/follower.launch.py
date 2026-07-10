@@ -43,6 +43,7 @@ def generate_launch_description():
     hardware_param_file = LaunchConfiguration('hardware_param_file')
     forward_map_to_main = LaunchConfiguration('forward_map_to_main')
     follow_distance = LaunchConfiguration('follow_distance')
+    start_legacy_follower = LaunchConfiguration('start_legacy_follower')
     initial_x = LaunchConfiguration('follower_initial_x')
     initial_y = LaunchConfiguration('follower_initial_y')
     initial_yaw = LaunchConfiguration('follower_initial_yaw')
@@ -199,6 +200,7 @@ def generate_launch_description():
 
         amcl_enabled = launch_bool(enable_amcl.perform(context))
         auto = launch_bool(auto_localize.perform(context))
+        require_ready_for_follow = bool(amcl_enabled and auto and not simulation)
 
         amcl = None
         localization_lifecycle = None
@@ -309,13 +311,42 @@ def generate_launch_description():
                 output='screen',
                 parameters=[{
                     'use_sim_time': simulation,
+                    'enable_scout_pose_seed': True,
+                    'active_scout_id_topic': '/failover/active_scout_id',
+                    'active_scout_robot_name': 'scout22',
+                    'follower_robot_name': 'follower21',
+                    'member_pose_topic': '/member_pose',
+                    'burger_pose_topic': '/burger_pose',
+                    'last_scout_pose_topic': '/failover/last_scout_pose',
+                    'scout_pose_max_age_sec': 8.0,
+                    'scout_pose_wait_timeout_sec': 2.0,
+                    'initial_pose_topic': '/initialpose',
+                    'initial_pose_xy_std_m': 1.0,
+                    'initial_pose_yaw_std_deg': 45.0,
+                    'initial_pose_settle_sec': 0.5,
+                    'allow_blind_global_reinit': False,
                     'spin_enabled': not simulation,
-                    'spin_speed_rad_s': 0.35,
+                    'spin_speed_rad_s': 0.40,
+                    'spin_target_angle_rad': 7.10,
+                    'spin_timeout_sec': 35.0,
+                    'spin_sensor_dropout_grace_sec': 1.5,
+                    'settle_duration_sec': 3.0,
+                    'require_valid_map': True,
+                    'min_known_map_cells': 100,
+                    'require_scan_before_spin': True,
+                    'require_odom_before_spin': True,
+                    'require_amcl_before_spin': True,
+                    'max_scan_age_sec': 1.2,
+                    'max_odom_age_sec': 1.2,
                     'cmd_vel_topic': '/cmd_vel',
                     'use_stamped_cmd_vel': True,
                     'amcl_pose_topic': '/amcl_pose',
-                    'localization_cov_xy_threshold': 0.35,
-                    'localization_cov_yaw_threshold': 0.25,
+                    'localization_cov_xy_threshold': 1.0,
+                    'localization_cov_yaw_threshold': 0.8,
+                    'localization_stable_duration_sec': 2.5,
+                    'localization_check_timeout_sec': 9.0,
+                    'max_spin_retries': 0,
+                    'force_spin_after_sec': 14.0,
                 }],
                 env=process_env,
                 respawn=True,
@@ -342,9 +373,7 @@ def generate_launch_description():
                 'use_sim_time': simulation,
                 'follow_distance': float(follow_distance.perform(context)),
                 'start_following': True,
-                # Do not hold Nav2 goals behind the localization spin; AMCL can
-                # keep refining while the robot starts moving.
-                'require_localization_ready': False,
+                'require_localization_ready': require_ready_for_follow,
             }],
             env=process_env,
             respawn=True,
@@ -357,6 +386,10 @@ def generate_launch_description():
         elif launch_bool(start_robot_bringup.perform(context)):
             robot_launch_args = {'use_sim_time': 'false', 'namespace': ''}
             param_file = hardware_param_file.perform(context)
+            if not param_file:
+                param_file = os.path.join(
+                    package_share, 'config', 'turtlebot3_burger_stamped_cmd_vel.yaml'
+                )
             if param_file:
                 robot_launch_args['tb3_param_dir'] = param_file
             actions.append(IncludeLaunchDescription(
@@ -373,6 +406,10 @@ def generate_launch_description():
             bridge_t, relay_t, amcl_t, localization_t, kickstart_t,
             nav_t, lifecycle_t, behavior_t,
         ) = timing
+        behavior_nodes = [goal_proxy]
+        if launch_bool(start_legacy_follower.perform(context)):
+            behavior_nodes.append(follower)
+
         actions.extend([
             LogInfo(msg=[
                 'LEADER_EGRESS_BRIDGE | source_domain=', str(main_domain),
@@ -386,7 +423,7 @@ def generate_launch_description():
             TimerAction(period=relay_t, actions=relay_nodes + [follower_pose]),
             TimerAction(period=nav_t, actions=navigation),
             TimerAction(period=lifecycle_t, actions=[navigation_lifecycle]),
-            TimerAction(period=behavior_t, actions=[goal_proxy, follower]),
+            TimerAction(period=behavior_t, actions=behavior_nodes),
         ])
         if amcl is not None:
             actions.append(TimerAction(
@@ -452,6 +489,15 @@ def generate_launch_description():
             'follow_distance',
             default_value='0.70',
             description='Desired distance behind the leader in metres.',
+        ),
+        DeclareLaunchArgument(
+            'start_legacy_follower',
+            default_value='true',
+            choices=['true', 'false'],
+            description=(
+                'Start fleet_follower. Set false when system_bringup '
+                'unified_field_robot owns FOLLOWER mode.'
+            ),
         ),
         DeclareLaunchArgument('follower_initial_x', default_value='-0.70'),
         DeclareLaunchArgument('follower_initial_y', default_value='0.0'),

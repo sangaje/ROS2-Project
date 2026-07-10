@@ -2,29 +2,39 @@
 """AMCL initial-localization spin state machine.
 
 A hardcoded initial pose only works when it matches where the robot was
-actually placed; when it doesn't, AMCL still converges confidently, just to
-the wrong spot near that seed. This node calls AMCL's own
-`/reinitialize_global_localization` service to spread particles across the
-whole map instead, then drives a verified in-place rotation so scan matching
-gets more than one viewpoint to disambiguate against, and only declares
-"ready" once `/amcl_pose` covariance has genuinely settled.
+actually placed. Rather than fall back straight to AMCL's blind
+`/reinitialize_global_localization` particle scatter -- which has nothing to
+disambiguate against on a sparse/partial map -- this node first tries to
+seed AMCL's initial pose from the fleet's currently active scout (already
+localized on the same shared map, via /member_pose or /burger_pose) using
+`/initialpose` with a loose covariance. Blind global reinit is kept only as
+the fallback when no scout pose is available. Either way, it then drives a
+verified in-place rotation so scan matching gets more than one viewpoint to
+refine against, and only declares "ready" once `/amcl_pose` covariance has
+genuinely settled.
 
 State machine:
 
-    WAIT_MAP -> WAIT_AMCL_ACTIVE -> WAIT_SCAN -> WAIT_TF
+    WAIT_MAP -> WAIT_AMCL_ACTIVE -> WAIT_SCOUT_POSE -> PUBLISH_INITIAL_POSE
+      (seeds /initialpose from the active scout's pose at most once; bounded
+       wait falls through to an unseeded local spin, not a navigation goal and
+       not a repeated /initialpose publish)
+      -> WAIT_SCAN -> WAIT_ODOM
       -> CHECK_LOCALIZATION_QUALITY (skips the spin only on a re-entry that
          is already converged -- never on a true first pass, since AMCL's
          seeded set_initial_pose covariance can look artificially good
          before the robot has moved at all)
       -> SPIN (odometry-yaw-integrated, not time-based) -> SETTLE
       -> CHECK_LOCALIZATION -> READY_FOR_NAV
-                             -> RETRY_SPIN (bounded) -> FAIL_SAFE
+                             -> RETRY_SPIN (legacy bounded branch; never
+                                republishes /initialpose in this startup)
+                             -> FAIL_SAFE
 
-Once READY_FOR_NAV is reached the `ready` topic latches true permanently --
-this node never re-triggers motion afterward. Re-spinning while Nav2 might
+Once READY_FOR_NAV is reached the `ready` topic latches true permanently.
+Once FAIL_SAFE is reached the `ready` topic stays false and this node will not
+try to recover by navigating toward the scout. Re-spinning while Nav2 might
 already be driving the robot would be a hazard, not a fix; downstream
-consumers (fleet_path_coordinator, fleet_follower) are expected to gate their
-own goal-sending on this flag instead.
+consumers are expected to gate their own goal-sending on this flag instead.
 """
 from __future__ import annotations
 
@@ -33,7 +43,9 @@ from enum import Enum, auto
 from typing import Optional
 
 import rclpy
-from geometry_msgs.msg import PoseWithCovarianceStamped, Twist, TwistStamped
+from geometry_msgs.msg import (
+    PoseStamped, PoseWithCovarianceStamped, Twist, TwistStamped,
+)
 from lifecycle_msgs.msg import State as LifecycleState
 from lifecycle_msgs.srv import GetState
 from nav_msgs.msg import Odometry, OccupancyGrid
@@ -41,7 +53,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
 from std_srvs.srv import Empty
 from tf2_ros import Buffer, TransformListener
 
@@ -59,7 +71,10 @@ def yaw_from_quaternion(q) -> float:
 class State(Enum):
     WAIT_MAP = auto()
     WAIT_AMCL_ACTIVE = auto()
+    WAIT_SCOUT_POSE = auto()
+    PUBLISH_INITIAL_POSE = auto()
     WAIT_SCAN = auto()
+    WAIT_ODOM = auto()
     WAIT_TF = auto()
     CHECK_LOCALIZATION_QUALITY = auto()
     SPIN = auto()
@@ -87,12 +102,36 @@ class GlobalLocalizeKickstart(Node):
         self.declare_parameter('global_frame', 'map')
         self.declare_parameter('ready_topic', 'localization_ready')
 
+        # Seed AMCL's initial pose from the currently active scout (already
+        # localized on the same shared map) instead of scattering blind --
+        # see module docstring. Falls back to blind reinit when unavailable.
+        self.declare_parameter('enable_scout_pose_seed', True)
+        self.declare_parameter('active_scout_id_topic', '/failover/active_scout_id')
+        self.declare_parameter('active_scout_robot_name', 'scout22')
+        self.declare_parameter('follower_robot_name', 'follower21')
+        self.declare_parameter('member_pose_topic', '/member_pose')
+        self.declare_parameter('burger_pose_topic', '/burger_pose')
+        self.declare_parameter('last_scout_pose_topic', '/failover/last_scout_pose')
+        self.declare_parameter('scout_pose_max_age_sec', 5.0)
+        self.declare_parameter('scout_pose_wait_timeout_sec', 2.0)
+        self.declare_parameter('initial_pose_topic', '/initialpose')
+        self.declare_parameter('initial_pose_xy_std_m', 1.0)
+        self.declare_parameter('initial_pose_yaw_std_deg', 45.0)
+        self.declare_parameter('initial_pose_settle_sec', 0.5)
+        self.declare_parameter('allow_blind_global_reinit', False)
+
         self.declare_parameter('spin_enabled', True)
+        self.declare_parameter('require_valid_map', True)
+        self.declare_parameter('min_known_map_cells', 100)
+        self.declare_parameter('require_scan_before_spin', True)
+        self.declare_parameter('require_odom_before_spin', True)
+        self.declare_parameter('require_amcl_before_spin', True)
         self.declare_parameter('spin_speed_rad_s', 0.35)
-        self.declare_parameter('spin_target_angle_rad', 2.0 * math.pi)
-        self.declare_parameter('spin_margin_rad', 0.35)
-        self.declare_parameter('spin_timeout_sec', 25.0)
-        self.declare_parameter('settle_duration_sec', 1.5)
+        self.declare_parameter('spin_target_angle_rad', 6.45)
+        self.declare_parameter('spin_margin_rad', 0.0)
+        self.declare_parameter('spin_timeout_sec', 30.0)
+        self.declare_parameter('spin_sensor_dropout_grace_sec', 1.2)
+        self.declare_parameter('settle_duration_sec', 2.0)
         # 좌우 바퀴 응답이 비대칭인 로봇은 angular.z 만 명령해도 제자리
         # 회전이 아니라 호를 그리며 실제로 이동한다 -- "제자리" 스핀이라는
         # 전제가 깨지므로, odom 상 시작 위치에서 이 이상 벗어나면 spin을
@@ -107,7 +146,16 @@ class GlobalLocalizeKickstart(Node):
         self.declare_parameter('max_spin_retries', 2)
         self.declare_parameter('amcl_active_poll_period_sec', 1.0)
         self.declare_parameter('max_scan_age_sec', 1.0)
+        self.declare_parameter('max_odom_age_sec', 1.0)
         self.declare_parameter('tick_period_sec', 0.1)
+        # Master guarantee: no matter which WAIT_* precondition is stuck
+        # (map/AMCL-active/scan/odom/TF), the spin gets attempted anyway
+        # once this much time has passed since this node started. Getting
+        # the preconditions right is *preferred* -- spinning against a
+        # real map with fresh sensors converges better -- but this node's
+        # one non-negotiable job is to eventually spin and let Nav2 through,
+        # not to wait forever for a perfect precondition that never arrives.
+        self.declare_parameter('force_spin_after_sec', 20.0)
 
         get = self.get_parameter
         self.reinit_service_name = str(get('reinit_service').value)
@@ -122,11 +170,40 @@ class GlobalLocalizeKickstart(Node):
         self.global_frame = str(get('global_frame').value)
         self.ready_topic = str(get('ready_topic').value)
 
+        self.enable_scout_pose_seed = bool(get('enable_scout_pose_seed').value)
+        self.active_scout_id_topic = str(get('active_scout_id_topic').value)
+        self.active_scout_robot_name = str(get('active_scout_robot_name').value)
+        self.follower_robot_name = str(get('follower_robot_name').value)
+        self.member_pose_topic = str(get('member_pose_topic').value)
+        self.burger_pose_topic = str(get('burger_pose_topic').value)
+        self.last_scout_pose_topic = str(get('last_scout_pose_topic').value)
+        self.scout_pose_max_age_sec = max(0.1, float(get('scout_pose_max_age_sec').value))
+        self.scout_pose_wait_timeout_sec = max(
+            0.1, float(get('scout_pose_wait_timeout_sec').value)
+        )
+        self.initial_pose_topic = str(get('initial_pose_topic').value)
+        initial_pose_xy_std = max(0.01, float(get('initial_pose_xy_std_m').value))
+        initial_pose_yaw_std_rad = max(
+            0.01, math.radians(float(get('initial_pose_yaw_std_deg').value))
+        )
+        self.initial_pose_xy_var = initial_pose_xy_std ** 2
+        self.initial_pose_yaw_var = initial_pose_yaw_std_rad ** 2
+        self.initial_pose_settle_sec = max(0.0, float(get('initial_pose_settle_sec').value))
+        self.allow_blind_global_reinit = bool(get('allow_blind_global_reinit').value)
+
         self.spin_enabled = bool(get('spin_enabled').value)
+        self.require_valid_map = bool(get('require_valid_map').value)
+        self.min_known_map_cells = max(0, int(get('min_known_map_cells').value))
+        self.require_scan_before_spin = bool(get('require_scan_before_spin').value)
+        self.require_odom_before_spin = bool(get('require_odom_before_spin').value)
+        self.require_amcl_before_spin = bool(get('require_amcl_before_spin').value)
         self.spin_speed = abs(float(get('spin_speed_rad_s').value))
         self.spin_target_angle = max(0.0, float(get('spin_target_angle_rad').value))
         self.spin_margin = max(0.0, float(get('spin_margin_rad').value))
         self.spin_timeout_sec = max(1.0, float(get('spin_timeout_sec').value))
+        self.spin_sensor_dropout_grace_sec = max(
+            0.0, float(get('spin_sensor_dropout_grace_sec').value)
+        )
         self.settle_duration_sec = max(0.0, float(get('settle_duration_sec').value))
         self.spin_max_drift_m = max(0.05, float(get('spin_max_drift_m').value))
 
@@ -144,7 +221,11 @@ class GlobalLocalizeKickstart(Node):
             0.1, float(get('amcl_active_poll_period_sec').value)
         )
         self.max_scan_age_sec = max(0.05, float(get('max_scan_age_sec').value))
+        self.max_odom_age_sec = max(0.05, float(get('max_odom_age_sec').value))
         self.tick_period_sec = max(0.02, float(get('tick_period_sec').value))
+        self.force_spin_after_sec = max(
+            1.0, float(get('force_spin_after_sec').value)
+        )
 
         latched_qos = QoSProfile(
             depth=1,
@@ -159,6 +240,9 @@ class GlobalLocalizeKickstart(Node):
         )
 
         self.ready_pub = self.create_publisher(Bool, self.ready_topic, latched_qos)
+        self.initial_pose_pub = self.create_publisher(
+            PoseWithCovarianceStamped, self.initial_pose_topic, 10
+        )
         if self.use_stamped:
             self.cmd_pub = self.create_publisher(TwistStamped, self.cmd_vel_topic, 10)
         else:
@@ -176,6 +260,18 @@ class GlobalLocalizeKickstart(Node):
         )
         self.create_subscription(Odometry, self.odom_topic, self._on_odom, 10)
         self.create_subscription(LaserScan, self.scan_topic, self._on_scan, scan_qos)
+        self.create_subscription(
+            String, self.active_scout_id_topic, self._on_active_scout_id, latched_qos
+        )
+        self.create_subscription(
+            PoseStamped, self.member_pose_topic, self._on_member_pose, 10
+        )
+        self.create_subscription(
+            PoseStamped, self.burger_pose_topic, self._on_burger_pose, 10
+        )
+        self.create_subscription(
+            PoseStamped, self.last_scout_pose_topic, self._on_last_scout_pose, latched_qos
+        )
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -186,19 +282,48 @@ class GlobalLocalizeKickstart(Node):
         self.reinit_in_flight = False
         self._amcl_state_call_in_flight = False
         self._last_amcl_poll_wall = 0.0
+        self.node_start_wall = self._now()
+        self._forced_spin = False
+        self.amcl_active = not self.require_amcl_before_spin
 
         self.last_scan_wall: Optional[float] = None
+        self.last_odom_wall: Optional[float] = None
         self.last_odom_yaw: Optional[float] = None
         self.last_odom_xy: Optional[tuple] = None
         self.spin_start_xy: Optional[tuple] = None
+        self.spin_direction = 1.0
         self.accumulated_yaw = 0.0
         self._last_progress_octant = -1
+        self._next_progress_mark_deg = 90
+        self._spin_motion_detected = False
+        self._last_spin_dropout_log_wall = -1.0e9
         self.spin_start_wall = 0.0
         self.settle_start_wall = 0.0
         self.check_start_wall = 0.0
         self.good_since_wall: Optional[float] = None
         self.last_pose_cov = None
         self.done = False
+        self.bootstrap_started = True
+        self.initial_pose_seeded = False
+        self.initial_pose_publish_count = 0
+        self.initial_spin_completed = False
+        self.localization_bootstrap_completed = False
+        self.bootstrap_failed = False
+
+        self._active_scout_id: Optional[str] = None
+        self._member_pose: Optional[PoseStamped] = None
+        self._member_pose_wall: Optional[float] = None
+        self._burger_pose: Optional[PoseStamped] = None
+        self._burger_pose_wall: Optional[float] = None
+        self._last_scout_pose: Optional[PoseStamped] = None
+        self._last_scout_pose_wall: Optional[float] = None
+        self._scout_pose_wait_start: Optional[float] = None
+        self._pending_seed_pose: Optional[tuple] = None
+        self._pending_seed_source: Optional[str] = None
+        self._pending_seed_age: Optional[float] = None
+        self._last_seed_wait_detail = 'no pose messages'
+        self._seeded_this_attempt = False
+        self._initial_pose_publish_wall = 0.0
 
         self._publish_ready(False)
         self.timer = self.create_timer(self.tick_period_sec, self._tick)
@@ -209,7 +334,14 @@ class GlobalLocalizeKickstart(Node):
             f'odom_topic={self.odom_topic} '
             f'spin_enabled={self.spin_enabled} spin_speed={self.spin_speed:.2f}rad/s '
             f'target={self.spin_target_angle + self.spin_margin:.2f}rad '
-            f'max_spin_retries={self.max_spin_retries}'
+            f'max_spin_retries={self.max_spin_retries} '
+            f'require_valid_map={self.require_valid_map} '
+            f'min_known_map_cells={self.min_known_map_cells} '
+            f'cmd_vel_type={"TwistStamped" if self.use_stamped else "Twist"}'
+        )
+        self.get_logger().warning(
+            '[BOOTSTRAP] START_ONCE | scout_pose_is_initial_estimate_only=true '
+            'navigation_to_scout_pose_disabled=true'
         )
 
     def _now(self) -> float:
@@ -218,8 +350,29 @@ class GlobalLocalizeKickstart(Node):
     # -- subscriptions ----------------------------------------------------
 
     def _on_map(self, msg: OccupancyGrid) -> None:
-        if msg.info.width > 0 and msg.info.height > 0:
-            self.map_received = True
+        width = int(msg.info.width)
+        height = int(msg.info.height)
+        cell_count = width * height
+        valid_shape = width > 0 and height > 0 and len(msg.data) == cell_count
+        known_cells = sum(1 for cell in msg.data if int(cell) != -1) if valid_shape else 0
+        valid = valid_shape and (
+            not self.require_valid_map
+            or known_cells >= self.min_known_map_cells
+        )
+        if not valid:
+            self.get_logger().info(
+                'GLOBAL_LOCALIZE_WAIT_MAP | invalid/empty map '
+                f'width={width} height={height} data={len(msg.data)} '
+                f'known={known_cells}/{self.min_known_map_cells}',
+                throttle_duration_sec=5.0,
+            )
+            return
+        if not self.map_received:
+            self.get_logger().warning(
+                'GLOBAL_LOCALIZE_VALID_MAP_RECEIVED | '
+                f'width={width} height={height} known={known_cells}'
+            )
+        self.map_received = True
 
     def _on_scan(self, _msg: LaserScan) -> None:
         self.last_scan_wall = self._now()
@@ -233,6 +386,22 @@ class GlobalLocalizeKickstart(Node):
         self.last_odom_xy = (
             msg.pose.pose.position.x, msg.pose.pose.position.y,
         )
+        self.last_odom_wall = self._now()
+
+    def _on_active_scout_id(self, msg: String) -> None:
+        self._active_scout_id = str(msg.data)
+
+    def _on_member_pose(self, msg: PoseStamped) -> None:
+        self._member_pose = msg
+        self._member_pose_wall = self._now()
+
+    def _on_burger_pose(self, msg: PoseStamped) -> None:
+        self._burger_pose = msg
+        self._burger_pose_wall = self._now()
+
+    def _on_last_scout_pose(self, msg: PoseStamped) -> None:
+        self._last_scout_pose = msg
+        self._last_scout_pose_wall = self._now()
 
     def _on_amcl_pose(self, msg: PoseWithCovarianceStamped) -> None:
         cov = msg.pose.covariance
@@ -250,9 +419,29 @@ class GlobalLocalizeKickstart(Node):
     # -- shared helpers -----------------------------------------------------
 
     def _scan_fresh(self) -> bool:
+        if not self.require_scan_before_spin:
+            return True
         if self.last_scan_wall is None:
             return False
         return (self._now() - self.last_scan_wall) <= self.max_scan_age_sec
+
+    def _odom_fresh(self) -> bool:
+        if not self.require_odom_before_spin:
+            return True
+        if self.last_odom_wall is None or self.last_odom_yaw is None:
+            return False
+        return (self._now() - self.last_odom_wall) <= self.max_odom_age_sec
+
+    def _spin_sensor_outage_is_brief(self) -> bool:
+        if self.last_scan_wall is None or self.last_odom_wall is None:
+            return False
+        now = self._now()
+        max_scan_age = self.max_scan_age_sec + self.spin_sensor_dropout_grace_sec
+        max_odom_age = self.max_odom_age_sec + self.spin_sensor_dropout_grace_sec
+        return (
+            now - self.last_scan_wall <= max_scan_age
+            and now - self.last_odom_wall <= max_odom_age
+        )
 
     def _tf_ok(self) -> bool:
         try:
@@ -261,6 +450,68 @@ class GlobalLocalizeKickstart(Node):
             )
         except Exception:  # noqa: BLE001
             return False
+
+    def _fresh_seed_candidate(
+        self,
+        source: str,
+        pose: Optional[PoseStamped],
+        wall: Optional[float],
+    ) -> Optional[tuple]:
+        if pose is None or wall is None:
+            return None
+        age = self._now() - wall
+        if age > self.scout_pose_max_age_sec:
+            return None
+        yaw = yaw_from_quaternion(pose.pose.orientation)
+        return (pose.pose.position.x, pose.pose.position.y, yaw, source, age)
+
+    def _scout_seed_pose(self) -> Optional[tuple]:
+        """(x, y, yaw) of the active/fresh scout, or None if unknown/stale.
+
+        Which topic counts as "the active scout" is resolved dynamically via
+        active_scout_id_topic rather than hardcoded, since the active scout
+        changes across failover.  If that latched status has not arrived yet,
+        prefer any fresh scout pose over falling straight back to blind global
+        reinitialize; the whole point is to start AMCL near the robot that
+        already owns the map.
+        """
+        member = (
+            self.active_scout_robot_name,
+            self._member_pose,
+            self._member_pose_wall,
+        )
+        follower = (
+            self.follower_robot_name,
+            self._burger_pose,
+            self._burger_pose_wall,
+        )
+        last_scout = (
+            'last_scout_pose',
+            self._last_scout_pose,
+            self._last_scout_pose_wall,
+        )
+        if self._active_scout_id == self.follower_robot_name:
+            ordered = (follower, member, last_scout)
+        elif self._active_scout_id == self.active_scout_robot_name:
+            ordered = (member, last_scout, follower)
+        else:
+            ordered = (member, last_scout, follower)
+
+        stale = []
+        for source, pose, wall in ordered:
+            candidate = self._fresh_seed_candidate(source, pose, wall)
+            if candidate is not None:
+                x, y, yaw, candidate_source, age = candidate
+                self._pending_seed_source = candidate_source
+                self._pending_seed_age = age
+                return (x, y, yaw)
+            if pose is not None and wall is not None:
+                stale.append(f'{source}:{self._now() - wall:.1f}s')
+        if stale:
+            self._last_seed_wait_detail = 'stale ' + ','.join(stale)
+        else:
+            self._last_seed_wait_detail = 'no pose messages'
+        return None
 
     def _covariance_ok(self) -> bool:
         if self.last_pose_cov is None:
@@ -289,10 +540,16 @@ class GlobalLocalizeKickstart(Node):
             message = TwistStamped()
             message.header.stamp = self.get_clock().now().to_msg()
             message.header.frame_id = self.base_frame
+            message.twist.linear.x = 0.0
+            message.twist.linear.y = 0.0
+            message.twist.linear.z = 0.0
             message.twist.angular.z = angular_z
             self.cmd_pub.publish(message)
         else:
             message = Twist()
+            message.linear.x = 0.0
+            message.linear.y = 0.0
+            message.linear.z = 0.0
             message.angular.z = angular_z
             self.cmd_pub.publish(message)
 
@@ -310,25 +567,69 @@ class GlobalLocalizeKickstart(Node):
     # -- state entry hooks ----------------------------------------------
 
     def _on_enter_ready_for_nav(self) -> None:
+        if self.spin_enabled and not self.initial_spin_completed:
+            self.get_logger().error(
+                '[BOOTSTRAP] READY_BLOCKED | spin did not complete'
+            )
+            self._transition(State.FAIL_SAFE)
+            return
         self._publish_twist(0.0)
         self._publish_ready(True)
+        self.localization_bootstrap_completed = True
         self.done = True
+        self.get_logger().warning('[BOOTSTRAP] COMPLETE_LATCHED')
         self.get_logger().warning('GLOBAL_LOCALIZE_READY_FOR_NAV')
 
     def _on_enter_fail_safe(self) -> None:
         self._publish_twist(0.0)
         self._publish_ready(False)
         self.good_since_wall = None
+        self.bootstrap_failed = True
+        self.done = True
         self.get_logger().error(
-            'GLOBAL_LOCALIZE_FAIL_SAFE | automatic retries exhausted, '
-            'still watching /amcl_pose passively (will not spin again)'
+            '[BOOTSTRAP] FAILED | zero cmd published, localization_ready=false'
+        )
+        self.get_logger().error(
+            'GLOBAL_LOCALIZE_FAIL_SAFE | bootstrap failed in this process; '
+            'will not republish /initialpose or navigate to scout pose'
         )
 
     # -- main dispatch ----------------------------------------------------
 
+    _PRE_SPIN_STATES = (
+        State.WAIT_MAP,
+        State.WAIT_AMCL_ACTIVE,
+        State.WAIT_SCOUT_POSE,
+        State.PUBLISH_INITIAL_POSE,
+        State.WAIT_SCAN,
+        State.WAIT_ODOM,
+        State.WAIT_TF,
+        State.CHECK_LOCALIZATION_QUALITY,
+    )
+
     def _tick(self) -> None:
         if self.done:
             return
+        if self.localization_bootstrap_completed or self.bootstrap_failed:
+            return
+        if (
+            not self._forced_spin
+            and self.state in self._PRE_SPIN_STATES
+            and self.map_received
+            and self.amcl_active
+            and self._now() - self.node_start_wall >= self.force_spin_after_sec
+        ):
+            self._forced_spin = True
+            self.get_logger().error(
+                'GLOBAL_LOCALIZE_FORCE_SPIN | '
+                f'stuck in {self.state.name} for '
+                f'{self.force_spin_after_sec:.0f}s+ since startup -- forcing '
+                'the spin attempt anyway. Blocking condition snapshot: '
+                f'map_received={self.map_received} '
+                f'scan_fresh={self._scan_fresh()} '
+                f'odom_fresh={self._odom_fresh()} tf_ok={self._tf_ok()}'
+            )
+            self._transition(State.CHECK_LOCALIZATION_QUALITY)
         getattr(self, f'_tick_{self.state.name.lower()}')()
 
     def _tick_wait_map(self) -> None:
@@ -341,6 +642,12 @@ class GlobalLocalizeKickstart(Node):
         )
 
     def _tick_wait_amcl_active(self) -> None:
+        if not self.require_amcl_before_spin:
+            self._transition(State.WAIT_SCOUT_POSE)
+            return
+        if self.amcl_active:
+            self._transition(State.WAIT_SCOUT_POSE)
+            return
         now = self._now()
         if now - self._last_amcl_poll_wall < self.amcl_active_poll_period_sec:
             return
@@ -366,14 +673,116 @@ class GlobalLocalizeKickstart(Node):
             self.get_logger().warning(f'GLOBAL_LOCALIZE_AMCL_STATE_ERROR | {error}')
             return
         if result.current_state.id == LifecycleState.PRIMARY_STATE_ACTIVE:
+            self.amcl_active = True
+            self._transition(State.WAIT_SCOUT_POSE)
+
+    def _tick_wait_scout_pose(self) -> None:
+        if self.initial_pose_seeded or not self.enable_scout_pose_seed:
+            self._transition(State.WAIT_SCAN)
+            return
+        if self._scout_pose_wait_start is None:
+            self._scout_pose_wait_start = self._now()
+        seed = self._scout_seed_pose()
+        if seed is not None:
+            self._pending_seed_pose = seed
+            self._scout_pose_wait_start = None
+            self._transition(State.PUBLISH_INITIAL_POSE)
+            return
+        if self._now() - self._scout_pose_wait_start >= self.scout_pose_wait_timeout_sec:
+            self.get_logger().warning(
+                'GLOBAL_LOCALIZE_SCOUT_POSE_UNAVAILABLE | '
+                f'no fresh pose for active_scout={self._active_scout_id} within '
+                f'{self.scout_pose_wait_timeout_sec:.1f}s '
+                f'({self._last_seed_wait_detail}) -- continuing without '
+                'an /initialpose seed; no navigation goal will be generated'
+            )
+            self._scout_pose_wait_start = None
+            self._pending_seed_source = None
+            self._pending_seed_age = None
+            self._transition(State.WAIT_SCAN)
+            return
+        self.get_logger().info(
+            'GLOBAL_LOCALIZE_WAIT_SCOUT_POSE | '
+            f'active_scout={self._active_scout_id} '
+            f'{self._last_seed_wait_detail}',
+            throttle_duration_sec=2.0,
+        )
+
+    def _on_enter_publish_initial_pose(self) -> None:
+        if self.initial_pose_seeded:
+            self.get_logger().warning(
+                '[BOOTSTRAP] INITIAL_POSE_REPUBLISH_BLOCKED | already seeded once'
+            )
+            self._transition(State.WAIT_SCAN)
+            return
+        seed = self._pending_seed_pose
+        if seed is None:
+            # Shouldn't happen (only entered right after a seed was found),
+            # but fail safe into the blind-reinit path rather than get stuck.
+            self._transition(State.WAIT_SCAN)
+            return
+        x, y, yaw = seed
+        msg = PoseWithCovarianceStamped()
+        msg.header.frame_id = self.global_frame
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.pose.pose.position.x = x
+        msg.pose.pose.position.y = y
+        msg.pose.pose.orientation.z = math.sin(0.5 * yaw)
+        msg.pose.pose.orientation.w = math.cos(0.5 * yaw)
+        cov = [0.0] * 36
+        cov[0] = self.initial_pose_xy_var
+        cov[7] = self.initial_pose_xy_var
+        cov[35] = self.initial_pose_yaw_var
+        msg.pose.covariance = cov
+        self.initial_pose_pub.publish(msg)
+        self._seeded_this_attempt = True
+        self.initial_pose_seeded = True
+        self.initial_pose_publish_count += 1
+        self._initial_pose_publish_wall = self._now()
+        source = self._pending_seed_source or self._active_scout_id or 'unknown'
+        age = self._pending_seed_age
+        age_text = 'unknown' if age is None else f'{age:.1f}s'
+        self.get_logger().warning(
+            'GLOBAL_LOCALIZE_INITIAL_POSE_SEEDED | '
+            f'source={source} age={age_text} x={x:.3f} y={y:.3f} '
+            f'yaw={math.degrees(yaw):.1f}deg topic={self.initial_pose_topic}'
+        )
+        self.get_logger().warning(
+            '[BOOTSTRAP] SCOUT_POSE_USED_AS_ESTIMATE_ONLY | '
+            f'source={source} topic={self.initial_pose_topic}'
+        )
+        self.get_logger().warning(
+            '[BOOTSTRAP] INITIAL_POSE_PUBLISHED_ONCE | '
+            f'count={self.initial_pose_publish_count} '
+            f'sigma_xy={math.sqrt(self.initial_pose_xy_var):.2f}m '
+            f'sigma_yaw={math.degrees(math.sqrt(self.initial_pose_yaw_var)):.1f}deg'
+        )
+        self.get_logger().warning('[BOOTSTRAP] NAVIGATION_TO_SCOUT_POSE_DISABLED')
+
+    def _tick_publish_initial_pose(self) -> None:
+        # Deliberately not gated on covariance or a stable map->odom TF --
+        # both can depend on this seed landing first. Just give AMCL a
+        # moment to ingest the message before moving on.
+        if self._now() - self._initial_pose_publish_wall >= self.initial_pose_settle_sec:
             self._transition(State.WAIT_SCAN)
 
     def _tick_wait_scan(self) -> None:
         if self._scan_fresh():
-            self._transition(State.WAIT_TF)
+            self._transition(State.WAIT_ODOM)
             return
         self.get_logger().info(
             f'GLOBAL_LOCALIZE_WAIT_SCAN | no fresh scan on {self.scan_topic}',
+            throttle_duration_sec=5.0,
+        )
+
+    def _tick_wait_odom(self) -> None:
+        if self._odom_fresh():
+            # Do not gate the initial spin on map->base TF. AMCL often needs
+            # this very rotation before that transform becomes trustworthy.
+            self._transition(State.CHECK_LOCALIZATION_QUALITY)
+            return
+        self.get_logger().info(
+            f'GLOBAL_LOCALIZE_WAIT_ODOM | no fresh odom/yaw on {self.odom_topic}',
             throttle_duration_sec=5.0,
         )
 
@@ -393,7 +802,7 @@ class GlobalLocalizeKickstart(Node):
         # robot has moved at all. Only a process that has already completed
         # a real reinit+spin+converge cycle may skip a re-spin here (e.g.
         # this node respawned while AMCL was already localized).
-        if self.total_attempts > 0 and self._update_stability_tracking():
+        if self.initial_spin_completed and self._update_stability_tracking():
             self.get_logger().warning(
                 'GLOBAL_LOCALIZE_ALREADY_CONVERGED | skipping spin'
             )
@@ -404,6 +813,28 @@ class GlobalLocalizeKickstart(Node):
 
     def _start_spin(self) -> None:
         if self.reinit_in_flight:
+            return
+        if self._seeded_this_attempt:
+            # Already seeded map-frame pose via /initialpose this attempt --
+            # go straight to spinning instead of also blindly scattering
+            # particles right after, which would undo the seed.
+            self.total_attempts += 1
+            source = self._pending_seed_source or self._active_scout_id or 'unknown'
+            self.get_logger().warning(
+                f'GLOBAL_LOCALIZE_ATTEMPT | attempt={self.total_attempts} '
+                f'retry={self.retry_count}/{self.max_spin_retries} '
+                f'seed=scout_pose({source})'
+            )
+            self._begin_spin()
+            return
+        if not self.allow_blind_global_reinit:
+            self.total_attempts += 1
+            self.get_logger().warning(
+                f'GLOBAL_LOCALIZE_ATTEMPT | attempt={self.total_attempts} '
+                f'retry={self.retry_count}/{self.max_spin_retries} '
+                'seed=no_initialpose_seed'
+            )
+            self._begin_spin()
             return
         if not self.reinit_client.service_is_ready():
             self.get_logger().info(
@@ -416,7 +847,7 @@ class GlobalLocalizeKickstart(Node):
         self.reinit_in_flight = True
         self.get_logger().warning(
             f'GLOBAL_LOCALIZE_ATTEMPT | attempt={self.total_attempts} '
-            f'retry={self.retry_count}/{self.max_spin_retries}'
+            f'retry={self.retry_count}/{self.max_spin_retries} seed=blind_global_reinit'
         )
         future = self.reinit_client.call_async(Empty.Request())
         future.add_done_callback(self._on_reinitialized)
@@ -427,27 +858,60 @@ class GlobalLocalizeKickstart(Node):
             future.result()
         except Exception as error:  # noqa: BLE001
             self.get_logger().error(f'GLOBAL_LOCALIZE_REINIT_FAILED | {error}')
+            self.total_attempts -= 1
             return
         self.get_logger().warning(
             f'GLOBAL_LOCALIZE_REINITIALIZED | attempt={self.total_attempts}'
         )
+        self._begin_spin()
+
+    def _begin_spin(self) -> None:
         self.accumulated_yaw = 0.0
-        self.last_odom_yaw = None
         self.spin_start_xy = self.last_odom_xy
+        self.spin_direction = 1.0 if self.total_attempts % 2 == 1 else -1.0
         self._last_progress_octant = -1
+        self._next_progress_mark_deg = 90
+        self._spin_motion_detected = False
         self.spin_start_wall = self._now()
         if not self.spin_enabled:
             self.settle_start_wall = self._now()
             self._transition(State.SETTLE)
             return
+        self.get_logger().warning(
+            '[BOOTSTRAP] SPIN_START | '
+            f'cmd_vel={self.cmd_vel_topic} '
+            f'type={"TwistStamped" if self.use_stamped else "Twist"} '
+            'linear_x=0.0'
+        )
+        self.get_logger().warning(
+            'GLOBAL_LOCALIZE_SPIN_START | '
+            f'attempt={self.total_attempts} '
+            f'direction={"ccw" if self.spin_direction > 0.0 else "cw"} '
+            f'cmd_vel={self.cmd_vel_topic} '
+            f'type={"TwistStamped" if self.use_stamped else "Twist"} '
+            f'target={math.degrees(self.spin_target_angle + self.spin_margin):.0f}deg'
+        )
         self._transition(State.SPIN)
 
     def _tick_spin(self) -> None:
-        if not self._scan_fresh() or not self._tf_ok():
+        if not self._scan_fresh() or not self._odom_fresh():
+            if self._spin_sensor_outage_is_brief():
+                now = self._now()
+                if now - self._last_spin_dropout_log_wall >= 2.0:
+                    self.get_logger().warning(
+                        'GLOBAL_LOCALIZE_SPIN_SENSOR_DROPOUT_GRACE | '
+                        'scan/odom briefly stale; keeping spin command active'
+                    )
+                    self._last_spin_dropout_log_wall = now
+                self._publish_twist(self.spin_direction * self.spin_speed)
+                return
             self._publish_twist(0.0)
-            fallback = State.WAIT_SCAN if not self._scan_fresh() else State.WAIT_TF
+            if not self._scan_fresh():
+                fallback = State.WAIT_SCAN
+            else:
+                fallback = State.WAIT_ODOM
             self.get_logger().warning(
-                'GLOBAL_LOCALIZE_SPIN_PAUSED | scan/TF dropped out mid-spin, '
+                'GLOBAL_LOCALIZE_SPIN_PAUSED | scan/odom dropped out mid-spin, '
                 f'falling back to {fallback.name} (not counted as a failed attempt)'
             )
             self._transition(fallback)
@@ -467,44 +931,77 @@ class GlobalLocalizeKickstart(Node):
                     'response is asymmetric enough that "spin in place" is '
                     'actually arcing away from the seeded position'
                 )
-                self.retry_count += 1
-                self._transition(State.RETRY_SPIN)
+                self.get_logger().error(
+                    '[BOOTSTRAP] SPIN_FAILED_DRIFT | '
+                    'no navigation fallback to scout pose will be attempted'
+                )
+                self._transition(State.FAIL_SAFE)
                 return
 
         target = self.spin_target_angle + self.spin_margin
         elapsed = self._now() - self.spin_start_wall
+        rotated_deg = math.degrees(self.accumulated_yaw)
+        if rotated_deg >= 5.0:
+            self._spin_motion_detected = True
 
         if self.accumulated_yaw >= target:
             self._publish_twist(0.0)
+            while self._next_progress_mark_deg <= 360:
+                self.get_logger().warning(
+                    f'[BOOTSTRAP] SPIN_PROGRESS {self._next_progress_mark_deg}'
+                )
+                self._next_progress_mark_deg += 90
+            self.initial_spin_completed = True
             self.get_logger().warning(
                 f'GLOBAL_LOCALIZE_SPIN_COMPLETE | attempt={self.total_attempts} '
                 f'rotated={math.degrees(self.accumulated_yaw):.0f}deg '
                 f'elapsed={elapsed:.1f}s'
             )
+            self.get_logger().warning('[BOOTSTRAP] SPIN_COMPLETE')
             self.settle_start_wall = self._now()
             self._transition(State.SETTLE)
             return
 
         if elapsed >= self.spin_timeout_sec:
             self._publish_twist(0.0)
+            if not self._spin_motion_detected:
+                self.get_logger().error(
+                    '[BOOTSTRAP] SPIN_COMMAND_NOT_EFFECTIVE | '
+                    f'cmd_vel={self.cmd_vel_topic} '
+                    f'type={"TwistStamped" if self.use_stamped else "Twist"} '
+                    f'rotated={rotated_deg:.0f}deg'
+                )
+                self.get_logger().error('[BOOTSTRAP] SPIN_FAILED_NO_MOTION')
+            else:
+                self.get_logger().error(
+                    f'[BOOTSTRAP] SPIN_FAILED_INCOMPLETE | '
+                    f'rotated={rotated_deg:.0f}deg target={math.degrees(target):.0f}deg'
+                )
             self.get_logger().error(
                 f'GLOBAL_LOCALIZE_SPIN_TIMEOUT | attempt={self.total_attempts} '
-                f'rotated={math.degrees(self.accumulated_yaw):.0f}deg of '
+                f'rotated={rotated_deg:.0f}deg of '
                 f'{math.degrees(target):.0f}deg'
             )
-            self.retry_count += 1
-            self._transition(State.RETRY_SPIN)
+            self._transition(State.FAIL_SAFE)
             return
 
+        while (
+            self._next_progress_mark_deg <= 360
+            and rotated_deg >= self._next_progress_mark_deg
+        ):
+            self.get_logger().warning(
+                f'[BOOTSTRAP] SPIN_PROGRESS {self._next_progress_mark_deg}'
+            )
+            self._next_progress_mark_deg += 90
         octant = int(self.accumulated_yaw / (math.pi / 4.0))
         if octant != self._last_progress_octant:
             self._last_progress_octant = octant
             self.get_logger().info(
                 'GLOBAL_LOCALIZE_SPIN_PROGRESS | '
-                f'{math.degrees(self.accumulated_yaw):.0f}/'
+                f'{rotated_deg:.0f}/'
                 f'{math.degrees(target):.0f}deg'
             )
-        self._publish_twist(self.spin_speed)
+        self._publish_twist(self.spin_direction * self.spin_speed)
 
     def _tick_settle(self) -> None:
         self._publish_twist(0.0)
@@ -530,29 +1027,37 @@ class GlobalLocalizeKickstart(Node):
                     f'xy_cov={self.last_pose_cov["xy_cov"]:.4f} '
                     f'yaw_cov={self.last_pose_cov["yaw_cov"]:.4f}'
                 )
+                if self.initial_spin_completed:
+                    self.get_logger().warning(
+                        '[BOOTSTRAP] COVARIANCE_NOT_STABLE_AFTER_SPIN | '
+                        f'{cov_text}; releasing Nav2 after verified 360deg spin'
+                    )
+                    self._transition(State.READY_FOR_NAV)
+                    return
             self.get_logger().warning(
                 f'GLOBAL_LOCALIZE_NOT_CONVERGED | attempt={self.total_attempts} '
                 f'{cov_text}'
             )
-            self.retry_count += 1
-            self._transition(State.RETRY_SPIN)
+            self._transition(State.FAIL_SAFE)
 
     def _tick_retry_spin(self) -> None:
         if self.retry_count > self.max_spin_retries:
             self._transition(State.FAIL_SAFE)
             return
+        self._seeded_this_attempt = False
+        self._pending_seed_source = None
+        self._pending_seed_age = None
+        self.get_logger().warning(
+            '[BOOTSTRAP] RETRY_SPIN_WITHOUT_INITIALPOSE | '
+            'initial pose seed remains one-shot'
+        )
         self._start_spin()
 
     def _tick_ready_for_nav(self) -> None:
         pass
 
     def _tick_fail_safe(self) -> None:
-        if self._update_stability_tracking():
-            self.get_logger().warning(
-                'GLOBAL_LOCALIZE_RECOVERED_AFTER_FAILSAFE | covariance became '
-                'stable without another automatic spin'
-            )
-            self._transition(State.READY_FOR_NAV)
+        pass
 
     def destroy_node(self) -> None:
         try:

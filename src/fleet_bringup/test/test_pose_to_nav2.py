@@ -1,4 +1,5 @@
 import rclpy
+from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseStamped
 
 from fleet_bringup.pose_to_nav2 import PoseToNav2Action
@@ -33,6 +34,11 @@ class FakeGoalHandle:
 
     def get_result_async(self):
         return self.result_future
+
+
+class FakeResult:
+    def __init__(self, status):
+        self.status = status
 
 
 class FakeActionClient:
@@ -108,5 +114,40 @@ def test_out_of_order_action_response_cannot_replace_latest_goal():
         second_future.resolve(second_handle)
         assert node.current_goal_handle is second_handle
         assert node.current_goal_id == 2
+    finally:
+        destroy_node(node)
+
+
+def test_failed_accepted_goal_is_requeued_with_retry_limit():
+    node = make_node()
+    try:
+        client = FakeActionClient(ready=True)
+        node.client = client
+        node.result_retry_sec = 0.5
+        node.max_result_retries = 1
+
+        node._on_goal_pose(goal(1.0, 0.0))
+        first_handle = FakeGoalHandle()
+        client.sent[0][2].resolve(first_handle)
+        first_handle.result_future.resolve(
+            FakeResult(GoalStatus.STATUS_ABORTED)
+        )
+
+        assert node.pending_goal is not None
+        assert node.failed_result_retries == 1
+
+        node.retry_not_before = -1.0e9
+        node._try_send_pending()
+        assert node.pending_goal is None
+        assert len(client.sent) == 2
+
+        second_handle = FakeGoalHandle()
+        client.sent[1][2].resolve(second_handle)
+        second_handle.result_future.resolve(
+            FakeResult(GoalStatus.STATUS_ABORTED)
+        )
+
+        assert node.pending_goal is None
+        assert node.failed_result_retries == 1
     finally:
         destroy_node(node)

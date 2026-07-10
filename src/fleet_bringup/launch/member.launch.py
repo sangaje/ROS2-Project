@@ -2,12 +2,10 @@
 """Member stack: domain bridge, AMCL and (via base.launch.py) Nav2 for a
 generic fleet member.
 
-A member never leads and never follows on its own. It reports its pose to
-the coordinator and executes whatever short yield/return goal the
-coordinator sends on /member_goal_pose when the leader or follower needs to
-pass. follower.launch.py builds on top of this file by adding its own
-trailing behaviour; leader.launch.py is a sibling that builds on
-base.launch.py directly with Cartographer instead of AMCL.
+A member reports its pose and executes direct Nav2 goals on /member_goal_pose.
+follower.launch.py builds on top of this file by adding trailing behaviour;
+leader.launch.py is a sibling that builds on base.launch.py directly with
+Cartographer instead of AMCL.
 """
 
 import os
@@ -207,13 +205,42 @@ def generate_launch_description():
                 name='member_global_localize',
                 output='screen',
                 parameters=[{
+                    'enable_scout_pose_seed': True,
+                    'active_scout_id_topic': '/failover/active_scout_id',
+                    'active_scout_robot_name': 'scout22',
+                    'follower_robot_name': 'follower21',
+                    'member_pose_topic': '/member_pose',
+                    'burger_pose_topic': '/burger_pose',
+                    'last_scout_pose_topic': '/failover/last_scout_pose',
+                    'scout_pose_max_age_sec': 8.0,
+                    'scout_pose_wait_timeout_sec': 2.0,
+                    'initial_pose_topic': '/initialpose',
+                    'initial_pose_xy_std_m': 1.0,
+                    'initial_pose_yaw_std_deg': 45.0,
+                    'initial_pose_settle_sec': 0.5,
+                    'allow_blind_global_reinit': False,
                     'spin_enabled': True,
-                    'spin_speed_rad_s': 0.35,
+                    'spin_speed_rad_s': 0.40,
+                    'spin_target_angle_rad': 7.10,
+                    'spin_timeout_sec': 35.0,
+                    'spin_sensor_dropout_grace_sec': 1.5,
+                    'settle_duration_sec': 3.0,
+                    'require_valid_map': True,
+                    'min_known_map_cells': 100,
+                    'require_scan_before_spin': True,
+                    'require_odom_before_spin': True,
+                    'require_amcl_before_spin': True,
+                    'max_scan_age_sec': 1.2,
+                    'max_odom_age_sec': 1.2,
                     'cmd_vel_topic': '/cmd_vel',
                     'use_stamped_cmd_vel': True,
                     'amcl_pose_topic': '/amcl_pose',
-                    'localization_cov_xy_threshold': 0.35,
-                    'localization_cov_yaw_threshold': 0.25,
+                    'localization_cov_xy_threshold': 1.0,
+                    'localization_cov_yaw_threshold': 0.8,
+                    'localization_stable_duration_sec': 2.5,
+                    'localization_check_timeout_sec': 9.0,
+                    'max_spin_retries': 0,
+                    'force_spin_after_sec': 14.0,
                 }],
                 env=process_env,
                 respawn=True,
@@ -225,13 +252,24 @@ def generate_launch_description():
             launch_arguments={
                 'domain_id': str(member_domain),
                 'start_robot_bringup': start_robot_bringup.perform(context),
-                'hardware_param_file': hardware_param_file.perform(context),
+                'hardware_param_file': (
+                    hardware_param_file.perform(context)
+                    or os.path.join(
+                        package_share,
+                        'config',
+                        'turtlebot3_burger_stamped_cmd_vel.yaml',
+                    )
+                ),
                 'nav2_params_file': nav2_params,
                 'start_nav2': start_nav2.perform(context),
                 'goal_pose_topic': '/member_goal_pose',
                 'goal_proxy_name': 'member_coord_goal',
                 'nav_delay_sec': '8.0',
                 'lifecycle_delay_sec': '12.0',
+                'require_localization_ready': (
+                    'true' if amcl_enabled and auto else 'false'
+                ),
+                'localization_ready_topic': '/localization_ready',
             }.items(),
         )
 

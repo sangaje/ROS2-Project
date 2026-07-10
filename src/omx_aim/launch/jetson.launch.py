@@ -77,6 +77,8 @@ def launch_setup(context, *args, **kwargs):
         arguments=yolo_args,
         parameters=[{
             'waffle_frame_candidates': ['base_link', 'base_footprint'],
+            'require_localization_ready': True,
+            'localization_ready_topic': '/localization_ready',
         }],
         respawn=True,
         respawn_delay=3.0,
@@ -87,7 +89,14 @@ def launch_setup(context, *args, **kwargs):
             package='omx_aim', executable='waffle_node', name='waffle_node',
             output='screen',
             parameters=[{
+                # /localization_ready (from global_localize_kickstart) is the
+                # single source of truth for nav readiness -- don't also
+                # gate on a separately-computed AMCL covariance check here,
+                # or the two can disagree.
                 'require_amcl_ready': False,
+                'require_localization_ready': True,
+                'localization_ready_topic': '/localization_ready',
+                'max_pending_goal_age_sec': 300.0,
             }],
         ),
         Node(
@@ -198,7 +207,7 @@ def generate_launch_description():
             'patrol_max_candidate_cells', default_value='2000',
             description='Maximum top-risk cells evaluated by patrol_planner NMS per cycle.'),
         DeclareLaunchArgument(
-            'debug_stream', default_value='false',
+            'debug_stream', default_value='true',
             description='yolo_node 의 Flask MJPEG 디버그 스트림 켜기'),
         DeclareLaunchArgument(
             'debug_port', default_value='8080',
