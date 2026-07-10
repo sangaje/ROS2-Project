@@ -469,6 +469,11 @@ class ActiveScoutRLRuntime:
     def _command_watchdog(self) -> None:
         if not self._active:
             return
+        # TF lookup can legitimately take up to max_tf_age_sec while
+        # Cartographer creates its first map->base transform. Until a coherent
+        # map snapshot exists, _map_tick() owns the zero-command safety hold.
+        if self._map_snapshot is None:
+            return
         now = time.monotonic()
         if (
             now - self._activated_at > self.config.command_timeout_sec
