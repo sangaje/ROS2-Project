@@ -183,7 +183,12 @@ def probe_checkpoint(
         except ImportError as exc:
             raise PolicyContractError(f'stable_baselines3 unavailable: {exc}') from exc
         try:
-            model = SAC.load(str(assets['checkpoint']), device='cpu')
+            # buffer_size=1 skips reallocating the training-time replay
+            # buffer (one array per Dict observation key -- multiple GiB
+            # for the map/map_seq keys). The preflight probe only calls
+            # predict()/inspects spaces, never touches the replay buffer,
+            # and a Pi-class device cannot afford the full allocation.
+            model = SAC.load(str(assets['checkpoint']), device='cpu', buffer_size=1)
         except Exception as exc:  # noqa: BLE001
             raise PolicyContractError(
                 f'checkpoint load failed with {Path(os.sys.executable)}: {exc}'

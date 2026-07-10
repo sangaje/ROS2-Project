@@ -117,7 +117,7 @@ def test_takeover_prefers_the_primarys_own_last_output_over_the_bridged_map():
         destroy_node(node)
 
 
-def test_relay_stands_down_the_moment_a_primary_reappears():
+def test_relay_stands_down_only_after_primary_confirmed_stable():
     node = make_node()
     try:
         published = []
@@ -129,6 +129,75 @@ def test_relay_stands_down_the_moment_a_primary_reappears():
         node._on_bridged_map(grid(10))
 
         node._check_primary()  # primes _primary_missing_since
+        now[0] += node.takeover_grace + 0.1
+        node._check_primary()
+        assert node._relaying is True
+
+        node.count_publishers = (
+            lambda topic: node._own_output_publishers + 1
+        )
+        node._check_primary()
+        # Reappearance seen but not yet confirmed stable -- still relaying.
+        assert node._relaying is True
+
+        now[0] += node.standby_confirm_sec - 0.1
+        node._check_primary()
+        assert node._relaying is True
+
+        now[0] += 0.2
+        node._check_primary()
+        assert node._relaying is False
+    finally:
+        destroy_node(node)
+
+
+def test_flickering_primary_presence_does_not_flap_the_relay_down():
+    node = make_node()
+    try:
+        published = []
+        node._pub.publish = lambda msg: published.append(msg)
+        node._volatile_pub.publish = lambda msg: None
+        now = [0.0]
+        node._now_sec = lambda: now[0]
+        node.count_publishers = lambda topic: node._own_output_publishers
+        node._on_bridged_map(grid(10))
+
+        node._check_primary()
+        now[0] += node.takeover_grace + 0.1
+        node._check_primary()
+        assert node._relaying is True
+
+        # Primary flickers present for less than standby_confirm_sec, then
+        # disappears again -- the relay must never have stopped serving.
+        node.count_publishers = (
+            lambda topic: node._own_output_publishers + 1
+        )
+        now[0] += node.standby_confirm_sec * 0.5
+        node._check_primary()
+        assert node._relaying is True
+
+        node.count_publishers = lambda topic: node._own_output_publishers
+        now[0] += 0.1
+        node._check_primary()
+        assert node._relaying is True
+        assert len(published) >= 1
+    finally:
+        destroy_node(node)
+
+
+def test_zero_standby_confirm_preserves_instant_standdown():
+    node = make_node()
+    try:
+        published = []
+        node.standby_confirm_sec = 0.0
+        node._pub.publish = lambda msg: published.append(msg)
+        node._volatile_pub.publish = lambda msg: None
+        now = [0.0]
+        node._now_sec = lambda: now[0]
+        node.count_publishers = lambda topic: node._own_output_publishers
+        node._on_bridged_map(grid(10))
+
+        node._check_primary()
         now[0] += node.takeover_grace + 0.1
         node._check_primary()
         assert node._relaying is True
