@@ -69,9 +69,10 @@ function setStreamSource(id, url, force = false) {
 }
 
 function configureStream(s) {
-  const omxPort = s.omx_debug.port;
-  const omxPath = s.omx_debug.stream_path || '/stream.mjpg';
-  streamSources.omxStream = `${location.protocol}//${location.hostname}:${omxPort}${omxPath}`;
+  // Keep OMX video on the same origin as the dashboard.  The server proxies
+  // its local :8080 debug stream, so a browser that can reach :8091 no longer
+  // needs a second firewall/DDS-host-specific port opened.
+  streamSources.omxStream = '/api/omx_stream.mjpg';
 
   const yolo = s.yolo_server || {};
   streamSources.scoutRawStream = yolo.raw_proxy_path || '/api/yolo_stream/raw.mjpg';

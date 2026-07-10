@@ -382,6 +382,41 @@ class LeaderUnifiedDashboard(Node):
             response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
             return response
 
+        @app.get('/api/omx_stream.mjpg')
+        def omx_stream():
+            """Proxy the local OMX debug stream through the dashboard port.
+
+            The dashboard is normally opened from another machine.  Pointing
+            the browser directly at ``<leader-ip>:8080`` made the video panel
+            depend on that extra port being reachable from the client, even
+            though the dashboard itself on 8091 was reachable.  Keep the
+            upstream strictly local and expose it through the already-open
+            dashboard HTTP endpoint instead.
+            """
+            url = f'http://127.0.0.1:{self.omx_debug_port}{self.omx_stream_path}'
+
+            def generate():
+                try:
+                    with urllib.request.urlopen(url, timeout=2.0) as upstream:
+                        while True:
+                            chunk = upstream.read(65536)
+                            if not chunk:
+                                break
+                            yield chunk
+                except Exception as exc:  # noqa: BLE001
+                    self.get_logger().warning(
+                        'UNIFIED_DASHBOARD_OMX_STREAM_PROXY_ERROR | '
+                        f'url={url} error={exc}',
+                        throttle_duration_sec=5.0,
+                    )
+
+            response = Response(
+                stream_with_context(generate()),
+                mimetype='multipart/x-mixed-replace; boundary=frame',
+            )
+            response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+            return response
+
         return app
 
     def _grid_response(self, response_class: Any, kind: str) -> Any:

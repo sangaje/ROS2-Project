@@ -178,12 +178,12 @@ DEBUG_PAGE = """<!doctype html>
         const root = document.getElementById('detections');
         const detections = Array.isArray(s.detections) ? s.detections : [];
         if (!detections.length) {
-          root.innerHTML = '<div class="muted">No person in latest frame.</div>';
+          root.innerHTML = '<div class="muted">No doll in latest frame.</div>';
         } else {
           root.innerHTML = detections.map((d, i) => {
             const conf = Number(d.conf ?? d.confidence ?? 0);
             const box = Array.isArray(d.bbox) ? d.bbox.map(v => Number(v).toFixed(0)).join(', ') : 'bbox unavailable';
-            return `<div class="det"><div><b>${i + 1}. ${d.label ?? 'person'}</b><div class="muted mono">${box}</div></div><div class="mono">${(conf * 100).toFixed(0)}%</div></div>`;
+            return `<div class="det"><div><b>${i + 1}. ${d.label ?? 'doll'}</b><div class="muted mono">${box}</div></div><div class="mono">${(conf * 100).toFixed(0)}%</div></div>`;
           }).join('');
         }
       } catch (_) {
@@ -352,7 +352,7 @@ def _draw_yolo_overlay(frame, detections, latency_ms):
     )
     if not detections:
         cv2.putText(
-            output, 'NO PERSON', (10, 55),
+            output, 'NO DOLL', (10, 55),
             cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 180, 255), 2,
         )
     return output
@@ -461,7 +461,7 @@ def build_app(args):
                     pred,
                     conf_thres=args.conf,
                     iou_thres=args.iou,
-                    classes=[0] if args.person_only else None,
+                    classes=[args.target_class] if args.target_class is not None else None,
                     max_det=args.max_det,
                 )
         else:
@@ -469,7 +469,7 @@ def build_app(args):
                 source=dummy,
                 imgsz=args.imgsz,
                 conf=args.conf,
-                classes=[0] if args.person_only else None,
+                classes=[args.target_class] if args.target_class is not None else None,
                 device=args.device,
                 half=use_half,
                 verbose=False,
@@ -563,7 +563,7 @@ def build_app(args):
                         pred,
                         conf_thres=args.conf,
                         iou_thres=args.iou,
-                        classes=[0] if args.person_only else None,
+                        classes=[args.target_class] if args.target_class is not None else None,
                         max_det=args.max_det,
                     )
                 input_shape = tensor.shape[2:]
@@ -572,7 +572,7 @@ def build_app(args):
                     source=frame,
                     imgsz=args.imgsz,
                     conf=args.conf,
-                    classes=[0] if args.person_only else None,
+                    classes=[args.target_class] if args.target_class is not None else None,
                     device=args.device,
                     half=use_half,
                     verbose=False,
@@ -771,7 +771,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--port', type=int, default=5005)
-    parser.add_argument('--model-path', default='yolo11s.pt')
+    parser.add_argument('--model-path', default='/home/seil/omx_aim/models/best.pt')
     parser.add_argument('--device', default='0')
     parser.add_argument('--half', type=as_bool, default=True)
     parser.add_argument('--fast-forward', type=as_bool, default=True)
@@ -782,8 +782,14 @@ def parse_args():
     parser.add_argument('--debug-jpeg-quality', type=int, default=80)
     parser.add_argument('--max-capture-age-sec', type=float, default=0.8)
     parser.add_argument('--max-queue-wait-sec', type=float, default=0.0)
-    parser.add_argument('--person-only', action='store_true', default=True)
-    parser.add_argument('--all-classes', action='store_false', dest='person_only')
+    parser.add_argument(
+        '--target-class', type=int, default=1,
+        help='Only infer this class. Custom doll model best.pt uses 1=enemy (doll).',
+    )
+    # Backward-compatible aliases for older launch commands.  New launches use
+    # --target-class, so the server no longer hard-codes COCO person (class 0).
+    parser.add_argument('--person-only', action='store_const', const=0, dest='target_class')
+    parser.add_argument('--all-classes', action='store_const', const=None, dest='target_class')
     return parser.parse_args()
 
 
