@@ -560,6 +560,7 @@ class ActiveScoutRLRuntime:
             f'active={self._active} scan_age_ms={scan_age:.0f} map_age_ms={map_age:.0f} '
             f'pose_ok={counters.pose_success_count > 0} obs_ok={obs_ok} '
             f'scan_cb={counters.scan_callback_count} map_cb={counters.map_callback_count} '
+            f'model_load={counters.model_load_count} '
             f'conf_attempts={counters.confidence_update_attempt_count} '
             f'conf_success={counters.confidence_update_success_count} '
             f'predict_attempts={counters.predict_attempt_count} '
