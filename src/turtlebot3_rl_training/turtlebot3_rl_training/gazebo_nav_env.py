@@ -12127,9 +12127,13 @@ class GazeboNavEnv(gym.Env):
         vector_obs = build_exploration_observation(
             scan_ranges=scan_msg.ranges,
             coverage_ratio=stats.coverage_ratio,
+            coverage_delta=stats.coverage_delta,
             frontier_distance=stats.frontier_distance,
             frontier_angle=stats.frontier_angle,
             target_priority=stats.target_priority,
+            mean_confidence=stats.mean_confidence,
+            stale_ratio=stats.stale_ratio,
+            low_confidence_ratio=stats.low_confidence_ratio,
             prev_action=self.prev_action,
             num_lidar_bins=self.num_lidar_bins,
             max_linear_speed=self.max_linear_speed,
