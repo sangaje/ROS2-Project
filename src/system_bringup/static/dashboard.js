@@ -90,6 +90,20 @@ function refreshStreams(force = true) {
   });
 }
 
+function reconnectStream(id) {
+  const image = document.getElementById(id);
+  const url = image.dataset.baseSrc;
+  if (!url) return;
+  // A single source failure should reconnect, but never tear down healthy
+  // MJPEG connections on a fixed timer.  The old periodic reset made panels
+  // appear/disappear after every browser refresh.
+  window.setTimeout(() => setStreamSource(id, url, true), 1500);
+}
+
+['omxStream', 'scoutRawStream', 'scoutYoloStream'].forEach(id => {
+  document.getElementById(id).addEventListener('error', () => reconnectStream(id));
+});
+
 function updateImages(s) {
   queueGridLoad('map', s.map.seq, s.map.status);
   queueGridLoad('risk', s.risk.seq, s.risk.status);
@@ -474,4 +488,3 @@ async function refresh() {
 window.addEventListener('resize', draw);
 refresh();
 setInterval(refresh, 500);
-setInterval(() => refreshStreams(true), 5000);

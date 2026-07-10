@@ -879,6 +879,16 @@ def _encode_grid_png(data: list, width: int, height: int, kind: str) -> bytes:
         raise ValueError(f'invalid {kind} grid dimensions/data')
 
     grid = np.asarray(data[: width * height], dtype=np.int16).reshape((height, width))
+    # Cartographer grids grow with explored area.  Encoding their full native
+    # resolution on every dashboard refresh can take longer than the next map
+    # update, so a browser never receives a completed PNG.  Downsample only
+    # the presentation image; world metadata remains full-resolution and the
+    # canvas scales this image back over the correct map extent.
+    max_render_dimension = 1600
+    stride = max(1, int(math.ceil(max(width, height) / max_render_dimension)))
+    if stride > 1:
+        grid = grid[::stride, ::stride]
+        height, width = grid.shape
     grid = np.flipud(grid)
 
     if kind == 'risk':
@@ -895,7 +905,9 @@ def _encode_grid_png(data: list, width: int, height: int, kind: str) -> bytes:
         occupied = grid >= 65
         known = ~unknown & ~occupied
         shade = np.clip(245 - (np.clip(grid, 0, 100) * 1.8), 35, 245).astype(np.uint8)
-        img[unknown] = (58, 55, 50)
+        # Keep unexplored space visibly distinct from the dashboard's black
+        # canvas, otherwise a valid all-unknown fresh map looks like no map.
+        img[unknown] = (96, 91, 82)
         img[known] = np.stack([shade[known], shade[known], shade[known]], axis=-1)
         img[occupied] = (38, 38, 38)
 
