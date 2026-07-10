@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import math
 import threading
 import time
+import traceback
 from typing import Callable, Optional
 
 import numpy as np
@@ -30,7 +31,12 @@ from turtlebot3_rl_training.observation import (
     build_exploration_observation,
 )
 
-from .rl_policy_contract import ActiveScoutPolicyConfig, active_scout_config, probe_checkpoint
+from .rl_policy_contract import (
+    ActiveScoutPolicyConfig,
+    active_scout_config,
+    load_deployment_model,
+    probe_checkpoint,
+)
 
 
 @dataclass(frozen=True)
@@ -51,6 +57,19 @@ class MapSnapshot:
     scan_generation: int
     map_generation: int
     updated_at: float
+
+
+@dataclass
+class RuntimeCounters:
+    model_load_count: int = 0
+    scan_callback_count: int = 0
+    map_callback_count: int = 0
+    pose_success_count: int = 0
+    confidence_update_attempt_count: int = 0
+    confidence_update_success_count: int = 0
+    predict_attempt_count: int = 0
+    predict_success_count: int = 0
+    predict_failure_count: int = 0
 
 
 def _stamp_time(message) -> Time:
@@ -192,6 +211,7 @@ class ActiveScoutRLRuntime:
         self.on_stop = on_stop
         self._active = False
         self._lock = threading.Lock()
+        self._map_state_lock = threading.Lock()
         self._scan: Optional[LaserScan] = None
         self._scan_received_at = 0.0
         self._scan_generation = 0
@@ -205,9 +225,13 @@ class ActiveScoutRLRuntime:
         self._last_command_at = 0.0
         self._activated_at = 0.0
         self._last_error_at = 0.0
+        self._last_heartbeat_at = 0.0
         self._last_stop_reason = 'not_activated'
         self._model_error: Optional[str] = None
+        self._last_error = ''
+        self.counters = RuntimeCounters()
         self._sensor_group = ReentrantCallbackGroup()
+        self._map_group = MutuallyExclusiveCallbackGroup()
         self._policy_group = MutuallyExclusiveCallbackGroup()
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self.node, spin_thread=False)
@@ -280,7 +304,7 @@ class ActiveScoutRLRuntime:
         self.map_timer = self.node.create_timer(
             self.config.control_dt_sec / self.config.map_substeps_per_action,
             self._map_tick,
-            callback_group=self._policy_group,
+            callback_group=self._map_group,
         )
         self.policy_timer = self.node.create_timer(
             self.config.control_dt_sec,
@@ -326,15 +350,20 @@ class ActiveScoutRLRuntime:
 
     def _load_model(self, model_loader):
         try:
-            if model_loader is None:
-                from stable_baselines3 import SAC
-                model_loader = SAC.load
-            model = model_loader(str(self.config.checkpoint), device='cpu', buffer_size=1)
+            model = (
+                load_deployment_model()
+                if model_loader is None
+                else model_loader(str(self.config.checkpoint), device='cpu', buffer_size=1)
+            )
             probe_checkpoint(model=model)
+            self.counters.model_load_count += 1
             return model
         except Exception as exc:  # noqa: BLE001
             self._model_error = str(exc)
-            self.node.get_logger().error(f'SCOUT_RL_MODEL_LOAD_FAILED | {exc}')
+            self._last_error = traceback.format_exc()
+            self.node.get_logger().error(
+                f'SCOUT_RL_MODEL_LOAD_FAILED | {exc}\n{self._last_error}'
+            )
             return None
 
     def _reset_episode_state(self) -> None:
@@ -349,12 +378,14 @@ class ActiveScoutRLRuntime:
             self._scan = message
             self._scan_received_at = time.monotonic()
             self._scan_generation += 1
+            self.counters.scan_callback_count += 1
 
     def _on_map(self, message: OccupancyGrid) -> None:
         with self._lock:
             self._map = message
             self._map_received_at = time.monotonic()
             self._map_generation += 1
+            self.counters.map_callback_count += 1
 
     def _sensor_snapshot(self) -> SensorSnapshot:
         with self._lock:
@@ -406,31 +437,41 @@ class ActiveScoutRLRuntime:
             stamp = _stamp_time(snapshot.scan)
             robot_xy, robot_yaw = self._lookup_pose(self.config.map_frame, self.config.base_frame, stamp)
             sensor_xy, sensor_yaw = self._lookup_pose(self.config.map_frame, scan_frame, stamp)
-            stats = self.exploration_map.update(
-                snapshot.scan,
-                robot_xy,
-                robot_yaw,
-                publish=True,
-                slam_map=snapshot.slam_map,
-                sensor_xy=sensor_xy,
-                sensor_yaw=sensor_yaw,
-            )
+            self.counters.pose_success_count += 1
+            self.counters.confidence_update_attempt_count += 1
+            # The exploration map is mutable, but the sensor lock is never held
+            # while this CPU-heavy update runs.  Policy reads take the same lock
+            # only while cropping an observation, then release it before predict.
+            with self._map_state_lock:
+                stats = self.exploration_map.update(
+                    snapshot.scan,
+                    robot_xy,
+                    robot_yaw,
+                    publish=True,
+                    slam_map=snapshot.slam_map,
+                    sensor_xy=sensor_xy,
+                    sensor_yaw=sensor_yaw,
+                )
+                self._map_snapshot = MapSnapshot(
+                    stats=stats,
+                    robot_xy=robot_xy,
+                    robot_yaw=robot_yaw,
+                    scan_generation=snapshot.scan_generation,
+                    map_generation=snapshot.map_generation,
+                    updated_at=now,
+                )
+            self.counters.confidence_update_success_count += 1
+            self._log_heartbeat()
         except TransformException as exc:
+            self._last_error = f'TransformException: {exc}'
             self._warn_throttled(f'SCOUT_RL_WAIT_TF | {exc}')
             self._hold('waiting_for_tf')
             return
         except Exception as exc:  # noqa: BLE001
-            self._warn_throttled(f'SCOUT_RL_WAIT_MAP_UPDATE | {exc}')
+            self._last_error = traceback.format_exc()
+            self._warn_throttled(f'SCOUT_RL_WAIT_MAP_UPDATE | {exc}\n{self._last_error}')
             self._hold('waiting_for_map_update')
             return
-        self._map_snapshot = MapSnapshot(
-            stats=stats,
-            robot_xy=robot_xy,
-            robot_yaw=robot_yaw,
-            scan_generation=snapshot.scan_generation,
-            map_generation=snapshot.map_generation,
-            updated_at=now,
-        )
 
     def _policy_tick(self) -> None:
         if not self._active or self.model is None:
@@ -447,22 +488,37 @@ class ActiveScoutRLRuntime:
             return
         assert snapshot.scan is not None
         try:
-            observation = self._build_observation(snapshot.scan, map_snapshot)
+            # Never retain the map lock over model.predict(): scan/map callbacks
+            # must remain able to replace their latest snapshots while inference
+            # runs on the other executor worker.
+            with self._map_state_lock:
+                observation = self._build_observation(snapshot.scan, map_snapshot)
+            if not all(np.all(np.isfinite(value)) for value in observation.values()):
+                raise RuntimeError('observation contains NaN or Inf')
             started = time.monotonic()
+            self.counters.predict_attempt_count += 1
             action, _ = self.model.predict(observation, deterministic=True)
             elapsed = time.monotonic() - started
             if elapsed > self.config.max_inference_sec:
+                self.counters.predict_failure_count += 1
                 self._warn_throttled(f'SCOUT_RL_INFERENCE_TIMEOUT | sec={elapsed:.3f}')
-                self._stop('inference_timeout')
+                self._hold('inference_timeout')
                 return
             command = self.safety.filter(np.asarray(action, dtype=np.float32), snapshot.scan)
         except Exception as exc:  # noqa: BLE001
-            self._warn_throttled(f'SCOUT_RL_INFERENCE_FAILED | {exc}')
-            self._stop('inference_error')
+            self.counters.predict_failure_count += 1
+            self._last_error = traceback.format_exc()
+            self._warn_throttled(f'SCOUT_RL_INFERENCE_FAILED | {exc}\n{self._last_error}')
+            # A bad frame or a transient CPU error must not turn ACTIVE_SCOUT
+            # into a permanent inactive latch.  The next coherent snapshot gets
+            # another deterministic attempt.
+            self._hold('inference_error')
             return
         self._previous_action = command.copy()
         self._last_command_at = now
+        self.counters.predict_success_count += 1
         self.publish_command(float(command[0]), float(command[1]))
+        self._log_heartbeat()
 
     def _command_watchdog(self) -> None:
         if not self._active:
@@ -485,6 +541,32 @@ class ActiveScoutRLRuntime:
         self._last_stop_reason = reason
         self._last_command_at = time.monotonic()
         self.publish_command(0.0, 0.0)
+        self._log_heartbeat()
+
+    def _log_heartbeat(self) -> None:
+        """Emit aggregate liveness evidence without per-tick log spam."""
+        now = time.monotonic()
+        if now - self._last_heartbeat_at < 1.0:
+            return
+        self._last_heartbeat_at = now
+        snapshot = self._sensor_snapshot()
+        map_snapshot = self._map_snapshot
+        scan_age = (now - snapshot.scan_received_at) * 1000.0 if snapshot.scan else -1.0
+        map_age = (now - snapshot.map_received_at) * 1000.0 if snapshot.slam_map else -1.0
+        obs_ok = bool(map_snapshot is not None and now - map_snapshot.updated_at <= self.config.max_scan_age_sec)
+        counters = self.counters
+        self.node.get_logger().info(
+            'RL_RUNTIME_HEARTBEAT | '
+            f'active={self._active} scan_age_ms={scan_age:.0f} map_age_ms={map_age:.0f} '
+            f'pose_ok={counters.pose_success_count > 0} obs_ok={obs_ok} '
+            f'scan_cb={counters.scan_callback_count} map_cb={counters.map_callback_count} '
+            f'conf_attempts={counters.confidence_update_attempt_count} '
+            f'conf_success={counters.confidence_update_success_count} '
+            f'predict_attempts={counters.predict_attempt_count} '
+            f'predict_success={counters.predict_success_count} '
+            f'predict_failure={counters.predict_failure_count} '
+            f'last_error={self._last_error.splitlines()[-1] if self._last_error else ""}'
+        )
 
     def _build_observation(self, scan: LaserScan, map_snapshot: MapSnapshot) -> dict[str, np.ndarray]:
         stats = map_snapshot.stats
@@ -526,12 +608,22 @@ class ActiveScoutRLRuntime:
         else:
             self._history_vector.append(vector.copy())
             self._history_map.append(map_observation.copy())
-        return {
+        observation = {
             'vector': vector,
             'map': map_observation,
             'seq': np.stack(self._history_vector, axis=0).astype(np.float32),
             'map_seq': np.stack(self._history_map, axis=0).astype(np.float32),
         }
+        if self.counters.predict_attempt_count > 0 and self.counters.predict_attempt_count % 10 == 0:
+            self.node.get_logger().info(
+                'OBS_RUNTIME | '
+                f'map_shape={observation["map"].shape} '
+                f'map_seq_shape={observation["map_seq"].shape} '
+                f'vector_shape={observation["vector"].shape} '
+                f'seq_shape={observation["seq"].shape} '
+                f'finite={all(np.all(np.isfinite(value)) for value in observation.values())}'
+            )
+        return observation
 
     def _stop(self, reason: str) -> None:
         was_active = self._active

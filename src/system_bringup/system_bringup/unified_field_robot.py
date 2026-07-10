@@ -98,6 +98,8 @@ class UnifiedFieldRobot(Node):
         super().__init__('unified_field_robot')
 
         self.declare_parameter('robot_name', 'field_robot')
+        self.declare_parameter('fleet_role', 'member')
+        self.declare_parameter('active_scout_robot_name', 'scout22')
         self.declare_parameter('initial_role', 'IDLE')
         self.declare_parameter('enable_follow_mode', True)
         self.declare_parameter('enable_scout_mode', True)
@@ -139,6 +141,8 @@ class UnifiedFieldRobot(Node):
 
         get = self.get_parameter
         self.robot_name = str(get('robot_name').value)
+        self.fleet_role = str(get('fleet_role').value).strip().lower()
+        self.active_scout_robot_name = str(get('active_scout_robot_name').value).strip()
         self.role = normalize_role(str(get('initial_role').value))
         self.enable_follow = bool(get('enable_follow_mode').value)
         self.enable_scout = bool(get('enable_scout_mode').value)
@@ -347,6 +351,15 @@ class UnifiedFieldRobot(Node):
             return
         if epoch < self.epoch:
             return
+        self.get_logger().info(
+            'ROLE_STATE | '
+            f'old={self.role.value} new='
+            f'{Role.ACTIVE_SCOUT.value if active == self.robot_name else Role.IDLE.value} '
+            f'reason=fleet_role_update robot_name={self.robot_name} '
+            f'active_scout_robot_name={active or self.active_scout_robot_name} '
+            f'fleet_role={self.fleet_role}',
+            throttle_duration_sec=2.0,
+        )
         if active != self.robot_name and epoch >= self.epoch and self.role == Role.ACTIVE_SCOUT:
             self.epoch = epoch
             self._enter_role(Role.IDLE, reason='higher_epoch_not_active')
@@ -537,8 +550,11 @@ class UnifiedFieldRobot(Node):
                 self.get_logger().warning('[SCOUT_RL] ACTIVATED role=ACTIVE_SCOUT')
             self._activate_rl()
         self.get_logger().warning(
-            f'FIELD_ROLE_TRANSITION | robot={self.robot_name} '
-            f'{old.value}->{role.value} reason={reason} epoch={self.epoch}'
+            'ROLE_STATE | '
+            f'old={old.value} new={role.value} reason={reason} '
+            f'robot_name={self.robot_name} '
+            f'active_scout_robot_name={self.active_scout_robot_name} '
+            f'fleet_role={self.fleet_role} epoch={self.epoch}'
         )
         self._publish_status()
 

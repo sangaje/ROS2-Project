@@ -7,6 +7,7 @@ import pytest
 from system_bringup.rl_policy_contract import (
     PolicyContractError,
     active_scout_config,
+    load_deployment_model,
     load_contract,
     probe_checkpoint,
     validate_static_assets,
@@ -62,3 +63,20 @@ def test_wrong_observation_contract_fails_fast():
 
     with pytest.raises(PolicyContractError, match='observation space'):
         probe_checkpoint(contract, model=model)
+
+
+def test_deployment_checkpoint_predicts_continuously_with_legacy_numpy_pickle():
+    """The deployed NumPy-2 checkpoint must run on the robot's NumPy-1 image."""
+    model = load_deployment_model()
+    observation = {
+        'map': np.zeros((4, 64, 64), dtype=np.float32),
+        'map_seq': np.zeros((8, 4, 64, 64), dtype=np.float32),
+        'seq': np.zeros((8, 69), dtype=np.float32),
+        'vector': np.zeros((69,), dtype=np.float32),
+    }
+
+    actions = [model.predict(observation, deterministic=True)[0] for _ in range(20)]
+
+    assert len(actions) == 20
+    assert all(np.asarray(action).shape == (2,) for action in actions)
+    assert all(np.all(np.isfinite(action)) for action in actions)

@@ -324,6 +324,8 @@ def generate_launch_description():
                     output='screen',
                     parameters=[{
                         'robot_name': local_robot_name,
+                        'fleet_role': fleet_role_value,
+                        'active_scout_robot_name': active_scout_robot_name.perform(context),
                         'initial_role': initial_field_role,
                         'enable_follow_mode': True,
                         'enable_scout_mode': True,

@@ -8,6 +8,8 @@ import json
 import math
 import os
 from pathlib import Path
+import sys
+import types
 from typing import Any, Optional
 
 
@@ -266,6 +268,94 @@ def _space_contract(space) -> dict[str, Any]:
     return {'shape': list(getattr(space, 'shape', ())), 'dtype': str(getattr(space, 'dtype', ''))}
 
 
+def _deployment_spaces(contract: dict[str, Any]):
+    """Build the saved policy spaces without unpickling version-specific gym data."""
+    try:
+        import numpy as np
+        from gymnasium import spaces
+    except ImportError as exc:
+        raise PolicyContractError(f'gymnasium/numpy unavailable: {exc}') from exc
+
+    observation = contract['observation_contract']
+    observation_space = spaces.Dict({
+        key: spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=tuple(int(value) for value in observation[key]['shape']),
+            dtype=np.float32,
+        )
+        for key in observation['keys']
+    })
+    action = contract['action_contract']
+    action_space = spaces.Box(
+        low=np.asarray(action['low'], dtype=np.float32),
+        high=np.asarray(action['high'], dtype=np.float32),
+        dtype=np.float32,
+    )
+    return observation_space, action_space
+
+
+def _install_numpy2_pickle_compatibility() -> None:
+    """Let NumPy 1.x load the deployment checkpoint written by NumPy 2.x.
+
+    The SB3 zip contains cloudpickled NumPy objects.  NumPy 2 renamed
+    ``numpy.core`` to ``numpy._core`` and changed the bit-generator pickle
+    argument.  The policy weights themselves are unchanged; this narrow shim is
+    used only while SB3 deserializes the historical checkpoint.
+    """
+    try:
+        import numpy as np
+        import numpy.core.numeric as numeric
+        import numpy.random._pickle as random_pickle
+    except ImportError as exc:
+        raise PolicyContractError(f'numpy unavailable: {exc}') from exc
+    try:
+        import numpy._core.numeric  # noqa: F401
+        return
+    except ModuleNotFoundError:
+        pass
+
+    compat_core = types.ModuleType('numpy._core')
+    compat_core.__path__ = []
+    compat_core.numeric = numeric
+    sys.modules.setdefault('numpy._core', compat_core)
+    sys.modules.setdefault('numpy._core.numeric', numeric)
+
+    original_ctor = random_pickle.__bit_generator_ctor
+    if not getattr(original_ctor, '_scout_rl_numpy2_compat', False):
+        def compatible_ctor(value='MT19937'):
+            if isinstance(value, type):
+                value = value.__name__
+            return original_ctor(value)
+
+        compatible_ctor._scout_rl_numpy2_compat = True
+        random_pickle.__bit_generator_ctor = compatible_ctor
+
+
+def load_deployment_model(contract: Optional[dict[str, Any]] = None):
+    """Load the frozen SAC checkpoint on either NumPy 1.x or NumPy 2.x."""
+    data = load_contract() if contract is None else _validate_contract(contract)
+    assets = validate_static_assets(data)
+    _install_numpy2_pickle_compatibility()
+    try:
+        from stable_baselines3 import SAC
+    except ImportError as exc:
+        raise PolicyContractError(f'stable_baselines3 unavailable: {exc}') from exc
+    observation_space, action_space = _deployment_spaces(data)
+    try:
+        return SAC.load(
+            str(assets['checkpoint']),
+            device='cpu',
+            buffer_size=1,
+            custom_objects={
+                'observation_space': observation_space,
+                'action_space': action_space,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise PolicyContractError(f'checkpoint load failed: {exc}') from exc
+
+
 def probe_checkpoint(
     contract: Optional[dict[str, Any]] = None,
     model=None,
@@ -274,14 +364,7 @@ def probe_checkpoint(
     data = load_contract() if contract is None else contract
     assets = validate_static_assets(data)
     if model is None:
-        try:
-            from stable_baselines3 import SAC
-        except ImportError as exc:
-            raise PolicyContractError(f'stable_baselines3 unavailable: {exc}') from exc
-        try:
-            model = SAC.load(str(assets['checkpoint']), device='cpu', buffer_size=1)
-        except Exception as exc:  # noqa: BLE001
-            raise PolicyContractError(f'checkpoint load failed: {exc}') from exc
+        model = load_deployment_model(data)
 
     expected_obs = data['observation_contract']
     actual_obs = _space_contract(model.observation_space)
