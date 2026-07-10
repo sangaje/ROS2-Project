@@ -1,4 +1,5 @@
 from pathlib import Path
+import threading
 
 import numpy as np
 from nav_msgs.msg import OccupancyGrid
@@ -187,7 +188,9 @@ def test_first_predict_exception_does_not_deactivate_active_scout():
     runtime.config = active_scout_config()
     runtime._active = True
     runtime.model = _FlakyModel()
-    runtime._map_state_lock = __import__('threading').Lock()
+    runtime._model_lock = threading.Lock()
+    runtime._model_error = None
+    runtime._map_state_lock = threading.Lock()
     runtime._map_snapshot = type('MapSnapshot', (), {'updated_at': __import__('time').monotonic()})()
     runtime._sensor_snapshot = lambda: SensorSnapshot(
         scan=_scan(), scan_received_at=__import__('time').monotonic(), scan_generation=1,
@@ -228,6 +231,9 @@ def test_command_watchdog_holds_and_retries_without_deactivating_active_scout():
     runtime = ActiveScoutRLRuntime.__new__(ActiveScoutRLRuntime)
     runtime.config = active_scout_config()
     runtime._active = True
+    runtime.model = object()
+    runtime._model_lock = threading.Lock()
+    runtime._model_error = None
     runtime._map_snapshot = object()
     now = __import__('time').monotonic()
     runtime._activated_at = now - runtime.config.command_timeout_sec - 0.1

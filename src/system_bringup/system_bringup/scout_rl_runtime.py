@@ -204,14 +204,17 @@ class ActiveScoutRLRuntime:
         config: Optional[ActiveScoutPolicyConfig] = None,
         model_loader=None,
         on_stop: Optional[Callable[[str], None]] = None,
+        on_ready: Optional[Callable[[], None]] = None,
     ) -> None:
         self.node = node
         self.config = config or active_scout_config()
         self.publish_command = publish_command
         self.on_stop = on_stop
+        self.on_ready = on_ready
         self._active = False
         self._lock = threading.Lock()
         self._map_state_lock = threading.Lock()
+        self._model_lock = threading.Lock()
         self._scan: Optional[LaserScan] = None
         self._scan_received_at = 0.0
         self._scan_generation = 0
@@ -229,6 +232,9 @@ class ActiveScoutRLRuntime:
         self._last_stop_reason = 'not_activated'
         self._model_error: Optional[str] = None
         self._last_error = ''
+        self._model_loading = True
+        self._model_ready_notified = False
+        self.model = None
         self.counters = RuntimeCounters()
         self._sensor_group = ReentrantCallbackGroup()
         self._map_group = MutuallyExclusiveCallbackGroup()
@@ -246,7 +252,6 @@ class ActiveScoutRLRuntime:
             obstacle_margin_m=self.config.lidar.obstacle_margin_m,
         )
         self.safety = VelocitySafetyFilter(self.config, self.lidar)
-        self.model = self._load_model(model_loader)
         self.exploration_map = ExplorationGridMap(
             node=self.node,
             resolution=self.config.map_resolution_m,
@@ -316,14 +321,21 @@ class ActiveScoutRLRuntime:
             self._command_watchdog,
             callback_group=self._sensor_group,
         )
+        self.model_state_timer = self.node.create_timer(
+            0.1,
+            self._model_state_tick,
+            callback_group=self._sensor_group,
+        )
+        self._start_model_loader(model_loader)
 
     @property
     def ready(self) -> bool:
-        return self.model is not None and self._model_error is None
+        with self._model_lock:
+            return self.model is not None and self._model_error is None
 
     @property
     def active(self) -> bool:
-        return self._active
+        return self._active and self.ready
 
     @property
     def last_stop_reason(self) -> str:
@@ -331,14 +343,22 @@ class ActiveScoutRLRuntime:
 
     def activate(self) -> None:
         self._reset_episode_state()
-        self._active = self.ready
+        self._active = True
         self._activated_at = time.monotonic()
         self._last_stop_reason = ''
+        if self.ready:
+            self.node.get_logger().warning('SCOUT_RL_ACTIVE | deterministic=true map_substeps=2')
+            return
+        if self._model_loading:
+            self.node.get_logger().warning(
+                'SCOUT_RL_MODEL_LOADING | runtime keeps map/scan callbacks live'
+            )
+            self.publish_command(0.0, 0.0)
+            return
         if not self.ready:
             self._stop('model_unavailable')
             self.node.get_logger().error(f'SCOUT_RL_UNAVAILABLE | {self._model_error}')
             return
-        self.node.get_logger().warning('SCOUT_RL_ACTIVE | deterministic=true map_substeps=2')
 
     def deactivate(self, reason: str) -> None:
         self._active = False
@@ -365,6 +385,36 @@ class ActiveScoutRLRuntime:
                 f'SCOUT_RL_MODEL_LOAD_FAILED | {exc}\n{self._last_error}'
             )
             return None
+
+    def _start_model_loader(self, model_loader) -> None:
+        """Keep PyTorch/SB3 import and checkpoint deserialization off the ROS executor."""
+        def load() -> None:
+            model = self._load_model(model_loader)
+            with self._model_lock:
+                self.model = model
+                self._model_loading = False
+
+        threading.Thread(
+            target=load,
+            name='scout_rl_model_loader',
+            daemon=True,
+        ).start()
+
+    def _model_state_tick(self) -> None:
+        """Apply loader completion on an executor callback, never the loader thread."""
+        if not self._active or self._model_loading:
+            return
+        if not self.ready:
+            self._stop('model_unavailable')
+            return
+        if self._model_ready_notified:
+            return
+        self._model_ready_notified = True
+        self.node.get_logger().warning(
+            'SCOUT_RL_ACTIVE | deterministic=true map_substeps=2 model=ready'
+        )
+        if self.on_ready is not None:
+            self.on_ready()
 
     def _reset_episode_state(self) -> None:
         self._history_vector.clear()

@@ -258,6 +258,7 @@ class UnifiedFieldRobot(Node):
                 self,
                 self._publish_rl_command,
                 on_stop=self._on_rl_stopped,
+                on_ready=self._on_rl_ready,
             )
 
         self.create_timer(0.1, self._tick)
@@ -797,6 +798,17 @@ class UnifiedFieldRobot(Node):
     def _on_rl_stopped(self, reason: str) -> None:
         if self.motion_authority == MotionAuthority.ACTIVE_SCOUT_RL:
             self._set_authority(MotionAuthority.NONE, f'rl_{reason}')
+
+    def _on_rl_ready(self) -> None:
+        """Grant command authority only after asynchronous model loading completes."""
+        if (
+            self.role == Role.ACTIVE_SCOUT
+            and self.rl_runtime is not None
+            and self.rl_runtime.active
+            and (not self.require_localization_ready or self.localization_ready)
+            and self._nav_motion_quiesced()
+        ):
+            self._set_authority(MotionAuthority.ACTIVE_SCOUT_RL, 'rl_model_ready')
 
     def _set_authority(self, authority: MotionAuthority, reason: str) -> None:
         if authority == self.motion_authority:
