@@ -5,7 +5,7 @@ from urllib.parse import unquote, urlparse
 from xml.etree import ElementTree as ET
 
 from ament_index_python.packages import get_package_share_directory
-from launch.actions import OpaqueFunction
+from launch.actions import OpaqueFunction, SetEnvironmentVariable
 
 
 REQUIRED_DDS_ENVIRONMENT = (
@@ -96,8 +96,11 @@ def _packaged_cyclonedds_uri() -> str:
     return f'file://{path}'
 
 
-def _prepare_process_environment(domain_id: str) -> Dict[str, str]:
-    env = os.environ.copy()
+def _prepare_process_environment(
+    domain_id: str,
+    base_environment: Dict[str, str] | None = None,
+) -> Dict[str, str]:
+    env = dict(base_environment) if base_environment is not None else os.environ.copy()
     env['ROS_DOMAIN_ID'] = str(domain_id)
     if (
         env.get('RMW_IMPLEMENTATION', '').strip() == 'rmw_cyclonedds_cpp'
@@ -213,12 +216,37 @@ def clean_process_environment(domain_id: str) -> Dict[str, str]:
 
 
 def dds_launch_environment(domain_id) -> List:
-    """Launch actions that validate DDS settings inherited from the shell."""
+    """Validate DDS settings and apply them to the launch environment.
+
+    Returning ``SetEnvironmentVariable`` actions from the opaque callback is
+    important: merely preparing a copied dictionary does not affect nodes or
+    includes that launch afterwards.  Start from the current launch context so
+    an explicitly supplied ``CYCLONEDDS_URI`` remains authoritative; only add
+    the package-local CycloneDDS configuration when no URI is present.
+    """
 
     def _validate(context, *args, **kwargs):
-        validate_shell_environment(_perform_if_needed(domain_id, context))
-        _prepare_process_environment(_perform_if_needed(domain_id, context))
-        return []
+        expected_domain_id = _perform_if_needed(domain_id, context)
+        validate_shell_environment(expected_domain_id)
+        resolved_domain_id = expected_domain_id
+        if resolved_domain_id is None:
+            resolved_domain_id = context.environment.get(
+                'ROS_DOMAIN_ID',
+                os.environ.get('ROS_DOMAIN_ID', ''),
+            )
+        env = _prepare_process_environment(
+            resolved_domain_id,
+            base_environment=context.environment,
+        )
+        actions = [
+            SetEnvironmentVariable('ROS_DOMAIN_ID', env['ROS_DOMAIN_ID']),
+        ]
+        cyclonedds_uri = env.get('CYCLONEDDS_URI', '').strip()
+        if cyclonedds_uri:
+            actions.append(
+                SetEnvironmentVariable('CYCLONEDDS_URI', cyclonedds_uri)
+            )
+        return actions
 
     return [OpaqueFunction(function=_validate)]
 

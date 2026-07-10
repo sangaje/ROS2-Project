@@ -214,6 +214,7 @@ class LeaderShadowFollow(Node):
         # -- the leader would never begin following at all.
         self.shadow_active = True
         self.last_goal: Optional[PoseStamped] = None
+        self.shadow_goal_active = False
         self.last_goal_wall = -1.0e9
         self.last_nominal_target: Optional[Point2] = None
         self.speed_profile: Optional[str] = None
@@ -254,12 +255,16 @@ class LeaderShadowFollow(Node):
         self.map_msg = msg
 
     def _on_failover_state(self, msg: String) -> None:
+        previous = self.failover_state
         self.failover_state = msg.data.strip() or 'UNKNOWN'
+        if previous != self.failover_state and not self._failover_allows_shadow():
+            self._cancel_shadow_goal(f'failover_{self.failover_state}')
 
     def _on_active_scout_id(self, msg: String) -> None:
         scout_id = msg.data.strip()
         if not scout_id or scout_id == self.active_scout_id:
             return
+        self._cancel_shadow_goal('active_scout_changed')
         self.active_scout_id = scout_id
         self.previous_scout_sample = None
         self.heading = None
@@ -273,6 +278,8 @@ class LeaderShadowFollow(Node):
     def _on_localization_ready(self, msg: Bool) -> None:
         previous = self.localization_ready
         self.localization_ready = bool(msg.data)
+        if previous and not self.localization_ready:
+            self._cancel_shadow_goal('localization_not_ready')
         if self.localization_ready and not previous:
             self.get_logger().warning(
                 f'[LEADER_SHADOW] LOCALIZATION_READY | topic={self.localization_ready_topic}'
@@ -285,6 +292,7 @@ class LeaderShadowFollow(Node):
 
     def _tick(self) -> None:
         if not self.enabled:
+            self._cancel_shadow_goal('disabled')
             self._set_controller_speed_limit(False)
             self.mode = LeaderMode.IDLE
             self._publish_state('disabled')
@@ -293,6 +301,7 @@ class LeaderShadowFollow(Node):
             self._publish_state('startup_grace')
             return
         if self.require_localization_ready and not self.localization_ready:
+            self._cancel_shadow_goal('waiting_localization_ready')
             self.mode = LeaderMode.IDLE
             self._set_controller_speed_limit(False)
             self._publish_state('waiting_localization_ready')
@@ -304,12 +313,14 @@ class LeaderShadowFollow(Node):
 
         scout_pose, scout_wall = self._active_scout_pose()
         if self.leader_pose is None or scout_pose is None:
+            self._cancel_shadow_goal('waiting_pose')
             self.mode = LeaderMode.IDLE
             self._set_controller_speed_limit(False)
             self._publish_state('waiting_pose')
             return
         scout_age = self._now() - scout_wall
         if scout_age > self.scout_pose_timeout:
+            self._cancel_shadow_goal('scout_pose_stale')
             self.mode = LeaderMode.SCOUT_SUSPECTED_DEAD
             self._set_controller_speed_limit(False)
             self._publish_state(f'scout_pose_stale_{scout_age:.2f}s')
@@ -323,6 +334,7 @@ class LeaderShadowFollow(Node):
             self.shadow_active = True
 
         if not self.shadow_active:
+            self._cancel_shadow_goal('inside_standoff_hysteresis')
             self.mode = LeaderMode.IDLE
             self._set_controller_speed_limit(False)
             self._publish_state('inside_standoff_hysteresis')
@@ -338,6 +350,7 @@ class LeaderShadowFollow(Node):
 
         goal = self._build_shadow_goal(scout_pose)
         if goal is None:
+            self._cancel_shadow_goal('no_feasible_shadow_target')
             self._publish_state('no_feasible_shadow_target')
             return
         if not self._should_publish_goal(goal):
@@ -347,6 +360,7 @@ class LeaderShadowFollow(Node):
         self.goal_pub.publish(goal)
         self.goal_debug_pub.publish(goal)
         self.last_goal = goal
+        self.shadow_goal_active = True
         self.last_goal_wall = self._now()
         self._publish_state('goal_sent', goal=goal, distance_to_scout=distance_to_scout)
         self.get_logger().warning(
@@ -373,6 +387,7 @@ class LeaderShadowFollow(Node):
         )
 
     def _stop_shadow_for_failover(self) -> None:
+        self._cancel_shadow_goal(f'failover_{self.failover_state}')
         self.shadow_active = False
         self.last_goal = None
         self._set_controller_speed_limit(False)
@@ -578,6 +593,17 @@ class LeaderShadowFollow(Node):
         msg = Bool()
         msg.data = bool(value)
         self.cancel_pub.publish(msg)
+
+    def _cancel_shadow_goal(self, reason: str) -> None:
+        """Cancel the previous shadow goal once when shadow loses authority."""
+        if not self.shadow_goal_active:
+            return
+        self._publish_cancel(True)
+        self.shadow_goal_active = False
+        self.last_goal = None
+        self.get_logger().warning(
+            f'[LEADER_SHADOW] GOAL_CANCELLED | reason={reason}'
+        )
 
     def _publish_state(
         self,

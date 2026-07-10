@@ -90,6 +90,19 @@ class PoseToNav2Action(Node):
         self.result_retry_sec = max(
             0.5, float(_safe_declare(self, 'result_retry_sec', 2.0))
         )
+        self.max_send_retries = max(
+            0, int(_safe_declare(self, 'max_send_retries', 2))
+        )
+        self.send_exception_retry_sec = max(
+            0.1,
+            float(_safe_declare(self, 'send_exception_retry_sec', 1.0)),
+        )
+        self.rejected_retry_sec = max(
+            0.1, float(_safe_declare(self, 'rejected_retry_sec', 2.0))
+        )
+        self.max_retry_backoff_sec = max(
+            0.1, float(_safe_declare(self, 'max_retry_backoff_sec', 15.0))
+        )
         self.require_localization_ready = bool(
             _safe_declare(self, 'require_localization_ready', False)
         )
@@ -144,6 +157,7 @@ class PoseToNav2Action(Node):
         self.current_goal_handle = None
         self.current_goal_id = 0
         self.pending_goal: Optional[PoseStamped] = None
+        self.inflight_goal_ids = set()
         self.goal_count = 0
         self.last_wait_log_time = -1.0e9
         self.retry_not_before = -1.0e9
@@ -153,6 +167,11 @@ class PoseToNav2Action(Node):
         self.startup_future = None
         self.last_lifecycle_start_time = -1.0e9
         self.failed_result_retries = 0
+        self.retry_attempts = {
+            'send_exception': 0,
+            'rejected': 0,
+            'result': 0,
+        }
         self.retry_timer = self.create_timer(0.25, self._try_send_pending)
 
         self.get_logger().info(
@@ -181,6 +200,11 @@ class PoseToNav2Action(Node):
         # here makes an RViz goal appear to vanish with no way to recover it.
         self.pending_goal = deepcopy(msg)
         self.failed_result_retries = 0
+        self.retry_attempts = {
+            'send_exception': 0,
+            'rejected': 0,
+            'result': 0,
+        }
         self.retry_not_before = -1.0e9
         self._try_send_pending()
 
@@ -193,23 +217,91 @@ class PoseToNav2Action(Node):
             )
             self.retry_not_before = -1.0e9
             self._try_send_pending()
+        elif previous and not self.localization_ready:
+            # A latched false commonly means the localization bootstrap
+            # restarted.  Invalidate every action request already handed to
+            # Nav2 and cancel the accepted one, while retaining at most the
+            # one goal that has not yet been sent.
+            self._invalidate_inflight(
+                cause='localization_not_ready',
+                clear_pending=False,
+            )
+            self.get_logger().warn(
+                'LOCALIZATION_NOT_READY_NAV2_CANCELLED | '
+                f'topic={self.localization_ready_topic}'
+            )
 
     def _on_cancel(self, msg: Bool) -> None:
         if not msg.data:
             return
-        self.pending_goal = None
-        if self.current_goal_handle is None:
+        had_work = self._invalidate_inflight(
+            cause='explicit_cancel',
+            clear_pending=True,
+        )
+        if not had_work:
             self.get_logger().info(
                 f'NAV2_GOAL_CANCEL_REQUEST_EMPTY | topic={self.cancel_topic}'
             )
             return
+        self.get_logger().warn(
+            f'NAV2_GOAL_CANCEL_REQUESTED | topic={self.cancel_topic}'
+        )
+
+    def _invalidate_inflight(self, *, cause: str, clear_pending: bool) -> bool:
+        """Make every already-sent callback stale and cancel an accepted goal.
+
+        ``goal_count`` is both a monotonic send id and the latest valid
+        generation.  Advancing it here means a goal accepted after the cancel
+        race is immediately canceled by ``_goal_response_cb`` instead of being
+        installed as the current handle.
+        """
+        had_work = bool(
+            self.pending_goal is not None
+            or self.current_goal_handle is not None
+            or self.inflight_goal_ids
+        )
+        self.goal_count += 1
+        self.retry_not_before = -1.0e9
+        if clear_pending:
+            self.pending_goal = None
+        handle = self.current_goal_handle
+        handle_id = self.current_goal_id
+        self.current_goal_handle = None
+        self.current_goal_id = 0
+        if handle is not None:
+            self._request_cancel(handle, goal_id=handle_id, cause=cause)
+        return had_work
+
+    def _request_cancel(self, goal_handle, *, goal_id: int, cause: str) -> None:
         try:
-            self.current_goal_handle.cancel_goal_async()
-            self.get_logger().warn(
-                f'NAV2_GOAL_CANCEL_REQUESTED | topic={self.cancel_topic}'
-            )
+            future = goal_handle.cancel_goal_async()
         except Exception as exc:  # noqa: BLE001
-            self.get_logger().warn(f'NAV2_GOAL_CANCEL_FAILED | {exc}')
+            self.get_logger().warn(
+                f'NAV2_GOAL_CANCEL_FAILED | cause={cause} goal_id={goal_id} {exc}'
+            )
+            return
+        if future is not None:
+            future.add_done_callback(
+                partial(self._cancel_response_cb, goal_id=goal_id, cause=cause)
+            )
+
+    def _cancel_response_cb(self, future, *, goal_id: int, cause: str) -> None:
+        try:
+            response = future.result()
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(
+                f'NAV2_GOAL_CANCEL_ACK_FAILED | cause={cause} '
+                f'goal_id={goal_id} {exc}'
+            )
+            return
+        return_code = getattr(response, 'return_code', None)
+        goals_canceling = getattr(response, 'goals_canceling', None)
+        count = len(goals_canceling) if goals_canceling is not None else None
+        self.get_logger().info(
+            'NAV2_GOAL_CANCEL_ACK | '
+            f'cause={cause} goal_id={goal_id} '
+            f'return_code={return_code} goals_canceling={count}'
+        )
 
     def _try_send_pending(self) -> None:
         if self.pending_goal is None:
@@ -234,12 +326,15 @@ class PoseToNav2Action(Node):
         msg = self.pending_goal
         self.pending_goal = None
         if self.cancel_previous_goal and self.current_goal_handle is not None:
-            try:
-                self.current_goal_handle.cancel_goal_async()
-            except Exception as exc:  # noqa: BLE001
-                self.get_logger().warn(
-                    f'CANCEL_PREVIOUS_GOAL_FAILED | {exc}'
-                )
+            previous_handle = self.current_goal_handle
+            previous_id = self.current_goal_id
+            self.current_goal_handle = None
+            self.current_goal_id = 0
+            self._request_cancel(
+                previous_handle,
+                goal_id=previous_id,
+                cause='newer_goal',
+            )
 
         goal = NavigateToPose.Goal()
         goal.pose = msg
@@ -259,10 +354,22 @@ class PoseToNav2Action(Node):
         )
 
         feedback_callback = self._feedback_cb if self.log_feedback else None
-        future = self.client.send_goal_async(
-            goal,
-            feedback_callback=feedback_callback,
-        )
+        try:
+            future = self.client.send_goal_async(
+                goal,
+                feedback_callback=feedback_callback,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(f'NAV2_GOAL_SEND_EXCEPTION | {exc}')
+            self._schedule_retry(
+                sent_goal=goal.pose,
+                goal_id=request_id,
+                cause='send_exception',
+                base_delay=self.send_exception_retry_sec,
+                limit=self.max_send_retries,
+            )
+            return
+        self.inflight_goal_ids.add(request_id)
         future.add_done_callback(
             partial(
                 self._goal_response_cb,
@@ -373,35 +480,44 @@ class PoseToNav2Action(Node):
         goal_id: int,
         sent_goal: PoseStamped,
     ) -> None:
+        self.inflight_goal_ids.discard(goal_id)
         try:
             goal_handle = future.result()
         except Exception as exc:  # noqa: BLE001
             self.get_logger().error(f'NAV2_GOAL_SEND_EXCEPTION | {exc}')
-            if goal_id == self.goal_count and self.pending_goal is None:
-                self.pending_goal = sent_goal
-                self.retry_not_before = (
-                    self.get_clock().now().nanoseconds * 1.0e-9 + 1.0
-                )
+            self._schedule_retry(
+                sent_goal=sent_goal,
+                goal_id=goal_id,
+                cause='send_exception',
+                base_delay=self.send_exception_retry_sec,
+                limit=self.max_send_retries,
+            )
             return
         if not goal_handle.accepted:
             self.get_logger().warn('NAV2_GOAL_REJECTED')
-            if goal_id == self.goal_count and self.pending_goal is None:
-                self.pending_goal = sent_goal
-                self.retry_not_before = (
-                    self.get_clock().now().nanoseconds * 1.0e-9
-                    + self.lifecycle_retry_sec
-                )
+            if goal_id == self.goal_count:
                 self.navigation_active = False
                 if self.auto_start_navigation_lifecycle:
                     self._request_navigation_startup(
                         self.get_clock().now().nanoseconds * 1.0e-9
                     )
+            self._schedule_retry(
+                sent_goal=sent_goal,
+                goal_id=goal_id,
+                cause='rejected',
+                base_delay=self.rejected_retry_sec,
+                limit=self.max_send_retries,
+            )
             return
 
         # Action responses may arrive out of order. Never let an older response
         # replace the handle for a newer user or safety goal.
         if goal_id != self.goal_count:
-            goal_handle.cancel_goal_async()
+            self._request_cancel(
+                goal_handle,
+                goal_id=goal_id,
+                cause='stale_goal_response',
+            )
             self.get_logger().info(
                 f'STALE_GOAL_CANCELLED | n={goal_id} '
                 f'latest={self.goal_count}'
@@ -437,24 +553,58 @@ class PoseToNav2Action(Node):
         self.get_logger().info(f'NAV2_GOAL_RESULT | status={result.status}')
         if (
             goal_id == self.goal_count
-            and result.status != GoalStatus.STATUS_SUCCEEDED
+            and result.status not in (
+                GoalStatus.STATUS_SUCCEEDED,
+                GoalStatus.STATUS_CANCELED,
+            )
             and self.retry_failed_results
-            and self.pending_goal is None
-            and self.failed_result_retries < self.max_result_retries
         ):
-            self.failed_result_retries += 1
-            self.pending_goal = sent_goal
-            self.retry_not_before = (
-                self.get_clock().now().nanoseconds * 1.0e-9
-                + self.result_retry_sec
+            scheduled = self._schedule_retry(
+                sent_goal=sent_goal,
+                goal_id=goal_id,
+                cause='result',
+                base_delay=self.result_retry_sec,
+                limit=self.max_result_retries,
             )
-            self.navigation_active = None
+            if scheduled:
+                self.navigation_active = None
+
+    def _schedule_retry(
+        self,
+        *,
+        sent_goal: PoseStamped,
+        goal_id: int,
+        cause: str,
+        base_delay: float,
+        limit: int,
+    ) -> bool:
+        """Retain only the latest goal and bound retries per failure cause."""
+        if goal_id != self.goal_count or self.pending_goal is not None:
+            return False
+        attempt = int(self.retry_attempts.get(cause, 0))
+        if attempt >= limit:
             self.get_logger().warning(
-                'NAV2_GOAL_RESULT_RETRY_SCHEDULED | '
-                f'status={result.status} '
-                f'retry={self.failed_result_retries}/{self.max_result_retries} '
-                f'in={self.result_retry_sec:.1f}s'
+                'NAV2_GOAL_RETRY_EXHAUSTED | '
+                f'cause={cause} retries={attempt}/{limit}'
             )
+            return False
+        attempt += 1
+        self.retry_attempts[cause] = attempt
+        if cause == 'result':
+            self.failed_result_retries = attempt
+        delay = min(
+            self.max_retry_backoff_sec,
+            max(0.1, float(base_delay)) * (2 ** (attempt - 1)),
+        )
+        self.pending_goal = deepcopy(sent_goal)
+        self.retry_not_before = (
+            self.get_clock().now().nanoseconds * 1.0e-9 + delay
+        )
+        self.get_logger().warning(
+            'NAV2_GOAL_RETRY_SCHEDULED | '
+            f'cause={cause} retry={attempt}/{limit} in={delay:.1f}s'
+        )
+        return True
 
     def _feedback_cb(self, feedback_msg) -> None:
         fb = feedback_msg.feedback

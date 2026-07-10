@@ -15,15 +15,18 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import shlex
 import signal
 import subprocess
 from copy import deepcopy
 from enum import Enum
 from functools import partial
+from pathlib import Path
 from typing import Optional
 
 import rclpy
+from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist, TwistStamped
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import Odometry
@@ -43,6 +46,16 @@ class Role(Enum):
     LOCALIZATION_SPIN = 'LOCALIZATION_SPIN'
     LOCALIZATION_SETTLE = 'LOCALIZATION_SETTLE'
     FAILED = 'FAILED'
+
+
+class MotionAuthority(Enum):
+    """The one non-safety command source allowed to own this robot."""
+
+    NONE = 'NONE'
+    LOCALIZATION_SPIN = 'LOCALIZATION_SPIN'
+    FAILOVER_RECOVERY_NAV = 'FAILOVER_RECOVERY_NAV'
+    ACTIVE_SCOUT_RL = 'ACTIVE_SCOUT_RL'
+    NORMAL_FOLLOW = 'NORMAL_FOLLOW'
 
 
 def yaw_from_quaternion(q) -> float:
@@ -69,6 +82,17 @@ def normalize_role(raw: str) -> Role:
     }
     key = aliases.get(key, key)
     return Role[key] if key in Role.__members__ else Role.IDLE
+
+
+def parse_epoch(value) -> Optional[int]:
+    """Parse an ownership epoch without truncating floats or accepting bools."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
 
 
 class UnifiedFieldRobot(Node):
@@ -100,6 +124,11 @@ class UnifiedFieldRobot(Node):
         self.declare_parameter('follow_goal_period_sec', 1.0)
         self.declare_parameter('follow_goal_update_distance_m', 0.25)
         self.declare_parameter('recovery_arrival_tolerance_m', 0.40)
+        self.declare_parameter('self_pose_timeout_sec', 2.0)
+        self.declare_parameter('movement_start_distance_m', 0.03)
+        self.declare_parameter('movement_start_samples', 3)
+        self.declare_parameter('max_recovery_nav_retries', 3)
+        self.declare_parameter('recovery_nav_retry_sec', 1.0)
         self.declare_parameter('max_xy_covariance', 0.22)
         self.declare_parameter('max_yaw_covariance', 0.16)
         self.declare_parameter('max_amcl_pose_age_sec', 3.0)
@@ -137,6 +166,19 @@ class UnifiedFieldRobot(Node):
         self.follow_goal_period = max(0.2, float(get('follow_goal_period_sec').value))
         self.follow_update_distance = max(0.05, float(get('follow_goal_update_distance_m').value))
         self.arrival_tolerance = max(0.05, float(get('recovery_arrival_tolerance_m').value))
+        self.self_pose_timeout = max(0.1, float(get('self_pose_timeout_sec').value))
+        self.movement_start_distance = max(
+            0.005, float(get('movement_start_distance_m').value)
+        )
+        self.movement_start_samples = max(
+            1, int(get('movement_start_samples').value)
+        )
+        self.max_recovery_nav_retries = max(
+            0, int(get('max_recovery_nav_retries').value)
+        )
+        self.recovery_nav_retry_sec = max(
+            0.1, float(get('recovery_nav_retry_sec').value)
+        )
         self.max_xy_cov = max(0.0, float(get('max_xy_covariance').value))
         self.max_yaw_cov = max(0.0, float(get('max_yaw_covariance').value))
         self.max_amcl_age = max(0.1, float(get('max_amcl_pose_age_sec').value))
@@ -178,8 +220,16 @@ class UnifiedFieldRobot(Node):
         self.epoch = 0
         self.goal_epoch = 0
         self.active_goal_handle = None
+        self.active_goal_source: Optional[str] = None
+        self.inflight_goal_ids = set()
+        self.cancel_requests = 0
+        self.pending_nav_goal: Optional[PoseStamped] = None
+        self.pending_nav_source: Optional[str] = None
+        self.nav_retry_not_before = -1.0e9
+        self.recovery_nav_failures = 0
         self.leader_pose: Optional[PoseStamped] = None
         self.self_pose: Optional[PoseStamped] = None
+        self.self_pose_wall: Optional[float] = None
         self.localization_ready = False
         self.last_follow_goal_xy: Optional[tuple[float, float]] = None
         self.last_follow_goal_wall = -1.0e9
@@ -188,13 +238,22 @@ class UnifiedFieldRobot(Node):
         self.xy_cov = float('inf')
         self.yaw_cov = float('inf')
         self.last_odom_yaw: Optional[float] = None
+        self.last_odom_xy: Optional[tuple[float, float]] = None
+        self.nav_start_odom_xy: Optional[tuple[float, float]] = None
+        self.movement_started = False
+        self.movement_sample_count = 0
         self.accumulated_yaw = 0.0
         self.spin_start_wall = 0.0
+        self.spin_command_started = False
+        self.spin_motion_detected = False
+        self.spin_last_attempt_completed = False
         self.settle_start_wall = 0.0
         self.spin_attempt = 0
         self.spin_direction = 1.0
         self.exploration_process: Optional[subprocess.Popen] = None
+        self.exploration_stop_wall: Optional[float] = None
         self.heartbeat_seq = 0
+        self.motion_authority = MotionAuthority.NONE
 
         self.create_timer(0.1, self._tick)
         self.create_timer(self.heartbeat_period, self._publish_heartbeat)
@@ -218,9 +277,24 @@ class UnifiedFieldRobot(Node):
 
     def _on_self_pose(self, msg: PoseStamped) -> None:
         self.self_pose = msg
+        self.self_pose_wall = self._now()
 
     def _on_localization_ready(self, msg: Bool) -> None:
+        previous = self.localization_ready
         self.localization_ready = bool(msg.data)
+        if previous and not self.localization_ready:
+            if self.role == Role.ACTIVE_SCOUT:
+                self._stop_exploration('localization_not_ready')
+                self._set_authority(MotionAuthority.NONE, 'localization_not_ready')
+            if self.active_goal_handle is not None or self.inflight_goal_ids:
+                self._invalidate_nav_goal(
+                    'localization_not_ready', clear_pending=True
+                )
+        elif self.localization_ready and not previous:
+            self.get_logger().warning(
+                'FIELD_LOCALIZATION_READY | '
+                f'topic={self.localization_ready_topic}'
+            )
 
     def _on_amcl(self, msg: PoseWithCovarianceStamped) -> None:
         cov = msg.pose.covariance
@@ -231,8 +305,32 @@ class UnifiedFieldRobot(Node):
     def _on_odom(self, msg: Odometry) -> None:
         yaw = yaw_from_quaternion(msg.pose.pose.orientation)
         if self.role == Role.LOCALIZATION_SPIN and self.last_odom_yaw is not None:
-            self.accumulated_yaw += abs(wrap_angle(yaw - self.last_odom_yaw))
+            delta = wrap_angle(yaw - self.last_odom_yaw)
+            self.accumulated_yaw += self.spin_direction * delta
+            if abs(delta) >= 0.005:
+                self.spin_motion_detected = True
         self.last_odom_yaw = yaw
+        self.last_odom_xy = (
+            float(msg.pose.pose.position.x),
+            float(msg.pose.pose.position.y),
+        )
+        if (
+            self.motion_authority in (
+                MotionAuthority.NORMAL_FOLLOW,
+                MotionAuthority.FAILOVER_RECOVERY_NAV,
+            )
+            and self.nav_start_odom_xy is not None
+        ):
+            distance = math.hypot(
+                self.last_odom_xy[0] - self.nav_start_odom_xy[0],
+                self.last_odom_xy[1] - self.nav_start_odom_xy[1],
+            )
+            if distance >= self.movement_start_distance:
+                self.movement_sample_count += 1
+                if self.movement_sample_count >= self.movement_start_samples:
+                    self.movement_started = True
+            else:
+                self.movement_sample_count = 0
 
     def _on_fleet_role(self, msg: String) -> None:
         try:
@@ -240,7 +338,12 @@ class UnifiedFieldRobot(Node):
         except json.JSONDecodeError:
             return
         active = str(data.get('active_scout_id', ''))
-        epoch = int(data.get('epoch', 0))
+        epoch = parse_epoch(data.get('epoch'))
+        if epoch is None:
+            self.get_logger().warning('FLEET_ROLE_BAD_EPOCH')
+            return
+        if epoch < self.epoch:
+            return
         if active != self.robot_name and epoch >= self.epoch and self.role == Role.ACTIVE_SCOUT:
             self.epoch = epoch
             self._enter_role(Role.IDLE, reason='higher_epoch_not_active')
@@ -254,7 +357,10 @@ class UnifiedFieldRobot(Node):
         target = str(data.get('robot', ''))
         if target and target != self.robot_name:
             return
-        epoch = int(data.get('epoch', self.epoch))
+        epoch = parse_epoch(data.get('epoch', self.epoch))
+        if epoch is None:
+            self.get_logger().warning('ROLE_COMMAND_BAD_EPOCH')
+            return
         if epoch < self.epoch:
             self.get_logger().warning(
                 f'ROLE_COMMAND_OLD_EPOCH | got={epoch} current={self.epoch}'
@@ -268,9 +374,14 @@ class UnifiedFieldRobot(Node):
                 self._enter_role(Role.FAILED, reason='recovery_without_target')
                 return
             self.recovery_target = target_pose
+            self.recovery_nav_failures = 0
+            self.nav_retry_not_before = -1.0e9
+            self.spin_attempt = 0
+            self.spin_last_attempt_completed = False
         self._enter_role(role, reason='role_command')
 
     def _tick(self) -> None:
+        self._update_exploration_process()
         if self.role == Role.FOLLOWER:
             self._tick_follow()
         elif self.role == Role.RECOVERY_NAVIGATING:
@@ -281,6 +392,9 @@ class UnifiedFieldRobot(Node):
             self._tick_spin()
         elif self.role == Role.LOCALIZATION_SETTLE:
             self._tick_localization_settle()
+        elif self.role == Role.ACTIVE_SCOUT:
+            self._ensure_exploration()
+        self._dispatch_pending_nav_goal()
         self._publish_status()
 
     def _tick_follow(self) -> None:
@@ -305,7 +419,7 @@ class UnifiedFieldRobot(Node):
         if self.last_follow_goal_xy is not None:
             if math.hypot(xy[0] - self.last_follow_goal_xy[0], xy[1] - self.last_follow_goal_xy[1]) < self.follow_update_distance:
                 return
-        self._send_nav_goal(goal, source='FOLLOW')
+        self._queue_nav_goal(goal, source='FOLLOW')
         self.last_follow_goal_xy = xy
         self.last_follow_goal_wall = now
 
@@ -313,11 +427,19 @@ class UnifiedFieldRobot(Node):
         if self.recovery_target is None:
             self._enter_role(Role.FAILED, reason='missing_recovery_target')
             return
-        if self.active_goal_handle is None:
-            self._send_nav_goal(self.recovery_target, source='RECOVERY')
         if self._at_pose(self.recovery_target):
             self._enter_role(Role.ARRIVED_AT_FAILURE_POSE, reason='arrival_distance')
             self._enter_role(Role.LOCALIZATION_CHECK, reason='arrived')
+            return
+        if self._now() < self.nav_retry_not_before:
+            return
+        if (
+            self.active_goal_handle is None
+            and not self.inflight_goal_ids
+            and self.pending_nav_goal is None
+            and self.cancel_requests == 0
+        ):
+            self._queue_nav_goal(self.recovery_target, source='RECOVERY')
 
     def _tick_localization_check(self) -> None:
         self.get_logger().warning(
@@ -325,6 +447,12 @@ class UnifiedFieldRobot(Node):
             f'xy_cov={self.xy_cov:.4f} yaw_cov={self.yaw_cov:.4f}',
             throttle_duration_sec=2.0,
         )
+        if self.spin_attempt > 0 and not self.spin_last_attempt_completed:
+            if self.spin_attempt > self.max_spin_retries:
+                self._enter_role(Role.FAILED, reason='spin_retries_exhausted')
+            else:
+                self._start_spin()
+            return
         if self._localization_ok():
             self._enter_role(Role.ACTIVE_SCOUT, reason='localization_ok')
             return
@@ -337,18 +465,45 @@ class UnifiedFieldRobot(Node):
         self.spin_attempt += 1
         self.spin_direction = 1.0 if self.spin_attempt % 2 == 1 else -1.0
         self.accumulated_yaw = 0.0
-        self.spin_start_wall = self._now()
+        self.spin_start_wall = 0.0
+        self.spin_command_started = False
+        self.spin_motion_detected = False
+        self.spin_last_attempt_completed = False
         self._enter_role(Role.LOCALIZATION_SPIN, reason='amcl_covariance')
 
     def _tick_spin(self) -> None:
+        if not self._non_rl_motion_quiesced():
+            return
+        if not self.spin_command_started:
+            self.spin_command_started = True
+            self.spin_start_wall = self._now()
+            self.accumulated_yaw = 0.0
+            self.spin_motion_detected = False
+            self._set_authority(
+                MotionAuthority.LOCALIZATION_SPIN, 'spin_command_started'
+            )
         elapsed = self._now() - self.spin_start_wall
         if self.accumulated_yaw >= self.spin_target:
             self._publish_twist(0.0)
+            self._set_authority(MotionAuthority.NONE, 'spin_complete')
+            self.spin_last_attempt_completed = True
             self.settle_start_wall = self._now()
             self._enter_role(Role.LOCALIZATION_SETTLE, reason='spin_complete')
             return
         if elapsed >= self.spin_timeout:
             self._publish_twist(0.0)
+            self._set_authority(MotionAuthority.NONE, 'spin_timeout')
+            if not self.spin_motion_detected:
+                self.get_logger().error(
+                    'SPIN_FAILED_NO_MOTION | '
+                    f'cmd_vel={self.cmd_vel_topic} elapsed={elapsed:.2f}s'
+                )
+            else:
+                self.get_logger().error(
+                    'SPIN_TIMEOUT | '
+                    f'rotated={self.accumulated_yaw:.3f} '
+                    f'target={self.spin_target:.3f}'
+                )
             self.settle_start_wall = self._now()
             self._enter_role(Role.LOCALIZATION_SETTLE, reason='spin_timeout')
             return
@@ -366,8 +521,12 @@ class UnifiedFieldRobot(Node):
         old = self.role
         if role != Role.FOLLOWER:
             self.last_follow_goal_xy = None
-        if old in (Role.FOLLOWER, Role.ACTIVE_SCOUT, Role.RECOVERY_NAVIGATING) and role != old:
-            self._cancel_goal(f'role_change_{old.value}_to_{role.value}')
+        if old != role:
+            self._set_authority(MotionAuthority.NONE, f'release_{old.value}')
+            self._invalidate_nav_goal(
+                f'role_change_{old.value}_to_{role.value}',
+                clear_pending=True,
+            )
         if old == Role.ACTIVE_SCOUT and role != Role.ACTIVE_SCOUT:
             self._stop_exploration(f'role_change_to_{role.value}')
             if self.scout_rl_enabled:
@@ -376,28 +535,71 @@ class UnifiedFieldRobot(Node):
         if role == Role.ACTIVE_SCOUT:
             if self.scout_rl_enabled:
                 self.get_logger().warning('[SCOUT_RL] ACTIVATED role=ACTIVE_SCOUT')
-            self._start_exploration()
+            self._ensure_exploration()
         self.get_logger().warning(
             f'FIELD_ROLE_TRANSITION | robot={self.robot_name} '
             f'{old.value}->{role.value} reason={reason} epoch={self.epoch}'
         )
         self._publish_status()
 
-    def _send_nav_goal(self, pose: PoseStamped, source: str) -> None:
+    def _queue_nav_goal(self, pose: PoseStamped, source: str) -> None:
+        """Keep only the newest goal and release the previous Nav2 owner."""
+        self.pending_nav_goal = self._copy_pose(pose)
+        self.pending_nav_source = source
+        if self.active_goal_handle is not None or self.inflight_goal_ids:
+            self._invalidate_nav_goal(
+                f'new_{source}_goal', clear_pending=False
+            )
+
+    def _dispatch_pending_nav_goal(self) -> None:
+        if self.pending_nav_goal is None or self.pending_nav_source is None:
+            return
+        source = self.pending_nav_source
+        if source == 'FOLLOW' and self.role != Role.FOLLOWER:
+            self.pending_nav_goal = None
+            self.pending_nav_source = None
+            return
+        if source == 'RECOVERY' and self.role != Role.RECOVERY_NAVIGATING:
+            self.pending_nav_goal = None
+            self.pending_nav_source = None
+            return
+        if not self._non_rl_motion_quiesced():
+            return
+        if source == 'FOLLOW' and self.require_localization_ready and not self.localization_ready:
+            return
         if not self.nav_client.server_is_ready():
             self.get_logger().warning(
                 f'FIELD_NAV2_WAIT | source={source} action={self.navigate_action}',
                 throttle_duration_sec=5.0,
             )
             return
-        self._cancel_goal(f'new_{source}_goal')
+        pose = self.pending_nav_goal
+        self.pending_nav_goal = None
+        self.pending_nav_source = None
         goal = NavigateToPose.Goal()
         goal.pose = deepcopy(pose)
         goal.pose.header.frame_id = goal.pose.header.frame_id or 'map'
         goal.pose.header.stamp = self.get_clock().now().to_msg()
         self.goal_epoch += 1
         goal_id = self.goal_epoch
-        future = self.nav_client.send_goal_async(goal)
+        try:
+            future = self.nav_client.send_goal_async(goal)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(
+                f'FIELD_NAV_GOAL_SEND_ERROR | source={source} {exc}'
+            )
+            self._handle_nav_failure(source, 'send_exception')
+            return
+        self.inflight_goal_ids.add(goal_id)
+        self.nav_start_odom_xy = self.last_odom_xy
+        self.movement_started = False
+        self.movement_sample_count = 0
+        authority = (
+            MotionAuthority.NORMAL_FOLLOW
+            if source == 'FOLLOW'
+            else MotionAuthority.FAILOVER_RECOVERY_NAV
+        )
+        self._set_authority(authority, f'{source.lower()}_goal_sent')
         future.add_done_callback(partial(self._goal_response_cb, goal_id=goal_id, source=source))
         self.get_logger().warning(
             f'FIELD_NAV_GOAL_SENT | source={source} '
@@ -405,44 +607,136 @@ class UnifiedFieldRobot(Node):
         )
 
     def _goal_response_cb(self, future, goal_id: int, source: str) -> None:
+        self.inflight_goal_ids.discard(goal_id)
         try:
             handle = future.result()
         except Exception as exc:  # noqa: BLE001
             self.get_logger().warning(f'FIELD_NAV_GOAL_ERROR | source={source} {exc}')
+            if goal_id == self.goal_epoch:
+                self._set_authority(MotionAuthority.NONE, 'goal_response_error')
+                self._handle_nav_failure(source, 'response_exception')
             return
         if goal_id != self.goal_epoch:
-            handle.cancel_goal_async()
+            if handle.accepted:
+                self._request_cancel(handle, goal_id, 'stale_goal_response')
             return
         if not handle.accepted:
             self.get_logger().warning(f'FIELD_NAV_GOAL_REJECTED | source={source}')
+            self._set_authority(MotionAuthority.NONE, 'goal_rejected')
+            self._handle_nav_failure(source, 'rejected')
             return
         self.active_goal_handle = handle
+        self.active_goal_source = source
         result_future = handle.get_result_async()
         result_future.add_done_callback(partial(self._goal_result_cb, goal_id=goal_id, source=source))
 
     def _goal_result_cb(self, future, goal_id: int, source: str) -> None:
-        if goal_id == self.goal_epoch:
-            self.active_goal_handle = None
         try:
             result = future.result()
             status = result.status
-        except Exception:  # noqa: BLE001
-            status = 'exception'
+        except Exception as exc:  # noqa: BLE001
+            status = None
+            error = str(exc)
+        else:
+            error = ''
+        if goal_id != self.goal_epoch:
+            self.get_logger().info(
+                f'STALE_FIELD_NAV_RESULT_IGNORED | source={source} '
+                f'goal_id={goal_id} current={self.goal_epoch}'
+            )
+            return
+        self.active_goal_handle = None
+        self.active_goal_source = None
+        self._set_authority(MotionAuthority.NONE, 'goal_result')
         self.get_logger().warning(f'FIELD_NAV_RESULT | source={source} status={status}')
-        if source == 'RECOVERY' and self.role == Role.RECOVERY_NAVIGATING:
-            self._enter_role(Role.ARRIVED_AT_FAILURE_POSE, reason='nav2_result')
-            self._enter_role(Role.LOCALIZATION_CHECK, reason='recovery_done')
+        if source != 'RECOVERY' or self.role != Role.RECOVERY_NAVIGATING:
+            return
+        if (
+            status == GoalStatus.STATUS_SUCCEEDED
+            and self.recovery_target is not None
+            and self._at_pose(self.recovery_target)
+        ):
+            self._enter_role(Role.ARRIVED_AT_FAILURE_POSE, reason='nav2_succeeded_at_pose')
+            self._enter_role(Role.LOCALIZATION_CHECK, reason='recovery_arrival_verified')
+            return
+        reason = error or f'status_{status}'
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            reason = 'success_without_verified_arrival'
+        self._handle_nav_failure(source, reason)
 
-    def _cancel_goal(self, reason: str) -> None:
+    def _invalidate_nav_goal(self, reason: str, *, clear_pending: bool) -> None:
+        self.goal_epoch += 1
+        if clear_pending:
+            self.pending_nav_goal = None
+            self.pending_nav_source = None
         handle = self.active_goal_handle
         self.active_goal_handle = None
+        self.active_goal_source = None
+        if self.motion_authority in (
+            MotionAuthority.NORMAL_FOLLOW,
+            MotionAuthority.FAILOVER_RECOVERY_NAV,
+        ):
+            self._set_authority(MotionAuthority.NONE, reason)
         if handle is None:
             return
+        self._request_cancel(handle, self.goal_epoch - 1, reason)
+
+    def _request_cancel(self, handle, goal_id: int, reason: str) -> None:
         try:
-            handle.cancel_goal_async()
+            future = handle.cancel_goal_async()
             self.get_logger().warning(f'FIELD_NAV_CANCEL | reason={reason}')
         except Exception as exc:  # noqa: BLE001
             self.get_logger().warning(f'FIELD_NAV_CANCEL_ERROR | reason={reason} {exc}')
+            return
+        self.cancel_requests += 1
+        future.add_done_callback(
+            partial(self._cancel_response_cb, goal_id=goal_id, reason=reason)
+        )
+
+    def _cancel_response_cb(self, future, goal_id: int, reason: str) -> None:
+        self.cancel_requests = max(0, self.cancel_requests - 1)
+        try:
+            response = future.result()
+            count = len(getattr(response, 'goals_canceling', []) or [])
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warning(
+                f'FIELD_NAV_CANCEL_ACK_ERROR | goal_id={goal_id} '
+                f'reason={reason} {exc}'
+            )
+            return
+        self.get_logger().info(
+            f'FIELD_NAV_CANCEL_ACK | goal_id={goal_id} '
+            f'reason={reason} goals_canceling={count}'
+        )
+
+    def _handle_nav_failure(self, source: str, reason: str) -> None:
+        if source != 'RECOVERY' or self.role != Role.RECOVERY_NAVIGATING:
+            return
+        if self.recovery_nav_failures >= self.max_recovery_nav_retries:
+            self._enter_role(Role.FAILED, reason=f'recovery_nav_failed_{reason}')
+            return
+        self.recovery_nav_failures += 1
+        delay = self.recovery_nav_retry_sec * (2 ** (self.recovery_nav_failures - 1))
+        self.nav_retry_not_before = self._now() + delay
+        self.get_logger().warning(
+            'FIELD_RECOVERY_RETRY_SCHEDULED | '
+            f'reason={reason} retry={self.recovery_nav_failures}/'
+            f'{self.max_recovery_nav_retries} in={delay:.1f}s'
+        )
+
+    def _nav_motion_quiesced(self) -> bool:
+        return (
+            self.active_goal_handle is None
+            and not self.inflight_goal_ids
+            and self.cancel_requests == 0
+        )
+
+    def _non_rl_motion_quiesced(self) -> bool:
+        process_running = (
+            self.exploration_process is not None
+            and self.exploration_process.poll() is None
+        )
+        return self._nav_motion_quiesced() and not process_running
 
     def _localization_ok(self) -> bool:
         if self.last_amcl_wall is None:
@@ -452,33 +746,152 @@ class UnifiedFieldRobot(Node):
         return self.xy_cov <= self.max_xy_cov and self.yaw_cov <= self.max_yaw_cov
 
     def _at_pose(self, target: PoseStamped) -> bool:
-        if self.self_pose is None:
+        if self.self_pose is None or self.self_pose_wall is None:
+            return False
+        if self._now() - self.self_pose_wall > self.self_pose_timeout:
+            return False
+        frame = str(self.self_pose.header.frame_id or '').strip().lstrip('/')
+        target_frame = str(target.header.frame_id or 'map').strip().lstrip('/')
+        if frame != target_frame:
             return False
         dx = self.self_pose.pose.position.x - target.pose.position.x
         dy = self.self_pose.pose.position.y - target.pose.position.y
-        return math.hypot(dx, dy) <= self.arrival_tolerance
+        return (
+            math.isfinite(dx)
+            and math.isfinite(dy)
+            and math.hypot(dx, dy) <= self.arrival_tolerance
+        )
 
-    def _start_exploration(self) -> None:
+    def _ensure_exploration(self) -> None:
         if not self.enable_scout or not self.enable_exploration or not self.exploration_command:
             return
         if self.role != Role.ACTIVE_SCOUT:
             return
+        if self.require_localization_ready and not self.localization_ready:
+            return
+        if not self._nav_motion_quiesced():
+            return
         if self.exploration_process is not None and self.exploration_process.poll() is None:
             return
-        self.exploration_process = subprocess.Popen(shlex.split(self.exploration_command))
+        # A prior unified_field_robot process that died before its own
+        # destroy_node() ran (SIGKILL, ros2 launch force-exit, crash) leaves
+        # its exploration child alive: it runs in its own session
+        # specifically so stray terminal signals don't kill it, which also
+        # means nothing but that graceful shutdown path ever kills it. Two
+        # live copies would both drive /cmd_vel and the RL debug topics at
+        # once. Sweep for and kill any match before claiming authority.
+        self._kill_stray_exploration_processes()
+        self.exploration_process = subprocess.Popen(
+            shlex.split(self.exploration_command),
+            start_new_session=True,
+        )
+        self.exploration_stop_wall = None
+        self._set_authority(MotionAuthority.ACTIVE_SCOUT_RL, 'exploration_started')
         self.get_logger().warning('[SCOUT_RL] MODEL_LOAD_REQUESTED')
         self.get_logger().warning(f'FIELD_EXPLORATION_STARTED | {self.exploration_command}')
+
+    def _kill_stray_exploration_processes(self) -> None:
+        """Kill any other live process running this exact exploration command.
+
+        Scans /proc directly instead of shelling out to pgrep -f so the
+        match is an exact substring test, not a regex evaluated against an
+        exploration_command string that can contain '.', '/', and other
+        regex metacharacters.
+        """
+        marker = self.exploration_command.strip()
+        if not marker:
+            return
+        own_pid = os.getpid()
+        tracked_pid = self.exploration_process.pid if self.exploration_process else None
+        try:
+            candidates = list(Path('/proc').iterdir())
+        except OSError:
+            return
+        for entry in candidates:
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            if pid in (own_pid, tracked_pid):
+                continue
+            try:
+                cmdline = (entry / 'cmdline').read_bytes()
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                continue
+            if marker.encode() not in cmdline.replace(b'\x00', b' '):
+                continue
+            self.get_logger().error(
+                f'FIELD_EXPLORATION_STRAY_PROCESS_KILLED | pid={pid}'
+            )
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
 
     def _stop_exploration(self, reason: str) -> None:
         process = self.exploration_process
         if process is None or process.poll() is not None:
+            self.exploration_process = None
+            self.exploration_stop_wall = None
             return
-        process.send_signal(signal.SIGINT)
-        self.exploration_process = None
+        if self.exploration_stop_wall is not None:
+            return
+        self.exploration_stop_wall = self._now()
+        try:
+            os.killpg(process.pid, signal.SIGINT)
+        except ProcessLookupError:
+            pass
         self.get_logger().warning(f'FIELD_EXPLORATION_STOPPED | reason={reason}')
+
+    def _update_exploration_process(self) -> None:
+        process = self.exploration_process
+        if process is None:
+            return
+        return_code = process.poll()
+        if return_code is not None:
+            expected = self.exploration_stop_wall is not None
+            self.exploration_process = None
+            self.exploration_stop_wall = None
+            if self.motion_authority == MotionAuthority.ACTIVE_SCOUT_RL:
+                self._set_authority(MotionAuthority.NONE, 'exploration_exited')
+            if self.role == Role.ACTIVE_SCOUT and not expected:
+                self.get_logger().error(
+                    f'FIELD_EXPLORATION_EXITED | return_code={return_code}'
+                )
+                self._enter_role(Role.FAILED, reason='exploration_process_exited')
+            return
+        if (
+            self.exploration_stop_wall is not None
+            and self._now() - self.exploration_stop_wall >= 2.0
+        ):
+            self.get_logger().error('FIELD_EXPLORATION_KILL_AFTER_TIMEOUT')
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    def _set_authority(self, authority: MotionAuthority, reason: str) -> None:
+        if authority == self.motion_authority:
+            return
+        old = self.motion_authority
+        self.motion_authority = authority
+        self.get_logger().warning(
+            'FIELD_MOTION_AUTHORITY | '
+            f'{old.value}->{authority.value} reason={reason} epoch={self.epoch}'
+        )
 
     def _publish_heartbeat(self) -> None:
         if self.role != Role.ACTIVE_SCOUT:
+            return
+        if self.require_localization_ready and not self.localization_ready:
+            return
+        if self.scout_rl_enabled and (
+            self.motion_authority != MotionAuthority.ACTIVE_SCOUT_RL
+            or self.exploration_process is None
+            or self.exploration_process.poll() is not None
+        ):
             return
         self.heartbeat_seq += 1
         msg = String()
@@ -497,6 +910,11 @@ class UnifiedFieldRobot(Node):
             'epoch': self.epoch,
             'role': self.role.value,
             'status': self.role.value,
+            'motion_authority': self.motion_authority.value,
+            'cmd_source': self.motion_authority.value,
+            'goal_generation': self.goal_epoch,
+            'pending_goal_count': 1 if self.pending_nav_goal is not None else 0,
+            'movement_started': self.movement_started,
             'xy_cov': None if math.isinf(self.xy_cov) else self.xy_cov,
             'yaw_cov': None if math.isinf(self.yaw_cov) else self.yaw_cov,
         }
@@ -552,7 +970,13 @@ class UnifiedFieldRobot(Node):
         try:
             self._publish_twist(0.0)
             self._stop_exploration('node_shutdown')
-            self._cancel_goal('node_shutdown')
+            process = self.exploration_process
+            if process is not None and process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            self._invalidate_nav_goal('node_shutdown', clear_pending=True)
         except Exception:  # noqa: BLE001
             pass
         super().destroy_node()

@@ -1163,7 +1163,11 @@ def main(args=None):
     # Importing MapVectorFeatureExtractor above ensures custom extractor class is available
     # when loading a model trained with MultiInputPolicy.
     _ = MapVectorFeatureExtractor
-    model = SAC.load(str(model_path))
+    # Overriding buffer_size avoids reallocating the training-time replay
+    # buffer (one array per Dict observation key, sized buffer_size x
+    # obs_shape -- multiple GiB for the map/map_seq keys). Inference only
+    # calls predict(), which never touches the replay buffer.
+    model = SAC.load(str(model_path), buffer_size=1)
     ros.get_logger().warn(f"[SCOUT_RL] MODEL_LOADED path={model_path}")
 
     model_obs_space = getattr(model, "observation_space", None)

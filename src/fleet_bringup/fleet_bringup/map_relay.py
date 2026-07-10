@@ -14,7 +14,17 @@ publishing too). If the primary disappears for longer than
 takeover_grace_sec, the relay takes over: it continues from the primary's
 own last published map if one was ever seen, or falls back to the latest
 bridged map otherwise, so downstream AMCL/costmaps keep seeing a map instead
-of losing it outright. It steps back down the moment the primary reappears.
+of losing it outright.
+
+Stepping back down requires the primary to be seen present continuously for
+standby_confirm_sec, not just one detection tick. A real robot's SLAM
+process can drop out of DDS discovery for a couple of seconds under CPU
+load or a brief restart; without this debounce, count_publishers() flips
+low->high->low and the relay repeatedly takes over and stands back down,
+so /map alternates between the relay's cached map and the primary's live
+map on every blip. While a reappearance is still unconfirmed the relay
+keeps serving its last output instead of republishing, so the two sources
+never publish to /map at the same time.
 """
 import rclpy
 from rclpy.node import Node
@@ -29,6 +39,7 @@ class MapRelay(Node):
         self.declare_parameter('output_topic', '/map')
         self.declare_parameter('check_period_sec', 1.0)
         self.declare_parameter('takeover_grace_sec', 2.0)
+        self.declare_parameter('standby_confirm_sec', 2.0)
         self.declare_parameter('relay_without_primary', False)
 
         self.input_topic = str(self.get_parameter('input_topic').value)
@@ -38,6 +49,9 @@ class MapRelay(Node):
         )
         self.takeover_grace = max(
             0.0, float(self.get_parameter('takeover_grace_sec').value)
+        )
+        self.standby_confirm_sec = max(
+            0.0, float(self.get_parameter('standby_confirm_sec').value)
         )
         self.relay_without_primary = bool(
             self.get_parameter('relay_without_primary').value
@@ -65,6 +79,7 @@ class MapRelay(Node):
         self._last_seen_output = None
         self._relaying = False
         self._primary_missing_since = None
+        self._primary_present_since = None
         self._first_bridged_logged = False
         self._first_output_logged = False
 
@@ -172,14 +187,31 @@ class MapRelay(Node):
 
         if external > 0:
             self._primary_missing_since = None
-            if self._relaying:
+            if not self._relaying:
+                return
+            if self._primary_present_since is None:
+                self._primary_present_since = now
+            present_sec = now - self._primary_present_since
+            if present_sec >= self.standby_confirm_sec:
                 self._relaying = False
+                self._primary_present_since = None
                 self.get_logger().warning(
-                    'MAP_RELAY_STANDBY | a primary map publisher is '
-                    'active again; relay standing down'
+                    'MAP_RELAY_STANDBY | a primary map publisher has been '
+                    f'active for {present_sec:.1f}s; relay standing down'
                 )
+                return
+            # Reappearance not yet confirmed stable -- do not republish
+            # (avoid two live sources on the output topic at once), but
+            # keep _relaying True so a flicker back to "missing" resumes
+            # serving the cached map instead of leaving a gap.
+            self.get_logger().info(
+                'MAP_RELAY_STANDBY_PENDING | primary map publisher seen, '
+                f'confirming for {self.standby_confirm_sec - present_sec:.1f}s more',
+                throttle_duration_sec=5.0,
+            )
             return
 
+        self._primary_present_since = None
         if self._primary_missing_since is None:
             self._primary_missing_since = now
 
