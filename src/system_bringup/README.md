@@ -187,7 +187,7 @@ ros2 launch system_bringup system.launch.py \
 
 # 정찰봇: 직접 SLAM 소유
 ros2 launch system_bringup system.launch.py \
-  role:=scout domain_id:=22 main_domain_id:=24 start_rl_policy:=false
+  role:=scout domain_id:=22 main_domain_id:=24
 ```
 
 bridge YAML은 실행 시점에 `/tmp` 아래 unique 파일로 동적 생성된다. 맵
@@ -230,23 +230,15 @@ Cartographer)이 동시에 주장해서 TF 트리가 두 갈래로 쪼개지고
   (2026-07-06 배선 완료). `fleet_role:=leader`는 대신 `enable_cartographer`로
   같은 역할을 한다.
 
-RL 정책(scout, `start_rl_policy:=true`가 기본): `rl_model_path`(SB3
-`.zip`), `rl_extra_args`(`eval_policy`에 그대로 넘길 추가 CLI 플래그
-문자열), `rl_disable_slam_map`(기본 true).
+RL 정책은 `ACTIVE_SCOUT` 역할의 내부 정찰 backend로만 켜진다. 모델 경로,
+map/LiDAR/history/action/safety 파라미터는 `run_train_v125_cube_safety.sh`
+에서 계산된 contract로 고정되어 있으며 public launch option으로 노출하지
+않는다. 현재 contract manifest는
+`system_bringup/config/scout_rl_policy_contract.json`에 있다.
 
 ### 알아둬야 할 통합 이슈: `eval_policy`와 SLAM 소유권
 
-`turtlebot3_rl_training`의 `eval_policy --real-robot`은 **무조건**
-자기 자신의 SLAM(Cartographer/slam_toolbox)과 `map->odom` TF를 새로
-띄우려고 한다(`--no-auto-start-slam`을 줘도 무시하고 다시 켠다). 이
-패키지는 fleet 스택(member/follower의 AMCL, leader의 Cartographer)이
-이미 그 TF를 갖고 있다고 가정하므로, 기본값으로 `--disable-slam-map`을
-같이 넘겨서 `eval_policy`가 자체 SLAM을 켜지 않게 막아둔다.
-
-다만 `--disable-slam-map`을 켜면 `eval_policy` 내부에서 맵 프레임 기반
-기능(TF, safety boundary, priority map 정렬 등)도 함께 꺼진다. 학습 때
-쓴 옵저베이션 구성에 따라 이게 정책 성능에 영향을 줄 수 있다 — 실제
-로봇에서 처음 돌릴 때는 반드시 동작을 확인하고, 필요하면
-`rl_disable_slam_map:=false`로 켜서 `eval_policy`가 자체 SLAM을 갖게
-하되 그 경우 `fleet_role:=member`(AMCL)와는 같이 쓰지 말 것 — 두
-소스가 동시에 `map->odom`을 방송하면 TF가 깨진다.
+`system_bringup`은 내부 env `TB3_RL_INFERENCE_EXTERNAL_SLAM=1`로
+`eval_policy`를 실행한다. 이 모드에서는 fleet/risk stack이 소유한 `/map`과
+TF를 사용하되, RL inference process가 별도의 SLAM backend를 띄우거나
+reset하지 않는다.

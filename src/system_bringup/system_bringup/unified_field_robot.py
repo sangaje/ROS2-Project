@@ -147,6 +147,7 @@ class UnifiedFieldRobot(Node):
         self.max_spin_retries = max(0, int(get('max_spin_retries').value))
         self.heartbeat_period = max(0.1, float(get('heartbeat_period_sec').value))
         self.exploration_command = str(get('exploration_command').value).strip()
+        self.scout_rl_enabled = bool(self.enable_scout and self.enable_exploration and self.exploration_command)
 
         latched_qos = QoSProfile(
             depth=1,
@@ -203,6 +204,11 @@ class UnifiedFieldRobot(Node):
             f'robot={self.robot_name} role={self.role.value} '
             f'nav={self.navigate_action} cmd_vel={self.cmd_vel_topic}'
         )
+        if self.scout_rl_enabled:
+            self.get_logger().warning(
+                '[SCOUT_RL] ROLE_GATED=true DETERMINISTIC=true SDE=false '
+                'backend=eval_policy'
+            )
 
     def _now(self) -> float:
         return self.get_clock().now().nanoseconds * 1.0e-9
@@ -364,8 +370,12 @@ class UnifiedFieldRobot(Node):
             self._cancel_goal(f'role_change_{old.value}_to_{role.value}')
         if old == Role.ACTIVE_SCOUT and role != Role.ACTIVE_SCOUT:
             self._stop_exploration(f'role_change_to_{role.value}')
+            if self.scout_rl_enabled:
+                self.get_logger().warning(f'[SCOUT_RL] DEACTIVATED role={role.value}')
         self.role = role
         if role == Role.ACTIVE_SCOUT:
+            if self.scout_rl_enabled:
+                self.get_logger().warning('[SCOUT_RL] ACTIVATED role=ACTIVE_SCOUT')
             self._start_exploration()
         self.get_logger().warning(
             f'FIELD_ROLE_TRANSITION | robot={self.robot_name} '
@@ -451,9 +461,12 @@ class UnifiedFieldRobot(Node):
     def _start_exploration(self) -> None:
         if not self.enable_scout or not self.enable_exploration or not self.exploration_command:
             return
+        if self.role != Role.ACTIVE_SCOUT:
+            return
         if self.exploration_process is not None and self.exploration_process.poll() is None:
             return
         self.exploration_process = subprocess.Popen(shlex.split(self.exploration_command))
+        self.get_logger().warning('[SCOUT_RL] MODEL_LOAD_REQUESTED')
         self.get_logger().warning(f'FIELD_EXPLORATION_STARTED | {self.exploration_command}')
 
     def _stop_exploration(self, reason: str) -> None:

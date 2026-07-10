@@ -10,7 +10,7 @@ def only_files(pattern):
 
 
 launch_files = only_files('launch/*.launch.py')
-config_files = only_files('config/*.yaml')
+config_files = only_files('config/*.yaml') + only_files('config/*.json')
 template_files = only_files('templates/*.html')
 static_files = only_files('static/*')
 

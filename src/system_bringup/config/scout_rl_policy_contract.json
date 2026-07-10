@@ -1,0 +1,81 @@
+{
+  "source_of_truth": {
+    "training_runner": "run_train_v125_cube_safety.sh",
+    "train_module": "turtlebot3_rl_training.train_sac",
+    "model_path": "rl_models/pure_velocity_sac_map32_lidar60_h8_deltatcn_domain22/sac_turtlebot3_burger.zip"
+  },
+  "policy": {
+    "algorithm": "SAC",
+    "loader": "stable_baselines3.SAC.load",
+    "feature_extractor": "turtlebot3_rl_training.feature_extractor.MapVectorFeatureExtractor",
+    "deterministic_inference": true,
+    "sde_inference": false,
+    "role_gate": "ACTIVE_SCOUT"
+  },
+  "observation_contract": {
+    "type": "gymnasium.spaces.Dict",
+    "keys": ["map", "map_seq", "seq", "vector"],
+    "map": {
+      "shape": [5, 32, 32],
+      "dtype": "float32",
+      "channels": [
+        "slam_geometry",
+        "confidence",
+        "stale_or_revisit",
+        "robot_centered_context",
+        "priority"
+      ],
+      "crop_size_m": 6.0,
+      "robot_centered": true
+    },
+    "vector": {
+      "lidar_bins": 60,
+      "stats_dim": 10,
+      "shape": [70],
+      "dtype": "float32"
+    },
+    "temporal": {
+      "enabled": true,
+      "history_len": 8,
+      "seq_shape": [8, 70],
+      "map_seq_shape": [8, 5, 32, 32],
+      "startup_padding": "repeat first fresh observation, matching GazeboNavEnv history initialization",
+      "takeover_reset": "restart policy backend on ACTIVE_SCOUT entry"
+    }
+  },
+  "lidar_preprocessing": {
+    "TB3_RL_LIDAR_CANONICAL_FRONT_ZERO": "1",
+    "TB3_RL_LIDAR_FRONT_INDEX": "0",
+    "TB3_RL_LIDAR_ANGLE_OFFSET_DEG": "0",
+    "TB3_RL_LIDAR_FLIP_LR": "0",
+    "TB3_RL_LIDAR_UNIFORM_ANGLE_RESAMPLE": "1",
+    "TB3_RL_LIDAR_MEDIAN_KERNEL": "3",
+    "TB3_RL_LIDAR_LOWPASS_KERNEL": "5",
+    "TB3_RL_LIDAR_OBSTACLE_MARGIN_M": "0.08"
+  },
+  "action_contract": {
+    "mode": "velocity",
+    "shape": [2],
+    "max_linear_speed": 0.5,
+    "max_angular_speed": 0.6,
+    "velocity_command_linear_limit": 0.5,
+    "velocity_command_angular_limit": 0.6,
+    "safety_backup": true,
+    "safety_slowdown": true,
+    "safety_trigger_distance_m": 0.19,
+    "safety_stop_distance_m": 0.24,
+    "safety_slow_distance_m": 0.37,
+    "safety_backup_speed_mps": 0.07,
+    "safety_turn_speed": 0.3,
+    "safety_backup_steps": 18,
+    "safety_cooldown_steps": 10
+  },
+  "system_bringup_integration": {
+    "leader_rl": false,
+    "follower_rl": false,
+    "recovery_navigation_rl": false,
+    "localization_spin_rl": false,
+    "active_scout_rl": true,
+    "public_rl_launch_arguments": []
+  }
+}

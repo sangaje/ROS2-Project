@@ -47,6 +47,164 @@ DEFAULT_FLEET_ROLE = {
     'leader': 'leader',
 }
 
+SCOUT_RL_MODEL_PATH = (
+    'rl_models/pure_velocity_sac_map32_lidar60_h8_deltatcn_domain22/'
+    'sac_turtlebot3_burger.zip'
+)
+
+SCOUT_RL_ENV = {
+    'TB3_RL_DISABLE_SHM_TRANSPORT': '1',
+    'TB3_RL_CARTOGRAPHER_RESTART_DELAY_SEC': '0.8',
+    'TB3_RL_DISABLE_BUFFER_GUARD': '0',
+    'TB3_RL_LIDAR_CANONICAL_FRONT_ZERO': '1',
+    'TB3_RL_LIDAR_FRONT_INDEX': '0',
+    'TB3_RL_LIDAR_ANGLE_OFFSET_DEG': '0',
+    'TB3_RL_LIDAR_FLIP_LR': '0',
+    'TB3_RL_LIDAR_UNIFORM_ANGLE_RESAMPLE': '1',
+    'TB3_RL_LIDAR_MEDIAN_KERNEL': '3',
+    'TB3_RL_LIDAR_LOWPASS_KERNEL': '5',
+    'TB3_RL_LIDAR_OBSTACLE_MARGIN_M': '0.08',
+    'TB3_RL_POLICY_SCAN_TOPIC': '/rl_policy_scan',
+    'TB3_RL_POLICY_SCAN_60_TOPIC': '/rl_policy_scan_60',
+    'TB3_RL_POLICY_SCAN_PUBLISH_EVERY_N': '5',
+    'TB3_RL_POLICY_SCAN_MARKER_TOPIC': '/rl_policy_scan_60_points',
+    'TB3_RL_RAW_SCAN_MARKER_TOPIC': '/rl_raw_scan_points',
+    'TB3_RL_RAW_SCAN_MARKER_UNCORRECTED': '0',
+    'TB3_RL_FORCE_NO_PRIORITY': '0',
+    'TB3_RL_NO_PRIORITY_MODEL_INPUT': '0',
+    'TB3_RL_PRIORITY_CLUSTER_SPAWN_INTERVAL_STEPS': '200',
+    'TB3_RL_PRIORITY_MAX_SEED_POINTS': '6',
+    'TB3_RL_PRIORITY_SPAWN_MIN_RANGE_M': '0.90',
+    'TB3_RL_PRIORITY_SPAWN_MAX_RANGE_M': '2.40',
+    'TB3_RL_PRIORITY_SPAWN_IN_CURRENT_FOV': '0',
+    'TB3_RL_PRIORITY_BIRTH_DELTA': '6.0',
+    'TB3_RL_QUIET_MAP_LOGS': '1',
+    'TB3_RL_QUIET_STARTUP_LOGS': '1',
+    'TB3_RL_CONFIDENCE_UNIFY_WITH_TF_CUBE': '1',
+    'TB3_RL_CONFIDENCE_UNIFY_STRICT': '1',
+    'TB3_RL_CONFIDENCE_SINGLE_CUBE_MARKER': '1',
+    'TB3_RL_CONFIDENCE_CUBE_FRAME': 'base_footprint',
+    'TB3_RL_CONFIDENCE_PREFER_TF_BUFFER': '0',
+    'TB3_RL_USE_MANUAL_TF_CACHE_FOR_CONFIDENCE': '1',
+    'TB3_RL_CONFIDENCE_TF_BUFFER_FALLBACK': '0',
+    'TB3_RL_CONFIDENCE_CUBE_TF_BUFFER_FALLBACK': '0',
+    'TB3_RL_MANUAL_TF_MAX_AGE_SEC': '15.0',
+    'TB3_RL_CONFIDENCE_TF_HOLD_SEC': '1.5',
+    'TB3_RL_TF_CUBE_POSE_WARN': '1',
+    'TB3_RL_CONFIDENCE_POSE_SOURCE': 'map_base_tf',
+    'TB3_RL_CONFIDENCE_ANCHOR_RESYNC': '1',
+    'TB3_RL_CONFIDENCE_ANCHOR_RESYNC_TOL_M': '0.03',
+    'TB3_RL_CONFIDENCE_PUBLISH_DEBUG_EVERY_N': '0',
+    'TB3_RL_FORCE_MAP_PUBLISH_EVERY_UPDATE': '1',
+    'TB3_RL_CONFIDENCE_DEBUG_EVERY_N': '0',
+    'TB3_RL_QUIET_PRIORITY_LOGS': '1',
+    'TB3_RL_QUIET_RESET_LOGS': '1',
+    'TB3_RL_DEBUG_OVERLAY_EVERY_N': '1',
+    'TB3_RL_INFERENCE_EXTERNAL_SLAM': '1',
+}
+
+
+def scout_rl_command() -> str:
+    command = [
+        'ros2', 'run', 'turtlebot3_rl_training', 'eval_policy',
+        '--model', SCOUT_RL_MODEL_PATH,
+        '--real-robot',
+        '--episodes', '1000000000',
+        '--no-manual-reset-prompt',
+        '--no-real-robot-stop-between-episodes',
+        '--control-dt', '0.10',
+        '--physics-step-size', '0.005',
+        '--max-episode-steps', '1000000000',
+        '--entity-name', 'burger',
+        '--set-pose-service', '/world/default/set_pose',
+        '--world-control-service', '/world/default/control',
+        '--action-mode', 'velocity',
+        '--cmd-vel-topic', '/cmd_vel',
+        '--max-linear-speed', '0.50',
+        '--max-angular-speed', '0.60',
+        '--velocity-command-linear-limit', '0.50',
+        '--velocity-command-angular-limit', '0.60',
+        '--velocity-safety-backup',
+        '--velocity-safety-trigger-distance-m', '0.19',
+        '--velocity-safety-stop-distance-m', '0.24',
+        '--velocity-safety-slow-distance-m', '0.37',
+        '--velocity-safety-backup-speed-mps', '0.07',
+        '--velocity-safety-turn-speed', '0.30',
+        '--velocity-safety-backup-steps', '18',
+        '--velocity-safety-cooldown-steps', '10',
+        '--velocity-safety-penalty', '10.0',
+        '--velocity-safety-slowdown',
+        '--velocity-safety-slow-min-scale', '0.20',
+        '--velocity-safety-slow-penalty', '1.80',
+        '--velocity-safety-slow-speed-power', '1.35',
+        '--velocity-safety-slow-danger-power', '1.10',
+        '--slam-backend', 'cartographer',
+        '--slam-map-topic', '/map',
+        '--map-frame', 'map',
+        '--pose-frame', 'map',
+        '--safety-boundary-frame', 'odom',
+        '--wait-slam-map',
+        '--strict-slam-map-required',
+        '--strict-slam-map-wait-timeout-sec', '60.0',
+        '--strict-slam-map-min-known-cells', '80',
+        '--strict-slam-map-min-known-ratio', '0.003',
+        '--post-reset-ready-gate',
+        '--post-reset-ready-timeout-sec', '12.0',
+        '--post-reset-ready-min-known-ratio', '0.003',
+        '--post-reset-ready-min-known-cells', '40',
+        '--post-reset-ready-min-lidar-beams', '30',
+        '--no-post-reset-ready-require-priority',
+        '--rl-map-topic', '/rl_task_map',
+        '--rl-confidence-topic', '/rl_confidence_map',
+        '--rl-priority-topic', '/rl_priority_map',
+        '--rl-filtered-slam-topic', '/rl_filtered_slam_map',
+        '--waypoint-marker-topic', '/rl_debug_overlay',
+        '--map-publish-every-n', '1',
+        '--map-live-update-period-sec', '0.01',
+        '--map-keepalive-period-sec', '0.50',
+        '--use-map-cnn',
+        '--map-obs-size', '32',
+        '--map-obs-size-m', '6.0',
+        '--num-lidar-bins', '60',
+        '--use-temporal-cnn',
+        '--temporal-history-len', '8',
+        '--temporal-features-dim', '64',
+        '--cnn-features-dim', '48',
+        '--vector-features-dim', '96',
+        '--combined-features-dim', '128',
+        '--front-fov-deg', '60.0',
+        '--front-angle-sigma-deg', '20.0',
+        '--confidence-max-range', '2.0',
+        '--seen-confidence-floor', '20.0',
+        '--confidence-reward-weight', '10.0',
+        '--slam-map-update-reward',
+        '--slam-map-update-reward-weight', '0.65',
+        '--enable-corridor-priority-reward',
+        '--corridor-priority-reward-weight', '2.75',
+        '--priority-recompute-interval', '4',
+        '--priority-clear-fov-deg', '60.0',
+        '--priority-clear-max-range-m', '2.0',
+        '--priority-clear-min-weight', '0.05',
+        '--priority-stuck-restart',
+        '--priority-stuck-restart-steps', '200',
+        '--coverage-stall-terminal',
+        '--coverage-stall-start-steps', '1000',
+        '--coverage-stall-window-steps', '500',
+        '--coverage-stall-min-slam-new-cells', '5',
+        '--coverage-stall-min-confidence-updated-cells', '30',
+        '--coverage-stall-terminal-penalty', '-10.0',
+        '--lidar-empty-restart',
+        '--lidar-empty-timeout-sec', '2.5',
+        '--lidar-empty-grace-sec', '1.0',
+        '--lidar-empty-min-valid-beams', '2',
+        '--collision-threshold', '0.16',
+        '--restart-on-collision',
+        '--no-terminate-on-out-of-bounds',
+        '--safety-boundary-radius-m', '8.0',
+        '--no-check-env',
+    ]
+    return ' '.join(shlex.quote(part) for part in command)
+
 
 def generate_launch_description():
     role = LaunchConfiguration('role')
@@ -73,10 +231,6 @@ def generate_launch_description():
     start_camera_sender = LaunchConfiguration('start_camera_sender')
     camera_sender_device = LaunchConfiguration('camera_sender_device')
     flask_server_url = LaunchConfiguration('flask_server_url')
-    start_rl_policy = LaunchConfiguration('start_rl_policy')
-    rl_model_path = LaunchConfiguration('rl_model_path')
-    rl_disable_slam_map = LaunchConfiguration('rl_disable_slam_map')
-    rl_extra_args = LaunchConfiguration('rl_extra_args')
     start_rviz = LaunchConfiguration('start_rviz')
     risk_domain_id = LaunchConfiguration('risk_domain_id')
     pc_domain_id = LaunchConfiguration('pc_domain_id')
@@ -130,10 +284,6 @@ def generate_launch_description():
     enable_localization_spin_on_takeover = LaunchConfiguration(
         'enable_localization_spin_on_takeover'
     )
-    enable_exploration_after_takeover = LaunchConfiguration(
-        'enable_exploration_after_takeover'
-    )
-    takeover_exploration_command = LaunchConfiguration('takeover_exploration_command')
     start_omx_aim = LaunchConfiguration('start_omx_aim')
     start_yolo_server = LaunchConfiguration('start_yolo_server')
     yolo_server_delay_sec = LaunchConfiguration('yolo_server_delay_sec')
@@ -211,7 +361,6 @@ def generate_launch_description():
         scout_rl_owns_cmd_vel = (
             role_value == 'scout'
             and fleet_role_value == 'member'
-            and launch_bool(start_rl_policy.perform(context))
         )
 
         fleet_launch_args = {
@@ -296,7 +445,13 @@ def generate_launch_description():
             else active_scout_robot_name.perform(context)
         )
 
-        if role_value == 'scout' and launch_bool(enable_scout_failover.perform(context)):
+        if (
+            role_value == 'scout'
+            and (
+                fleet_role_value == 'member'
+                or launch_bool(enable_scout_failover.perform(context))
+            )
+        ):
             local_robot_name = (
                 follower_robot_name.perform(context)
                 if fleet_role_value == 'follower'
@@ -308,21 +463,8 @@ def generate_launch_description():
             self_pose_topic = (
                 '/burger_pose' if fleet_role_value == 'follower' else '/member_pose'
             )
-            takeover_command = takeover_exploration_command.perform(context).strip()
-            if not takeover_command:
-                takeover_command_parts = [
-                    'ros2', 'run', 'turtlebot3_rl_training', 'eval_policy',
-                    '--model', rl_model_path.perform(context),
-                    '--real-robot',
-                ]
-                if launch_bool(rl_disable_slam_map.perform(context)):
-                    takeover_command_parts.append('--disable-slam-map')
-                extra = rl_extra_args.perform(context).strip()
-                if extra:
-                    takeover_command_parts.extend(shlex.split(extra))
-                takeover_command = ' '.join(
-                    shlex.quote(part) for part in takeover_command_parts
-                )
+            field_env = dict(process_env)
+            field_env.update(SCOUT_RL_ENV)
             actions.append(TimerAction(
                 period=2.5,
                 actions=[Node(
@@ -339,10 +481,8 @@ def generate_launch_description():
                         'enable_localization_spin': launch_bool(
                             enable_localization_spin_on_takeover.perform(context)
                         ),
-                        'enable_exploration': launch_bool(
-                            enable_exploration_after_takeover.perform(context)
-                        ),
-                        'exploration_command': takeover_command,
+                        'enable_exploration': True,
+                        'exploration_command': scout_rl_command(),
                         'leader_pose_topic': '/leader_pose',
                         'self_pose_topic': self_pose_topic,
                         'follow_distance_m': 0.70,
@@ -359,7 +499,7 @@ def generate_launch_description():
                         'cmd_vel_topic': '/cmd_vel',
                         'use_stamped_cmd_vel': True,
                     }],
-                    env=process_env,
+                    env=field_env,
                     respawn=True,
                     respawn_delay=3.0,
                 )],
@@ -834,43 +974,6 @@ def generate_launch_description():
                 }.items(),
             ))
 
-        if fleet_role_value == 'follower':
-            # A follower is a scout that is temporarily suspending its own
-            # recon duty to tail the leader instead -- follower.launch.py's
-            # Nav2 stack already drives cmd_vel to chase the leader. The
-            # camera sender is role-gated above, so it opens only after this
-            # robot actually becomes ACTIVE_SCOUT during failover takeover.
-            if launch_bool(start_rl_policy.perform(context)):
-                actions.append(LogInfo(msg=[
-                    'SYSTEM_BRINGUP | fleet_role=follower: suspending the '
-                    'RL policy (follower.launch.py\'s own Nav2 pursuit '
-                    'drives cmd_vel instead). Camera sender waits for '
-                    'ACTIVE_SCOUT role before streaming.'
-                ]))
-        elif launch_bool(start_rl_policy.perform(context)):
-            rl_command = [
-                'ros2', 'run', 'turtlebot3_rl_training', 'eval_policy',
-                '--model', rl_model_path.perform(context),
-                '--real-robot',
-            ]
-            if launch_bool(rl_disable_slam_map.perform(context)):
-                # eval_policy unconditionally tries to own SLAM (its own
-                # Cartographer/slam_toolbox + map->odom TF) whenever
-                # --real-robot is passed, unless map use is disabled here.
-                # The fleet stack above already owns localization for this
-                # robot, so leave this on unless you deliberately run the
-                # scout WITHOUT fleet_bringup's own localization.
-                rl_command.append('--disable-slam-map')
-            extra = rl_extra_args.perform(context).strip()
-            if extra:
-                rl_command.extend(shlex.split(extra))
-            actions.append(ExecuteProcess(
-                cmd=rl_command,
-                output='screen',
-                name='scout_rl_policy',
-                env=process_env,
-            ))
-
         if launch_bool(start_rviz.perform(context)):
             actions.append(LogInfo(msg=[
                 'SYSTEM_BRINGUP | start_rviz is ignored on robot-side '
@@ -1070,31 +1173,6 @@ def generate_launch_description():
             ),
         ),
         DeclareLaunchArgument(
-            'start_rl_policy', default_value='false',
-            choices=['true', 'false'],
-            description=(
-                'Scout only: run the trained RL policy against cmd_vel. '
-                'Default false for teleop/lightweight Scout operation.'
-            ),
-        ),
-        DeclareLaunchArgument(
-            'rl_model_path',
-            default_value='rl_models/sac_turtlebot3_burger.zip',
-        ),
-        DeclareLaunchArgument(
-            'rl_disable_slam_map', default_value='true',
-            choices=['true', 'false'],
-            description=(
-                'Stop eval_policy from starting its own SLAM/map->odom TF, '
-                "since the fleet stack above already owns it. Turn off "
-                'only if this scout runs without fleet_bringup.'
-            ),
-        ),
-        DeclareLaunchArgument(
-            'rl_extra_args', default_value='',
-            description='Extra raw CLI flags appended to `ros2 run turtlebot3_rl_training eval_policy`.',
-        ),
-        DeclareLaunchArgument(
             'start_rviz', default_value='false',
             choices=['true', 'false'],
             description=(
@@ -1277,17 +1355,6 @@ def generate_launch_description():
             default_value='true',
             choices=['true', 'false'],
             description='Follower-side takeover agent performs 360deg AMCL spin when covariance is poor.',
-        ),
-        DeclareLaunchArgument(
-            'enable_exploration_after_takeover',
-            default_value='true',
-            choices=['true', 'false'],
-            description='Start the configured exploration command after follower is promoted.',
-        ),
-        DeclareLaunchArgument(
-            'takeover_exploration_command',
-            default_value='',
-            description='Optional raw command launched by follower takeover agent; empty builds eval_policy from rl_* args.',
         ),
         DeclareLaunchArgument(
             'start_omx_aim',
