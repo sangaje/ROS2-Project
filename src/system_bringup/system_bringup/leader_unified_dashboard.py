@@ -390,6 +390,28 @@ class LeaderUnifiedDashboard(Node):
             response.headers['X-Accel-Buffering'] = 'no'
             return response
 
+        @app.get('/api/yolo_frame/<kind>.jpg')
+        def yolo_frame(kind):
+            if kind == 'raw':
+                path = '/frame/raw.jpg'
+            elif kind in ('yolo', 'overlay'):
+                path = '/frame/yolo.jpg'
+            else:
+                return jsonify({'ok': False, 'error': 'kind must be raw or yolo'}), 404
+            return self._single_jpeg_proxy(
+                Response,
+                f'http://127.0.0.1:{self.yolo_server_port}{path}',
+                f'Scout {kind} frame waiting',
+            )
+
+        @app.get('/api/omx_frame.jpg')
+        def omx_frame():
+            return self._single_jpeg_proxy(
+                Response,
+                f'http://127.0.0.1:{self.omx_debug_port}/frame.jpg',
+                'OMX frame waiting',
+            )
+
         @app.get('/api/omx_stream.mjpg')
         def omx_stream():
             """Proxy the local OMX debug stream through the dashboard port.
@@ -456,6 +478,29 @@ class LeaderUnifiedDashboard(Node):
             return response
 
         return app
+
+    def _single_jpeg_proxy(self, response_class: Any, url: str, waiting_label: str) -> Any:
+        """Serve one current frame, never a long-lived MJPEG connection.
+
+        Browser reloads repeatedly interrupted the three concurrent MJPEG
+        proxies, producing panels that appeared only after a lucky F5.  A
+        short single-image request is independent, cache-busted by the UI,
+        and cannot retain a stale stream connection.
+        """
+        try:
+            with urllib.request.urlopen(url, timeout=0.8) as upstream:
+                payload = upstream.read()
+            response = response_class(payload, mimetype='image/jpeg')
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warning(
+                f'UNIFIED_DASHBOARD_FRAME_PROXY_WAIT | url={url} error={exc}',
+                throttle_duration_sec=5.0,
+            )
+            response = response_class(
+                _placeholder_jpeg(waiting_label), mimetype='image/jpeg'
+            )
+        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+        return response
 
     def _grid_response(self, response_class: Any, kind: str) -> Any:
         try:
@@ -943,6 +988,21 @@ def _encode_grid_png(data: list, width: int, height: int, kind: str) -> bytes:
     ok, encoded = cv2.imencode('.png', img)
     if not ok:
         raise RuntimeError(f'failed to encode {kind} grid')
+    return encoded.tobytes()
+
+
+def _placeholder_jpeg(label: str) -> bytes:
+    import cv2
+    import numpy as np
+
+    image = np.zeros((360, 640, 3), dtype=np.uint8)
+    cv2.putText(
+        image, label[:62], (72, 185), cv2.FONT_HERSHEY_SIMPLEX,
+        0.72, (0, 190, 255), 2,
+    )
+    ok, encoded = cv2.imencode('.jpg', image)
+    if not ok:
+        raise RuntimeError('failed to create dashboard placeholder')
     return encoded.tobytes()
 
 

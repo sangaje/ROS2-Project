@@ -13,6 +13,7 @@ const gridLoad = {
   risk: {loading: false, requestedSeq: -1, pendingSeq: -1, latestSeq: -1},
 };
 let streamSources = {};
+const framePollTimers = {};
 const canvas = document.getElementById('mapCanvas');
 const ctx = canvas.getContext('2d');
 const roleColors = {leader: '#58a6ff', follower: '#63d297'};
@@ -73,14 +74,13 @@ function setStreamSource(id, url, force = false) {
 }
 
 function configureStream(s) {
-  // Keep OMX video on the same origin as the dashboard.  The server proxies
-  // its local :8080 debug stream, so a browser that can reach :8091 no longer
-  // needs a second firewall/DDS-host-specific port opened.
-  streamSources.omxStream = '/api/omx_stream.mjpg';
+  // Use latest-JPEG polling, not long-lived MJPEG proxy connections.  This
+  // makes each panel independent and stable across browser reloads.
+  streamSources.omxStream = '/api/omx_frame.jpg';
 
   const yolo = s.yolo_server || {};
-  streamSources.scoutRawStream = yolo.raw_proxy_path || '/api/yolo_stream/raw.mjpg';
-  streamSources.scoutYoloStream = yolo.overlay_proxy_path || '/api/yolo_stream/yolo.mjpg';
+  streamSources.scoutRawStream = '/api/yolo_frame/raw.jpg';
+  streamSources.scoutYoloStream = '/api/yolo_frame/yolo.jpg';
   refreshStreams(false);
 }
 
@@ -91,18 +91,26 @@ function refreshStreams(force = true) {
 }
 
 function reconnectStream(id) {
-  const image = document.getElementById(id);
-  const url = image.dataset.baseSrc;
-  if (!url) return;
-  // A single source failure should reconnect, but never tear down healthy
-  // MJPEG connections on a fixed timer.  The old periodic reset made panels
-  // appear/disappear after every browser refresh.
-  window.setTimeout(() => setStreamSource(id, url, true), 1500);
+  scheduleFramePoll(id, 750);
 }
 
 ['omxStream', 'scoutRawStream', 'scoutYoloStream'].forEach(id => {
-  document.getElementById(id).addEventListener('error', () => reconnectStream(id));
+  const image = document.getElementById(id);
+  // Poll only after the previous JPEG has completed.  A fixed interval can
+  // repeatedly cancel a slower first request and recreate the F5-dependent
+  // black panels that this dashboard is meant to avoid.
+  image.addEventListener('load', () => scheduleFramePoll(id, 220));
+  image.addEventListener('error', () => reconnectStream(id));
 });
+
+function scheduleFramePoll(id, delayMs) {
+  window.clearTimeout(framePollTimers[id]);
+  framePollTimers[id] = window.setTimeout(() => {
+    const image = document.getElementById(id);
+    const url = image.dataset.baseSrc;
+    if (url) setStreamSource(id, url, true);
+  }, delayMs);
+}
 
 function updateImages(s) {
   queueGridLoad('map', s.map.seq, s.map.status);

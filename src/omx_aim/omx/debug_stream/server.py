@@ -62,6 +62,7 @@ class DebugStream:
         app = Flask(__name__)
         app.add_url_rule('/', 'index', self._index)
         app.add_url_rule('/stream.mjpg', 'stream', self._stream_view)
+        app.add_url_rule('/frame.jpg', 'frame', self._frame_view)
         app.add_url_rule('/events', 'events', self._events_view)
         app.add_url_rule('/state.json', 'state_json', self._state_json_view)
 
@@ -86,6 +87,23 @@ class DebugStream:
         from flask import Response
         return Response(self._frame_gen(),
                         mimetype='multipart/x-mixed-replace; boundary=frame')
+
+    def _frame_view(self):
+        """Single latest JPEG for polling dashboards (reload-safe)."""
+        from flask import Response
+
+        frame, _ = self.bus.get_frame()
+        if frame is None:
+            return Response('waiting for OMX frame\n', status=503, mimetype='text/plain')
+        ok, encoded = cv2.imencode(
+            '.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
+        )
+        if not ok:
+            return Response('OMX JPEG encode failed\n', status=500, mimetype='text/plain')
+        return Response(
+            encoded.tobytes(), mimetype='image/jpeg',
+            headers={'Cache-Control': 'no-store, no-cache, max-age=0'},
+        )
 
     def _events_view(self):
         from flask import Response
