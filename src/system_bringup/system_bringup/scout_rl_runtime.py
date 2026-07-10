@@ -394,12 +394,12 @@ class ActiveScoutRLRuntime:
         snapshot = self._sensor_snapshot()
         now = time.monotonic()
         if not self._fresh(snapshot, now):
-            self._stop('stale_sensor_or_map')
+            self._hold('waiting_for_sensor_or_map')
             return
         assert snapshot.scan is not None and snapshot.slam_map is not None
         map_frame = str(snapshot.slam_map.header.frame_id or '').lstrip('/')
         if map_frame != self.config.map_frame.lstrip('/'):
-            self._stop('map_frame_mismatch')
+            self._hold('waiting_for_expected_map_frame')
             return
         scan_frame = str(snapshot.scan.header.frame_id or self.config.scan_frame).lstrip('/')
         try:
@@ -416,12 +416,12 @@ class ActiveScoutRLRuntime:
                 sensor_yaw=sensor_yaw,
             )
         except TransformException as exc:
-            self._warn_throttled(f'SCOUT_RL_TF_UNAVAILABLE | {exc}')
-            self._stop('tf_unavailable')
+            self._warn_throttled(f'SCOUT_RL_WAIT_TF | {exc}')
+            self._hold('waiting_for_tf')
             return
         except Exception as exc:  # noqa: BLE001
-            self._warn_throttled(f'SCOUT_RL_MAP_UPDATE_FAILED | {exc}')
-            self._stop('map_update_error')
+            self._warn_throttled(f'SCOUT_RL_WAIT_MAP_UPDATE | {exc}')
+            self._hold('waiting_for_map_update')
             return
         self._map_snapshot = MapSnapshot(
             stats=stats,
@@ -445,7 +445,7 @@ class ActiveScoutRLRuntime:
             or map_snapshot.map_generation != snapshot.map_generation
             or now - map_snapshot.updated_at > self.config.control_dt_sec
         ):
-            self._stop('stale_observation')
+            self._hold('waiting_for_coherent_observation')
             return
         assert snapshot.scan is not None
         try:
@@ -476,6 +476,12 @@ class ActiveScoutRLRuntime:
         ):
             self._warn_throttled('SCOUT_RL_COMMAND_TIMEOUT')
             self._stop('command_timeout')
+
+    def _hold(self, reason: str) -> None:
+        """Keep the role active while a startup/transient data gate recovers."""
+        self._last_stop_reason = reason
+        self._last_command_at = time.monotonic()
+        self.publish_command(0.0, 0.0)
 
     def _build_observation(self, scan: LaserScan, map_snapshot: MapSnapshot) -> dict[str, np.ndarray]:
         stats = map_snapshot.stats
