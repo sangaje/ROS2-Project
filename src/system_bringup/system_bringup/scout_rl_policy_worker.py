@@ -29,6 +29,7 @@ class ScoutRLPolicyWorker(Node):
         self.declare_parameter('initial_role_active', True)
         self.declare_parameter('cmd_vel_topic', '/cmd_vel')
         self.declare_parameter('use_stamped_cmd_vel', True)
+        self.declare_parameter('enable_velocity_safety_filter', True)
 
         get = self.get_parameter
         self.robot_name = str(get('robot_name').value).strip()
@@ -36,6 +37,9 @@ class ScoutRLPolicyWorker(Node):
         self.role_active = bool(get('initial_role_active').value)
         self.cmd_vel_topic = str(get('cmd_vel_topic').value)
         self.use_stamped = bool(get('use_stamped_cmd_vel').value)
+        self.enable_velocity_safety_filter = bool(
+            get('enable_velocity_safety_filter').value
+        )
 
         if self.use_stamped:
             self.cmd_pub = self.create_publisher(TwistStamped, self.cmd_vel_topic, 10)
@@ -48,13 +52,18 @@ class ScoutRLPolicyWorker(Node):
             history=HistoryPolicy.KEEP_LAST,
         )
         self.create_subscription(String, self.role_topic, self._on_role, role_qos)
-        self.runtime = ActiveScoutRLRuntime(self, self._publish_command)
+        self.runtime = ActiveScoutRLRuntime(
+            self,
+            self._publish_command,
+            enable_velocity_safety_filter=self.enable_velocity_safety_filter,
+        )
         if self.role_active:
             self.runtime.activate()
         self.get_logger().warning(
             'SCOUT_RL_POLICY_WORKER_READY | '
             f'robot={self.robot_name} role_topic={self.role_topic} '
-            f'cmd_vel={self.cmd_vel_topic} initial_active={self.role_active}'
+            f'cmd_vel={self.cmd_vel_topic} initial_active={self.role_active} '
+            f'safety_filter={self.enable_velocity_safety_filter}'
         )
 
     def _on_role(self, msg: String) -> None:

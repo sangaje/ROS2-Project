@@ -54,6 +54,17 @@ def test_runtime_keeps_v132_backup_sequence_nonblocking():
     assert safety.cooldown_remaining == config.safety_cooldown_steps
 
 
+def test_raw_policy_command_only_clips_to_the_trained_action_box():
+    runtime = ActiveScoutRLRuntime.__new__(ActiveScoutRLRuntime)
+    runtime.config = active_scout_config()
+
+    command = runtime._raw_policy_command(np.array([0.10, 0.03], dtype=np.float32))
+
+    # The raw diagnostic path intentionally does not apply the 0.04rad/s
+    # angular deadband used by VelocitySafetyFilter.
+    assert np.allclose(command, [0.10, 0.03])
+
+
 def test_contract_lidar_config_ignores_mutable_environment(monkeypatch):
     monkeypatch.setenv('TB3_RL_LIDAR_FLIP_LR', '1')
     frozen = LidarPreprocessorConfig(
@@ -204,6 +215,7 @@ def test_first_predict_exception_does_not_deactivate_active_scout():
         'vector': np.zeros((69,), dtype=np.float32),
     }
     runtime.safety = type('Safety', (), {'filter': lambda self, action, scan: action})()
+    runtime.enable_velocity_safety_filter = True
     runtime.counters = RuntimeCounters()
     runtime._last_error = ''
     runtime._previous_action = np.zeros(2, dtype=np.float32)

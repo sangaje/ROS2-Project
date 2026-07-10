@@ -205,12 +205,14 @@ class ActiveScoutRLRuntime:
         model_loader=None,
         on_stop: Optional[Callable[[str], None]] = None,
         on_ready: Optional[Callable[[], None]] = None,
+        enable_velocity_safety_filter: bool = True,
     ) -> None:
         self.node = node
         self.config = config or active_scout_config()
         self.publish_command = publish_command
         self.on_stop = on_stop
         self.on_ready = on_ready
+        self.enable_velocity_safety_filter = bool(enable_velocity_safety_filter)
         self._active = False
         self._lock = threading.Lock()
         self._map_state_lock = threading.Lock()
@@ -225,6 +227,8 @@ class ActiveScoutRLRuntime:
         self._history_vector: deque[np.ndarray] = deque(maxlen=self.config.history_len)
         self._history_map: deque[np.ndarray] = deque(maxlen=self.config.history_len)
         self._previous_action = np.zeros(2, dtype=np.float32)
+        self._last_policy_action = np.zeros(2, dtype=np.float32)
+        self._last_command = np.zeros(2, dtype=np.float32)
         self._last_command_at = 0.0
         self._activated_at = 0.0
         self._last_error_at = 0.0
@@ -558,7 +562,12 @@ class ActiveScoutRLRuntime:
                 self._warn_throttled(f'SCOUT_RL_INFERENCE_TIMEOUT | sec={elapsed:.3f}')
                 self._hold('inference_timeout')
                 return
-            command = self.safety.filter(np.asarray(action, dtype=np.float32), snapshot.scan)
+            self._last_policy_action = np.asarray(action, dtype=np.float32).reshape(-1).copy()
+            command = (
+                self.safety.filter(self._last_policy_action, snapshot.scan)
+                if self.enable_velocity_safety_filter
+                else self._raw_policy_command(self._last_policy_action)
+            )
         except Exception as exc:  # noqa: BLE001
             self.counters.predict_failure_count += 1
             self._last_error = traceback.format_exc()
@@ -569,6 +578,7 @@ class ActiveScoutRLRuntime:
             self._hold('inference_error')
             return
         self._previous_action = command.copy()
+        self._last_command = command.copy()
         self._last_command_at = now
         self.counters.predict_success_count += 1
         self.publish_command(float(command[0]), float(command[1]))
@@ -623,8 +633,27 @@ class ActiveScoutRLRuntime:
             f'predict_attempts={counters.predict_attempt_count} '
             f'predict_success={counters.predict_success_count} '
             f'predict_failure={counters.predict_failure_count} '
+            f'safety_filter={self.enable_velocity_safety_filter} '
+            f'raw_action=({self._last_policy_action[0]:+.3f},{self._last_policy_action[1]:+.3f}) '
+            f'command=({self._last_command[0]:+.3f},{self._last_command[1]:+.3f}) '
             f'last_error={self._last_error.splitlines()[-1] if self._last_error else ""}'
         )
+
+    def _raw_policy_command(self, action: np.ndarray) -> np.ndarray:
+        """Publish the deterministic policy action with only Box-bound clipping.
+
+        This diagnostic path deliberately omits deadbands, slowdown and backup
+        recovery.  It is intended for controlled tests of the checkpoint's raw
+        behavior, not normal operation.
+        """
+        raw = np.asarray(action, dtype=np.float32).reshape(-1)
+        if raw.size != 2 or not np.all(np.isfinite(raw)):
+            raise RuntimeError(f'invalid raw policy action: {raw!r}')
+        return np.clip(
+            raw,
+            np.asarray(self.config.action_low, dtype=np.float32),
+            np.asarray(self.config.action_high, dtype=np.float32),
+        ).astype(np.float32, copy=False)
 
     def _build_observation(self, scan: LaserScan, map_snapshot: MapSnapshot) -> dict[str, np.ndarray]:
         stats = map_snapshot.stats
