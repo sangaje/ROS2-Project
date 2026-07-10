@@ -771,7 +771,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--port', type=int, default=5005)
-    parser.add_argument('--model-path', default='/home/seil/omx_aim/models/best.pt')
+    parser.add_argument('--model-path', default='yolo11n.pt')
     parser.add_argument('--device', default='0')
     parser.add_argument('--half', type=as_bool, default=True)
     parser.add_argument('--fast-forward', type=as_bool, default=True)
@@ -784,7 +784,7 @@ def parse_args():
     parser.add_argument('--max-queue-wait-sec', type=float, default=0.0)
     parser.add_argument(
         '--target-class', type=int, default=1,
-        help='Only infer this class. Custom doll model best.pt uses 1=enemy (doll).',
+        help='Only infer this class. COCO person class 0 is used as the doll target.',
     )
     # Backward-compatible aliases for older launch commands.  New launches use
     # --target-class, so the server no longer hard-codes COCO person (class 0).

@@ -10,8 +10,8 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('host', default_value='0.0.0.0'),
         DeclareLaunchArgument('port', default_value='5005'),
-        DeclareLaunchArgument('model_path', default_value='/home/seil/omx_aim/models/best.pt'),
-        DeclareLaunchArgument('target_class', default_value='1'),
+        DeclareLaunchArgument('model_path', default_value='yolo11n.pt'),
+        DeclareLaunchArgument('target_class', default_value='0'),
         DeclareLaunchArgument('device', default_value='0'),
         DeclareLaunchArgument('half', default_value='true'),
         DeclareLaunchArgument('fast_forward', default_value='true'),

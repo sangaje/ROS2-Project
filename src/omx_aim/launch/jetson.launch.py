@@ -43,6 +43,7 @@ def launch_setup(context, *args, **kwargs):
     yolo_node_delay = float(
         LaunchConfiguration('yolo_node_delay_sec').perform(context)
     )
+    yolo_node_model_path = LaunchConfiguration('yolo_node_model_path').perform(context)
     patrol_delay = float(
         LaunchConfiguration('patrol_planner_delay_sec').perform(context)
     )
@@ -80,6 +81,9 @@ def launch_setup(context, *args, **kwargs):
             'require_localization_ready': True,
             'localization_ready_topic': '/localization_ready',
         }],
+        additional_env={
+            'OMX_YOLO_MODEL_PATH': yolo_node_model_path,
+        },
         respawn=True,
         respawn_delay=3.0,
     )
@@ -199,6 +203,13 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'yolo_node_delay_sec', default_value='14.0',
             description='Delay heavy OMX YOLO/camera/model startup on constrained Jetson hardware.'),
+        DeclareLaunchArgument(
+            'yolo_node_model_path', default_value='yolo11n.pt',
+            description=(
+                'Model used by omx_yolo_node. Pass an absolute best.pt path '
+                'only when that file exists on this Jetson.'
+            ),
+        ),
         DeclareLaunchArgument(
             'patrol_planner_delay_sec', default_value='6.0',
             description='Small grace before starting patrol_planner.'),

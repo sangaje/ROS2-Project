@@ -483,7 +483,7 @@ def generate_launch_description():
                         '--host', yolo_server_host.perform(context),
                         '--port', yolo_server_port.perform(context),
                         '--model-path', yolo_server_model_path.perform(context),
-                        '--target-class', '1',
+                        '--target-class', '0',
                         '--device', yolo_server_device.perform(context),
                         '--half', yolo_server_half.perform(context),
                         '--fast-forward', 'true',
@@ -537,6 +537,9 @@ def generate_launch_description():
                         'yolo_server_half': yolo_server_half.perform(context),
                         'yolo_node_delay_sec': (
                             omx_yolo_node_delay_sec.perform(context)
+                        ),
+                        'yolo_node_model_path': (
+                            yolo_server_model_path.perform(context)
                         ),
                         'start_patrol_planner': (
                             start_patrol_planner.perform(context)
@@ -970,7 +973,7 @@ def generate_launch_description():
                 'needs an interactive terminal.'
             ),
         ),
-        DeclareLaunchArgument('risk_model_path', default_value='/home/seil/omx_aim/models/best.pt'),
+        DeclareLaunchArgument('risk_model_path', default_value='yolo11n.pt'),
         DeclareLaunchArgument(
             'detection_source', default_value='flask_topic',
             description=(
@@ -1248,7 +1251,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'yolo_server_model_path',
-            default_value='/home/seil/omx_aim/models/best.pt',
+            default_value='yolo11n.pt',
             description='Leader role only: YOLO model path for flask_yolo_server.',
         ),
         DeclareLaunchArgument(
