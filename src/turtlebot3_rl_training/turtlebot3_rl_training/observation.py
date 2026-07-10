@@ -1,8 +1,31 @@
 import math
 import os
+from dataclasses import dataclass
 from typing import Optional, Sequence
 
 import numpy as np
+
+
+@dataclass(frozen=True)
+class LidarPreprocessorConfig:
+    """Frozen LiDAR semantics for a policy invocation.
+
+    Training keeps its environment-variable compatibility path. Deployment
+    passes this object from the policy contract, so sensor callbacks never read
+    mutable process environment state.
+    """
+
+    canonical_front_zero: bool = True
+    front_index: int = 0
+    angle_offset_deg: float = 0.0
+    flip_lr: bool = False
+    uniform_angle_resample: bool = True
+    median_kernel: int = 3
+    lowpass_kernel: int = 5
+    obstacle_margin_m: float = 0.08
+    sector_bins: int = 0
+    sector_lowpass_kernel: int = 3
+    sector_expand_mode: str = 'linear'
 
 
 def normalize_angle(angle: float) -> float:
@@ -271,6 +294,7 @@ def _canonical_angle_resample(
     angle_increment: float,
     angle_max: Optional[float] = None,
     front_index: int = 0,
+    config: Optional[LidarPreprocessorConfig] = None,
 ) -> np.ndarray:
     """Conservative angle-aware LiDAR resampling for policy input.
 
@@ -330,9 +354,10 @@ def _canonical_angle_resample(
     #   TB3_RL_LIDAR_FLIP_LR          : mirror left/right before offset
     #
     # Use offset/flip only after checking /rl_raw_scan_points vs /map.
-    if _env_bool("TB3_RL_LIDAR_FLIP_LR", False):
+    config = config or _environment_lidar_config()
+    if config.flip_lr:
         source_angles = -source_angles
-    angle_offset_deg = _env_float("TB3_RL_LIDAR_ANGLE_OFFSET_DEG", 0.0)
+    angle_offset_deg = float(config.angle_offset_deg)
     if abs(angle_offset_deg) > 1.0e-9:
         source_angles = source_angles + math.radians(float(angle_offset_deg))
 
@@ -401,9 +426,27 @@ def _canonical_angle_resample(
 
     return np.clip(pooled, min_range, max_range).astype(np.float32)
 
-_LIDAR_MEDIAN_KERNEL: int | None = None
-_LIDAR_LOWPASS_KERNEL: int | None = None
-_LIDAR_OBSTACLE_MARGIN: float | None = None
+_ENVIRONMENT_LIDAR_CONFIG: LidarPreprocessorConfig | None = None
+
+
+def _environment_lidar_config() -> LidarPreprocessorConfig:
+    """Legacy training configuration, resolved only once per process."""
+    global _ENVIRONMENT_LIDAR_CONFIG
+    if _ENVIRONMENT_LIDAR_CONFIG is None:
+        _ENVIRONMENT_LIDAR_CONFIG = LidarPreprocessorConfig(
+            canonical_front_zero=_env_bool('TB3_RL_LIDAR_CANONICAL_FRONT_ZERO', True),
+            front_index=_env_int('TB3_RL_LIDAR_FRONT_INDEX', 0, min_value=0),
+            angle_offset_deg=_env_float('TB3_RL_LIDAR_ANGLE_OFFSET_DEG', 0.0),
+            flip_lr=_env_bool('TB3_RL_LIDAR_FLIP_LR', False),
+            uniform_angle_resample=_env_bool('TB3_RL_LIDAR_UNIFORM_ANGLE_RESAMPLE', True),
+            median_kernel=_env_int('TB3_RL_LIDAR_MEDIAN_KERNEL', 3),
+            lowpass_kernel=_env_int('TB3_RL_LIDAR_LOWPASS_KERNEL', 5),
+            obstacle_margin_m=_env_float('TB3_RL_LIDAR_OBSTACLE_MARGIN_M', 0.08),
+            sector_bins=_env_optional_int('TB3_RL_LIDAR_SECTOR_BINS', 0, min_value=0),
+            sector_lowpass_kernel=_env_int('TB3_RL_LIDAR_SECTOR_LOWPASS_KERNEL', 3),
+            sector_expand_mode=os.environ.get('TB3_RL_LIDAR_SECTOR_EXPAND_MODE', 'linear'),
+        )
+    return _ENVIRONMENT_LIDAR_CONFIG
 
 
 def downsample_lidar(
@@ -414,6 +457,7 @@ def downsample_lidar(
     scan_angle_min: Optional[float] = None,
     scan_angle_increment: Optional[float] = None,
     scan_angle_max: Optional[float] = None,
+    config: Optional[LidarPreprocessorConfig] = None,
 ) -> np.ndarray:
     """Return a 0~1 normalized LiDAR vector with anti-alias filtering.
 
@@ -436,17 +480,7 @@ def downsample_lidar(
       TB3_RL_LIDAR_LOWPASS_KERNEL         default 5, set 1 to disable
       TB3_RL_LIDAR_OBSTACLE_MARGIN_M      default 0.08
     """
-    global _LIDAR_MEDIAN_KERNEL, _LIDAR_LOWPASS_KERNEL, _LIDAR_OBSTACLE_MARGIN
-    if _LIDAR_MEDIAN_KERNEL is None:
-        _LIDAR_MEDIAN_KERNEL = _make_odd_kernel(
-            _env_int("TB3_RL_LIDAR_MEDIAN_KERNEL", 3),
-            min_value=1,
-        )
-        _LIDAR_LOWPASS_KERNEL = _make_odd_kernel(
-            _env_int("TB3_RL_LIDAR_LOWPASS_KERNEL", 5),
-            min_value=1,
-        )
-        _LIDAR_OBSTACLE_MARGIN = _env_float("TB3_RL_LIDAR_OBSTACLE_MARGIN_M", 0.08)
+    config = config or _environment_lidar_config()
 
     num_bins = max(int(num_bins), 1)
     ranges = np.asarray(scan_ranges, dtype=np.float32)
@@ -462,9 +496,9 @@ def downsample_lidar(
     )
     ranges = np.clip(ranges, min_range, max_range).astype(np.float32)
 
-    median_kernel = _LIDAR_MEDIAN_KERNEL
-    lowpass_kernel = _LIDAR_LOWPASS_KERNEL
-    obstacle_margin = _LIDAR_OBSTACLE_MARGIN
+    median_kernel = _make_odd_kernel(config.median_kernel, min_value=1)
+    lowpass_kernel = _make_odd_kernel(config.lowpass_kernel, min_value=1)
+    obstacle_margin = max(float(config.obstacle_margin_m), 0.0)
 
     robust_ranges = _circular_median_filter(ranges, median_kernel)
     smooth_ranges = _circular_lowpass_filter(robust_ranges, lowpass_kernel)
@@ -475,12 +509,8 @@ def downsample_lidar(
         scan_angle_increment,
     )
 
-    if geometry_valid and _env_bool("TB3_RL_LIDAR_CANONICAL_FRONT_ZERO", True):
-        try:
-            front_index = int(os.environ.get("TB3_RL_LIDAR_FRONT_INDEX", "0"))
-        except Exception:
-            front_index = 0
-        front_index = int(front_index) % int(num_bins)
+    if geometry_valid and config.canonical_front_zero:
+        front_index = int(config.front_index) % int(num_bins)
 
         # v4: optional stable-sector bridge.
         # Existing 145000 checkpoint still requires 360 LiDAR inputs, but the
@@ -489,7 +519,7 @@ def downsample_lidar(
         #     raw scan -> filtered canonical sectors, e.g. 60 -> expand to 360
         # This keeps the neural network input shape unchanged while reducing
         # beam-count jitter and preserving obstacles conservatively.
-        sector_bins = _env_optional_int("TB3_RL_LIDAR_SECTOR_BINS", 0, min_value=0)
+        sector_bins = max(int(config.sector_bins), 0)
         if sector_bins >= 2 and sector_bins != num_bins:
             sector_front_index = int(round(float(front_index) * float(sector_bins) / float(num_bins))) % int(sector_bins)
             sector_pooled = _canonical_angle_resample(
@@ -503,12 +533,10 @@ def downsample_lidar(
                 angle_increment=float(scan_angle_increment),
                 angle_max=scan_angle_max,
                 front_index=sector_front_index,
+                config=config,
             )
 
-            sector_lowpass_kernel = _make_odd_kernel(
-                _env_int("TB3_RL_LIDAR_SECTOR_LOWPASS_KERNEL", 3),
-                min_value=1,
-            )
+            sector_lowpass_kernel = _make_odd_kernel(config.sector_lowpass_kernel, min_value=1)
             if sector_lowpass_kernel > 1 and sector_pooled.size > 2:
                 # Conservative sector-level low-pass: smooth free-space, but do
                 # not allow smoothing to erase a close obstacle by more than the
@@ -524,7 +552,7 @@ def downsample_lidar(
                 output_front_index=front_index,
                 min_range=min_range,
                 max_range=max_range,
-                mode=os.environ.get("TB3_RL_LIDAR_SECTOR_EXPAND_MODE", "linear"),
+                mode=config.sector_expand_mode,
             )
         else:
             pooled = _canonical_angle_resample(
@@ -538,8 +566,9 @@ def downsample_lidar(
                 angle_increment=float(scan_angle_increment),
                 angle_max=scan_angle_max,
                 front_index=front_index,
+                config=config,
             )
-    elif _env_bool("TB3_RL_LIDAR_UNIFORM_ANGLE_RESAMPLE", True) and geometry_valid:
+    elif config.uniform_angle_resample and geometry_valid:
         pooled = _uniform_angle_resample(
             robust_ranges=robust_ranges,
             smooth_ranges=smooth_ranges,
@@ -658,6 +687,7 @@ def build_exploration_observation(
     scan_angle_increment: Optional[float] = None,
     scan_angle_max: Optional[float] = None,
     include_target_priority: bool = True,
+    lidar_config: Optional[LidarPreprocessorConfig] = None,
 ) -> np.ndarray:
     """
     SLAM-assisted exploration observation.
@@ -692,6 +722,7 @@ def build_exploration_observation(
         scan_angle_min=scan_angle_min,
         scan_angle_increment=scan_angle_increment,
         scan_angle_max=scan_angle_max,
+        config=lidar_config,
     )
 
     coverage_ratio_norm = np.clip(float(coverage_ratio), 0.0, 1.0)

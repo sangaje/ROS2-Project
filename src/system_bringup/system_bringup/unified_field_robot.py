@@ -5,7 +5,7 @@ Follower and scout are the same robot runtime with different role-selected
 goal sources:
 
 * FOLLOWER -> follow leader pose with Nav2.
-* ACTIVE_SCOUT -> publish active-scout heartbeat and run exploration command.
+* ACTIVE_SCOUT -> publish active-scout heartbeat and run in-process SAC inference.
 * RECOVERY_NAVIGATING -> cancel the previous role and navigate to failure pose.
 * LOCALIZATION_SPIN -> own cmd_vel for a verified in-place rotation.
 * LOCALIZATION_SETTLE -> wait briefly so AMCL can settle before checking.
@@ -15,14 +15,9 @@ from __future__ import annotations
 
 import json
 import math
-import os
-import shlex
-import signal
-import subprocess
 from copy import deepcopy
 from enum import Enum
 from functools import partial
-from pathlib import Path
 from typing import Optional
 
 import rclpy
@@ -31,9 +26,12 @@ from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Twist, Twi
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import Odometry
 from rclpy.action import ActionClient
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool, String
+
+from .scout_rl_runtime import ActiveScoutRLRuntime
 
 
 class Role(Enum):
@@ -138,7 +136,6 @@ class UnifiedFieldRobot(Node):
         self.declare_parameter('settle_duration_sec', 2.0)
         self.declare_parameter('max_spin_retries', 3)
         self.declare_parameter('heartbeat_period_sec', 0.5)
-        self.declare_parameter('exploration_command', '')
 
         get = self.get_parameter
         self.robot_name = str(get('robot_name').value)
@@ -188,8 +185,7 @@ class UnifiedFieldRobot(Node):
         self.settle_duration = max(0.0, float(get('settle_duration_sec').value))
         self.max_spin_retries = max(0, int(get('max_spin_retries').value))
         self.heartbeat_period = max(0.1, float(get('heartbeat_period_sec').value))
-        self.exploration_command = str(get('exploration_command').value).strip()
-        self.scout_rl_enabled = bool(self.enable_scout and self.enable_exploration and self.exploration_command)
+        self.scout_rl_enabled = bool(self.enable_scout and self.enable_exploration)
 
         latched_qos = QoSProfile(
             depth=1,
@@ -250,10 +246,15 @@ class UnifiedFieldRobot(Node):
         self.settle_start_wall = 0.0
         self.spin_attempt = 0
         self.spin_direction = 1.0
-        self.exploration_process: Optional[subprocess.Popen] = None
-        self.exploration_stop_wall: Optional[float] = None
         self.heartbeat_seq = 0
         self.motion_authority = MotionAuthority.NONE
+        self.rl_runtime: Optional[ActiveScoutRLRuntime] = None
+        if self.scout_rl_enabled:
+            self.rl_runtime = ActiveScoutRLRuntime(
+                self,
+                self._publish_rl_command,
+                on_stop=self._on_rl_stopped,
+            )
 
         self.create_timer(0.1, self._tick)
         self.create_timer(self.heartbeat_period, self._publish_heartbeat)
@@ -266,7 +267,7 @@ class UnifiedFieldRobot(Node):
         if self.scout_rl_enabled:
             self.get_logger().warning(
                 '[SCOUT_RL] ROLE_GATED=true DETERMINISTIC=true SDE=false '
-                'backend=eval_policy'
+                'backend=in_process'
             )
 
     def _now(self) -> float:
@@ -284,7 +285,7 @@ class UnifiedFieldRobot(Node):
         self.localization_ready = bool(msg.data)
         if previous and not self.localization_ready:
             if self.role == Role.ACTIVE_SCOUT:
-                self._stop_exploration('localization_not_ready')
+                self._deactivate_rl('localization_not_ready')
                 self._set_authority(MotionAuthority.NONE, 'localization_not_ready')
             if self.active_goal_handle is not None or self.inflight_goal_ids:
                 self._invalidate_nav_goal(
@@ -295,6 +296,8 @@ class UnifiedFieldRobot(Node):
                 'FIELD_LOCALIZATION_READY | '
                 f'topic={self.localization_ready_topic}'
             )
+            if self.role == Role.ACTIVE_SCOUT:
+                self._activate_rl()
 
     def _on_amcl(self, msg: PoseWithCovarianceStamped) -> None:
         cov = msg.pose.covariance
@@ -381,7 +384,6 @@ class UnifiedFieldRobot(Node):
         self._enter_role(role, reason='role_command')
 
     def _tick(self) -> None:
-        self._update_exploration_process()
         if self.role == Role.FOLLOWER:
             self._tick_follow()
         elif self.role == Role.RECOVERY_NAVIGATING:
@@ -392,8 +394,6 @@ class UnifiedFieldRobot(Node):
             self._tick_spin()
         elif self.role == Role.LOCALIZATION_SETTLE:
             self._tick_localization_settle()
-        elif self.role == Role.ACTIVE_SCOUT:
-            self._ensure_exploration()
         self._dispatch_pending_nav_goal()
         self._publish_status()
 
@@ -528,14 +528,14 @@ class UnifiedFieldRobot(Node):
                 clear_pending=True,
             )
         if old == Role.ACTIVE_SCOUT and role != Role.ACTIVE_SCOUT:
-            self._stop_exploration(f'role_change_to_{role.value}')
+            self._deactivate_rl(f'role_change_to_{role.value}')
             if self.scout_rl_enabled:
                 self.get_logger().warning(f'[SCOUT_RL] DEACTIVATED role={role.value}')
         self.role = role
         if role == Role.ACTIVE_SCOUT:
             if self.scout_rl_enabled:
                 self.get_logger().warning('[SCOUT_RL] ACTIVATED role=ACTIVE_SCOUT')
-            self._ensure_exploration()
+            self._activate_rl()
         self.get_logger().warning(
             f'FIELD_ROLE_TRANSITION | robot={self.robot_name} '
             f'{old.value}->{role.value} reason={reason} epoch={self.epoch}'
@@ -732,11 +732,7 @@ class UnifiedFieldRobot(Node):
         )
 
     def _non_rl_motion_quiesced(self) -> bool:
-        process_running = (
-            self.exploration_process is not None
-            and self.exploration_process.poll() is None
-        )
-        return self._nav_motion_quiesced() and not process_running
+        return self._nav_motion_quiesced()
 
     def _localization_ok(self) -> bool:
         if self.last_amcl_wall is None:
@@ -762,115 +758,24 @@ class UnifiedFieldRobot(Node):
             and math.hypot(dx, dy) <= self.arrival_tolerance
         )
 
-    def _ensure_exploration(self) -> None:
-        if not self.enable_scout or not self.enable_exploration or not self.exploration_command:
-            return
-        if self.role != Role.ACTIVE_SCOUT:
+    def _activate_rl(self) -> None:
+        if self.rl_runtime is None or self.role != Role.ACTIVE_SCOUT:
             return
         if self.require_localization_ready and not self.localization_ready:
             return
         if not self._nav_motion_quiesced():
             return
-        if self.exploration_process is not None and self.exploration_process.poll() is None:
-            return
-        # A prior unified_field_robot process that died before its own
-        # destroy_node() ran (SIGKILL, ros2 launch force-exit, crash) leaves
-        # its exploration child alive: it runs in its own session
-        # specifically so stray terminal signals don't kill it, which also
-        # means nothing but that graceful shutdown path ever kills it. Two
-        # live copies would both drive /cmd_vel and the RL debug topics at
-        # once. Sweep for and kill any match before claiming authority.
-        self._kill_stray_exploration_processes()
-        self.exploration_process = subprocess.Popen(
-            shlex.split(self.exploration_command),
-            start_new_session=True,
-        )
-        self.exploration_stop_wall = None
-        self._set_authority(MotionAuthority.ACTIVE_SCOUT_RL, 'exploration_started')
-        self.get_logger().warning('[SCOUT_RL] MODEL_LOAD_REQUESTED')
-        self.get_logger().warning(f'FIELD_EXPLORATION_STARTED | {self.exploration_command}')
+        self.rl_runtime.activate()
+        if self.rl_runtime.active:
+            self._set_authority(MotionAuthority.ACTIVE_SCOUT_RL, 'rl_activated')
 
-    def _kill_stray_exploration_processes(self) -> None:
-        """Kill any other live process running this exact exploration command.
+    def _deactivate_rl(self, reason: str) -> None:
+        if self.rl_runtime is not None:
+            self.rl_runtime.deactivate(reason)
 
-        Scans /proc directly instead of shelling out to pgrep -f so the
-        match is an exact substring test, not a regex evaluated against an
-        exploration_command string that can contain '.', '/', and other
-        regex metacharacters.
-        """
-        marker = self.exploration_command.strip()
-        if not marker:
-            return
-        own_pid = os.getpid()
-        tracked_pid = self.exploration_process.pid if self.exploration_process else None
-        try:
-            candidates = list(Path('/proc').iterdir())
-        except OSError:
-            return
-        for entry in candidates:
-            if not entry.name.isdigit():
-                continue
-            pid = int(entry.name)
-            if pid in (own_pid, tracked_pid):
-                continue
-            try:
-                cmdline = (entry / 'cmdline').read_bytes()
-            except (FileNotFoundError, ProcessLookupError, PermissionError):
-                continue
-            if marker.encode() not in cmdline.replace(b'\x00', b' '):
-                continue
-            self.get_logger().error(
-                f'FIELD_EXPLORATION_STRAY_PROCESS_KILLED | pid={pid}'
-            )
-            try:
-                os.killpg(pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
-
-    def _stop_exploration(self, reason: str) -> None:
-        process = self.exploration_process
-        if process is None or process.poll() is not None:
-            self.exploration_process = None
-            self.exploration_stop_wall = None
-            return
-        if self.exploration_stop_wall is not None:
-            return
-        self.exploration_stop_wall = self._now()
-        try:
-            os.killpg(process.pid, signal.SIGINT)
-        except ProcessLookupError:
-            pass
-        self.get_logger().warning(f'FIELD_EXPLORATION_STOPPED | reason={reason}')
-
-    def _update_exploration_process(self) -> None:
-        process = self.exploration_process
-        if process is None:
-            return
-        return_code = process.poll()
-        if return_code is not None:
-            expected = self.exploration_stop_wall is not None
-            self.exploration_process = None
-            self.exploration_stop_wall = None
-            if self.motion_authority == MotionAuthority.ACTIVE_SCOUT_RL:
-                self._set_authority(MotionAuthority.NONE, 'exploration_exited')
-            if self.role == Role.ACTIVE_SCOUT and not expected:
-                self.get_logger().error(
-                    f'FIELD_EXPLORATION_EXITED | return_code={return_code}'
-                )
-                self._enter_role(Role.FAILED, reason='exploration_process_exited')
-            return
-        if (
-            self.exploration_stop_wall is not None
-            and self._now() - self.exploration_stop_wall >= 2.0
-        ):
-            self.get_logger().error('FIELD_EXPLORATION_KILL_AFTER_TIMEOUT')
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+    def _on_rl_stopped(self, reason: str) -> None:
+        if self.motion_authority == MotionAuthority.ACTIVE_SCOUT_RL:
+            self._set_authority(MotionAuthority.NONE, f'rl_{reason}')
 
     def _set_authority(self, authority: MotionAuthority, reason: str) -> None:
         if authority == self.motion_authority:
@@ -889,8 +794,8 @@ class UnifiedFieldRobot(Node):
             return
         if self.scout_rl_enabled and (
             self.motion_authority != MotionAuthority.ACTIVE_SCOUT_RL
-            or self.exploration_process is None
-            or self.exploration_process.poll() is not None
+            or self.rl_runtime is None
+            or not self.rl_runtime.active
         ):
             return
         self.heartbeat_seq += 1
@@ -926,15 +831,35 @@ class UnifiedFieldRobot(Node):
         role_msg.data = self.role.value
         self.role_pub.publish(role_msg)
 
+    def _publish_rl_command(self, linear_x: float, angular_z: float) -> None:
+        """The RL runtime may command only the ACTIVE_SCOUT authority.
+
+        A zero command is always permitted so a stale callback cannot leave a
+        prior velocity latched while a role transition is in flight.
+        """
+        if (
+            self.role != Role.ACTIVE_SCOUT
+            or self.motion_authority != MotionAuthority.ACTIVE_SCOUT_RL
+        ):
+            if linear_x == 0.0 and angular_z == 0.0:
+                self._publish_command(0.0, 0.0)
+            return
+        self._publish_command(linear_x, angular_z)
+
     def _publish_twist(self, angular_z: float) -> None:
+        self._publish_command(0.0, angular_z)
+
+    def _publish_command(self, linear_x: float, angular_z: float) -> None:
         if self.use_stamped:
             msg = TwistStamped()
             msg.header.stamp = self.get_clock().now().to_msg()
             msg.header.frame_id = 'base_footprint'
+            msg.twist.linear.x = float(linear_x)
             msg.twist.angular.z = angular_z
             self.cmd_pub.publish(msg)
         else:
             msg = Twist()
+            msg.linear.x = float(linear_x)
             msg.angular.z = angular_z
             self.cmd_pub.publish(msg)
 
@@ -969,13 +894,7 @@ class UnifiedFieldRobot(Node):
     def destroy_node(self) -> None:
         try:
             self._publish_twist(0.0)
-            self._stop_exploration('node_shutdown')
-            process = self.exploration_process
-            if process is not None and process.poll() is None:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+            self._deactivate_rl('node_shutdown')
             self._invalidate_nav_goal('node_shutdown', clear_pending=True)
         except Exception:  # noqa: BLE001
             pass
@@ -985,11 +904,14 @@ class UnifiedFieldRobot(Node):
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = UnifiedFieldRobot()
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
+        executor.shutdown()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

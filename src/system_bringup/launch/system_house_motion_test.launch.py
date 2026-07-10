@@ -726,28 +726,6 @@ def _robot_state_publisher(ns: str, model: str) -> Node:
     )
 
 
-def _exploration_command(ns: str) -> str:
-    return (
-        'ros2 run region_mapper region_nav2_explorer_node '
-        '--ros-args '
-        f'-r __ns:=/{ns} '
-        '-p use_sim_time:=true '
-        '-p map_topic:=/map '
-        '-p region_map_topic:=/slam_region_graph/region_map '
-        '-p scan_topic:=scan '
-        '-p global_frame:=map '
-        f'-p robot_frame:={ns}/base_footprint '
-        f'-p navigate_action_name:=/{ns}/navigate_to_pose '
-        '-p auto_start:=true '
-        '-p coverage_front_only:=true '
-        '-p coverage_fov_deg:=60.0 '
-        '-p view_fov_deg:=80.0 '
-        # The explorer updates coverage at 10 Hz. Keep that data path intact,
-        # but avoid emitting two identical debug records every second.
-        '-p coverage_live_debug_throttle_sec:=10.0'
-    )
-
-
 def _region_graph_node(field_robot: dict) -> Node:
     """Provide the region map consumed by the active Scout explorer.
 
@@ -842,7 +820,7 @@ def generate_launch_description():
 
     actions = [
         DeclareLaunchArgument('scenario', default_value='house'),
-        DeclareLaunchArgument('ros_domain_id', default_value=EnvironmentVariable('ROS_DOMAIN_ID', default_value='30')),
+        DeclareLaunchArgument('ros_domain_id', default_value=EnvironmentVariable('ROS_DOMAIN_ID')),
         DeclareLaunchArgument('rviz', default_value='true', choices=['true', 'false']),
         DeclareLaunchArgument('headless', default_value='false', choices=['true', 'false']),
         *dds_launch_environment(ros_domain_id),
@@ -1045,8 +1023,7 @@ def generate_launch_description():
                     'enable_scout_mode': True,
                     'enable_recovery_mode': True,
                     'enable_localization_spin': bool(config['features']['localization_spin']),
-                    'enable_exploration': True,
-                    'exploration_command': _exploration_command(field_a['namespace']),
+                    'enable_exploration': False,
                     'follow_distance_m': float(field_runtime['follow_distance_m']),
                     'follow_goal_period_sec': float(field_runtime['follow_goal_period_sec']),
                     'follow_goal_update_distance_m': float(field_runtime['follow_goal_update_distance_m']),
@@ -1080,8 +1057,7 @@ def generate_launch_description():
                     'enable_scout_mode': True,
                     'enable_recovery_mode': True,
                     'enable_localization_spin': bool(config['features']['localization_spin']),
-                    'enable_exploration': True,
-                    'exploration_command': _exploration_command(field_b['namespace']),
+                    'enable_exploration': False,
                     'follow_distance_m': float(field_runtime['follow_distance_m']),
                     'follow_goal_period_sec': float(field_runtime['follow_goal_period_sec']),
                     'follow_goal_update_distance_m': float(field_runtime['follow_goal_update_distance_m']),

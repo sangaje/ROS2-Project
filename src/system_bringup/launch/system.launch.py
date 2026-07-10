@@ -8,7 +8,6 @@ role:=leader -> fleet bringup (default fleet_role=leader) + shared-map
 """
 
 import os
-import shlex
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -35,11 +34,6 @@ from fleet_bringup.launch_utils import (
     dds_launch_environment,
     launch_bool,
 )
-from system_bringup.rl_policy_contract import (
-    inference_command,
-    inference_environment,
-    run_checkpoint_preflight,
-)
 
 
 FLEET_LAUNCH_FILES = {
@@ -51,13 +45,6 @@ DEFAULT_FLEET_ROLE = {
     'scout': 'member',
     'leader': 'leader',
 }
-
-SCOUT_RL_ENV = inference_environment()
-
-
-def scout_rl_command() -> str:
-    """Return the frozen, preflighted ACTIVE_SCOUT inference command."""
-    return shlex.join(inference_command())
 
 def generate_launch_description():
     role = LaunchConfiguration('role')
@@ -307,18 +294,15 @@ def generate_launch_description():
             )
         ):
             local_exploration = launch_bool(enable_exploration.perform(context))
-            field_env = dict(process_env)
             if local_exploration:
-                preflight_output = run_checkpoint_preflight()
-                actions.append(LogInfo(msg=[preflight_output]))
-                field_env.update(SCOUT_RL_ENV)
+                actions.append(LogInfo(msg=[
+                    'SYSTEM_BRINGUP | ACTIVE_SCOUT RL is in-process in '
+                    'unified_field_robot; no eval_policy subprocess is started.',
+                ]))
             else:
                 actions.append(LogInfo(msg=[
                     'SYSTEM_BRINGUP | enable_exploration:=false -- this robot '
-                    'will NOT run its own RL inference subprocess. Run it '
-                    'remotely (e.g. system_bringup pc_remote_rl.launch.py) '
-                    'against this domain instead, or nothing will drive '
-                    '/cmd_vel while ACTIVE_SCOUT.'
+                    'will not publish ACTIVE_SCOUT RL commands.'
                 ]))
             local_robot_name = (
                 follower_robot_name.perform(context)
@@ -348,9 +332,6 @@ def generate_launch_description():
                             enable_localization_spin_on_takeover.perform(context)
                         ),
                         'enable_exploration': local_exploration,
-                        'exploration_command': (
-                            scout_rl_command() if local_exploration else ''
-                        ),
                         'leader_pose_topic': '/leader_pose',
                         'self_pose_topic': self_pose_topic,
                         'require_localization_ready': not scout_owns_slam,
@@ -369,7 +350,7 @@ def generate_launch_description():
                         'cmd_vel_topic': '/cmd_vel',
                         'use_stamped_cmd_vel': True,
                     }],
-                    env=field_env,
+                    env=process_env,
                     respawn=True,
                     respawn_delay=3.0,
                 )],
@@ -1231,13 +1212,9 @@ def generate_launch_description():
             default_value='true',
             choices=['true', 'false'],
             description=(
-                'Scout only (fleet_role:=member, or any role while '
-                'ACTIVE_SCOUT-eligible): run the RL inference subprocess on '
-                'this robot. Set false to let a remote process (e.g. '
-                'system_bringup pc_remote_rl.launch.py) drive /cmd_vel '
-                'instead -- this robot then skips the checkpoint preflight '
-                'and never spawns a local eval_policy, so it does not need '
-                'the checkpoint/venv present locally.'
+                'Enable the deterministic in-process ACTIVE_SCOUT SAC runtime. '
+                'It is role-gated and never starts a remote or eval_policy '
+                'subprocess; false leaves ACTIVE_SCOUT motion stopped.'
             ),
         ),
         DeclareLaunchArgument(
