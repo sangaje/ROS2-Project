@@ -264,3 +264,11 @@ def test_standalone_policy_worker_is_registered_as_the_separate_process():
 
     assert worker.is_file()
     assert 'scout_rl_policy_worker = system_bringup.scout_rl_policy_worker:main' in setup
+
+
+def test_runtime_map_subscription_accepts_cartographer_volatile_maps():
+    source = (Path(__file__).parents[1] / 'system_bringup' / 'scout_rl_runtime.py').read_text(
+        encoding='utf-8'
+    )
+
+    assert 'durability=DurabilityPolicy.VOLATILE' in source

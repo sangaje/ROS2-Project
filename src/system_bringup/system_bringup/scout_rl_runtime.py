@@ -296,7 +296,11 @@ class ActiveScoutRLRuntime:
             depth=1,
             history=HistoryPolicy.KEEP_LAST,
             reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            # Cartographer publishes /map as VOLATILE.  A transient-local
+            # subscription is incompatible with that publisher and receives
+            # zero maps; VOLATILE requests are compatible with either volatile
+            # or transient-local map publishers.
+            durability=DurabilityPolicy.VOLATILE,
         )
         self.scan_sub = self.node.create_subscription(
             LaserScan, self.config.scan_topic, self._on_scan, qos_profile_sensor_data,
