@@ -34,6 +34,7 @@ setup(
     license='Apache-2.0',
     entry_points={
         'console_scripts': [
+            'cmd_vel_marker = fleet_bringup.cmd_vel_marker:main',
             'fleet_debug_marker = fleet_bringup.fleet_debug_marker:main',
             'fleet_follow_signal = fleet_bringup.fleet_follow_signal:main',
             'fleet_follower = fleet_bringup.fleet_follower:main',
