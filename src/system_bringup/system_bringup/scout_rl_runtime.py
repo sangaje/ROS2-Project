@@ -29,6 +29,7 @@ from turtlebot3_rl_training.exploration_map import ExplorationGridMap, MapUpdate
 from turtlebot3_rl_training.observation import (
     LidarPreprocessorConfig,
     build_exploration_observation,
+    downsample_lidar,
 )
 
 from .rl_policy_contract import (
@@ -310,6 +311,11 @@ class ActiveScoutRLRuntime:
             LaserScan, self.config.scan_topic, self._on_scan, qos_profile_sensor_data,
             callback_group=self._sensor_group,
         )
+        self.policy_scan_pub = self.node.create_publisher(
+            LaserScan,
+            '/rl_policy_scan_60',
+            qos_profile_sensor_data,
+        )
         self.map_sub = self.node.create_subscription(
             OccupancyGrid, self.config.map_topic, self._on_map, map_qos,
             callback_group=self._sensor_group,
@@ -437,6 +443,9 @@ class ActiveScoutRLRuntime:
             self._scan_received_at = time.monotonic()
             self._scan_generation += 1
             self.counters.scan_callback_count += 1
+        # This is intentionally independent of map/TF/inference readiness.
+        # If this topic is absent, the policy process is not receiving /scan.
+        self._publish_policy_scan_from_raw(message)
 
     def _on_map(self, message: OccupancyGrid) -> None:
         with self._lock:
@@ -711,6 +720,32 @@ class ActiveScoutRLRuntime:
                 f'finite={all(np.all(np.isfinite(value)) for value in observation.values())}'
             )
         return observation
+
+    def _publish_policy_scan_from_raw(self, scan: LaserScan) -> None:
+        """Publish the exact 60-bin LiDAR preprocessing result on every scan."""
+        lidar = downsample_lidar(
+            scan.ranges,
+            num_bins=self.config.lidar_bins,
+            scan_angle_min=scan.angle_min,
+            scan_angle_increment=scan.angle_increment,
+            scan_angle_max=scan.angle_max,
+            config=self.lidar,
+        )
+        message = LaserScan()
+        message.header.stamp = scan.header.stamp
+        message.header.frame_id = scan.header.frame_id or self.config.scan_frame
+        message.angle_min = 0.0
+        message.angle_increment = (2.0 * math.pi) / float(self.config.lidar_bins)
+        message.angle_max = message.angle_min + (
+            (self.config.lidar_bins - 1) * message.angle_increment
+        )
+        message.range_min = 0.12
+        message.range_max = 3.5
+        # `build_exploration_observation` normalizes exactly this range.
+        message.ranges = (
+            lidar * (message.range_max - message.range_min) + message.range_min
+        ).astype(np.float32).tolist()
+        self.policy_scan_pub.publish(message)
 
     def _stop(self, reason: str) -> None:
         was_active = self._active

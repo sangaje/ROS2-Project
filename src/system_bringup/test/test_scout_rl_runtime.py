@@ -284,3 +284,12 @@ def test_runtime_map_subscription_accepts_cartographer_volatile_maps():
     )
 
     assert 'durability=DurabilityPolicy.VOLATILE' in source
+
+
+def test_runtime_publishes_the_exact_policy_lidar_debug_topic():
+    source = (Path(__file__).parents[1] / 'system_bringup' / 'scout_rl_runtime.py').read_text(
+        encoding='utf-8'
+    )
+
+    assert "'/rl_policy_scan_60'" in source
+    assert 'def _publish_policy_scan_from_raw' in source
