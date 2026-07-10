@@ -1397,7 +1397,21 @@ class GazeboNavEnv(gym.Env):
         # docstring). No-priority mode additionally removes target_priority AND
         # frontier_distance/frontier_angle (dead constants when the priority
         # map is off), so the actor/critic sees lidar+3 instead.
-        self.obs_extra_dim = 3 if self.no_priority_model_input else 6
+        #
+        # A checkpoint already trained (and frozen behind a policy contract,
+        # e.g. system_bringup/config/scout_rl_policy_contract.json) on the
+        # pre-trim vector layout expects its original obs_extra_dim and will
+        # fail SB3's observation-space check against the trimmed default
+        # below. TB3_RL_OBS_EXTRA_DIM_OVERRIDE lets a frozen inference
+        # contract pin its own value without changing what new training runs
+        # get by default.
+        obs_extra_dim_override = str(
+            os.environ.get("TB3_RL_OBS_EXTRA_DIM_OVERRIDE", "")
+        ).strip()
+        if obs_extra_dim_override:
+            self.obs_extra_dim = int(obs_extra_dim_override)
+        else:
+            self.obs_extra_dim = 3 if self.no_priority_model_input else 6
         self.obs_dim = self.num_lidar_bins + self.obs_extra_dim
         self.map_channels = 4 if self.no_priority_model_input else 5
 
