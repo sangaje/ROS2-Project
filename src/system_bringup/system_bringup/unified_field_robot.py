@@ -22,6 +22,7 @@ import subprocess
 from copy import deepcopy
 from enum import Enum
 from functools import partial
+from pathlib import Path
 from typing import Optional
 
 import rclpy
@@ -772,6 +773,14 @@ class UnifiedFieldRobot(Node):
             return
         if self.exploration_process is not None and self.exploration_process.poll() is None:
             return
+        # A prior unified_field_robot process that died before its own
+        # destroy_node() ran (SIGKILL, ros2 launch force-exit, crash) leaves
+        # its exploration child alive: it runs in its own session
+        # specifically so stray terminal signals don't kill it, which also
+        # means nothing but that graceful shutdown path ever kills it. Two
+        # live copies would both drive /cmd_vel and the RL debug topics at
+        # once. Sweep for and kill any match before claiming authority.
+        self._kill_stray_exploration_processes()
         self.exploration_process = subprocess.Popen(
             shlex.split(self.exploration_command),
             start_new_session=True,
@@ -780,6 +789,46 @@ class UnifiedFieldRobot(Node):
         self._set_authority(MotionAuthority.ACTIVE_SCOUT_RL, 'exploration_started')
         self.get_logger().warning('[SCOUT_RL] MODEL_LOAD_REQUESTED')
         self.get_logger().warning(f'FIELD_EXPLORATION_STARTED | {self.exploration_command}')
+
+    def _kill_stray_exploration_processes(self) -> None:
+        """Kill any other live process running this exact exploration command.
+
+        Scans /proc directly instead of shelling out to pgrep -f so the
+        match is an exact substring test, not a regex evaluated against an
+        exploration_command string that can contain '.', '/', and other
+        regex metacharacters.
+        """
+        marker = self.exploration_command.strip()
+        if not marker:
+            return
+        own_pid = os.getpid()
+        tracked_pid = self.exploration_process.pid if self.exploration_process else None
+        try:
+            candidates = list(Path('/proc').iterdir())
+        except OSError:
+            return
+        for entry in candidates:
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            if pid in (own_pid, tracked_pid):
+                continue
+            try:
+                cmdline = (entry / 'cmdline').read_bytes()
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                continue
+            if marker.encode() not in cmdline.replace(b'\x00', b' '):
+                continue
+            self.get_logger().error(
+                f'FIELD_EXPLORATION_STRAY_PROCESS_KILLED | pid={pid}'
+            )
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
 
     def _stop_exploration(self, reason: str) -> None:
         process = self.exploration_process

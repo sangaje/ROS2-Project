@@ -1,4 +1,7 @@
 import json
+import os
+import subprocess
+import time
 
 from builtin_interfaces.msg import Time
 from geometry_msgs.msg import PoseStamped
@@ -258,4 +261,56 @@ def test_shadow_goal_cancel_is_edge_triggered_on_failover():
     assert len(node.cancel_pub.messages) == 1
     assert node.cancel_pub.messages[0] == Bool(data=True)
     assert node.shadow_goal_active is False
+
+
+def test_kill_stray_exploration_processes_kills_matching_orphan():
+    node, logger = _bare_field()
+    marker = f'UNIQUE_TEST_MARKER_{os.getpid()}_{time.time_ns()}'
+    node.exploration_command = marker
+    node.exploration_process = None
+    stray = subprocess.Popen(
+        ['python3', '-c', f'import time; time.sleep(30)  # {marker}'],
+        start_new_session=True,
+    )
+    try:
+        time.sleep(0.2)
+        assert stray.poll() is None
+
+        node._kill_stray_exploration_processes()
+
+        assert stray.wait(timeout=2.0) is not None
+        assert any(
+            'FIELD_EXPLORATION_STRAY_PROCESS_KILLED' in text
+            for _, text in logger.messages
+        )
+    finally:
+        if stray.poll() is None:
+            stray.kill()
+            stray.wait()
+
+
+def test_kill_stray_exploration_processes_does_not_touch_unrelated_or_tracked():
+    node, logger = _bare_field()
+    marker = f'UNIQUE_TEST_MARKER_{os.getpid()}_{time.time_ns()}'
+    node.exploration_command = marker
+
+    unrelated = subprocess.Popen(['sleep', '30'], start_new_session=True)
+    tracked = subprocess.Popen(
+        ['python3', '-c', f'import time; time.sleep(30)  # {marker}'],
+        start_new_session=True,
+    )
+    node.exploration_process = tracked
+    try:
+        time.sleep(0.2)
+        node._kill_stray_exploration_processes()
+        time.sleep(0.2)
+
+        assert unrelated.poll() is None
+        assert tracked.poll() is None
+        assert logger.messages == []
+    finally:
+        for proc in (unrelated, tracked):
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
 

@@ -56,4 +56,10 @@ POSE_GRAPH.optimize_every_n_nodes = 60
 POSE_GRAPH.constraint_builder.min_score = 0.65
 POSE_GRAPH.constraint_builder.global_localization_min_score = 0.70
 
+-- Match the Ceres build's actual thread cap (Raspberry Pi Ceres packages are
+-- commonly built with 4 threads). Leaving the upstream default of 7 logs a
+-- "Bounding to maximum number available" warning on every solve.
+TRAJECTORY_BUILDER_2D.ceres_scan_matcher.ceres_solver_options.num_threads = 4
+POSE_GRAPH.optimization_problem.ceres_solver_options.num_threads = 4
+
 return options
