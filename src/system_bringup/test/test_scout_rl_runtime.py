@@ -256,3 +256,11 @@ def test_deployment_runtime_has_no_process_or_nondeterministic_predict_path():
     assert 'Popen(' not in text
     assert 'deterministic=True' in text
     assert 'reset_noise' not in text
+
+
+def test_standalone_policy_worker_is_registered_as_the_separate_process():
+    setup = (Path(__file__).parents[1] / 'setup.py').read_text(encoding='utf-8')
+    worker = Path(__file__).parents[1] / 'system_bringup' / 'scout_rl_policy_worker.py'
+
+    assert worker.is_file()
+    assert 'scout_rl_policy_worker = system_bringup.scout_rl_policy_worker:main' in setup
