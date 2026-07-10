@@ -378,6 +378,38 @@ def _normalize_device(device):
     return text
 
 
+def _resolve_inference_device(requested):
+    """Return a CUDA device only when this torch build supports its CC.
+
+    Jetson Orin is compute capability 8.7.  A PyTorch build lacking ``sm_87``
+    emits a warning at startup, then fails asynchronously during inference
+    with a missing CUDA kernel.  Falling back before model/tensor placement
+    keeps the HTTP stream and dashboard responsive.
+    """
+    requested = _normalize_device(requested)
+    if requested.lower() in ('cpu', 'none', ''):
+        return 'cpu', None
+    if not requested.lower().startswith('cuda'):
+        return requested, None
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return 'cpu', 'CUDA unavailable'
+        index = int(requested.split(':', 1)[1]) if ':' in requested else 0
+        major, minor = torch.cuda.get_device_capability(index)
+        required_arch = f'sm_{major}{minor}'
+        supported_arches = set(torch.cuda.get_arch_list())
+        if not supported_arches or required_arch not in supported_arches:
+            available = ','.join(sorted(supported_arches)) or 'none'
+            return 'cpu', (
+                f'GPU CC {major}.{minor} requires {required_arch}, '
+                f'torch supports [{available}]'
+            )
+    except Exception as exc:  # noqa: BLE001
+        return 'cpu', f'CUDA capability check failed: {exc}'
+    return requested, None
+
+
 def _cuda_synchronize_if_needed(device):
     if 'cuda' not in str(device).lower():
         return
@@ -408,7 +440,12 @@ def build_app(args):
     from ultralytics import YOLO
 
     app = Flask(__name__)
-    args.device = _normalize_device(args.device)
+    args.device, cpu_fallback_reason = _resolve_inference_device(args.device)
+    if cpu_fallback_reason:
+        print(
+            '[flask_yolo_server] CUDA_FALLBACK_CPU | '
+            f'{cpu_fallback_reason}', flush=True,
+        )
     model = YOLO(args.model_path)
     use_half = bool(args.half) and str(args.device).lower() not in ('cpu', 'none', '')
     use_fast_forward = bool(args.fast_forward)

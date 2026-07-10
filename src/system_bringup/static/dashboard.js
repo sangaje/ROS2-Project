@@ -9,8 +9,8 @@ let riskSeq = -1;
 let mapReady = false;
 let riskReady = false;
 const gridLoad = {
-  map: {loading: false, requestedSeq: -1, pendingSeq: -1},
-  risk: {loading: false, requestedSeq: -1, pendingSeq: -1},
+  map: {loading: false, requestedSeq: -1, pendingSeq: -1, latestSeq: -1},
+  risk: {loading: false, requestedSeq: -1, pendingSeq: -1, latestSeq: -1},
 };
 let streamSources = {};
 const canvas = document.getElementById('mapCanvas');
@@ -112,6 +112,7 @@ function updateImages(s) {
 function queueGridLoad(kind, seq, status) {
   if (status === 'NO DATA' || !Number.isFinite(seq)) return;
   const state = gridLoad[kind];
+  state.latestSeq = Math.max(state.latestSeq, seq);
   const loadedSeq = kind === 'map' ? mapSeq : riskSeq;
   if (seq <= loadedSeq || seq <= state.requestedSeq) return;
   if (state.loading) {
@@ -128,14 +129,23 @@ function completeGridLoad(kind, ok) {
   const state = gridLoad[kind];
   state.loading = false;
   if (kind === 'map') {
-    mapReady = ok;
+    // Retain the last complete map during a transient image request error.
+    // A failed first request is retried below instead of permanently blanking
+    // the canvas until the user manually refreshes the browser.
+    mapReady = ok || mapReady;
     if (ok) mapSeq = state.requestedSeq;
   } else {
-    riskReady = ok;
+    riskReady = ok || riskReady;
     if (ok) riskSeq = state.requestedSeq;
   }
   const pending = state.pendingSeq;
   state.pendingSeq = -1;
+  if (!ok) {
+    state.requestedSeq = -1;
+    window.setTimeout(() => queueGridLoad(kind, state.latestSeq, 'OK'), 1000);
+    draw();
+    return;
+  }
   if (pending > (kind === 'map' ? mapSeq : riskSeq)) {
     queueGridLoad(kind, pending, 'OK');
   }

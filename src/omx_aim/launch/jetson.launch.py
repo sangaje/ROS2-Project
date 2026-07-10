@@ -45,6 +45,7 @@ def launch_setup(context, *args, **kwargs):
     )
     yolo_node_model_path = LaunchConfiguration('yolo_node_model_path').perform(context)
     omx_camera_index = LaunchConfiguration('omx_camera_index').perform(context)
+    yolo_server_device = LaunchConfiguration('yolo_server_device').perform(context)
     patrol_delay = float(
         LaunchConfiguration('patrol_planner_delay_sec').perform(context)
     )
@@ -85,6 +86,9 @@ def launch_setup(context, *args, **kwargs):
         additional_env={
             'OMX_YOLO_MODEL_PATH': yolo_node_model_path,
             'OMX_YOLO_CAMERA_INDEX': omx_camera_index,
+            # Keep OMX and the Flask server on the same explicitly selected
+            # backend; ``cpu`` is required for the current Orin torch wheel.
+            'OMX_YOLO_DEVICE': yolo_server_device,
         },
         respawn=True,
         respawn_delay=3.0,

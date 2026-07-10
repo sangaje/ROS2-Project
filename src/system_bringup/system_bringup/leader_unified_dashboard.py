@@ -403,20 +403,49 @@ class LeaderUnifiedDashboard(Node):
             """
             url = f'http://127.0.0.1:{self.omx_debug_port}{self.omx_stream_path}'
 
+            def placeholder_frame(message: str) -> bytes:
+                import cv2
+                import numpy as np
+
+                image = np.zeros((360, 640, 3), dtype=np.uint8)
+                cv2.putText(
+                    image, 'OMX VIDEO WAITING', (155, 160),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 190, 255), 2,
+                )
+                cv2.putText(
+                    image, message[:72], (48, 205),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (220, 220, 220), 1,
+                )
+                ok, encoded = cv2.imencode('.jpg', image)
+                if not ok:
+                    return b''
+                return (
+                    b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+                    + encoded.tobytes() + b'\r\n'
+                )
+
             def generate():
-                try:
-                    with urllib.request.urlopen(url, timeout=2.0) as upstream:
-                        while True:
-                            chunk = upstream.read(8192)
-                            if not chunk:
-                                break
-                            yield chunk
-                except Exception as exc:  # noqa: BLE001
-                    self.get_logger().warning(
-                        'UNIFIED_DASHBOARD_OMX_STREAM_PROXY_ERROR | '
-                        f'url={url} error={exc}',
-                        throttle_duration_sec=5.0,
-                    )
+                # Keep this response alive while OMX is still loading or
+                # restarting.  A normal proxy emitted no bytes in that state,
+                # leaving a browser image permanently black until a reload.
+                while True:
+                    try:
+                        with urllib.request.urlopen(url, timeout=1.0) as upstream:
+                            while True:
+                                chunk = upstream.read(8192)
+                                if not chunk:
+                                    break
+                                yield chunk
+                    except Exception as exc:  # noqa: BLE001
+                        self.get_logger().warning(
+                            'UNIFIED_DASHBOARD_OMX_STREAM_PROXY_ERROR | '
+                            f'url={url} error={exc}',
+                            throttle_duration_sec=5.0,
+                        )
+                        frame = placeholder_frame(f'upstream reconnecting: {type(exc).__name__}')
+                        if frame:
+                            yield frame
+                        time.sleep(1.0)
 
             response = Response(
                 stream_with_context(generate()),
