@@ -483,7 +483,7 @@ def generate_launch_description():
                         '--host', yolo_server_host.perform(context),
                         '--port', yolo_server_port.perform(context),
                         '--model-path', yolo_server_model_path.perform(context),
-                        '--target-class', '0',
+                        '--target-class', '1',
                         '--device', yolo_server_device.perform(context),
                         '--half', yolo_server_half.perform(context),
                         '--fast-forward', 'true',

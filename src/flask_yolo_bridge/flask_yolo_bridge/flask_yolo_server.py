@@ -784,7 +784,7 @@ def parse_args():
     parser.add_argument('--max-queue-wait-sec', type=float, default=0.0)
     parser.add_argument(
         '--target-class', type=int, default=1,
-        help='Only infer this class. COCO person class 0 is used as the doll target.',
+        help='Only infer this class. Project doll target class is 1.',
     )
     # Backward-compatible aliases for older launch commands.  New launches use
     # --target-class, so the server no longer hard-codes COCO person (class 0).
