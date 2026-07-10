@@ -144,7 +144,7 @@ export TB3_RL_STEP_PROFILER=0
 # fps dropped once training passed learning-starts and gradient updates began
 # firing (train-freq-steps=24). Time each SAC.train() call directly to see if
 # gradient updates are really the new bottleneck before touching control_dt.
-export TB3_RL_TIME_GRAD_UPDATE=0
+export TB3_RL_TIME_GRAD_UPDATE="${TB3_RL_TIME_GRAD_UPDATE:-0}"
 export TB3_RL_STEP_PROFILER_EVERY_N=100
 export TB3_RL_STEP_PROFILER_SLOW_MS=500
 # action_execute stayed ~38ms even though gz_step/wait_time_adv/wait_sensor
@@ -186,26 +186,34 @@ export TB3_RL_RANDOM_OBSTACLE_NOISE_SIGMA_M=0.35
 # older non-SDE checkpoints (loading would hit a state_dict shape mismatch). Point at a fresh
 # "_gsde" model/log dir instead of touching the existing non-SDE checkpoints in the old dir --
 # the auto-checkpoint scan below will find nothing there and start from scratch automatically.
-export MODEL_DIR="rl_models/pure_velocity_sac_map64_lidar60_h8_deltatcn_domain22_nopriority_gsde_v022_dt02_b128"
-export LOG_DIR="rl_logs/pure_velocity_sac_map64_lidar60_h8_deltatcn_domain22_nopriority_gsde_v022_dt02_b128"
+export MODEL_DIR="rl_models/pure_velocity_sac_map64_lidar60_h8_deltatcn_domain22_nopriority_gsde_v022_dt02_b128_obs63"
+export LOG_DIR="rl_logs/pure_velocity_sac_map64_lidar60_h8_deltatcn_domain22_nopriority_gsde_v022_dt02_b128_obs63"
 mkdir -p "${MODEL_DIR}" "${LOG_DIR}"
 
 LOAD_MODEL="$(python3 - <<'PY'
 import re
 import zipfile
 import os
+import json
 from pathlib import Path
 
 model_dir = Path(os.environ.get("MODEL_DIR", "rl_models/pure_velocity_sac_map64_lidar60_h8_deltatcn_domain22_nopriority"))
 
 def step(path: Path) -> int:
+    # SB3 stores the authoritative counter inside every model archive.  Main
+    # and emergency filenames do not contain a step, so comparing their mtime
+    # (an epoch-sized integer) against checkpoint step numbers can select the
+    # wrong model.  Rank every archive on the same num_timesteps scale.
+    try:
+        with zipfile.ZipFile(path) as archive:
+            data = json.loads(archive.read("data"))
+        return int(data.get("num_timesteps", -1))
+    except Exception:
+        pass
     match = re.search(r"_(\d+)_steps(?:\.zip)?$", path.stem)
     if match:
         return int(match.group(1))
-    try:
-        return int(path.stat().st_mtime)
-    except Exception:
-        return -1
+    return -1
 
 def valid(path: Path) -> bool:
     try:
@@ -260,15 +268,20 @@ fi
 # ============================================================
 # Keep policy and executed /cmd_vel speeds SLAM-friendly so Cartographer has
 # time to integrate scans without tearing the map.
-CRITIC_RESET_MARKER="${MODEL_DIR}/.v132_reward_simplified_critic_reset_done"
 RESET_CRITICS_ARG=()
-if [[ -n "${LOAD_ARG:-}" && "${TB3_RL_RESET_CRITICS_ON_LOAD:-auto}" != "0" && ! -f "${CRITIC_RESET_MARKER}" ]]; then
-    echo "  ✓ reward 구조 변경 후 1회 critic reset 활성화"
-    RESET_CRITICS_ARG=(--sac-reset-critics)
-    touch "${CRITIC_RESET_MARKER}"
-elif [[ "${TB3_RL_RESET_CRITICS_ON_LOAD:-auto}" == "1" ]]; then
+if [[ "${TB3_RL_RESET_CRITICS_ON_LOAD:-auto}" == "1" ]]; then
     echo "  ✓ TB3_RL_RESET_CRITICS_ON_LOAD=1: critic reset 강제 활성화"
     RESET_CRITICS_ARG=(--sac-reset-critics)
+fi
+# In auto mode train_sac.py compares the semantics version stored inside the
+# checkpoint.  Legacy checkpoints get exactly one actor-only migration; a
+# successfully saved migrated checkpoint will not reset critics again even if
+# it is copied to another directory.
+
+REPLAY_RESUME_ARG=(--resume-replay-buffer)
+if [[ "${TB3_RL_RESUME_REPLAY_BUFFER:-1}" == "0" ]]; then
+    echo "  ✓ TB3_RL_RESUME_REPLAY_BUFFER=0: actor만 재사용하고 replay는 새로 시작"
+    REPLAY_RESUME_ARG=(--no-resume-replay-buffer)
 fi
 
 # Fast confidence-visible mode with a fixed sim-time control contract:
@@ -293,9 +306,10 @@ python3 -m turtlebot3_rl_training.train_sac \
     --sac-use-sde \
     --sac-sde-sample-freq 4 \
     --sac-target-entropy -2.0 \
-    --sac-reset-ent-coef 0.08 \
-    --sac-min-ent-coef 0.06 \
-    --warmup-action-steps 0 \
+    --sac-reset-ent-coef 0.20 \
+    --sac-min-ent-coef 0.03 \
+    --sac-max-ent-coef 0.20 \
+    --warmup-action-steps 15000 \
     --warmup-action-zero-linear-prob 0.05 \
     --warmup-action-random-prob 0.45 \
     --warmup-action-noise-prob 0.45 \
@@ -338,18 +352,18 @@ python3 -m turtlebot3_rl_training.train_sac \
     \
     --velocity-safety-backup \
     --velocity-safety-backup-steps 4 \
-    --velocity-safety-cooldown-steps 8 \
+    --velocity-safety-cooldown-steps 1 \
     --velocity-safety-penalty 2.50 \
     --no-velocity-safety-terminal \
     --velocity-safety-terminal-distance-m 0.00 \
     --velocity-safety-terminal-penalty 0.0 \
     --velocity-safety-terminal-forward-min 0.02 \
-    --velocity-safety-trigger-distance-m 0.15 \
-    --velocity-safety-stop-distance-m 0.00 \
-    --velocity-safety-slow-distance-m 0.00 \
-    --no-velocity-safety-slowdown \
+    --velocity-safety-trigger-distance-m 0.22 \
+    --velocity-safety-stop-distance-m 0.22 \
+    --velocity-safety-slow-distance-m 0.40 \
+    --velocity-safety-slowdown \
     --velocity-safety-slow-min-scale 1.00 \
-    --velocity-safety-slow-penalty 0.00 \
+    --velocity-safety-slow-penalty 1.00 \
     --velocity-safety-slow-speed-power 1.20 \
     --velocity-safety-slow-danger-power 1.00 \
     \
@@ -450,9 +464,9 @@ python3 -m turtlebot3_rl_training.train_sac \
     --log-dir "${LOG_DIR}" \
     ${LOAD_ARG} \
     "${RESET_CRITICS_ARG[@]}" \
-    --resume-replay-buffer \
+    "${REPLAY_RESUME_ARG[@]}" \
     --save-replay-buffer \
-    --train-freq-steps 12 \
+    --train-freq-steps 4 \
     --gradient-steps 1 \
     --checkpoint-freq 50000 \
     \
