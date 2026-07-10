@@ -328,4 +328,14 @@ def load_config(path=None):
         else:
             yolo_cfg.model_path = str(model_path)
 
+    camera_index_override = os.environ.get("OMX_YOLO_CAMERA_INDEX", "").strip()
+    if camera_index_override:
+        try:
+            cfg.ibvs.camera_index = int(camera_index_override)
+        except ValueError as exc:
+            raise ValueError(
+                'OMX_YOLO_CAMERA_INDEX must be an integer camera index, got '
+                f'{camera_index_override!r}'
+            ) from exc
+
     return cfg

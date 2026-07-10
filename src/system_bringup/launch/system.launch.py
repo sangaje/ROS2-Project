@@ -134,6 +134,7 @@ def generate_launch_description():
     yolo_server_device = LaunchConfiguration('yolo_server_device')
     yolo_server_half = LaunchConfiguration('yolo_server_half')
     omx_yolo_node_delay_sec = LaunchConfiguration('omx_yolo_node_delay_sec')
+    omx_camera_index = LaunchConfiguration('omx_camera_index')
     start_patrol_planner = LaunchConfiguration('start_patrol_planner')
     patrol_planner_delay_sec = LaunchConfiguration('patrol_planner_delay_sec')
     patrol_min_risk = LaunchConfiguration('patrol_min_risk')
@@ -541,6 +542,7 @@ def generate_launch_description():
                         'yolo_node_model_path': (
                             yolo_server_model_path.perform(context)
                         ),
+                        'omx_camera_index': omx_camera_index.perform(context),
                         'start_patrol_planner': (
                             start_patrol_planner.perform(context)
                         ),
@@ -1269,6 +1271,10 @@ def generate_launch_description():
             'omx_yolo_node_delay_sec',
             default_value='14.0',
             description='Leader role only: delay heavy OMX YOLO/camera/model startup.',
+        ),
+        DeclareLaunchArgument(
+            'omx_camera_index', default_value='0',
+            description='Leader role only: OpenCV camera index for OMX debug/YOLO video.',
         ),
         DeclareLaunchArgument(
             'start_patrol_planner',

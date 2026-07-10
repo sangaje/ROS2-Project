@@ -44,6 +44,7 @@ def launch_setup(context, *args, **kwargs):
         LaunchConfiguration('yolo_node_delay_sec').perform(context)
     )
     yolo_node_model_path = LaunchConfiguration('yolo_node_model_path').perform(context)
+    omx_camera_index = LaunchConfiguration('omx_camera_index').perform(context)
     patrol_delay = float(
         LaunchConfiguration('patrol_planner_delay_sec').perform(context)
     )
@@ -83,6 +84,7 @@ def launch_setup(context, *args, **kwargs):
         }],
         additional_env={
             'OMX_YOLO_MODEL_PATH': yolo_node_model_path,
+            'OMX_YOLO_CAMERA_INDEX': omx_camera_index,
         },
         respawn=True,
         respawn_delay=3.0,
@@ -209,6 +211,10 @@ def generate_launch_description():
                 'Model used by omx_yolo_node. Pass an absolute best.pt path '
                 'only when that file exists on this Jetson.'
             ),
+        ),
+        DeclareLaunchArgument(
+            'omx_camera_index', default_value='0',
+            description='OpenCV camera index used by OMX debug/YOLO video.',
         ),
         DeclareLaunchArgument(
             'patrol_planner_delay_sec', default_value='6.0',

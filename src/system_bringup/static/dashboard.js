@@ -8,6 +8,10 @@ let mapSeq = -1;
 let riskSeq = -1;
 let mapReady = false;
 let riskReady = false;
+const gridLoad = {
+  map: {loading: false, requestedSeq: -1, pendingSeq: -1},
+  risk: {loading: false, requestedSeq: -1, pendingSeq: -1},
+};
 let streamSources = {};
 const canvas = document.getElementById('mapCanvas');
 const ctx = canvas.getContext('2d');
@@ -87,25 +91,47 @@ function refreshStreams(force = true) {
 }
 
 function updateImages(s) {
-  // Don't clear mapReady/riskReady here -- that blanks the canvas on every
-  // poll cycle where seq changed (i.e. constantly during active SLAM),
-  // since the new image only finishes loading asynchronously later. Keep
-  // drawing the still-valid previous image until onload actually swaps it
-  // in; only onerror below should ever mark it not-ready.
-  if (s.map.seq !== mapSeq && s.map.status !== 'NO DATA') {
-    mapSeq = s.map.seq;
-    mapImg.src = `/api/map.png?v=${mapSeq}&t=${Date.now()}`;
-  }
-  if (s.risk.seq !== riskSeq && s.risk.status !== 'NO DATA') {
-    riskSeq = s.risk.seq;
-    riskImg.src = `/api/risk.png?v=${riskSeq}&t=${Date.now()}`;
-  }
+  queueGridLoad('map', s.map.seq, s.map.status);
+  queueGridLoad('risk', s.risk.seq, s.risk.status);
 }
 
-mapImg.onload = () => { mapReady = true; draw(); };
-riskImg.onload = () => { riskReady = true; draw(); };
-mapImg.onerror = () => { mapReady = false; draw(); };
-riskImg.onerror = () => { riskReady = false; draw(); };
+function queueGridLoad(kind, seq, status) {
+  if (status === 'NO DATA' || !Number.isFinite(seq)) return;
+  const state = gridLoad[kind];
+  const loadedSeq = kind === 'map' ? mapSeq : riskSeq;
+  if (seq <= loadedSeq || seq <= state.requestedSeq) return;
+  if (state.loading) {
+    state.pendingSeq = Math.max(state.pendingSeq, seq);
+    return;
+  }
+  state.loading = true;
+  state.requestedSeq = seq;
+  const image = kind === 'map' ? mapImg : riskImg;
+  image.src = `/api/${kind}.png?v=${seq}&t=${Date.now()}`;
+}
+
+function completeGridLoad(kind, ok) {
+  const state = gridLoad[kind];
+  state.loading = false;
+  if (kind === 'map') {
+    mapReady = ok;
+    if (ok) mapSeq = state.requestedSeq;
+  } else {
+    riskReady = ok;
+    if (ok) riskSeq = state.requestedSeq;
+  }
+  const pending = state.pendingSeq;
+  state.pendingSeq = -1;
+  if (pending > (kind === 'map' ? mapSeq : riskSeq)) {
+    queueGridLoad(kind, pending, 'OK');
+  }
+  draw();
+}
+
+mapImg.onload = () => completeGridLoad('map', true);
+riskImg.onload = () => completeGridLoad('risk', true);
+mapImg.onerror = () => completeGridLoad('map', false);
+riskImg.onerror = () => completeGridLoad('risk', false);
 
 function resizeCanvas() {
   const rect = canvas.getBoundingClientRect();

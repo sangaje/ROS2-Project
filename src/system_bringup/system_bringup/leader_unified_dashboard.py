@@ -364,7 +364,10 @@ class LeaderUnifiedDashboard(Node):
                 try:
                     with urllib.request.urlopen(url, timeout=2.0) as upstream:
                         while True:
-                            chunk = upstream.read(65536)
+                            # MJPEG frames are commonly smaller than 64 KiB.
+                            # Waiting for a whole 64 KiB block kept the browser
+                            # panel black despite a healthy upstream stream.
+                            chunk = upstream.read(8192)
                             if not chunk:
                                 break
                             yield chunk
@@ -380,6 +383,7 @@ class LeaderUnifiedDashboard(Node):
                 mimetype='multipart/x-mixed-replace; boundary=frame',
             )
             response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+            response.headers['X-Accel-Buffering'] = 'no'
             return response
 
         @app.get('/api/omx_stream.mjpg')

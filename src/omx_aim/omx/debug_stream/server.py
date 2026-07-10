@@ -25,6 +25,7 @@ import threading
 import time
 
 import cv2
+import numpy as np
 
 from .state_bus import StateBus
 
@@ -104,7 +105,12 @@ class DebugStream:
     # ----- generators -----
 
     def _frame_gen(self):
-        """MJPEG generator. seq 비교로 stale frame 스킵."""
+        """MJPEG generator. seq 비교로 stale frame 스킵.
+
+        A camera open/read failure used to yield no bytes at all, which makes
+        browser ``<img>`` elements look permanently black.  Keep the stream
+        alive with a clear diagnostic frame until the detector reconnects.
+        """
         interval = 1.0 / self.fps
         params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
         last_seq = -1
@@ -112,9 +118,23 @@ class DebugStream:
         while True:
             time.sleep(interval)
             frame, seq = self.bus.get_frame()
-            if frame is None or seq == last_seq:
+            if frame is None:
+                frame = np.zeros((360, 640, 3), dtype=np.uint8)
+                cv2.putText(
+                    frame, 'WAITING FOR OMX CAMERA', (78, 160),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 190, 255), 2,
+                )
+                cv2.putText(
+                    frame, 'camera reconnecting / yolo starting', (115, 205),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1,
+                )
+                # Emit the diagnostic periodically even though its source
+                # frame sequence has not changed.
+                last_seq = seq
+            elif seq == last_seq:
                 continue
-            last_seq = seq
+            else:
+                last_seq = seq
 
             ok, buf = cv2.imencode('.jpg', frame, params)
             if not ok:
