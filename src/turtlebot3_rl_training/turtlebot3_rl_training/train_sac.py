@@ -1,5 +1,6 @@
 import argparse
 import atexit
+import json
 import os
 import subprocess
 import sys
@@ -19,6 +20,7 @@ from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 from stable_baselines3.common.buffers import DictReplayBuffer
 from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.type_aliases import TrainFreq, TrainFrequencyUnit
 from stable_baselines3.common.utils import get_schedule_fn
 from turtlebot3_rl_training.feature_extractor import MapVectorFeatureExtractor
 from turtlebot3_rl_training.gazebo_nav_env import GazeboNavEnv
@@ -32,6 +34,11 @@ from turtlebot3_rl_training.ros_interface import TurtleBot3RosInterface
 # undo this.
 warnings.filterwarnings("ignore", message=".*get_schedule_fn.*deprecated.*")
 warnings.filterwarnings("ignore", message=".*constant_fn.*deprecated.*")
+
+# Bump this only when transition semantics change enough that old critic targets
+# and replay samples are no longer compatible.  The value is stored inside SB3
+# model zips, making the actor-only migration automatic and exactly once.
+TRAINING_SEMANTICS_VERSION = "robust_collision_safety_v1"
 
 
 
@@ -114,6 +121,65 @@ def _reset_sac_critics(model: SAC, logger=None) -> bool:
         if logger is not None:
             logger.warn(f"SAC_CRITIC_RESET_FAILED | {type(exc).__name__}: {exc}")
         return False
+
+
+def _sample_sac_td_diagnostics(model: SAC) -> Optional[dict[str, float]]:
+    """Measure replay reward/target/TD spread without perturbing training RNG."""
+    replay_buffer = getattr(model, "replay_buffer", None)
+    if replay_buffer is None or replay_buffer.size() <= 0:
+        return None
+
+    import numpy as np
+    import torch as th
+
+    numpy_state = np.random.get_state()
+    torch_state = th.random.get_rng_state()
+    cuda_states = th.cuda.get_rng_state_all() if th.cuda.is_available() else None
+    try:
+        replay_data = replay_buffer.sample(
+            int(getattr(model, "batch_size", 128)),
+            env=getattr(model, "_vec_normalize_env", None),
+        )
+        with th.no_grad():
+            next_actions, next_log_prob = model.actor.action_log_prob(replay_data.next_observations)
+            next_q_values = th.cat(
+                model.critic_target(replay_data.next_observations, next_actions), dim=1
+            )
+            next_q_values, _ = th.min(next_q_values, dim=1, keepdim=True)
+            if getattr(model, "log_ent_coef", None) is not None:
+                ent_coef = th.exp(model.log_ent_coef.detach())
+            else:
+                ent_coef = getattr(model, "ent_coef_tensor", th.tensor(0.0, device=model.device))
+            soft_next_q = next_q_values - ent_coef * next_log_prob.reshape(-1, 1)
+            target_q = replay_data.rewards + (1.0 - replay_data.dones) * float(model.gamma) * soft_next_q
+            current_q_values = model.critic(replay_data.observations, replay_data.actions)
+            td_abs = th.cat([(q - target_q).abs().reshape(-1) for q in current_q_values])
+
+        rewards = replay_data.rewards.reshape(-1)
+        targets = target_q.reshape(-1)
+
+        def _stats(prefix: str, values) -> dict[str, float]:
+            values = values.float()
+            return {
+                f"{prefix}_mean": float(values.mean().item()),
+                f"{prefix}_std": float(values.std(unbiased=False).item()),
+                f"{prefix}_min": float(values.min().item()),
+                f"{prefix}_p05": float(th.quantile(values, 0.05).item()),
+                f"{prefix}_p95": float(th.quantile(values, 0.95).item()),
+                f"{prefix}_max": float(values.max().item()),
+            }
+
+        result = {}
+        result.update(_stats("reward", rewards))
+        result.update(_stats("target", targets))
+        result.update(_stats("td_abs", td_abs))
+        result["done_frac"] = float(replay_data.dones.float().mean().item())
+        return result
+    finally:
+        np.random.set_state(numpy_state)
+        th.random.set_rng_state(torch_state)
+        if cuda_states is not None:
+            th.cuda.set_rng_state_all(cuda_states)
 
 
 def _install_warmup_action_mixer(
@@ -353,6 +419,13 @@ def _wait_for_training_geometry_ready(ros, cli_args) -> bool:
 
 
 def _model_step_from_name(path: Path) -> int:
+    if path.suffix == ".zip":
+        try:
+            with zipfile.ZipFile(path) as archive:
+                data = json.loads(archive.read("data"))
+            return int(data.get("num_timesteps", -1))
+        except Exception:
+            pass
     match = re.search(r"_(\d+)_steps(?:\.zip)?$", path.stem)
     if match:
         return int(match.group(1))
@@ -429,9 +502,41 @@ def _safe_save_sac_model(model, base_path: Path, logger=None) -> Path:
             pass
 
 
+def _safe_save_replay_buffer(model, target_path: Path, logger=None) -> Path:
+    """Save the SAC replay buffer through a temp file before an atomic rename.
+
+    SB3's model.save_replay_buffer() pickles directly into the destination path
+    with no temp file, so a second interrupt (e.g. a Ctrl+C landing on an
+    already-in-progress emergency save) truncates the pickle in place -- and a
+    truncated file at exactly the path the next run's auto-loader globs for
+    (_guess_replay_buffer_path) breaks that resume with
+    "pickle data was truncated" before training can even start. Writing to a
+    sibling .tmp path and only renaming into place once the dump has fully
+    completed means an interrupted save leaves the old good file (or nothing)
+    at target_path, never a corrupt one.
+    """
+    target_path = Path(target_path)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target_path.parent / f".{target_path.name}.tmp_{os.getpid()}_{int(time.time() * 1000)}"
+    try:
+        model.save_replay_buffer(str(tmp_path))
+        os.replace(tmp_path, target_path)
+        return target_path
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+
+
 def _find_latest_sac_model(model_dir: Path) -> Optional[Path]:
     candidates = []
-    for pattern in ("sac_turtlebot3_burger_checkpoint_*_steps.zip", "sac_turtlebot3_burger.zip"):
+    for pattern in (
+        "sac_turtlebot3_burger_checkpoint_*_steps.zip",
+        "sac_turtlebot3_burger.zip",
+        "sac_turtlebot3_burger_emergency.zip",
+    ):
         candidates.extend(model_dir.glob(pattern))
     candidates = [p for p in candidates if _is_valid_zip_model(p)]
     if not candidates:
@@ -440,10 +545,6 @@ def _find_latest_sac_model(model_dir: Path) -> Optional[Path]:
 
 
 def _guess_replay_buffer_path(model_path: Path, model_dir: Path) -> Optional[Path]:
-    explicit_final = model_dir / "sac_turtlebot3_burger_replay_buffer.pkl"
-    if explicit_final.exists():
-        return explicit_final
-
     stem = model_path.stem
     match = re.search(r"_(\d+)_steps$", stem)
     if match:
@@ -451,6 +552,16 @@ def _guess_replay_buffer_path(model_path: Path, model_dir: Path) -> Optional[Pat
         same_step = model_dir / f"sac_turtlebot3_burger_checkpoint_replay_buffer_{step}_steps.pkl"
         if same_step.exists():
             return same_step
+
+    if stem.endswith("_emergency"):
+        emergency = model_dir / "sac_turtlebot3_burger_emergency_replay_buffer.pkl"
+        if emergency.exists():
+            return emergency
+
+    if stem == "sac_turtlebot3_burger":
+        explicit_final = model_dir / "sac_turtlebot3_burger_replay_buffer.pkl"
+        if explicit_final.exists():
+            return explicit_final
 
     candidates = list(model_dir.glob("sac_turtlebot3_burger_checkpoint_replay_buffer_*_steps.pkl"))
     candidates += list(model_dir.glob("*_replay_buffer*.pkl"))
@@ -882,15 +993,23 @@ class RotatingCheckpointCallback(CheckpointCallback):
 
 
 class EntropyCoefficientFloorCallback(BaseCallback):
-    """Keep learned SAC alpha above a configured floor during fine-tuning."""
+    """Keep learned SAC alpha within a configured [min, max] band during fine-tuning."""
 
-    def __init__(self, min_ent_coef: Optional[float], verbose: int = 0):
+    def __init__(
+        self,
+        min_ent_coef: Optional[float],
+        max_ent_coef: Optional[float] = None,
+        verbose: int = 0,
+    ):
         super().__init__(verbose=verbose)
         self.min_ent_coef = None if min_ent_coef is None else max(float(min_ent_coef), 0.0)
+        self.max_ent_coef = None if max_ent_coef is None else max(float(max_ent_coef), 0.0)
         self.clamp_count = 0
 
     def _clamp_entropy_coefficient(self) -> None:
-        if self.min_ent_coef is None or self.min_ent_coef <= 0.0:
+        has_min = self.min_ent_coef is not None and self.min_ent_coef > 0.0
+        has_max = self.max_ent_coef is not None and self.max_ent_coef > 0.0
+        if not has_min and not has_max:
             return
         log_ent_coef = getattr(self.model, "log_ent_coef", None)
         if log_ent_coef is None:
@@ -898,13 +1017,19 @@ class EntropyCoefficientFloorCallback(BaseCallback):
         try:
             import torch as th
             with th.no_grad():
-                min_log = th.log(th.as_tensor(self.min_ent_coef, device=log_ent_coef.device, dtype=log_ent_coef.dtype))
-                if bool(th.any(log_ent_coef.data < min_log)):
-                    log_ent_coef.data.copy_(th.maximum(log_ent_coef.data, min_log.expand_as(log_ent_coef.data)))
+                clamped = log_ent_coef.data
+                if has_min:
+                    min_log = th.log(th.as_tensor(self.min_ent_coef, device=log_ent_coef.device, dtype=log_ent_coef.dtype))
+                    clamped = th.maximum(clamped, min_log.expand_as(clamped))
+                if has_max:
+                    max_log = th.log(th.as_tensor(self.max_ent_coef, device=log_ent_coef.device, dtype=log_ent_coef.dtype))
+                    clamped = th.minimum(clamped, max_log.expand_as(clamped))
+                if bool(th.any(clamped != log_ent_coef.data)):
+                    log_ent_coef.data.copy_(clamped)
                     self.clamp_count += 1
                     if self.verbose > 0 and (self.clamp_count == 1 or self.clamp_count % 1000 == 0):
                         print(
-                            f"[SAC ENTROPY] clamped alpha floor={self.min_ent_coef:.6f} count={self.clamp_count}",
+                            f"[SAC ENTROPY] clamped alpha band=[{self.min_ent_coef}, {self.max_ent_coef}] count={self.clamp_count}",
                             flush=True,
                         )
         except Exception:
@@ -1063,6 +1188,8 @@ class TrainingProgressCallback(BaseCallback):
         self.recent_terminal_reasons = deque(maxlen=self.window_size)
         self.recent_policy_w = deque(maxlen=max(self.print_freq, 100))
         self.recent_executed_w = deque(maxlen=max(self.print_freq, 100))
+        self.recent_critic_loss = deque(maxlen=self.window_size)
+        self.recent_actor_loss = deque(maxlen=self.window_size)
         self._current_episode_reward = 0.0
         self._current_episode_len = 0
         self._episode_start_wall_time = 0.0
@@ -1108,6 +1235,18 @@ class TrainingProgressCallback(BaseCallback):
         return float(default)
 
     @staticmethod
+    def _mean_std(values) -> tuple[float, float]:
+        """Population mean/std over a small rolling window (plain Python, no numpy import needed here)."""
+        n = len(values)
+        if n == 0:
+            return float("nan"), float("nan")
+        mean = sum(values) / n
+        if n < 2:
+            return float(mean), float("nan")
+        variance = sum((v - mean) ** 2 for v in values) / n
+        return float(mean), float(variance ** 0.5)
+
+    @staticmethod
     def _finite_or_blank(x: float) -> str:
         try:
             if math.isfinite(float(x)):
@@ -1140,7 +1279,8 @@ class TrainingProgressCallback(BaseCallback):
             path.parent.mkdir(parents=True, exist_ok=True)
             csv_header = (
                 "timesteps,progress_percent,fps,elapsed_sec,eta_sec,"
-                "actor_loss,critic_loss,ent_coef_loss,ent_coef,learning_rate,"
+                "actor_loss,critic_loss,critic_loss_mean,critic_loss_std,actor_loss_mean,actor_loss_std,"
+                "ent_coef_loss,ent_coef,learning_rate,"
                 "mean_episode_reward,mean_episode_length,last_episode_wall_sec,"
                 "last_episode_sps_wall,last_episode_sim_sec,last_episode_sps_sim,"
                 "mean_episode_sps_wall,mean_episode_sps_sim,last_reward,last_done,"
@@ -1375,6 +1515,12 @@ class TrainingProgressCallback(BaseCallback):
 
             actor_loss = self._logger_value("train/actor_loss")
             critic_loss = self._logger_value("train/critic_loss")
+            if math.isfinite(critic_loss):
+                self.recent_critic_loss.append(critic_loss)
+            if math.isfinite(actor_loss):
+                self.recent_actor_loss.append(actor_loss)
+            critic_loss_mean, critic_loss_std = self._mean_std(self.recent_critic_loss)
+            actor_loss_mean, actor_loss_std = self._mean_std(self.recent_actor_loss)
             ent_coef_loss = self._logger_value("train/ent_coef_loss")
             ent_coef = self._logger_value("train/ent_coef")
             try:
@@ -1417,6 +1563,8 @@ class TrainingProgressCallback(BaseCallback):
                 f"fps={fps:6.2f}  eta={self._fmt_duration(eta)}\n"
                 f"      loss: Q={_num(critic_loss)}  actor={_num(actor_loss)}  "
                 f"alpha={_num(ent_coef, 7, 4)}  lr={_num(learning_rate, 9, 6)}\n"
+                f"      loss{self.window_size}: Q_mean={_num(critic_loss_mean, 8, 3)} Q_std={_num(critic_loss_std, 7, 3)}  "
+                f"actor_mean={_num(actor_loss_mean, 8, 3)} actor_std={_num(actor_loss_std, 7, 3)}\n"
                 f"      ep  : R{self.window_size}={_num(mean_ep_reward, 9, 2)}  "
                 f"len={_num(mean_ep_len, 7, 1)}  sps={_num(mean_ep_sps_wall, 7, 2)}  "
                 f"r_now={reward:+8.3f}\n"
@@ -1472,6 +1620,8 @@ class TrainingProgressCallback(BaseCallback):
             self._csv_file.write(
                 f"{trained_steps},{progress * 100.0:.6f},{fps:.6f},{elapsed:.6f},{eta:.6f},"
                 f"{self._finite_or_blank(actor_loss)},{self._finite_or_blank(critic_loss)},"
+                f"{self._finite_or_blank(critic_loss_mean)},{self._finite_or_blank(critic_loss_std)},"
+                f"{self._finite_or_blank(actor_loss_mean)},{self._finite_or_blank(actor_loss_std)},"
                 f"{self._finite_or_blank(ent_coef_loss)},{self._finite_or_blank(ent_coef)},"
                 f"{self._finite_or_blank(learning_rate)},"
                 f"{self._finite_or_blank(mean_ep_reward)},{self._finite_or_blank(mean_ep_len)},"
@@ -1750,6 +1900,7 @@ def parse_args():
     parser.add_argument("--sac-target-entropy", type=float, default=None)
     parser.add_argument("--sac-reset-ent-coef", type=float, default=None)
     parser.add_argument("--sac-min-ent-coef", type=float, default=None)
+    parser.add_argument("--sac-max-ent-coef", type=float, default=None)
     parser.add_argument(
         "--sac-use-sde",
         action=argparse.BooleanOptionalAction,
@@ -2991,6 +3142,7 @@ def main(args=None):
         f"target_entropy={effective_target_entropy if effective_target_entropy is not None else 'auto'}, "
         f"reset_alpha={cli_args.sac_reset_ent_coef if cli_args.sac_reset_ent_coef is not None else 'off'}, "
         f"min_alpha={cli_args.sac_min_ent_coef if cli_args.sac_min_ent_coef is not None else 'off'}, "
+        f"max_alpha={cli_args.sac_max_ent_coef if cli_args.sac_max_ent_coef is not None else 'off'}, "
         f"lr={float(cli_args.sac_learning_rate):.6f}, "
         f"warmup_actions={int(cli_args.warmup_action_steps)}, "
         f"weight_decay={cli_args.policy_weight_decay}"
@@ -3068,6 +3220,7 @@ def main(args=None):
                 pass
     # ---------------------------------------------------------------------------
 
+    semantics_migration_required = False
     if cli_args.load_model:
         load_path = Path(cli_args.load_model).expanduser()
         if not load_path.exists():
@@ -3082,6 +3235,16 @@ def main(args=None):
             device=sac_device,
             custom_objects={"replay_buffer_class": SkipStoreDictReplayBuffer},
         )
+        loaded_semantics_version = str(
+            getattr(model, "_tb3_training_semantics_version", "legacy") or "legacy"
+        )
+        semantics_migration_required = loaded_semantics_version != TRAINING_SEMANTICS_VERSION
+        if semantics_migration_required:
+            ros.get_logger().warn(
+                "TRAINING_SEMANTICS_MIGRATION | "
+                f"checkpoint={loaded_semantics_version} current={TRAINING_SEMANTICS_VERSION}; "
+                "keeping actor, resetting critics, discarding incompatible replay, and warming up a fresh buffer"
+            )
         if bool(getattr(cli_args, "sac_use_sde", False)) and not bool(getattr(model, "use_sde", False)):
             ros.get_logger().warn(
                 "SAC_USE_SDE_IGNORED | --sac-use-sde was requested but the loaded checkpoint "
@@ -3111,16 +3274,22 @@ def main(args=None):
                 ros.get_logger().warn(f"SKIP_STORE_BUFFER_SETUP | could not enforce on load: {type(_rb_exc).__name__}: {_rb_exc}")
             except Exception:
                 pass
-        # Keep the loaded weights, but apply safe current CLI throughput knobs.
-        # SB3 stores train_freq as an internal TrainFreq object, so use the
-        # algorithm helper when available instead of assigning a raw tuple.
-        try:
-            model.train_freq = model._convert_train_freq((max(int(cli_args.train_freq_steps), 1), "step"))
-        except Exception:
-            pass
+        # Keep the loaded weights, but apply current CLI throughput knobs.  The
+        # old code called _convert_train_freq(tuple), although SB3's method takes
+        # no arguments and returns None; the swallowed TypeError silently kept
+        # the checkpoint's old frequency (12) on every resumed run.
+        requested_train_freq = max(int(cli_args.train_freq_steps), 1)
+        model.train_freq = TrainFreq(requested_train_freq, TrainFrequencyUnit.STEP)
+        if (
+            int(model.train_freq.frequency) != requested_train_freq
+            or model.train_freq.unit != TrainFrequencyUnit.STEP
+        ):
+            raise RuntimeError(
+                "Failed to apply resumed SAC train frequency: "
+                f"requested={requested_train_freq}/step effective={model.train_freq}"
+            )
         model.gradient_steps = max(int(cli_args.gradient_steps), 0)
         model.batch_size = int(cli_args.batch_size)
-        model.learning_starts = max(int(cli_args.learning_starts), 0)
         model.learning_rate = float(cli_args.sac_learning_rate)
         model.lr_schedule = get_schedule_fn(float(cli_args.sac_learning_rate))
         # Allow longer-horizon fine-tuning even when loading an existing SAC checkpoint.
@@ -3130,17 +3299,41 @@ def main(args=None):
 
         # Reward-only 변경은 policy 구조를 바꾸지 않으므로 env만 교체해서 이어 학습 가능하다.
         # 단, replay buffer는 SAC.save()에 포함되지 않는다. 저장해 둔 buffer가 있으면 별도로 로드한다.
-        if cli_args.load_replay_buffer:
+        replay_buffer_loaded = False
+        if cli_args.load_replay_buffer and not semantics_migration_required:
             rb_path = Path(cli_args.load_replay_buffer).expanduser()
             if not rb_path.exists():
                 raise FileNotFoundError(f"--load-replay-buffer not found: {rb_path}")
             model.load_replay_buffer(str(rb_path))
+            replay_buffer_loaded = bool(
+                getattr(model, "replay_buffer", None) is not None
+                and model.replay_buffer.size() > 0
+            )
             ros.get_logger().info(f"Loaded replay buffer: {rb_path}")
+        elif semantics_migration_required:
+            ros.get_logger().warn(
+                "REPLAY_BUFFER_SKIPPED_FOR_SEMANTICS_MIGRATION | "
+                f"selected={cli_args.load_replay_buffer or '(none)'}"
+            )
         else:
             ros.get_logger().warn(
                 "No replay buffer loaded. The policy/critics are continued, "
                 "but the off-policy replay buffer starts from the loaded model default state. "
                 "For future continuation, train with --save-replay-buffer."
+            )
+        warmup_steps = max(int(cli_args.learning_starts), 0)
+        if replay_buffer_loaded:
+            model.learning_starts = warmup_steps
+        else:
+            # num_timesteps is restored from the checkpoint.  Using the raw CLI
+            # value (e.g. 1500) would therefore train immediately on a replay
+            # containing only a handful of new transitions.  Interpret it as a
+            # fresh-buffer warmup duration when no replay was loaded.
+            model.learning_starts = int(model.num_timesteps) + warmup_steps
+            ros.get_logger().warn(
+                "RESUME_EMPTY_REPLAY_WARMUP | "
+                f"current_step={int(model.num_timesteps)} warmup={warmup_steps} "
+                f"updates_resume_at={int(model.learning_starts)}"
             )
     else:
         model = SAC(
@@ -3165,8 +3358,24 @@ def main(args=None):
             replay_buffer_class=SkipStoreDictReplayBuffer,
         )
 
-    if bool(getattr(cli_args, "sac_reset_critics", False)):
-        _reset_sac_critics(model, logger=ros.get_logger())
+    critic_reset_requested = bool(getattr(cli_args, "sac_reset_critics", False))
+    critic_reset_ok = True
+    if critic_reset_requested or semantics_migration_required:
+        critic_reset_ok = _reset_sac_critics(model, logger=ros.get_logger())
+    if semantics_migration_required and not critic_reset_ok:
+        raise RuntimeError(
+            "Cannot complete the actor-only training-semantics migration because critic reset failed"
+        )
+    if semantics_migration_required:
+        # Keep actor parameters, but do not carry Adam momentum accumulated
+        # against the discarded critics into the new critic objective.
+        actor_optimizer = getattr(getattr(model, "actor", None), "optimizer", None)
+        if actor_optimizer is not None:
+            actor_optimizer.state.clear()
+            ros.get_logger().warn(
+                "SAC_ACTOR_OPTIMIZER_RESET | actor weights kept; stale optimizer state cleared"
+            )
+    model._tb3_training_semantics_version = TRAINING_SEMANTICS_VERSION
     _reset_sac_entropy_coefficient(model, cli_args.sac_reset_ent_coef, logger=ros.get_logger())
     _install_warmup_action_mixer(
         model,
@@ -3218,16 +3427,29 @@ def main(args=None):
 
     try:
         callbacks = [checkpoint_callback]
-        if cli_args.sac_min_ent_coef is not None and float(cli_args.sac_min_ent_coef) > 0.0:
-            callbacks.append(EntropyCoefficientFloorCallback(cli_args.sac_min_ent_coef, verbose=1))
+        _has_ent_coef_min = cli_args.sac_min_ent_coef is not None and float(cli_args.sac_min_ent_coef) > 0.0
+        _has_ent_coef_max = cli_args.sac_max_ent_coef is not None and float(cli_args.sac_max_ent_coef) > 0.0
+        if _has_ent_coef_min or _has_ent_coef_max:
+            callbacks.append(
+                EntropyCoefficientFloorCallback(
+                    cli_args.sac_min_ent_coef, cli_args.sac_max_ent_coef, verbose=1
+                )
+            )
         if progress_callback is not None:
             callbacks.append(progress_callback)
         if cli_args.debug_print_freq > 0:
             callbacks.append(debug_callback)
 
-        if str(os.environ.get("TB3_RL_TIME_GRAD_UPDATE", "0")).strip().lower() in {"1", "true", "yes", "on"}:
+        _orig_train = None
+        _time_grad_updates = str(os.environ.get("TB3_RL_TIME_GRAD_UPDATE", "0")).strip().lower() in {"1", "true", "yes", "on"}
+        _td_diagnostics = str(os.environ.get("TB3_RL_TD_DIAGNOSTICS", "0")).strip().lower() in {"1", "true", "yes", "on"}
+        if _time_grad_updates or _td_diagnostics:
             _orig_train = model.train
             _grad_update_stats = {"n": 0, "acc": 0.0}
+            try:
+                _td_diag_every = max(int(os.environ.get("TB3_RL_TD_DIAGNOSTICS_EVERY_N", "5") or 5), 1)
+            except Exception:
+                _td_diag_every = 5
 
             def _timed_train(*_targs, **_tkwargs):
                 _t0 = time.perf_counter()
@@ -3236,11 +3458,34 @@ def main(args=None):
                 _grad_update_stats["n"] += 1
                 _grad_update_stats["acc"] += _dt
                 n = _grad_update_stats["n"]
-                if n % 5 == 0 or _dt > 0.5:
-                    ros.get_logger().warn(
+                if _time_grad_updates and (n % 5 == 0 or _dt > 0.5):
+                    print(
                         "GRAD_UPDATE_TIME | "
-                        f"call={n} last={_dt * 1000.0:.1f}ms avg={_grad_update_stats['acc'] / n * 1000.0:.1f}ms"
+                        f"call={n} last={_dt * 1000.0:.1f}ms avg={_grad_update_stats['acc'] / n * 1000.0:.1f}ms",
+                        flush=True,
                     )
+                if _td_diagnostics and n % _td_diag_every == 0:
+                    diag = _sample_sac_td_diagnostics(model)
+                    if diag is not None:
+                        effective_train_freq = max(
+                            float(getattr(getattr(model, "train_freq", None), "frequency", cli_args.train_freq_steps)),
+                            1.0,
+                        )
+                        effective_gradient_steps = float(getattr(model, "gradient_steps", cli_args.gradient_steps))
+                        print(
+                            "SAC_TD_DIAG | "
+                            f"call={n} utd={effective_gradient_steps / effective_train_freq:.4f} "
+                            f"reward_mean={diag['reward_mean']:.4f} reward_std={diag['reward_std']:.4f} "
+                            f"reward_min={diag['reward_min']:.4f} reward_p05={diag['reward_p05']:.4f} "
+                            f"reward_p95={diag['reward_p95']:.4f} reward_max={diag['reward_max']:.4f} "
+                            f"done_frac={diag['done_frac']:.4f} "
+                            f"target_mean={diag['target_mean']:.4f} target_std={diag['target_std']:.4f} "
+                            f"target_min={diag['target_min']:.4f} target_p05={diag['target_p05']:.4f} "
+                            f"target_p95={diag['target_p95']:.4f} target_max={diag['target_max']:.4f} "
+                            f"td_abs_mean={diag['td_abs_mean']:.4f} td_abs_p95={diag['td_abs_p95']:.4f} "
+                            f"td_abs_max={diag['td_abs_max']:.4f}",
+                            flush=True,
+                        )
                 return _result
 
             model.train = _timed_train
@@ -3278,10 +3523,35 @@ def main(args=None):
                     progress_callback._rich_live.stop()
                 except Exception:
                     pass
+            # gazebo_nav_env.reset()'s recovery loop raises this exact RuntimeError
+            # only when its `while rclpy.ok()` guard already sees the ROS context
+            # as shut down -- i.e. a SIGINT/SIGTERM was already delivered and
+            # rclpy's own signal handler tore the context down before this code's
+            # `except KeyboardInterrupt` above ever got a chance to fire. This is
+            # a graceful external stop, not an unexpected bug, so log/handle it
+            # the same way as the KeyboardInterrupt branch instead of the scarier
+            # "TRAINING_ABORTED" wording (which used to make every Ctrl+C during a
+            # reset-recovery wait look like a crash).
+            is_ros_shutdown_stop = isinstance(exc, RuntimeError) and "ROS shutdown" in str(exc)
             try:
-                ros.get_logger().error(
-                    f"TRAINING_ABORTED | learn() raised; saving emergency checkpoint | {learn_error}"
-                )
+                if is_ros_shutdown_stop:
+                    ros.get_logger().warn(
+                        f"TRAINING_INTERRUPTED | ROS shutdown detected during reset recovery "
+                        f"(external SIGINT/SIGTERM); saving emergency checkpoint | {learn_error}"
+                    )
+                else:
+                    ros.get_logger().error(
+                        f"TRAINING_ABORTED | learn() raised; saving emergency checkpoint | {learn_error}"
+                    )
+            except Exception:
+                pass
+
+        # train() was temporarily shadowed on this instance for timing/TD
+        # diagnostics.  Remove the instance attribute before SAC.save(); the
+        # closure captures the ROS node and cannot be pickled safely.
+        if _orig_train is not None:
+            try:
+                delattr(model, "train")
             except Exception:
                 pass
 
@@ -3293,7 +3563,7 @@ def main(args=None):
                 ros.get_logger().info(f"Saved emergency model to {emergency_zip}")
                 if bool(cli_args.save_replay_buffer):
                     em_replay = model_dir / "sac_turtlebot3_burger_emergency_replay_buffer.pkl"
-                    model.save_replay_buffer(str(em_replay))
+                    _safe_save_replay_buffer(model, em_replay, logger=ros.get_logger())
                     ros.get_logger().info(f"Saved emergency replay buffer to {em_replay}")
             except Exception as save_exc:
                 try:
@@ -3309,7 +3579,7 @@ def main(args=None):
             saved_zip = _safe_save_sac_model(model, save_path, logger=ros.get_logger())
             if bool(cli_args.save_replay_buffer):
                 replay_path = model_dir / "sac_turtlebot3_burger_replay_buffer.pkl"
-                model.save_replay_buffer(str(replay_path))
+                _safe_save_replay_buffer(model, replay_path, logger=ros.get_logger())
                 ros.get_logger().info(f"Saved replay buffer to {replay_path}")
             ros.get_logger().info(f"Saved model to {saved_zip}")
         except Exception as final_exc:

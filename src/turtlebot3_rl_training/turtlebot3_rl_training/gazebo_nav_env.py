@@ -50,7 +50,7 @@ except Exception:  # pragma: no cover - behavior_server optional action
 
 from turtlebot3_rl_training.exploration_map import ExplorationGridMap, MapUpdateStats
 from turtlebot3_rl_training.observation import build_exploration_observation
-from turtlebot3_rl_training.reset_manager import ResetManager
+from turtlebot3_rl_training.reset_manager import ResetManager, ResetPose
 from turtlebot3_rl_training.reward import (
     PHYSICAL_TERMINAL_REWARD,
     compute_exploration_reward,
@@ -1391,9 +1391,13 @@ class GazeboNavEnv(gym.Env):
             str(os.environ.get("TB3_RL_NO_PRIORITY_MODEL_INPUT", "0")).strip().lower()
             in {"1", "true", "yes", "on", "enable", "enabled"}
         )
-        # Normal vector extras are 10.  No-priority mode removes target_priority
-        # from the policy vector, so the actor/critic sees lidar+9 instead.
-        self.obs_extra_dim = 9 if self.no_priority_model_input else 10
+        # Normal vector extras are 6 (mean_confidence_norm/stale_ratio/
+        # low_confidence_ratio/coverage_delta_norm were dropped for both modes
+        # -- unverified or redundant signal, see build_exploration_observation
+        # docstring). No-priority mode additionally removes target_priority AND
+        # frontier_distance/frontier_angle (dead constants when the priority
+        # map is off), so the actor/critic sees lidar+3 instead.
+        self.obs_extra_dim = 3 if self.no_priority_model_input else 6
         self.obs_dim = self.num_lidar_bins + self.obs_extra_dim
         self.map_channels = 4 if self.no_priority_model_input else 5
 
@@ -1764,6 +1768,7 @@ class GazeboNavEnv(gym.Env):
         self._last_terminal_reason = "none"
         self._last_collision_restart_requested = False
         self._cached_collision_scan = None
+        self._cached_collision_raw_scan = None
         self._cached_collision_scan_time = None
 
         self.fallen_roll_threshold = float(fallen_roll_threshold)
@@ -2354,7 +2359,14 @@ class GazeboNavEnv(gym.Env):
             return
         _diag_on = str(os.environ.get("TB3_RL_RESET_PROFILER", "0")).strip().lower() in {"1", "true", "yes", "on"}
         _diag_t0 = time.perf_counter() if _diag_on else 0.0
-        self._refresh_known_random_obstacles()
+        # Discovery is needed once after a training-process restart because the
+        # Gazebo world may still contain obstacles created by the previous run.
+        # Once at least one name is known, Pass 1 already detects stale cache
+        # entries through set_pose failures and Pass 2 recreates them.  Running
+        # `gz model --list` on every warm reset only adds ~0.65 s of transport
+        # discovery work and opens another short-lived Gazebo participant.
+        if not getattr(self, "_known_random_obstacle_names", set()):
+            self._refresh_known_random_obstacles()
         if _diag_on:
             print(f"OBSTACLE_DIAG | refresh_known={(time.perf_counter()-_diag_t0)*1000.0:.1f}ms known_count={len(getattr(self, '_known_random_obstacle_names', []))}", flush=True)
         try:
@@ -2421,11 +2433,28 @@ class GazeboNavEnv(gym.Env):
             if e["name"] in getattr(self, "_known_random_obstacle_names", set())
         ]
         if known_idx:
-            reqs = [
-                (pose_service, "gz.msgs.Pose", _pose_req(entries[i]["name"], entries[i]["x"], entries[i]["y"], entries[i]["sz"] / 2.0, entries[i]["yaw"]), 1200)
-                for i in known_idx
-            ]
-            results = self._gz_service_bool_batch(reqs)
+            if self.reset_manager is not None and hasattr(self.reset_manager, "set_model_poses_batch"):
+                pose_requests = [
+                    (
+                        entries[i]["name"],
+                        ResetPose(
+                            x=entries[i]["x"],
+                            y=entries[i]["y"],
+                            z=entries[i]["sz"] / 2.0,
+                            yaw=entries[i]["yaw"],
+                        ),
+                    )
+                    for i in known_idx
+                ]
+                results = self.reset_manager.set_model_poses_batch(
+                    pose_requests, timeout_sec=1.2, chunk_size=6
+                )
+            else:
+                reqs = [
+                    (pose_service, "gz.msgs.Pose", _pose_req(entries[i]["name"], entries[i]["x"], entries[i]["y"], entries[i]["sz"] / 2.0, entries[i]["yaw"]), 1200)
+                    for i in known_idx
+                ]
+                results = self._gz_service_bool_batch(reqs)
             retry_idx = [i for i, ok in zip(known_idx, results, strict=True) if not ok]
             for i, ok in zip(known_idx, results, strict=True):
                 entries[i]["placed_ok"] = bool(ok)
@@ -2497,11 +2526,18 @@ class GazeboNavEnv(gym.Env):
 
         inactive_names = [name for name in list(getattr(self, "_active_random_obstacle_names", [])) if name not in set(placed_names)]
         if inactive_names:
-            reqs = [
-                (pose_service, "gz.msgs.Pose", _pose_req(name, 0.0, 0.0, -20.0, 0.0), 500)
-                for name in inactive_names
-            ]
-            self._gz_service_bool_batch(reqs)
+            if self.reset_manager is not None and hasattr(self.reset_manager, "set_model_poses_batch"):
+                self.reset_manager.set_model_poses_batch(
+                    [(name, ResetPose(x=0.0, y=0.0, z=-20.0, yaw=0.0)) for name in inactive_names],
+                    timeout_sec=0.6,
+                    chunk_size=6,
+                )
+            else:
+                reqs = [
+                    (pose_service, "gz.msgs.Pose", _pose_req(name, 0.0, 0.0, -20.0, 0.0), 500)
+                    for name in inactive_names
+                ]
+                self._gz_service_bool_batch(reqs)
         self._active_random_obstacle_names = placed_names
         if _diag_on:
             print(f"OBSTACLE_DIAG | placed={placed}/{len(selected)} known_after={len(self._known_random_obstacle_names)}", flush=True)
@@ -3540,6 +3576,7 @@ class GazeboNavEnv(gym.Env):
 
     def _reset_once(self, seed=None, options=None):
         super().reset(seed=seed)
+        reset_trigger_reason = str(getattr(self, "_last_terminal_reason", "none"))
         _reset_prof_on = str(os.environ.get("TB3_RL_RESET_PROFILER", "0")).strip().lower() in {"1", "true", "yes", "on"}
         if _reset_prof_on:
             _reset_prof_t0 = time.perf_counter()
@@ -3989,7 +4026,7 @@ class GazeboNavEnv(gym.Env):
             )
             profile_msg = (
                 "RESET_PROFILE | "
-                f"episode={self.episode_index} reason={self._last_terminal_reason} | {txt}"
+                f"episode={self.episode_index} reason={reset_trigger_reason} | {txt}"
             )
             # QUIET_ALL_ROS_LOGS drops the logger's own warn() severity, which
             # would otherwise silently swallow this diagnostic even with the
@@ -12076,13 +12113,9 @@ class GazeboNavEnv(gym.Env):
         vector_obs = build_exploration_observation(
             scan_ranges=scan_msg.ranges,
             coverage_ratio=stats.coverage_ratio,
-            coverage_delta=stats.coverage_delta,
             frontier_distance=stats.frontier_distance,
             frontier_angle=stats.frontier_angle,
             target_priority=stats.target_priority,
-            mean_confidence=stats.mean_confidence,
-            stale_ratio=stats.stale_ratio,
-            low_confidence_ratio=stats.low_confidence_ratio,
             prev_action=self.prev_action,
             num_lidar_bins=self.num_lidar_bins,
             max_linear_speed=self.max_linear_speed,
@@ -12226,18 +12259,30 @@ class GazeboNavEnv(gym.Env):
             return False
 
         scan_time = self.ros.last_scan_time
-        if scan_time != self._cached_collision_scan_time:
-            ranges = np.asarray(self.ros.scan.ranges, dtype=np.float32)
-            ranges = np.nan_to_num(
-                ranges,
-                nan=10.0,
-                posinf=10.0,
-                neginf=0.0,
-            )
+        if scan_time != self._cached_collision_scan_time or self._cached_collision_scan is None:
+            raw_ranges = np.asarray(self.ros.scan.ranges, dtype=np.float32)
+            range_min = max(float(getattr(self.ros.scan, "range_min", 0.05)), 0.03)
+            range_max = float(getattr(self.ros.scan, "range_max", 10.0))
+            if not math.isfinite(range_max) or range_max <= range_min:
+                range_max = 10.0
+            valid = np.isfinite(raw_ranges) & (raw_ranges >= range_min) & (raw_ranges <= range_max)
+            raw_ranges = np.where(valid, raw_ranges, range_max).astype(np.float32)
+            # Match the policy input's first anti-speckle stage.  The old raw
+            # global minimum terminated on one isolated beam (and even invalid
+            # zero ranges) that the actor never observed after median filtering.
+            ranges = np.median(
+                np.stack(
+                    [np.roll(raw_ranges, 1), raw_ranges, np.roll(raw_ranges, -1)],
+                    axis=0,
+                ),
+                axis=0,
+            ).astype(np.float32)
+            self._cached_collision_raw_scan = raw_ranges
             self._cached_collision_scan = ranges
             self._cached_collision_scan_time = scan_time
         else:
             ranges = self._cached_collision_scan
+            raw_ranges = self._cached_collision_raw_scan
 
         finite = ranges[np.isfinite(ranges)]
         global_min = float(np.min(finite)) if finite.size else 10.0
@@ -12247,13 +12292,37 @@ class GazeboNavEnv(gym.Env):
             half_width_rad=math.radians(28.0),
             max_considered_range=0.80,
         )
-        # LiDAR collision threshold is the hard terminal condition.  Use both
-        # global min and front-sector min so a wall hit in front terminates even
-        # when a single noisy global beam is filtered by the controller.
-        hit = bool(min(global_min, front_min) < self.collision_threshold)
+        # The robust global scan already includes the front sector.  Do not OR it
+        # with the raw front minimum, which would reintroduce the single-beam
+        # observation/terminal mismatch fixed above.
+        hit = bool(global_min < self.collision_threshold)
         if hit:
             self._last_collision_global_min = float(global_min)
             self._last_collision_front_min = float(front_min)
+            if str(os.environ.get("TB3_RL_COLLISION_DIAG", "0")).strip().lower() in {"1", "true", "yes", "on"}:
+                try:
+                    finite_ranges = np.asarray(raw_ranges, dtype=np.float32)
+                    median3 = np.asarray(ranges, dtype=np.float32)
+                    below = finite_ranges < float(self.collision_threshold)
+                    doubled = np.concatenate([below, below])
+                    max_run = 0
+                    run = 0
+                    for flag in doubled:
+                        run = run + 1 if bool(flag) else 0
+                        max_run = max(max_run, min(run, int(below.size)))
+                    print(
+                        "COLLISION_DIAG | "
+                        f"raw_min={float(np.min(finite_ranges)):.4f} "
+                        f"median3_min={float(np.min(median3)):.4f} "
+                        f"below_beams={int(np.count_nonzero(below))} max_adjacent_run={int(max_run)} "
+                        f"front_min={float(front_min):.4f} threshold={float(self.collision_threshold):.4f} "
+                        f"policy_v={float(getattr(self, '_last_velocity_safety_policy_v', 0.0)):.4f} "
+                        f"executed_v={float(getattr(self, '_last_velocity_safety_executed_v', 0.0)):.4f} "
+                        f"executed_w={float(getattr(self, '_last_velocity_safety_executed_w', 0.0)):.4f}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
         return hit
 
     def _instantaneous_shake_reason(self) -> str:

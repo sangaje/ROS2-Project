@@ -221,6 +221,50 @@ class ResetManager:
             fixed_yaw=fixed_yaw,
         )
 
+    def set_model_poses_batch(
+        self,
+        requests: list[tuple[str, ResetPose]],
+        timeout_sec: float = 1.2,
+        chunk_size: int = 6,
+    ) -> list[bool]:
+        """Set several model poses through the existing ROS-Gazebo bridge.
+
+        This deliberately skips robot-specific pose verification.  Random
+        obstacle callers already retry failed entries through the existing
+        Gazebo CLI fallback, while successful service replies are sufficient
+        for static obstacle relocation.
+        """
+        if not requests:
+            return []
+        if not self.wait_until_ready(timeout_sec=min(max(float(timeout_sec), 0.1), 2.0)):
+            return [False] * len(requests)
+
+        results: list[bool] = []
+        chunk_size = max(int(chunk_size), 1)
+        for start in range(0, len(requests), chunk_size):
+            chunk = requests[start : start + chunk_size]
+            futures = []
+            for entity_name, reset_pose in chunk:
+                req = SetEntityPose.Request()
+                req.entity.name = str(entity_name)
+                req.entity.type = Entity.MODEL
+                req.pose = self.build_pose(reset_pose)
+                futures.append(self.client.call_async(req))
+
+            deadline = time.monotonic() + max(float(timeout_sec), 0.1)
+            while rclpy.ok() and time.monotonic() < deadline:
+                if all(future.done() for future in futures):
+                    break
+                rclpy.spin_once(self.node, timeout_sec=0.01)
+
+            for future in futures:
+                try:
+                    response = future.result() if future.done() else None
+                    results.append(bool(response is not None and response.success))
+                except Exception:
+                    results.append(False)
+        return results
+
     def reset_to_pose(
         self,
         reset_pose: ResetPose,

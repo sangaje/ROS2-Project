@@ -2804,12 +2804,28 @@ return options
         for attr in ("model_odom_bridge_proc", "robot_state_publisher_proc"):
             try:
                 proc = getattr(self, attr, None)
-                if proc is not None and proc.poll() is None:
-                    proc.terminate()
+                if proc is not None:
+                    # Both processes are launched with start_new_session=True.
+                    # Terminating only the `ros2 run/launch` wrapper can leave
+                    # its parameter_bridge/RSP child alive as an orphan.  Signal
+                    # the owned process group, just as stop_slam_toolbox() does.
+                    try:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    except Exception:
+                        if proc.poll() is None:
+                            proc.terminate()
                     try:
                         proc.wait(timeout=1.5)
-                    except Exception:
-                        proc.kill()
+                    except subprocess.TimeoutExpired:
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except Exception:
+                            if proc.poll() is None:
+                                proc.kill()
+                        try:
+                            proc.wait(timeout=1.0)
+                        except Exception:
+                            pass
                 setattr(self, attr, None)
             except Exception:
                 pass

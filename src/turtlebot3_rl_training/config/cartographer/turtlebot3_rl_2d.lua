@@ -78,6 +78,19 @@ TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.angular_search_window =
 TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.translation_delta_cost_weight = 1.0
 TRAJECTORY_BUILDER_2D.real_time_correlative_scan_matcher.rotation_delta_cost_weight = 1.0
 
+-- Global loop closure (below) and the local search window (above) were
+-- already tightened, but ceres_scan_matcher itself was left at cartographer's
+-- stock weights (occupied_space=1, translation=10, rotation=40). That solver
+-- runs after every single scan insertion and re-fits the pose to whatever the
+-- new scan best matches -- with a sparse, fresh-per-episode map that snap can
+-- visibly nudge the published pose even with loop closure off. Trust the
+-- odometry-seeded prior (from real_time_correlative_scan_matcher) more and
+-- let new scan data pull the pose less: raise translation/rotation weight
+-- relative to occupied_space_weight (stock ratio 10:1 and 40:1 -> ~30:1 and
+-- ~120:1 here).
+TRAJECTORY_BUILDER_2D.ceres_scan_matcher.translation_weight = 30.
+TRAJECTORY_BUILDER_2D.ceres_scan_matcher.rotation_weight = 120.
+
 POSE_GRAPH.constraint_builder.min_score = 0.65
 POSE_GRAPH.constraint_builder.global_localization_min_score = 0.7
 
