@@ -9,9 +9,11 @@ uses fleet_bringup and multi/region providers underneath.
 from __future__ import annotations
 
 import copy
+import math
 import os
 import tempfile
 from pathlib import Path
+from xml.etree import ElementTree
 
 import yaml
 from ament_index_python.packages import get_package_share_directory
@@ -61,16 +63,142 @@ def _find_tb3_file(*parts: str) -> Path:
     raise FileNotFoundError(f'turtlebot3_gazebo file not found: {"/".join(parts)}')
 
 
-def _nav_map_yaml() -> Path:
-    try:
-        nav_share = Path(get_package_share_directory('turtlebot3_navigation2'))
-        candidate = nav_share / 'map' / 'map.yaml'
-        if candidate.exists():
-            return candidate
-    except Exception:
-        pass
-    multi_share = Path(get_package_share_directory('multi'))
-    return multi_share / 'maps' / 'turtlemap.yaml'
+def _sdf_pose(element) -> tuple[float, float, float, float]:
+    pose = element.find('pose')
+    values = [float(value) for value in (pose.text or '').split()] if pose is not None else []
+    values.extend([0.0] * (6 - len(values)))
+    return values[0], values[1], values[2], values[5]
+
+
+def _house_collision_map(config: dict) -> Path:
+    """Rasterize the installed House SDF collision geometry for Nav2.
+
+    The TurtleBot3 navigation package's bundled ``map.yaml`` is a different
+    hexagonal arena.  Using it in the House world lets AMCL become active but
+    makes real House poses unplannable.  This generator uses only collision
+    boxes/cylinders that intersect the robot/LiDAR plane; mesh furniture remains
+    protected by the live local obstacle layer.
+    """
+    resolution = 0.05
+    margin = 0.50
+    sdf_path = _find_tb3_file('models', 'turtlebot3_house', 'model.sdf')
+    model = ElementTree.parse(sdf_path).getroot().find('model')
+    if model is None:
+        raise RuntimeError(f'House SDF has no model element: {sdf_path}')
+
+    # (kind, centre_x, centre_y, yaw, size_x/radius, size_y)
+    obstacles: list[tuple[str, float, float, float, float, float]] = []
+    for link in model.findall('link'):
+        link_x, link_y, link_z, link_yaw = _sdf_pose(link)
+        cos_link = math.cos(link_yaw)
+        sin_link = math.sin(link_yaw)
+        for collision in link.findall('collision'):
+            local_x, local_y, local_z, local_yaw = _sdf_pose(collision)
+            geometry = collision.find('geometry')
+            if geometry is None:
+                continue
+            centre_x = link_x + cos_link * local_x - sin_link * local_y
+            centre_y = link_y + sin_link * local_x + cos_link * local_y
+            centre_z = link_z + local_z
+            yaw = link_yaw + local_yaw
+            box = geometry.find('box/size')
+            cylinder = geometry.find('cylinder')
+            if box is not None:
+                size = [float(value) for value in (box.text or '').split()]
+                if len(size) != 3:
+                    continue
+                # Ignore floors/ceilings; keep geometry intersecting the base
+                # and planar LiDAR height.
+                if centre_z + 0.5 * size[2] < 0.10 or centre_z - 0.5 * size[2] > 0.30:
+                    continue
+                obstacles.append(('box', centre_x, centre_y, yaw, size[0], size[1]))
+            elif cylinder is not None:
+                radius = cylinder.find('radius')
+                length = cylinder.find('length')
+                if radius is None or length is None:
+                    continue
+                radius_value = float(radius.text or 0.0)
+                length_value = float(length.text or 0.0)
+                if centre_z + 0.5 * length_value < 0.10 or centre_z - 0.5 * length_value > 0.30:
+                    continue
+                obstacles.append(('cylinder', centre_x, centre_y, yaw, radius_value, radius_value))
+    if not obstacles:
+        raise RuntimeError(f'No planar House collisions found in {sdf_path}')
+
+    extents = []
+    for kind, cx, cy, yaw, size_x, size_y in obstacles:
+        if kind == 'cylinder':
+            half_x = half_y = size_x
+        else:
+            half_x = 0.5 * (abs(math.cos(yaw)) * size_x + abs(math.sin(yaw)) * size_y)
+            half_y = 0.5 * (abs(math.sin(yaw)) * size_x + abs(math.cos(yaw)) * size_y)
+        extents.append((cx - half_x, cy - half_y, cx + half_x, cy + half_y))
+    min_x = math.floor((min(extent[0] for extent in extents) - margin) / resolution) * resolution
+    min_y = math.floor((min(extent[1] for extent in extents) - margin) / resolution) * resolution
+    max_x = math.ceil((max(extent[2] for extent in extents) + margin) / resolution) * resolution
+    max_y = math.ceil((max(extent[3] for extent in extents) + margin) / resolution) * resolution
+    width = int(round((max_x - min_x) / resolution))
+    height = int(round((max_y - min_y) / resolution))
+    pixels = bytearray([254]) * (width * height)
+
+    for kind, cx, cy, yaw, size_x, size_y in obstacles:
+        cos_yaw = math.cos(yaw)
+        sin_yaw = math.sin(yaw)
+        if kind == 'cylinder':
+            radius_x = radius_y = size_x
+        else:
+            radius_x = 0.5 * (abs(cos_yaw) * size_x + abs(sin_yaw) * size_y)
+            radius_y = 0.5 * (abs(sin_yaw) * size_x + abs(cos_yaw) * size_y)
+        gx0 = max(0, int(math.floor((cx - radius_x - min_x) / resolution)))
+        gx1 = min(width - 1, int(math.ceil((cx + radius_x - min_x) / resolution)))
+        gy0 = max(0, int(math.floor((cy - radius_y - min_y) / resolution)))
+        gy1 = min(height - 1, int(math.ceil((cy + radius_y - min_y) / resolution)))
+        for gy in range(gy0, gy1 + 1):
+            world_y = min_y + (gy + 0.5) * resolution
+            for gx in range(gx0, gx1 + 1):
+                world_x = min_x + (gx + 0.5) * resolution
+                dx = world_x - cx
+                dy = world_y - cy
+                if kind == 'cylinder':
+                    occupied = dx * dx + dy * dy <= size_x * size_x
+                else:
+                    local_x = cos_yaw * dx + sin_yaw * dy
+                    local_y = -sin_yaw * dx + cos_yaw * dy
+                    occupied = abs(local_x) <= 0.5 * size_x and abs(local_y) <= 0.5 * size_y
+                if occupied:
+                    pixels[(height - 1 - gy) * width + gx] = 0
+
+    # The map boundary is occupied so a global plan can never escape the
+    # collision-derived House extent.
+    for gx in range(width):
+        pixels[gx] = 0
+        pixels[(height - 1) * width + gx] = 0
+    for row in range(height):
+        pixels[row * width] = 0
+        pixels[row * width + width - 1] = 0
+
+    for key, robot in config['robots'].items():
+        spawn = robot['spawn']
+        gx = int(math.floor((float(spawn['x']) - min_x) / resolution))
+        gy = int(math.floor((float(spawn['y']) - min_y) / resolution))
+        if not (0 <= gx < width and 0 <= gy < height):
+            raise RuntimeError(f'{key} spawn is outside the generated House map')
+        if pixels[(height - 1 - gy) * width + gx] == 0:
+            raise RuntimeError(f'{key} spawn intersects House collision geometry')
+
+    map_dir = RUNTIME_DIR / 'maps'
+    map_dir.mkdir(parents=True, exist_ok=True)
+    image_path = map_dir / 'house_collision_map.pgm'
+    image_path.write_bytes(f'P5\n{width} {height}\n255\n'.encode('ascii') + pixels)
+    return _write_yaml(map_dir / 'house_collision_map.yaml', {
+        'image': image_path.name,
+        'mode': 'trinary',
+        'resolution': resolution,
+        'origin': [min_x, min_y, 0.0],
+        'negate': 0,
+        'occupied_thresh': 0.65,
+        'free_thresh': 0.196,
+    })
 
 
 def _replace_robot_sdf(template: Path, namespace: str) -> str:
@@ -439,7 +567,7 @@ def _prepare_runtime_assets(config: dict) -> tuple[Path, Path, dict[str, Path]]:
         key: _robot_nav2_params(config, robot)
         for key, robot in config['robots'].items()
     }
-    return world, _nav_map_yaml(), nav2_params
+    return world, _house_collision_map(config), nav2_params
 
 
 def _bridge_args(namespaces: list[str]) -> list[str]:
@@ -533,12 +661,54 @@ def _nav2_group(ns: str, params: Path, goal_topic: str, cancel_topic: str = '') 
                     'goal_pose_topic': goal_topic,
                     'cancel_topic': cancel_topic,
                     'navigate_action': f'/{ns}/navigate_to_pose',
-                    'require_localization_ready': False,
+                    'require_localization_ready': True,
+                    'localization_ready_topic': f'/{ns}/localization_ready',
                 }],
                 additional_env=extra_env,
             ),
         ]),
     ])
+
+
+def _bootstrap_node(robot: dict, localization: dict) -> Node:
+    """Create one odometry-verified startup localization FSM per robot."""
+    ns = robot['namespace']
+    return Node(
+        package='fleet_bringup',
+        executable='global_localize_kickstart',
+        name=f'{ns}_global_localize_kickstart',
+        output='screen',
+        parameters=[{
+            'use_sim_time': True,
+            'map_topic': '/map',
+            'odom_topic': f'/{ns}/odom',
+            'scan_topic': f'/{ns}/scan',
+            'cmd_vel_topic': f'/{ns}/cmd_vel',
+            'use_stamped_cmd_vel': True,
+            'amcl_pose_topic': f'/{ns}/amcl_pose',
+            'amcl_lifecycle_service': f'/{ns}/amcl/get_state',
+            'base_frame': f'{ns}/base_footprint',
+            'global_frame': 'map',
+            'ready_topic': f'/{ns}/localization_ready',
+            # AMCL's set_initial_pose parameters are the one fixed spawn seed.
+            # Never reuse another robot's scout pose as this robot's estimate.
+            'enable_scout_pose_seed': False,
+            'allow_blind_global_reinit': False,
+            'spin_enabled': bool(localization['initial_spin_enabled']),
+            'require_valid_map': True,
+            'min_known_map_cells': 100,
+            'require_scan_before_spin': True,
+            'require_odom_before_spin': True,
+            'require_amcl_before_spin': True,
+            'spin_speed_rad_s': float(localization['spin_speed_rad_s']),
+            'spin_target_angle_rad': float(localization['spin_target_angle_rad']),
+            'spin_timeout_sec': float(localization['spin_timeout_sec']),
+            'max_spin_retries': int(localization['max_spin_retries']),
+            'localization_cov_xy_threshold': float(localization['max_xy_covariance']),
+            'localization_cov_yaw_threshold': float(localization['max_yaw_covariance']),
+            'force_spin_after_sec': 25.0,
+        }],
+    )
 
 
 def _robot_state_publisher(ns: str, model: str) -> Node:
@@ -571,7 +741,40 @@ def _exploration_command(ns: str) -> str:
         '-p auto_start:=true '
         '-p coverage_front_only:=true '
         '-p coverage_fov_deg:=60.0 '
-        '-p view_fov_deg:=80.0'
+        '-p view_fov_deg:=80.0 '
+        # The explorer updates coverage at 10 Hz. Keep that data path intact,
+        # but avoid emitting two identical debug records every second.
+        '-p coverage_live_debug_throttle_sec:=10.0'
+    )
+
+
+def _region_graph_node(field_robot: dict) -> Node:
+    """Provide the region map consumed by the active Scout explorer.
+
+    The graph extractor is passive (it never publishes velocity commands), so
+    one system-level instance can safely serve whichever field robot owns the
+    ACTIVE_SCOUT lease.  Its TF seed follows field A, the initial lease owner.
+    """
+    ns = field_robot['namespace']
+    return Node(
+        package='region_mapper',
+        executable='slam_region_graph_node',
+        name='slam_region_graph',
+        output='screen',
+        parameters=[{
+            'use_sim_time': True,
+            'map_topic': '/map',
+            'global_frame': 'map',
+            'robot_frame': f'{ns}/base_footprint',
+            'region_map_topic': '/slam_region_graph/region_map',
+            'timer_period': 0.25,
+            'region_update_period': 1.0,
+            'map_stable_time': 0.60,
+            'force_update_without_map_delta': True,
+            'force_assign_all_free_to_regions': True,
+            'use_reachable_only': True,
+            'fallback_to_all_free_without_tf': False,
+        }],
     )
 
 
@@ -718,6 +921,11 @@ def generate_launch_description():
                 }],
             ),
         ]),
+        TimerAction(period=5.5, actions=[
+            _bootstrap_node(leader, localization),
+            _bootstrap_node(field_a, localization),
+            _bootstrap_node(field_b, localization),
+        ]),
         TimerAction(period=6.0, actions=[
             Node(
                 package='fleet_bringup',
@@ -764,6 +972,7 @@ def generate_launch_description():
                     'leader_cancel_topic': '/fleet/leader_nav_cancel',
                     'role_command_topic': '/fleet/field_robot_role_cmd',
                     'field_robot_status_topic': '/fleet/field_robot_status',
+                    'bootstrap_ready_topic': f"/{field_a['namespace']}/localization_ready",
                     'scout_liveness_timeout_sec': float(failover['scout_liveness_timeout_sec']),
                     'scout_failure_confirm_sec': float(failover['scout_failure_confirm_sec']),
                     'scout_pose_timeout_sec': float(failover['scout_pose_timeout_sec']),
@@ -792,6 +1001,7 @@ def generate_launch_description():
                     'map_topic': '/map',
                     'active_scout_robot_name': field_a['robot_name'],
                     'follower_robot_name': field_b['robot_name'],
+                    'localization_ready_topic': f"/{leader['namespace']}/localization_ready",
                     'scout_pose_timeout_sec': float(failover['scout_pose_timeout_sec']),
                     'startup_grace_sec': 6.0,
                     'leader_shadow_follow_distance_m': float(leader_cfg['shadow_distance_m']),
@@ -810,6 +1020,9 @@ def generate_launch_description():
                 respawn_delay=3.0,
             ),
         ]),
+        TimerAction(period=6.5, actions=[
+            _region_graph_node(field_a),
+        ]),
         TimerAction(period=7.0, actions=[
             Node(
                 package='system_bringup',
@@ -826,6 +1039,8 @@ def generate_launch_description():
                     'cmd_vel_topic': f"/{field_a['namespace']}/cmd_vel",
                     'amcl_pose_topic': f"/{field_a['namespace']}/amcl_pose",
                     'odom_topic': f"/{field_a['namespace']}/odom",
+                    'localization_ready_topic': f"/{field_a['namespace']}/localization_ready",
+                    'require_localization_ready': True,
                     'enable_follow_mode': True,
                     'enable_scout_mode': True,
                     'enable_recovery_mode': True,
@@ -859,6 +1074,8 @@ def generate_launch_description():
                     'cmd_vel_topic': f"/{field_b['namespace']}/cmd_vel",
                     'amcl_pose_topic': f"/{field_b['namespace']}/amcl_pose",
                     'odom_topic': f"/{field_b['namespace']}/odom",
+                    'localization_ready_topic': f"/{field_b['namespace']}/localization_ready",
+                    'require_localization_ready': True,
                     'enable_follow_mode': True,
                     'enable_scout_mode': True,
                     'enable_recovery_mode': True,

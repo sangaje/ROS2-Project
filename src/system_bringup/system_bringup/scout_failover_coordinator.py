@@ -10,13 +10,15 @@ epoch-based recovery role command to the unified field robot runtime.
 
 from __future__ import annotations
 
+from copy import deepcopy
+from enum import Enum
 import json
 import math
-from enum import Enum
+import time
 from typing import Optional
 
-import rclpy
 from geometry_msgs.msg import PoseStamped
+import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool, String
@@ -31,6 +33,56 @@ class FailoverState(Enum):
     FOLLOWER_SCOUT_TAKEOVER = 'FOLLOWER_SCOUT_TAKEOVER'
     NEW_SCOUT_EXPLORING = 'NEW_SCOUT_EXPLORING'
     FAILOVER_FAILED = 'FAILOVER_FAILED'
+
+
+def heartbeat_qos_profile() -> QoSProfile:
+    """Match the best-effort, volatile heartbeat endpoint in domain_bridge."""
+    return QoSProfile(
+        depth=5,
+        reliability=ReliabilityPolicy.BEST_EFFORT,
+        durability=DurabilityPolicy.VOLATILE,
+        history=HistoryPolicy.KEEP_LAST,
+    )
+
+
+def parse_epoch(value) -> Optional[int]:
+    """Return a non-negative integer epoch without silently truncating values."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit():
+            return int(text)
+    return None
+
+
+def is_finite_map_pose(msg: PoseStamped) -> bool:
+    """Validate the map-frame pose fields used by failover decisions."""
+    frame = str(msg.header.frame_id or '').strip().lstrip('/')
+    if frame != 'map':
+        return False
+    position = msg.pose.position
+    orientation = msg.pose.orientation
+    values = (
+        position.x,
+        position.y,
+        position.z,
+        orientation.x,
+        orientation.y,
+        orientation.z,
+        orientation.w,
+    )
+    if not all(math.isfinite(float(value)) for value in values):
+        return False
+    quaternion_norm_sq = (
+        float(orientation.x) ** 2
+        + float(orientation.y) ** 2
+        + float(orientation.z) ** 2
+        + float(orientation.w) ** 2
+    )
+    return quaternion_norm_sq > 1.0e-12
 
 
 def yaw_from_quaternion(q) -> float:
@@ -73,6 +125,8 @@ class ScoutFailoverCoordinator(Node):
         self.declare_parameter('scout_takeover_arrival_tolerance_m', 0.40)
         self.declare_parameter('recovery_goal_republish_sec', 2.0)
         self.declare_parameter('max_recovery_goal_republishes', 5)
+        self.declare_parameter('robot_pose_timeout_sec', 2.0)
+        self.declare_parameter('recovery_timeout_sec', 30.0)
 
         get = self.get_parameter
         self.enabled = bool(get('enable_scout_failover').value)
@@ -108,6 +162,8 @@ class ScoutFailoverCoordinator(Node):
         self.max_goal_republishes = max(
             1, int(get('max_recovery_goal_republishes').value)
         )
+        self.robot_pose_timeout = max(0.1, float(get('robot_pose_timeout_sec').value))
+        self.recovery_timeout = max(1.0, float(get('recovery_timeout_sec').value))
 
         latched_qos = QoSProfile(
             depth=1,
@@ -118,17 +174,30 @@ class ScoutFailoverCoordinator(Node):
 
         self.leader_goal_pub = self.create_publisher(PoseStamped, self.leader_goal_topic, 10)
         self.leader_cancel_pub = self.create_publisher(Bool, self.leader_cancel_topic, latched_qos)
-        self.follow_command_pub = self.create_publisher(String, self.follow_command_topic, latched_qos)
+        self.follow_command_pub = self.create_publisher(
+            String, self.follow_command_topic, latched_qos
+        )
         self.role_command_pub = self.create_publisher(String, self.role_command_topic, latched_qos)
         self.role_pub = self.create_publisher(String, self.role_topic, latched_qos)
         self.state_pub = self.create_publisher(String, '/failover/state', latched_qos)
-        self.active_scout_pub = self.create_publisher(String, '/failover/active_scout_id', latched_qos)
+        self.active_scout_pub = self.create_publisher(
+            String, '/failover/active_scout_id', latched_qos
+        )
         self.epoch_pub = self.create_publisher(String, '/failover/scout_epoch', latched_qos)
         self.scout_alive_pub = self.create_publisher(Bool, '/failover/scout_alive', latched_qos)
-        self.last_pose_pub = self.create_publisher(PoseStamped, '/failover/last_scout_pose', latched_qos)
-        self.failure_pose_pub = self.create_publisher(PoseStamped, '/failover/failure_pose', latched_qos)
+        self.last_pose_pub = self.create_publisher(
+            PoseStamped, '/failover/last_scout_pose', latched_qos
+        )
+        self.failure_pose_pub = self.create_publisher(
+            PoseStamped, '/failover/failure_pose', latched_qos
+        )
 
-        self.create_subscription(String, self.scout_liveness_topic, self._on_liveness, 10)
+        self.create_subscription(
+            String,
+            self.scout_liveness_topic,
+            self._on_liveness,
+            heartbeat_qos_profile(),
+        )
         self.create_subscription(PoseStamped, self.scout_pose_topic, self._on_scout_pose, 10)
         self.create_subscription(PoseStamped, self.leader_pose_topic, self._on_leader_pose, 10)
         self.create_subscription(PoseStamped, self.follower_pose_topic, self._on_follower_pose, 10)
@@ -144,12 +213,17 @@ class ScoutFailoverCoordinator(Node):
         self.state = FailoverState.NORMAL_OPERATION
         self.start_wall = self._now()
         self.bootstrap_ready = not self.require_bootstrap_complete
+        self.bootstrap_ready_wall: Optional[float] = (
+            self.start_wall if self.bootstrap_ready else None
+        )
         self.last_liveness_wall: Optional[float] = None
         self.last_scout_pose_wall: Optional[float] = None
         self.last_scout_pose: Optional[PoseStamped] = None
         self.failure_pose: Optional[PoseStamped] = None
         self.leader_pose: Optional[PoseStamped] = None
+        self.leader_pose_wall: Optional[float] = None
         self.follower_pose: Optional[PoseStamped] = None
+        self.follower_pose_wall: Optional[float] = None
         self.suspected_since: Optional[float] = None
         self.scout_epoch = 0
         self.recovery_goal_publish_count = 0
@@ -157,6 +231,7 @@ class ScoutFailoverCoordinator(Node):
         self.leader_goal: Optional[PoseStamped] = None
         self.follower_goal: Optional[PoseStamped] = None
         self.leader_recovery_position_reached = False
+        self.recovery_started_wall: Optional[float] = None
 
         self.create_timer(0.2, self._tick)
         self._publish_state()
@@ -168,13 +243,33 @@ class ScoutFailoverCoordinator(Node):
         )
 
     def _now(self) -> float:
-        return self.get_clock().now().nanoseconds * 1.0e-9
+        return time.monotonic()
 
-    def _on_liveness(self, _msg: String) -> None:
-        if self.state in (
-            FailoverState.FOLLOWER_SCOUT_TAKEOVER,
-            FailoverState.NEW_SCOUT_EXPLORING,
+    def _on_liveness(self, msg: String) -> None:
+        if self.state not in (
+            FailoverState.NORMAL_OPERATION,
+            FailoverState.SCOUT_SUSPECTED_DEAD,
         ):
+            return
+        try:
+            data = json.loads(msg.data)
+        except (json.JSONDecodeError, TypeError):
+            self.get_logger().warning(
+                '[FAILOVER] HEARTBEAT_IGNORED malformed_json',
+                throttle_duration_sec=5.0,
+            )
+            return
+        if not isinstance(data, dict):
+            return
+        epoch = parse_epoch(data.get('epoch'))
+        robot = str(data.get('robot', '')).strip()
+        if epoch is None:
+            self.get_logger().warning(
+                '[FAILOVER] HEARTBEAT_IGNORED malformed_epoch',
+                throttle_duration_sec=5.0,
+            )
+            return
+        if epoch != self.scout_epoch or robot != self.active_scout_id:
             return
         self.last_liveness_wall = self._now()
         if self.state == FailoverState.SCOUT_SUSPECTED_DEAD:
@@ -182,9 +277,9 @@ class ScoutFailoverCoordinator(Node):
             self.suspected_since = None
 
     def _on_scout_pose(self, msg: PoseStamped) -> None:
-        if (msg.header.frame_id or 'map') != 'map':
+        if not is_finite_map_pose(msg):
             self.get_logger().warning(
-                f'[FAILOVER] SCOUT_POSE_IGNORED frame={msg.header.frame_id!r}',
+                f'[FAILOVER] SCOUT_POSE_IGNORED invalid_pose frame={msg.header.frame_id!r}',
                 throttle_duration_sec=5.0,
             )
             return
@@ -195,14 +290,32 @@ class ScoutFailoverCoordinator(Node):
         self.last_pose_pub.publish(msg)
 
     def _on_leader_pose(self, msg: PoseStamped) -> None:
+        if not is_finite_map_pose(msg):
+            self.get_logger().warning(
+                f'[FAILOVER] LEADER_POSE_IGNORED invalid_pose frame={msg.header.frame_id!r}',
+                throttle_duration_sec=5.0,
+            )
+            return
         self.leader_pose = msg
+        self.leader_pose_wall = self._now()
 
     def _on_follower_pose(self, msg: PoseStamped) -> None:
+        if not is_finite_map_pose(msg):
+            self.get_logger().warning(
+                f'[FAILOVER] FOLLOWER_POSE_IGNORED invalid_pose frame={msg.header.frame_id!r}',
+                throttle_duration_sec=5.0,
+            )
+            return
         self.follower_pose = msg
+        self.follower_pose_wall = self._now()
 
     def _on_bootstrap_ready(self, msg: Bool) -> None:
         previous = self.bootstrap_ready
         self.bootstrap_ready = bool(msg.data)
+        if self.bootstrap_ready and not previous:
+            self.bootstrap_ready_wall = self._now()
+        elif not self.bootstrap_ready:
+            self.bootstrap_ready_wall = None
         if self.bootstrap_ready and not previous:
             self.get_logger().warning(
                 f'[FAILOVER] BOOTSTRAP_READY | topic={self.bootstrap_ready_topic}'
@@ -211,39 +324,42 @@ class ScoutFailoverCoordinator(Node):
     def _on_field_status(self, msg: String) -> None:
         try:
             data = json.loads(msg.data)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, TypeError):
             return
-        if int(data.get('epoch', -1)) != self.scout_epoch:
+        if not isinstance(data, dict):
+            return
+        epoch = parse_epoch(data.get('epoch'))
+        if epoch is None:
+            self.get_logger().warning(
+                '[FAILOVER] FIELD_STATUS_IGNORED malformed_epoch',
+                throttle_duration_sec=5.0,
+            )
+            return
+        if epoch != self.scout_epoch:
+            return
+        if self.state != FailoverState.FOLLOWER_SCOUT_TAKEOVER:
             return
         if self.require_bootstrap_complete and not self.bootstrap_ready:
             return
-        status = str(data.get('status', '')).upper()
-        if status == 'ACTIVE_SCOUT':
-            robot = str(data.get('robot', self.follower_name))
-            # unified_field_robot republishes its status at 10 Hz, so this
-            # callback fires continuously while a scout stays ACTIVE_SCOUT --
-            # only log/transition on the actual edge into that role, not on
-            # every repeat message, or this spams the log forever.
-            already_resumed = (
-                self.state == FailoverState.NEW_SCOUT_EXPLORING
-                and self.active_scout_id == robot
-            )
-            self.active_scout_id = robot
-            self._publish_role()
-            if already_resumed:
-                return
-            self._transition(FailoverState.NEW_SCOUT_EXPLORING)
-            self.get_logger().warning(
-                '[FAILOVER] EXPLORATION_RESUMED | '
-                f'active_scout={self.active_scout_id} epoch={self.scout_epoch}'
-            )
+        status = str(data.get('status', '')).strip().upper()
+        robot = str(data.get('robot', '')).strip()
+        if status != 'ACTIVE_SCOUT' or robot != self.follower_name:
+            return
+        self.active_scout_id = robot
+        self._transition(FailoverState.NEW_SCOUT_EXPLORING)
+        self._publish_role()
+        self.get_logger().warning(
+            '[FAILOVER] EXPLORATION_RESUMED | '
+            f'active_scout={self.active_scout_id} epoch={self.scout_epoch}'
+        )
 
     def _tick(self) -> None:
         self._publish_state()
         self._publish_role()
         if not self.enabled:
             return
-        if self._now() - self.start_wall < self.startup_grace:
+        now = self._now()
+        if now - self.start_wall < self.startup_grace:
             return
         if self.require_bootstrap_complete and not self.bootstrap_ready:
             self.get_logger().info(
@@ -254,52 +370,81 @@ class ScoutFailoverCoordinator(Node):
             return
 
         if self.state == FailoverState.NORMAL_OPERATION:
-            self._check_liveness()
+            self._check_liveness(now=now)
         elif self.state == FailoverState.SCOUT_SUSPECTED_DEAD:
-            self._confirm_or_recover()
+            self._confirm_or_recover(now=now)
         elif self.state in (
             FailoverState.FAILOVER_TRIGGERED,
             FailoverState.RECOVERY_NAVIGATING,
         ):
-            self._recovery_loop()
-    def _check_liveness(self) -> None:
+            self._recovery_loop(now=now)
+
+    def _watchdog_arm_wall(self) -> Optional[float]:
+        if self.require_bootstrap_complete and self.bootstrap_ready_wall is None:
+            return None
+        ready_wall = self.bootstrap_ready_wall
+        if ready_wall is None:
+            ready_wall = self.start_wall
+        return max(self.start_wall + self.startup_grace, ready_wall)
+
+    def _check_liveness(self, now: Optional[float] = None) -> None:
+        now = self._now() if now is None else now
+        arm_wall = self._watchdog_arm_wall()
+        if arm_wall is None:
+            return
+        reference_wall = arm_wall
+        if self.last_liveness_wall is not None:
+            reference_wall = max(reference_wall, self.last_liveness_wall)
+        age = now - reference_wall
+        if age <= self.liveness_timeout:
+            if self.last_liveness_wall is None:
+                self.get_logger().info(
+                    '[FAILOVER] WAIT_SCOUT_HEARTBEAT',
+                    throttle_duration_sec=5.0,
+                )
+            return
         if self.last_liveness_wall is None:
             self.get_logger().info(
-                '[FAILOVER] WAIT_SCOUT_HEARTBEAT',
-                throttle_duration_sec=5.0,
+                '[FAILOVER] INITIAL_SCOUT_HEARTBEAT_TIMEOUT'
             )
-            return
-        age = self._now() - self.last_liveness_wall
-        if age <= self.liveness_timeout:
-            return
-        self.suspected_since = self._now()
+        self.suspected_since = now
         self.get_logger().warning(
             '[FAILOVER] SCOUT_HEARTBEAT_LOST | '
             f'age={age:.2f}s timeout={self.liveness_timeout:.2f}s'
         )
         self._transition(FailoverState.SCOUT_SUSPECTED_DEAD)
 
-    def _confirm_or_recover(self) -> None:
+    def _confirm_or_recover(self, now: Optional[float] = None) -> None:
+        now = self._now() if now is None else now
         if self.last_liveness_wall is not None:
-            age = self._now() - self.last_liveness_wall
+            age = now - self.last_liveness_wall
             if age <= self.liveness_timeout:
                 self.suspected_since = None
                 self._transition(FailoverState.NORMAL_OPERATION)
                 return
         if self.suspected_since is None:
-            self.suspected_since = self._now()
+            self.suspected_since = now
             return
-        if self._now() - self.suspected_since < self.confirm_sec:
+        if now - self.suspected_since < self.confirm_sec:
             return
-        self._confirm_dead()
+        self._confirm_dead(now=now)
 
-    def _confirm_dead(self) -> None:
+    def _confirm_dead(self, now: Optional[float] = None) -> None:
+        if self.state != FailoverState.SCOUT_SUSPECTED_DEAD:
+            return
+        if self.failure_pose is not None:
+            return
+        now = self._now() if now is None else now
         if self.last_scout_pose is None or self.last_scout_pose_wall is None:
             self.get_logger().error('[FAILOVER] FAILED | no scout pose cached')
             self._transition(FailoverState.FAILOVER_FAILED)
             return
-        pose_age = self._now() - self.last_scout_pose_wall
-        if pose_age > self.pose_timeout:
+        pose_age = now - self.last_scout_pose_wall
+        if (
+            pose_age < 0.0
+            or pose_age > self.pose_timeout
+            or not is_finite_map_pose(self.last_scout_pose)
+        ):
             self.get_logger().error(
                 '[FAILOVER] FAILED | stale scout pose '
                 f'age={pose_age:.2f}s max={self.pose_timeout:.2f}s'
@@ -328,6 +473,11 @@ class ScoutFailoverCoordinator(Node):
         self._trigger_failover()
 
     def _trigger_failover(self) -> None:
+        if self.state != FailoverState.SCOUT_DEAD_CONFIRMED:
+            return
+        if self.recovery_started_wall is not None:
+            return
+        self.recovery_started_wall = self._now()
         self._cancel_leader_goal()
         command = String()
         command.data = 'PAUSE'
@@ -336,11 +486,23 @@ class ScoutFailoverCoordinator(Node):
         self._transition(FailoverState.FAILOVER_TRIGGERED)
         self._recovery_loop(force=True)
 
-    def _recovery_loop(self, force: bool = False) -> None:
+    def _recovery_loop(
+        self,
+        force: bool = False,
+        now: Optional[float] = None,
+    ) -> None:
         if self.failure_pose is None or self.leader_goal is None or self.follower_goal is None:
-            self._transition(FailoverState.FAILOVER_FAILED)
+            self._fail_recovery('missing recovery pose')
             return
-        now = self._now()
+        now = self._now() if now is None else now
+        if self.recovery_started_wall is None:
+            self.recovery_started_wall = now
+        recovery_age = now - self.recovery_started_wall
+        if recovery_age < 0.0 or recovery_age >= self.recovery_timeout:
+            self._fail_recovery(
+                f'recovery timeout age={recovery_age:.2f}s max={self.recovery_timeout:.2f}s'
+            )
+            return
         should_publish = force or (
             now - self.last_recovery_goal_wall >= self.goal_republish_sec
             and self.recovery_goal_publish_count < self.max_goal_republishes
@@ -369,11 +531,52 @@ class ScoutFailoverCoordinator(Node):
             )
             self._transition(FailoverState.RECOVERY_NAVIGATING)
 
-        if self._follower_arrived():
+        if self._follower_arrived(now=now):
             self.get_logger().warning('[FAILOVER] FOLLOWER_ARRIVED')
             self._transition(FailoverState.FOLLOWER_SCOUT_TAKEOVER)
-    def _follower_arrived(self) -> bool:
+
+    def _fail_recovery(self, reason: str) -> None:
+        if self.state == FailoverState.FAILOVER_FAILED:
+            return
+        self.get_logger().error(f'[FAILOVER] FAILED | {reason}')
+        if self.recovery_started_wall is not None:
+            self._cancel_leader_goal()
+            self._publish_terminal_role_command(reason)
+        self._transition(FailoverState.FAILOVER_FAILED)
+
+    def _publish_terminal_role_command(self, reason: str) -> None:
+        data = {
+            'role': 'FAILED',
+            'epoch': self.scout_epoch,
+            'robot': self.follower_name,
+            'reason': reason,
+        }
+        msg = String()
+        msg.data = json.dumps(data, sort_keys=True)
+        self.role_command_pub.publish(msg)
+
+    def _pose_is_fresh(
+        self,
+        receipt_wall: Optional[float],
+        timeout: float,
+        now: Optional[float] = None,
+    ) -> bool:
+        if receipt_wall is None:
+            return False
+        now = self._now() if now is None else now
+        age = now - receipt_wall
+        return 0.0 <= age <= timeout
+
+    def _follower_arrived(self, now: Optional[float] = None) -> bool:
         if self.follower_pose is None or self.failure_pose is None:
+            return False
+        if not is_finite_map_pose(self.follower_pose):
+            return False
+        if not self._pose_is_fresh(
+            self.follower_pose_wall,
+            self.robot_pose_timeout,
+            now=now,
+        ):
             return False
         dx = self.follower_pose.pose.position.x - self.failure_pose.pose.position.x
         dy = self.follower_pose.pose.position.y - self.failure_pose.pose.position.y
@@ -381,6 +584,13 @@ class ScoutFailoverCoordinator(Node):
 
     def _leader_already_near_failure(self) -> bool:
         if self.leader_pose is None or self.failure_pose is None:
+            return False
+        if not is_finite_map_pose(self.leader_pose):
+            return False
+        if not self._pose_is_fresh(
+            self.leader_pose_wall,
+            self.robot_pose_timeout,
+        ):
             return False
         dx = self.leader_pose.pose.position.x - self.failure_pose.pose.position.x
         dy = self.leader_pose.pose.position.y - self.failure_pose.pose.position.y
@@ -464,7 +674,7 @@ class ScoutFailoverCoordinator(Node):
         msg = PoseStamped()
         msg.header.frame_id = source.header.frame_id or 'map'
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.pose = source.pose
+        msg.pose = deepcopy(source.pose)
         return msg
 
     def _offset_pose(self, failure: PoseStamped, standoff: float) -> PoseStamped:

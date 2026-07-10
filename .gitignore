@@ -18,9 +18,7 @@ log/
 .vscode/
 .idea/
 
-rl_*
-
-# RL model/checkpoint outputs
+# RL model/checkpoint outputs (directories only -- rl_policy_contract.py etc. are source)
 rl_models*/
 rl_*/
 *.pkl

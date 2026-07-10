@@ -26,8 +26,8 @@ State machine:
          before the robot has moved at all)
       -> SPIN (odometry-yaw-integrated, not time-based) -> SETTLE
       -> CHECK_LOCALIZATION -> READY_FOR_NAV
-                             -> RETRY_SPIN (legacy bounded branch; never
-                                republishes /initialpose in this startup)
+                             -> RETRY_SPIN (bounded; never republishes
+                                /initialpose in this startup)
                              -> FAIL_SAFE
 
 Once READY_FOR_NAV is reached the `ready` topic latches true permanently.
@@ -142,19 +142,16 @@ class GlobalLocalizeKickstart(Node):
         self.declare_parameter('localization_cov_yaw_threshold', 0.25)
         self.declare_parameter('localization_stable_duration_sec', 1.5)
         self.declare_parameter('localization_check_timeout_sec', 7.0)
+        self.declare_parameter('max_amcl_pose_age_sec', 1.5)
 
         self.declare_parameter('max_spin_retries', 2)
         self.declare_parameter('amcl_active_poll_period_sec', 1.0)
         self.declare_parameter('max_scan_age_sec', 1.0)
         self.declare_parameter('max_odom_age_sec', 1.0)
         self.declare_parameter('tick_period_sec', 0.1)
-        # Master guarantee: no matter which WAIT_* precondition is stuck
-        # (map/AMCL-active/scan/odom/TF), the spin gets attempted anyway
-        # once this much time has passed since this node started. Getting
-        # the preconditions right is *preferred* -- spinning against a
-        # real map with fresh sensors converges better -- but this node's
-        # one non-negotiable job is to eventually spin and let Nav2 through,
-        # not to wait forever for a perfect precondition that never arrives.
+        # Compatibility name retained for launch files.  This is now a hard
+        # prerequisite deadline, not permission to spin without the sensors
+        # needed to verify that rotation and localization actually worked.
         self.declare_parameter('force_spin_after_sec', 20.0)
 
         get = self.get_parameter
@@ -214,6 +211,21 @@ class GlobalLocalizeKickstart(Node):
         )
         self.check_timeout_sec = max(
             0.0, float(get('localization_check_timeout_sec').value)
+        )
+        requested_amcl_pose_age = max(
+            0.1, float(get('max_amcl_pose_age_sec').value)
+        )
+        # AMCL commonly publishes only after motion exceeds update_min_*.
+        # Therefore the last covariance observed at the end of SPIN must
+        # remain valid through SETTLE plus the stability window; otherwise a
+        # successful stop creates a circular wait for a pose update that
+        # itself requires more motion and every verified spin is retried.
+        minimum_evidence_age = (
+            self.settle_duration_sec + self.stable_duration_sec + 0.5
+        )
+        self.max_amcl_pose_age_sec = max(
+            requested_amcl_pose_age,
+            minimum_evidence_age,
         )
 
         self.max_spin_retries = max(0, int(get('max_spin_retries').value))
@@ -283,7 +295,6 @@ class GlobalLocalizeKickstart(Node):
         self._amcl_state_call_in_flight = False
         self._last_amcl_poll_wall = 0.0
         self.node_start_wall = self._now()
-        self._forced_spin = False
         self.amcl_active = not self.require_amcl_before_spin
 
         self.last_scan_wall: Optional[float] = None
@@ -302,6 +313,7 @@ class GlobalLocalizeKickstart(Node):
         self.check_start_wall = 0.0
         self.good_since_wall: Optional[float] = None
         self.last_pose_cov = None
+        self.last_pose_cov_wall: Optional[float] = None
         self.done = False
         self.bootstrap_started = True
         self.initial_pose_seeded = False
@@ -381,7 +393,10 @@ class GlobalLocalizeKickstart(Node):
         yaw = yaw_from_quaternion(msg.pose.pose.orientation)
         if self.state == State.SPIN and self.last_odom_yaw is not None:
             delta = wrap_angle(yaw - self.last_odom_yaw)
-            self.accumulated_yaw += abs(delta)
+            # Count net odometry rotation in the commanded direction.  Using
+            # abs(delta) lets oscillation or yaw noise add up to a false 360
+            # degree completion even when the robot never turns around once.
+            self.accumulated_yaw += self.spin_direction * delta
         self.last_odom_yaw = yaw
         self.last_odom_xy = (
             msg.pose.pose.position.x, msg.pose.pose.position.y,
@@ -415,6 +430,7 @@ class GlobalLocalizeKickstart(Node):
             'x': float(msg.pose.pose.position.x),
             'y': float(msg.pose.pose.position.y),
         }
+        self.last_pose_cov_wall = self._now()
 
     # -- shared helpers -----------------------------------------------------
 
@@ -514,10 +530,14 @@ class GlobalLocalizeKickstart(Node):
         return None
 
     def _covariance_ok(self) -> bool:
-        if self.last_pose_cov is None:
+        if self.last_pose_cov is None or self.last_pose_cov_wall is None:
+            return False
+        if self._now() - self.last_pose_cov_wall > self.max_amcl_pose_age_sec:
             return False
         return (
-            self.last_pose_cov['xy_cov'] <= self.cov_xy_threshold
+            self.last_pose_cov['xy_cov'] >= 0.0
+            and self.last_pose_cov['yaw_cov'] >= 0.0
+            and self.last_pose_cov['xy_cov'] <= self.cov_xy_threshold
             and self.last_pose_cov['yaw_cov'] <= self.cov_yaw_threshold
         )
 
@@ -567,9 +587,15 @@ class GlobalLocalizeKickstart(Node):
     # -- state entry hooks ----------------------------------------------
 
     def _on_enter_ready_for_nav(self) -> None:
-        if self.spin_enabled and not self.initial_spin_completed:
+        if not self.initial_spin_completed:
             self.get_logger().error(
-                '[BOOTSTRAP] READY_BLOCKED | spin did not complete'
+                '[BOOTSTRAP] READY_BLOCKED | verified odometry spin did not complete'
+            )
+            self._transition(State.FAIL_SAFE)
+            return
+        if not self._update_stability_tracking():
+            self.get_logger().error(
+                '[BOOTSTRAP] READY_BLOCKED | AMCL covariance is not fresh and stable'
             )
             self._transition(State.FAIL_SAFE)
             return
@@ -607,29 +633,60 @@ class GlobalLocalizeKickstart(Node):
         State.CHECK_LOCALIZATION_QUALITY,
     )
 
+    def _mandatory_spin_prerequisite_failures(self) -> list[str]:
+        failures = []
+        if self.require_valid_map and not self.map_received:
+            failures.append('valid_map')
+        if self.require_amcl_before_spin and not self.amcl_active:
+            failures.append('amcl_active')
+        if self.require_scan_before_spin and not self._scan_fresh():
+            failures.append('fresh_scan')
+        if self.require_odom_before_spin and not self._odom_fresh():
+            failures.append('fresh_odom')
+        if self.state == State.WAIT_TF and not self._tf_ok():
+            failures.append('map_to_base_tf')
+        if self.reinit_in_flight:
+            failures.append('reinitialize_response')
+        if self.spin_enabled and self.spin_target_angle + self.spin_margin <= 0.0:
+            failures.append('positive_spin_target')
+        return failures
+
+    def _retry_or_fail(self, reason: str) -> None:
+        """Schedule one bounded retry, or latch FAIL_SAFE when exhausted."""
+        self._publish_twist(0.0)
+        self.good_since_wall = None
+        if self.retry_count >= self.max_spin_retries:
+            self.get_logger().error(
+                'GLOBAL_LOCALIZE_RETRIES_EXHAUSTED | '
+                f'reason={reason} retries={self.retry_count}/{self.max_spin_retries}'
+            )
+            self._transition(State.FAIL_SAFE)
+            return
+        self.retry_count += 1
+        self.get_logger().warning(
+            'GLOBAL_LOCALIZE_RETRY_SCHEDULED | '
+            f'reason={reason} retry={self.retry_count}/{self.max_spin_retries}'
+        )
+        self._transition(State.RETRY_SPIN)
+
     def _tick(self) -> None:
         if self.done:
             return
         if self.localization_bootstrap_completed or self.bootstrap_failed:
             return
         if (
-            not self._forced_spin
-            and self.state in self._PRE_SPIN_STATES
-            and self.map_received
-            and self.amcl_active
+            self.state in self._PRE_SPIN_STATES
             and self._now() - self.node_start_wall >= self.force_spin_after_sec
         ):
-            self._forced_spin = True
-            self.get_logger().error(
-                'GLOBAL_LOCALIZE_FORCE_SPIN | '
-                f'stuck in {self.state.name} for '
-                f'{self.force_spin_after_sec:.0f}s+ since startup -- forcing '
-                'the spin attempt anyway. Blocking condition snapshot: '
-                f'map_received={self.map_received} '
-                f'scan_fresh={self._scan_fresh()} '
-                f'odom_fresh={self._odom_fresh()} tf_ok={self._tf_ok()}'
-            )
-            self._transition(State.CHECK_LOCALIZATION_QUALITY)
+            failures = self._mandatory_spin_prerequisite_failures()
+            if failures:
+                self.get_logger().error(
+                    'GLOBAL_LOCALIZE_PREREQUISITE_TIMEOUT | '
+                    f'state={self.state.name} deadline={self.force_spin_after_sec:.1f}s '
+                    f'missing={",".join(failures)}; refusing unverified spin'
+                )
+                self._transition(State.FAIL_SAFE)
+                return
         getattr(self, f'_tick_{self.state.name.lower()}')()
 
     def _tick_wait_map(self) -> None:
@@ -667,6 +724,8 @@ class GlobalLocalizeKickstart(Node):
 
     def _on_amcl_get_state(self, future) -> None:
         self._amcl_state_call_in_flight = False
+        if self.done or self.state != State.WAIT_AMCL_ACTIVE:
+            return
         try:
             result = future.result()
         except Exception as error:  # noqa: BLE001
@@ -814,6 +873,14 @@ class GlobalLocalizeKickstart(Node):
     def _start_spin(self) -> None:
         if self.reinit_in_flight:
             return
+        failures = self._mandatory_spin_prerequisite_failures()
+        if failures:
+            self.get_logger().error(
+                'GLOBAL_LOCALIZE_SPIN_PREREQUISITE_MISSING | '
+                f'missing={",".join(failures)}'
+            )
+            self._transition(State.FAIL_SAFE)
+            return
         if self._seeded_this_attempt:
             # Already seeded map-frame pose via /initialpose this attempt --
             # go straight to spinning instead of also blindly scattering
@@ -837,6 +904,13 @@ class GlobalLocalizeKickstart(Node):
             self._begin_spin()
             return
         if not self.reinit_client.service_is_ready():
+            if self._now() - self.node_start_wall >= self.force_spin_after_sec:
+                self.get_logger().error(
+                    'GLOBAL_LOCALIZE_REINIT_SERVICE_TIMEOUT | '
+                    f'service={self.reinit_service_name}; refusing unverified spin'
+                )
+                self._transition(State.FAIL_SAFE)
+                return
             self.get_logger().info(
                 'GLOBAL_LOCALIZE_WAIT_REINIT_SERVICE | '
                 f'{self.reinit_service_name} not ready',
@@ -854,11 +928,16 @@ class GlobalLocalizeKickstart(Node):
 
     def _on_reinitialized(self, future) -> None:
         self.reinit_in_flight = False
+        if self.done or self.state not in (
+            State.CHECK_LOCALIZATION_QUALITY,
+            State.RETRY_SPIN,
+        ):
+            return
         try:
             future.result()
         except Exception as error:  # noqa: BLE001
             self.get_logger().error(f'GLOBAL_LOCALIZE_REINIT_FAILED | {error}')
-            self.total_attempts -= 1
+            self._retry_or_fail('reinitialize_failed')
             return
         self.get_logger().warning(
             f'GLOBAL_LOCALIZE_REINITIALIZED | attempt={self.total_attempts}'
@@ -874,8 +953,10 @@ class GlobalLocalizeKickstart(Node):
         self._spin_motion_detected = False
         self.spin_start_wall = self._now()
         if not self.spin_enabled:
-            self.settle_start_wall = self._now()
-            self._transition(State.SETTLE)
+            self.get_logger().error(
+                '[BOOTSTRAP] SPIN_DISABLED | verified odometry spin is required'
+            )
+            self._transition(State.FAIL_SAFE)
             return
         self.get_logger().warning(
             '[BOOTSTRAP] SPIN_START | '
@@ -911,10 +992,10 @@ class GlobalLocalizeKickstart(Node):
             else:
                 fallback = State.WAIT_ODOM
             self.get_logger().warning(
-                'GLOBAL_LOCALIZE_SPIN_PAUSED | scan/odom dropped out mid-spin, '
-                f'falling back to {fallback.name} (not counted as a failed attempt)'
+                'GLOBAL_LOCALIZE_SPIN_ABORTED | scan/odom dropped out mid-spin, '
+                f'last_required={fallback.name}'
             )
-            self._transition(fallback)
+            self._retry_or_fail('sensor_dropout')
             return
 
         if self.spin_start_xy is not None and self.last_odom_xy is not None:
@@ -982,7 +1063,7 @@ class GlobalLocalizeKickstart(Node):
                 f'rotated={rotated_deg:.0f}deg of '
                 f'{math.degrees(target):.0f}deg'
             )
-            self._transition(State.FAIL_SAFE)
+            self._retry_or_fail('spin_timeout')
             return
 
         while (
@@ -1027,18 +1108,11 @@ class GlobalLocalizeKickstart(Node):
                     f'xy_cov={self.last_pose_cov["xy_cov"]:.4f} '
                     f'yaw_cov={self.last_pose_cov["yaw_cov"]:.4f}'
                 )
-                if self.initial_spin_completed:
-                    self.get_logger().warning(
-                        '[BOOTSTRAP] COVARIANCE_NOT_STABLE_AFTER_SPIN | '
-                        f'{cov_text}; releasing Nav2 after verified 360deg spin'
-                    )
-                    self._transition(State.READY_FOR_NAV)
-                    return
             self.get_logger().warning(
                 f'GLOBAL_LOCALIZE_NOT_CONVERGED | attempt={self.total_attempts} '
                 f'{cov_text}'
             )
-            self._transition(State.FAIL_SAFE)
+            self._retry_or_fail('covariance_not_stable')
 
     def _tick_retry_spin(self) -> None:
         if self.retry_count > self.max_spin_retries:
