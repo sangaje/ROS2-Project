@@ -193,11 +193,15 @@ class LeaderUnifiedDashboard(Node):
             ),
         }
 
+        # /map is published by map_relay with both TRANSIENT_LOCAL and
+        # VOLATILE writers.  Request VOLATILE here: it is compatible with
+        # both writers, while a TRANSIENT_LOCAL subscription silently misses
+        # the live volatile Cartographer/map-relay updates.
         grid_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            durability=DurabilityPolicy.VOLATILE,
         )
         latest_best_effort_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
