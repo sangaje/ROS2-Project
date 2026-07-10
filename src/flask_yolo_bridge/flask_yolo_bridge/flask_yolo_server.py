@@ -347,7 +347,7 @@ def _draw_yolo_overlay(frame, detections, latency_ms):
         )
     cv2.putText(
         output,
-        f'people={len(detections)} inference={latency_ms:.1f}ms',
+        f'dolls={len(detections)} inference={latency_ms:.1f}ms',
         (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 255), 2,
     )
     if not detections:
@@ -485,6 +485,21 @@ def build_app(args):
         print(f'[flask_yolo_server] warmup failed: {exc}', flush=True)
     state = DebugState()
     runtime = {'warmup_ms': warmup_ms}
+
+    def update_debug_overlay(frame, width, height, capture_age_ms, status_text):
+        """Keep the overlay MJPEG stream live before/without inference."""
+        import cv2
+
+        overlay = _draw_yolo_overlay(frame, [], 0.0)
+        cv2.putText(
+            overlay, status_text, (10, 82),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 180, 255), 2,
+        )
+        state.update_yolo(
+            _encode_jpeg(overlay, args.debug_jpeg_quality),
+            0, 0.0, width, height, capture_age_ms,
+            detections=[],
+        )
 
     class InferenceWorker:
         def __init__(self):
@@ -658,8 +673,10 @@ def build_app(args):
 
         # Keep the debug camera view live even when this frame is too old or YOLO is busy.
         state.update_raw(original_jpeg, int(w), int(h), capture_age_ms)
+        update_debug_overlay(frame, int(w), int(h), capture_age_ms, 'YOLO QUEUED')
 
         if args.max_capture_age_sec > 0.0 and raw_age_sec > args.max_capture_age_sec:
+            update_debug_overlay(frame, int(w), int(h), capture_age_ms, 'YOLO STALE FRAME')
             return jsonify({
                 'ok': False,
                 'stale': True,
@@ -673,6 +690,7 @@ def build_app(args):
             results, input_shape, predict_ms = inference_worker.infer(frame)
         except InferenceBusyError as exc:
             busy_age_sec = _request_capture_age_sec(request)
+            update_debug_overlay(frame, int(w), int(h), capture_age_ms, 'YOLO BUSY - RETRYING')
             return jsonify({
                 'ok': False,
                 'stale': True,
@@ -682,6 +700,7 @@ def build_app(args):
                 'detections': [],
             })
         except Exception as exc:
+            update_debug_overlay(frame, int(w), int(h), capture_age_ms, 'YOLO INFERENCE ERROR')
             return jsonify({'ok': False, 'error': f'YOLO inference failed: {exc}'}), 500
 
         t_post0 = time.perf_counter()

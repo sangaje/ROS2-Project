@@ -407,7 +407,7 @@ class LeaderUnifiedDashboard(Node):
                 try:
                     with urllib.request.urlopen(url, timeout=2.0) as upstream:
                         while True:
-                            chunk = upstream.read(65536)
+                            chunk = upstream.read(8192)
                             if not chunk:
                                 break
                             yield chunk
@@ -423,6 +423,7 @@ class LeaderUnifiedDashboard(Node):
                 mimetype='multipart/x-mixed-replace; boundary=frame',
             )
             response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+            response.headers['X-Accel-Buffering'] = 'no'
             return response
 
         return app
