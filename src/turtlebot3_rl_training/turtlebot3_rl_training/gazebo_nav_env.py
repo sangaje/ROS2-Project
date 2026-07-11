@@ -2673,27 +2673,26 @@ class GazeboNavEnv(gym.Env):
             # scaling both axes together, which just makes bigger blobs, not
             # longer ones. yaw below still randomizes which way each points,
             # so the long axis doesn't need to be biased toward x or y.
-            # v137: another size bump on top of v136 -- room interior is
-            # roughly 12.7m x 6.7m (half-extents ~6.33/~3.33 after the wall
-            # margin below), so a 4.2m-long beam or a 2.9m blob still fits
-            # with room to spare even when the wall clamp pins its center
-            # near the room's edge.
+            # v137: another size bump on top of v136 pushed blob/panel maxima
+            # to 2.90/4.2m. v139 measured (by replaying this exact placement
+            # loop) that this only leaves room for ~25-26 of the requested
+            # 50-60 obstacles to actually fit -- the room runs out of
+            # clearance-satisfying space, not placement attempts. v140 pulls
+            # the ceiling back down specifically to raise the *actually
+            # placed* count (measured ~47 avg with these numbers, vs ~26
+            # before) while still keeping obstacles meaningfully bigger/
+            # longer than the original v135 sizes (1.65/3.2m).
             shape = random.choice(("box", "box", "cylinder", "ellipsoid", "ellipsoid", "capsule"))
             if shape != "cylinder" and random.random() < 0.35:
-                long_len = random.uniform(2.2, 4.2)
-                short_len = random.uniform(0.10, 0.45)
+                long_len = random.uniform(1.4, 2.4)
+                short_len = random.uniform(0.10, 0.35)
                 if random.random() < 0.5:
                     sx, sy = long_len, short_len
                 else:
                     sx, sy = short_len, long_len
             else:
-                # Kept short of the 4.2m long-panel ceiling on purpose: this
-                # branch samples sx/sy independently, so pushing it that high
-                # would let a "blob" (box/ellipsoid/capsule, roughly equal on
-                # both axes) reach ~4.2m square and eat well over half the
-                # room's 6.66m width by itself.
-                sx = random.uniform(0.08, 2.90)
-                sy = random.uniform(0.08, 2.90)
+                sx = random.uniform(0.08, 1.30)
+                sy = random.uniform(0.08, 1.30)
             sz = random.uniform(0.25, 2.40)
             # Hard safety clamp: training_house.sdf's outer walls are at
             # x=+-6.5/y=+-3.5 with 0.18m thickness, so the inner face is at
