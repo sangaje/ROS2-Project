@@ -624,7 +624,13 @@ class GazeboNavEnv(gym.Env):
             self.random_obstacle_noise_sigma_m = 0.35
         self.random_obstacle_prefix = str(os.environ.get("TB3_RL_RANDOM_OBSTACLE_PREFIX", "tb3_rl_rand_obs")).strip() or "tb3_rl_rand_obs"
         self.random_obstacle_world_name = self._world_name_from_service_path(world_control_service, fallback="default")
-        self._random_obstacle_names = [f"{self.random_obstacle_prefix}_{idx}" for idx in range(30)]
+        # Pool size must cover random_obstacle_count_max: count is silently
+        # clamped to len(_random_obstacle_names) below (see the reset method),
+        # so a pool smaller than the configured max caps the real spawn count
+        # without any error or log line.
+        self._random_obstacle_names = [
+            f"{self.random_obstacle_prefix}_{idx}" for idx in range(int(self.random_obstacle_count_max))
+        ]
         self._active_random_obstacle_names: list[str] = []
         self._known_random_obstacle_names: set[str] = set()
 
