@@ -22,6 +22,14 @@ def _model_backend(model_path: str) -> str:
     return 'pytorch'
 
 
+def _safe_model_names(model) -> dict:
+    try:
+        names = getattr(model, "names", {}) or {}
+    except Exception:
+        names = {}
+    return names if isinstance(names, dict) else {}
+
+
 def _resolve_supported_device(requested: str) -> tuple[str, str | None]:
     """Prevent an unsupported Jetson CUDA binary from killing OMX video."""
     device = str(requested).strip()
@@ -90,9 +98,9 @@ class YoloDetector:
         if self.device.lower() in ("cpu", "none", ""):
             self.use_half = False
 
-        self.model = YOLO(cfg.yolo.model_path)
+        self.model = YOLO(cfg.yolo.model_path, task="detect")
         self.target_class = cfg.yolo.target_class
-        self.class_name = self.model.names.get(
+        self.class_name = _safe_model_names(self.model).get(
             self.target_class, f"cls_{self.target_class}")
         self._log(f"YOLO 로드: {cfg.yolo.model_path}, "
                   f"클래스 {self.target_class} ({self.class_name}), "

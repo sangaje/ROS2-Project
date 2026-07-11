@@ -435,6 +435,14 @@ def _validate_model_path(model_path, backend):
     raise FileNotFoundError(f'YOLO model not found: {path}')
 
 
+def _safe_model_names(model):
+    try:
+        names = getattr(model, 'names', {}) or {}
+    except Exception:
+        names = {}
+    return names if isinstance(names, dict) else {}
+
+
 def _resolve_inference_device(requested):
     """Return a CUDA device only when this torch build supports its CC.
 
@@ -513,7 +521,7 @@ def build_app(args):
             flush=True,
         )
     _validate_model_path(args.model_path, backend)
-    model = YOLO(args.model_path)
+    model = YOLO(args.model_path, task='detect')
     use_half = bool(args.half) and backend == 'pytorch' and str(args.device).lower() not in ('cpu', 'none', '')
     use_fast_forward = bool(args.fast_forward) and backend == 'pytorch'
     fast_net = None
@@ -521,7 +529,7 @@ def build_app(args):
     non_max_suppression = None
     scale_boxes = None
     torch = None
-    class_names = getattr(model, 'names', {}) or {}
+    class_names = _safe_model_names(model)
     if use_fast_forward:
         try:
             import torch as _torch
