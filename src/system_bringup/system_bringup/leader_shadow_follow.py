@@ -90,9 +90,13 @@ class LeaderShadowFollow(Node):
         self.declare_parameter('leader_shadow_max_angular_vel', 0.85)
         self.declare_parameter('leader_restore_max_linear_vel', 0.46)
         self.declare_parameter('leader_restore_max_angular_vel', 0.90)
-        self.declare_parameter('leader_shadow_goal_update_period_sec', 0.6)
-        self.declare_parameter('leader_shadow_goal_min_change_m', 0.25)
+        self.declare_parameter('leader_shadow_goal_update_period_sec', 2.0)
+        self.declare_parameter('leader_shadow_goal_min_change_m', 0.60)
         self.declare_parameter('leader_shadow_cmd_goal_tolerance_m', 0.16)
+        self.declare_parameter('leader_shadow_cmd_linear_scale', 3.0)
+        self.declare_parameter('leader_shadow_cmd_angular_scale', 1.0)
+        self.declare_parameter('leader_shadow_cmd_max_linear_vel', 0.75)
+        self.declare_parameter('leader_shadow_cmd_max_angular_vel', 1.20)
         self.declare_parameter('leader_shadow_linear_kp', 0.70)
         self.declare_parameter('leader_shadow_angular_kp', 1.40)
         self.declare_parameter('leader_shadow_heading_slowdown_rad', 0.75)
@@ -148,6 +152,14 @@ class LeaderShadowFollow(Node):
         self.goal_period = max(0.3, float(get('leader_shadow_goal_update_period_sec').value))
         self.goal_min_change = max(0.05, float(get('leader_shadow_goal_min_change_m').value))
         self.cmd_goal_tolerance = max(0.03, float(get('leader_shadow_cmd_goal_tolerance_m').value))
+        self.cmd_linear_scale = max(0.1, float(get('leader_shadow_cmd_linear_scale').value))
+        self.cmd_angular_scale = max(0.1, float(get('leader_shadow_cmd_angular_scale').value))
+        self.cmd_max_linear_vel = max(self.shadow_linear_vel, float(
+            get('leader_shadow_cmd_max_linear_vel').value
+        ))
+        self.cmd_max_angular_vel = max(self.shadow_angular_vel, float(
+            get('leader_shadow_cmd_max_angular_vel').value
+        ))
         self.linear_kp = max(0.01, float(get('leader_shadow_linear_kp').value))
         self.angular_kp = max(0.01, float(get('leader_shadow_angular_kp').value))
         self.heading_slowdown_rad = max(
@@ -251,6 +263,8 @@ class LeaderShadowFollow(Node):
             f'follower_scout={self.follower_robot_name}:{self.follower_pose_topic} '
             f'distance={self.follow_distance:.2f}m fov={self.scan_fov_deg:.1f}deg '
             f'direct_cmd={self.direct_shadow_cmd_vel}:{self.cmd_vel_topic} '
+            f'cmd_scale=lin{self.cmd_linear_scale:.2f}/ang{self.cmd_angular_scale:.2f} '
+            f'cmd_cap=lin{self.cmd_max_linear_vel:.2f}/ang{self.cmd_max_angular_vel:.2f} '
             f'controller_service={self.controller_set_parameters_service} '
             f'localization_gate={self.require_localization_ready}:{self.localization_ready_topic}'
         )
@@ -596,6 +610,11 @@ class LeaderShadowFollow(Node):
         angular = max(
             -self.shadow_angular_vel,
             min(self.shadow_angular_vel, self.angular_kp * heading_error),
+        )
+        linear = min(self.cmd_max_linear_vel, linear * self.cmd_linear_scale)
+        angular = max(
+            -self.cmd_max_angular_vel,
+            min(self.cmd_max_angular_vel, angular * self.cmd_angular_scale),
         )
         self._publish_twist(linear, angular)
         self.direct_cmd_active = True

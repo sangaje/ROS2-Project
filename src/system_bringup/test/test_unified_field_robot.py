@@ -1,7 +1,7 @@
 import json
 
 from builtin_interfaces.msg import Time
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, TwistStamped
 from std_msgs.msg import Bool, String
 
 from system_bringup.leader_shadow_follow import LeaderShadowFollow
@@ -251,7 +251,35 @@ def test_shadow_goal_cancel_is_edge_triggered_on_failover():
     node._on_failover_state(message)
     node._on_failover_state(message)
 
-    assert len(node.cancel_pub.messages) == 1
-    assert node.cancel_pub.messages[0] == Bool(data=True)
+    assert node.cancel_pub.messages == [Bool(data=True), Bool(data=False)]
     assert node.shadow_goal_active is False
 
+
+def test_direct_shadow_cmd_compensates_loaded_leader_speed():
+    node = LeaderShadowFollow.__new__(LeaderShadowFollow)
+    node.leader_pose = _pose()
+    node.cmd_pub = _Publisher()
+    node.use_stamped_cmd_vel = True
+    node.get_clock = lambda: _Clock()
+    node._stop_direct_cmd = lambda reason: None
+    node.cmd_goal_tolerance = 0.16
+    node.shadow_linear_vel = 0.38
+    node.catchup_linear_vel = 0.46
+    node.shadow_angular_vel = 0.85
+    node.linear_kp = 0.70
+    node.angular_kp = 1.40
+    node.heading_slowdown_rad = 0.75
+    node.cmd_linear_scale = 3.0
+    node.cmd_angular_scale = 1.0
+    node.cmd_max_linear_vel = 0.75
+    node.cmd_max_angular_vel = 1.20
+    node.direct_cmd_active = False
+
+    node._publish_direct_shadow_cmd(_pose(2.0, 0.0), catchup=False)
+
+    assert len(node.cmd_pub.messages) == 1
+    command = node.cmd_pub.messages[0]
+    assert isinstance(command, TwistStamped)
+    assert command.twist.linear.x == 0.75
+    assert command.twist.angular.z == 0.0
+    assert node.direct_cmd_active is True

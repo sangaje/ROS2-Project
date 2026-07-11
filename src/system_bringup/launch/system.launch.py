@@ -110,6 +110,18 @@ def generate_launch_description():
     leader_shadow_goal_min_change_m = LaunchConfiguration(
         'leader_shadow_goal_min_change_m'
     )
+    leader_shadow_cmd_linear_scale = LaunchConfiguration(
+        'leader_shadow_cmd_linear_scale'
+    )
+    leader_shadow_cmd_angular_scale = LaunchConfiguration(
+        'leader_shadow_cmd_angular_scale'
+    )
+    leader_shadow_cmd_max_linear_vel = LaunchConfiguration(
+        'leader_shadow_cmd_max_linear_vel'
+    )
+    leader_shadow_cmd_max_angular_vel = LaunchConfiguration(
+        'leader_shadow_cmd_max_angular_vel'
+    )
     leader_shadow_heading_min_motion_m = LaunchConfiguration(
         'leader_shadow_heading_min_motion_m'
     )
@@ -646,6 +658,18 @@ def generate_launch_description():
                             ),
                             'leader_shadow_goal_min_change_m': float(
                                 leader_shadow_goal_min_change_m.perform(context)
+                            ),
+                            'leader_shadow_cmd_linear_scale': float(
+                                leader_shadow_cmd_linear_scale.perform(context)
+                            ),
+                            'leader_shadow_cmd_angular_scale': float(
+                                leader_shadow_cmd_angular_scale.perform(context)
+                            ),
+                            'leader_shadow_cmd_max_linear_vel': float(
+                                leader_shadow_cmd_max_linear_vel.perform(context)
+                            ),
+                            'leader_shadow_cmd_max_angular_vel': float(
+                                leader_shadow_cmd_max_angular_vel.perform(context)
                             ),
                             'leader_shadow_heading_min_motion_m': float(
                                 leader_shadow_heading_min_motion_m.perform(context)
@@ -1222,13 +1246,36 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'leader_shadow_goal_update_period_sec',
-            default_value='0.6',
+            default_value='2.0',
             description='Minimum time between leader shadow Nav2 goal updates.',
         ),
         DeclareLaunchArgument(
             'leader_shadow_goal_min_change_m',
-            default_value='0.25',
+            default_value='0.60',
             description='Minimum shadow target displacement before sending another leader goal.',
+        ),
+        DeclareLaunchArgument(
+            'leader_shadow_cmd_linear_scale',
+            default_value='3.0',
+            description=(
+                'Direct /cmd_vel compensation for a loaded leader that only '
+                'achieves a fraction of commanded linear speed.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'leader_shadow_cmd_angular_scale',
+            default_value='1.0',
+            description='Direct /cmd_vel angular compensation scale.',
+        ),
+        DeclareLaunchArgument(
+            'leader_shadow_cmd_max_linear_vel',
+            default_value='0.75',
+            description='Hard cap for compensated direct /cmd_vel linear.x.',
+        ),
+        DeclareLaunchArgument(
+            'leader_shadow_cmd_max_angular_vel',
+            default_value='1.20',
+            description='Hard cap for compensated direct /cmd_vel angular.z.',
         ),
         DeclareLaunchArgument(
             'leader_shadow_heading_min_motion_m',
