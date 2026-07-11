@@ -8,15 +8,14 @@
 amcl:
   ros__parameters:
     use_sim_time: true
-    # 좌우 바퀴 응답이 비대칭(한쪽이 회전 시 훨씬 느림)이라 odom 의 회전
-    # 추정이 실제 회전량과 어긋난다. alpha1(회전->회전 오차)/alpha4(회전
-    # ->이동 오차)를 크게 잡아서 AMCL 이 odom 의 회전 성분을 덜 믿고
-    # 스캔 매칭으로 더 많이 보정하게 함.
-    alpha1: 0.22
-    alpha2: 0.10
-    alpha3: 0.12
-    alpha4: 0.16
-    alpha5: 0.03
+    # The leader Waffle Pi is heavier/slower than the nominal TB3 model.  Its
+    # commanded rotation/acceleration can lag the odom model, so let AMCL trust
+    # odom a little less and smooth corrections over real scan evidence.
+    alpha1: 0.30
+    alpha2: 0.14
+    alpha3: 0.18
+    alpha4: 0.24
+    alpha5: 0.05
     base_frame_id: "base_footprint"
     beam_skip_distance: 0.35
     beam_skip_error_threshold: 0.9
@@ -43,8 +42,8 @@ amcl:
     sigma_hit: 0.10
     tf_broadcast: true
     transform_tolerance: 1.0
-    update_min_a: 0.025
-    update_min_d: 0.025
+    update_min_a: 0.04
+    update_min_d: 0.04
     z_hit: 0.82
     z_max: 0.03
     z_rand: 0.12
@@ -69,15 +68,15 @@ lifecycle_manager_localization:
 controller_server:
   ros__parameters:
     use_sim_time: true
-    # 좌우 바퀴 비대칭 때문에 DWB 가 가정하는 이상적인 미분구동 모델과
-    # 실제 거동(회전 중 호를 그림)이 어긋난다. 더 자주(controller_frequency
-    # 상향) 더 짧게(sim_time 아래 하향) 재평가해서 모델 오차가 누적되기
-    # 전에 자주 보정하게 함.
-    controller_frequency: 20.0
+    # The leader is a loaded Waffle Pi, not a fresh nominal model.  Use slower
+    # accelerations and longer trajectory rollout so DWB chooses commands the
+    # hardware can actually realize instead of constantly asking for impossible
+    # catch-up motion.
+    controller_frequency: 15.0
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.001
     min_theta_velocity_threshold: 0.001
-    failure_tolerance: 2.0
+    failure_tolerance: 4.0
     odom_topic: "/odom"
     enable_stamped_cmd_vel: true
     progress_checker_plugins: ["progress_checker"]
@@ -86,8 +85,8 @@ controller_server:
 
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      required_movement_radius: 0.03
-      movement_time_allowance: 45.0
+      required_movement_radius: 0.02
+      movement_time_allowance: 70.0
 
     goal_checker:
       stateful: true
@@ -100,25 +99,24 @@ controller_server:
       debug_trajectory_details: true
       min_vel_x: 0.0
       min_vel_y: 0.0
-      max_vel_x: 0.45
+      max_vel_x: 0.34
       max_vel_y: 0.0
-      # 좌우 바퀴 응답 비대칭이 커질수록(고속 회전일수록) 더 벌어지는
-      # 것으로 보여서 회전 속도/가감속 한계를 낮춤 -- 더 낮고 꾸준한
-      # 회전 속도 구간에서 실제 거동이 명령과 덜 어긋난다.
-      max_vel_theta: 0.9
+      # Keep rotation below the range where the loaded chassis arcs wide and
+      # diverges from the differential-drive model.
+      max_vel_theta: 0.65
       min_speed_xy: 0.0
-      max_speed_xy: 0.45
+      max_speed_xy: 0.34
       min_speed_theta: 0.0
-      acc_lim_x: 3.5
+      acc_lim_x: 0.55
       acc_lim_y: 0.0
-      acc_lim_theta: 2.4
-      decel_lim_x: -3.0
+      acc_lim_theta: 0.90
+      decel_lim_x: -0.65
       decel_lim_y: 0.0
-      decel_lim_theta: -2.4
-      vx_samples: 20
+      decel_lim_theta: -1.00
+      vx_samples: 16
       vy_samples: 1
-      vtheta_samples: 40
-      sim_time: 1.0
+      vtheta_samples: 32
+      sim_time: 1.6
       linear_granularity: 0.05
       angular_granularity: 0.025
       transform_tolerance: 0.5
@@ -174,9 +172,9 @@ behavior_server:
     transform_tolerance: 0.5
     transform_timeout: 0.1
     simulate_ahead_time: 2.0
-    max_rotational_vel: 1.0
-    min_rotational_vel: 0.4
-    rotational_acc_lim: 3.2
+    max_rotational_vel: 0.65
+    min_rotational_vel: 0.25
+    rotational_acc_lim: 0.90
     enable_stamped_cmd_vel: true
 
 bt_navigator:
