@@ -9402,10 +9402,12 @@ class GazeboNavEnv(gym.Env):
         whether the commanded turn direction has stayed the same sign.
 
         A small deadzone lets minor corrections/noise through without
-        counting as "turning". A sign flip (a real correction back the other
-        way) resets the run immediately; dropping below the deadzone decays
-        it gradually instead of resetting, so a brief straight blip inside a
-        real curve does not erase accumulated bias.
+        counting as "turning". Both a sign flip (turning the other way) and
+        dropping below the deadzone (going straight) decay the accumulator
+        gradually over subsequent steps rather than resetting it to 0 -- a
+        single opposite-direction tick or a brief straight blip should not
+        let a policy erase accumulated bias in one step; it should cost
+        several steps of not-drifting to actually fade.
         """
         try:
             angular_z = float(action[1])
@@ -9426,8 +9428,15 @@ class GazeboNavEnv(gym.Env):
         sign = 1 if angular_z > 0.0 else -1
         prev_sign = int(getattr(self, "_directional_bias_sign", 0))
         if prev_sign != 0 and sign != prev_sign:
-            self.directional_bias_steps = 0
-            self.directional_bias_accum = 0.0
+            # Direction reversal: decay gradually (same rate as the
+            # going-straight case below) instead of resetting to 0, so a
+            # policy cannot erase accumulated bias by flipping direction for
+            # a single step. If the reversal is genuine (a real correction),
+            # it fades over the next several steps just like going straight
+            # does; if it is not sustained, accumulation resumes from the
+            # decayed baseline rather than from zero.
+            self.directional_bias_steps = max(int(getattr(self, "directional_bias_steps", 0)) - 2, 0)
+            self.directional_bias_accum = float(getattr(self, "directional_bias_accum", 0.0)) * 0.85
         else:
             self.directional_bias_steps = int(getattr(self, "directional_bias_steps", 0)) + 1
             self.directional_bias_accum = float(getattr(self, "directional_bias_accum", 0.0)) + turn_norm
