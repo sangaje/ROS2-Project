@@ -707,6 +707,11 @@ class GazeboNavEnv(gym.Env):
         # Surfaced in STEP_PROFILE so "is the reported speed real" can be
         # checked from the log instead of trusting it silently.
         self._world_step_stale_total = 0
+        # Lifetime counter of ControlWorld multi_step calls that failed/timed
+        # out on their first attempt (before the retry added below). Distinct
+        # from _world_step_stale_total: a stale step still advanced physics,
+        # this counts steps where the service call itself did not succeed.
+        self._world_step_call_fail_total = 0
         self.world_reset_on_episode = str(
             os.environ.get("TB3_RL_WORLD_RESET_ON_EPISODE", "0")
         ).strip().lower() in {"1", "true", "yes", "on"}
@@ -9720,9 +9725,21 @@ class GazeboNavEnv(gym.Env):
         _t0 = time.perf_counter() if _prof_on else 0.0
 
         if self.use_world_step and self.sim_controller is not None:
-            ok = self.sim_controller.step(
-                int(override_sim_steps) if override_sim_steps is not None else self.sim_steps_per_action
-            )
+            step_n = int(override_sim_steps) if override_sim_steps is not None else self.sim_steps_per_action
+            ok = self.sim_controller.step(step_n)
+
+            if not ok:
+                # v135: a single ControlWorld timeout used to give up after one
+                # try, silently turning this RL step into a near no-op --
+                # physics never advanced, but the step still counted toward
+                # episode length and the next observation stayed stale. Retry
+                # within the same wall-clock budget already used below for the
+                # sim-time-advance contract instead of a single-shot attempt.
+                self._world_step_call_fail_total += 1
+                _retry_start = time.time()
+                while not ok and (time.time() - _retry_start) < self.world_step_contract_max_wait_sec:
+                    ok = self.sim_controller.step(step_n)
+
             if _prof_on:
                 _t1 = time.perf_counter()
                 self._last_advance_gz_step_sec = _t1 - _t0
@@ -9731,7 +9748,10 @@ class GazeboNavEnv(gym.Env):
 
             if not ok:
                 self.ros.get_logger().warn(
-                    "World multi_step failed. Falling back to short ROS spin."
+                    "World multi_step failed after retrying for "
+                    f"{self.world_step_contract_max_wait_sec:.1f}s "
+                    f"(fail_total={self._world_step_call_fail_total}). "
+                    "Falling back to short ROS spin."
                 )
                 self.ros.spin_steps(num_spins=20, timeout_sec=0.001)
                 return
