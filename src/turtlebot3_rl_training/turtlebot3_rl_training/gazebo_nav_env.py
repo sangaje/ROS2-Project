@@ -1558,6 +1558,15 @@ class GazeboNavEnv(gym.Env):
             disable_priority_map=self.disable_priority_map,
             path_publish_topic=self.rl_path_topic,
             filtered_slam_publish_topic=self.rl_filtered_slam_topic,
+            # v135: ExplorationGridMap defaults this to "/rl_memory_map" (a
+            # backward-compat alias for old RViz configs) unless overridden,
+            # unlike every other RL map layer above which is explicitly wired
+            # to "" when disabled. That default alone kept
+            # _has_any_map_publisher True even with map/confidence/priority/
+            # filtered-slam all off, so publish() still did full-grid copies
+            # and clips every step for a topic nothing subscribes to (the
+            # current rviz config doesn't reference it). Disable explicitly.
+            legacy_memory_publish_topic="",
             # Strict /map-locked publication is useful only when the runtime is
             # actually map-frame aligned.  In the current pure-velocity odom mode
             # we must NOT wait for /map metadata before publishing RL layers;
