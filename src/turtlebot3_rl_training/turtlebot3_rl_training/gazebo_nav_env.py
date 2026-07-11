@@ -622,6 +622,16 @@ class GazeboNavEnv(gym.Env):
             self.random_obstacle_robot_clearance_m = 0.85
             self.random_obstacle_pair_clearance_m = 0.34
             self.random_obstacle_noise_sigma_m = 0.35
+        # v135: obstacle *layout* only re-randomizes every N episodes (default
+        # 1 = every episode, unchanged). Robot pose/SLAM/confidence/TF etc.
+        # still reset every episode regardless of this value -- this only
+        # controls how often obstacle positions get freshly randomized.
+        try:
+            self.random_obstacle_refresh_episodes = max(
+                int(os.environ.get("TB3_RL_RANDOM_OBSTACLE_REFRESH_EPISODES", "1") or 1), 1
+            )
+        except Exception:
+            self.random_obstacle_refresh_episodes = 1
         self.random_obstacle_prefix = str(os.environ.get("TB3_RL_RANDOM_OBSTACLE_PREFIX", "tb3_rl_rand_obs")).strip() or "tb3_rl_rand_obs"
         self.random_obstacle_world_name = self._world_name_from_service_path(world_control_service, fallback="default")
         # Pool size must cover random_obstacle_count_max: count is silently
@@ -2513,6 +2523,21 @@ class GazeboNavEnv(gym.Env):
 
     def _reset_random_episode_obstacles(self, reset_xy: np.ndarray | None = None) -> None:
         if not bool(getattr(self, "random_obstacles_enabled", False)):
+            return
+        # v135: obstacle *layout* only re-randomizes every
+        # random_obstacle_refresh_episodes episodes (default 1 = unchanged,
+        # every episode). Every other per-episode reset item -- robot pose,
+        # SLAM/Cartographer, confidence map, TF -- still resets every episode
+        # regardless; this is scoped narrowly to obstacle position
+        # randomization. Robot spawn pose still varies every episode via
+        # reset-pose-list, so the policy is not seeing a literally identical
+        # episode even when the obstacle layout repeats. On a skipped
+        # episode, existing obstacles are left exactly where they are -- no
+        # reposition network calls at all, which is also most of this
+        # function's per-episode cost.
+        refresh_every = int(getattr(self, "random_obstacle_refresh_episodes", 1))
+        has_existing_layout = bool(getattr(self, "_active_random_obstacle_names", []))
+        if has_existing_layout and refresh_every > 1 and (int(getattr(self, "episode_index", 0)) % refresh_every) != 0:
             return
         _diag_on = str(os.environ.get("TB3_RL_RESET_PROFILER", "0")).strip().lower() in {"1", "true", "yes", "on"}
         _diag_t0 = time.perf_counter() if _diag_on else 0.0

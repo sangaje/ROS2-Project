@@ -176,8 +176,12 @@ export TB3_RL_WORLD_RESET_TIMEOUT_SEC=3.0
 # discovered Gazebo robot candidates" 에러가 난다. world reset 직후에만 약간 더 기다린다.
 export TB3_RL_POST_WORLD_RESET_SETTLE_SEC=0.30
 export TB3_RL_RANDOM_OBSTACLES=1
-export TB3_RL_RANDOM_OBSTACLE_COUNT_MIN=50
-export TB3_RL_RANDOM_OBSTACLE_COUNT_MAX=80
+export TB3_RL_RANDOM_OBSTACLE_COUNT_MIN=40
+export TB3_RL_RANDOM_OBSTACLE_COUNT_MAX=50
+# v135: obstacle layout only re-randomizes every N episodes; robot pose/SLAM/
+# confidence/TF etc. still reset every single episode regardless (see
+# _reset_random_episode_obstacles()). N=1 would be every-episode (unchanged).
+export TB3_RL_RANDOM_OBSTACLE_REFRESH_EPISODES=5
 export TB3_RL_RANDOM_OBSTACLE_ROBOT_CLEARANCE_M=0.85
 export TB3_RL_RANDOM_OBSTACLE_PAIR_CLEARANCE_M=0.34
 export TB3_RL_RANDOM_OBSTACLE_NOISE_SIGMA_M=0.35
