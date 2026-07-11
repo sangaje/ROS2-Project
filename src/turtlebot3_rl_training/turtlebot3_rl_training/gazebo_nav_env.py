@@ -4952,8 +4952,6 @@ class GazeboNavEnv(gym.Env):
                 )
         self._update_explored_stall_steps(map_stats=map_stats, action=action_for_reward)
         self._update_confidence_stall_steps(map_stats=map_stats, action=action_for_reward)
-        self._update_sustained_rotation_steps(action=action_for_reward)
-        self._update_orbit_stall_steps(map_stats=map_stats, action=action_for_reward)
         self._update_directional_bias_steps(action=action_for_reward)
         if _prof_on:
             _prof_mark("map_update")
@@ -5115,11 +5113,6 @@ class GazeboNavEnv(gym.Env):
             confidence_stall_max_penalty=self.confidence_stall_max_penalty,
             confidence_stall_gain_threshold=self.confidence_stall_gain_threshold,
             confidence_stall_low_ratio_threshold=self.confidence_stall_low_ratio_threshold,
-            sustained_rotation_steps=self.sustained_rotation_steps,
-            orbit_stall_steps=int(getattr(self, "orbit_stall_steps", 0)),
-            orbit_path_efficiency=float(getattr(self, "_last_orbit_path_efficiency", 1.0)),
-            orbit_path_length=float(getattr(self, "_last_orbit_path_length", 0.0)),
-            orbit_yaw_accum=float(getattr(self, "_last_orbit_yaw_accum", 0.0)),
             directional_bias_steps=int(getattr(self, "directional_bias_steps", 0)),
             directional_bias_accum=float(getattr(self, "directional_bias_accum", 0.0)),
             max_linear_speed=self.max_linear_speed,

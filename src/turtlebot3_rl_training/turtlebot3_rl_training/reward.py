@@ -235,19 +235,6 @@ def compute_exploration_reward(
     confidence_stall_max_penalty: float = 1.50,
     confidence_stall_gain_threshold: float = 0.035,
     confidence_stall_low_ratio_threshold: float = 0.20,
-    sustained_rotation_steps: int = 0,
-    sustained_rotation_start_steps: int = 6,
-    sustained_rotation_growth: float = 0.050,
-    sustained_rotation_power: float = 1.45,
-    sustained_rotation_max_penalty: float = 2.50,
-    orbit_stall_steps: int = 0,
-    orbit_stall_start_steps: int = 4,
-    orbit_stall_growth: float = 0.035,
-    orbit_stall_power: float = 1.45,
-    orbit_stall_max_penalty: float = 1.75,
-    orbit_path_efficiency: float = 1.0,
-    orbit_path_length: float = 0.0,
-    orbit_yaw_accum: float = 0.0,
     directional_bias_steps: int = 0,
     directional_bias_accum: float = 0.0,
     directional_bias_start_accum: float = 3.0,
@@ -379,12 +366,11 @@ def compute_exploration_reward(
 
     # No penalties for revisit, confidence stall, stale cells, target switching,
     # or wall proximity unless those behaviors become a physical safety event
-    # handled outside this dense reward.  Rotation/orbit ARE penalized below --
-    # gazebo_nav_env.py already tracks sustained_rotation_steps/orbit_stall_steps
-    # (both reset the moment the behavior produces real new coverage/confidence
-    # gain, so productive turning is never punished) but nothing previously
-    # consumed them here, so a policy could spin/orbit forever in an
-    # already-explored area for free.
+    # handled outside this dense reward.  Sustained one-direction turning IS
+    # penalized below via directional_bias_accum (see gazebo_nav_env.py's
+    # _update_directional_bias_steps()) -- the single rotation-abuse term,
+    # unconditional on forward speed or incidental info gain, so a policy
+    # cannot spin/orbit/spiral in an already-explored area for free.
 
     # Explored-stall penalty: escalates only once the robot has gone
     # explored_stall_start_steps consecutive steps with zero new coverage (real
@@ -398,38 +384,12 @@ def compute_exploration_reward(
         )
         reward -= stall_penalty
 
-    # Sustained in-place spin penalty (low forward speed, high turn rate held
-    # for several consecutive steps).  _update_sustained_rotation_steps() only
-    # accumulates while forward_norm stays low and turn_norm stays high, so a
-    # normal short heading-correction turn never crosses sustained_rotation_start_steps.
-    rotation_over = int(sustained_rotation_steps) - int(sustained_rotation_start_steps)
-    if rotation_over > 0:
-        rotation_penalty = min(
-            float(sustained_rotation_growth) * (float(rotation_over) ** float(sustained_rotation_power)),
-            float(sustained_rotation_max_penalty),
-        )
-        reward -= rotation_penalty
-
-    # Forward arc-loop ("orbit") penalty: driving forward while continuously
-    # turning so path length grows but net displacement/new-information stays
-    # near zero -- the harder-to-detect version of spinning in place, and the
-    # one that specifically matches circling inside an already-covered area.
-    # _update_orbit_stall_steps() already exempts genuine avoidance maneuvers
-    # that create real coverage/confidence/priority gain, so this only fires on
-    # the exploit.
-    orbit_over = int(orbit_stall_steps) - int(orbit_stall_start_steps)
-    if orbit_over > 0:
-        orbit_penalty = min(
-            float(orbit_stall_growth) * (float(orbit_over) ** float(orbit_stall_power)),
-            float(orbit_stall_max_penalty),
-        )
-        reward -= orbit_penalty
-
-    # One-direction bias penalty: unlike sustained_rotation (low-forward only)
-    # and orbit_stall (only fires once info gain has actually stopped), this
-    # is unconditional -- it fires purely from having steadily turned the same
-    # sign (left or right) regardless of forward speed or incidental info
-    # gain, so a policy cannot avoid it by driving a wide circle/spiral that
+    # One-direction bias penalty: the single rotation-abuse penalty (replaces
+    # the earlier separate sustained-rotation/orbit-stall terms, which
+    # overlapped with this one and each other). Unconditional on forward speed
+    # or incidental info gain -- it fires purely from having steadily turned
+    # the same sign (left or right) regardless of what else the policy is
+    # doing, so a policy cannot dodge it by driving a wide circle/spiral that
     # keeps grazing a little new coverage each pass. directional_bias_accum
     # grows with both the degree of each turn and how many consecutive steps
     # it has held the same direction, so the penalty scales with both severity
