@@ -12901,7 +12901,34 @@ class GazeboNavEnv(gym.Env):
     def _get_robot_pose2d(self, frame_id: Optional[str] = None) -> Optional[tuple[np.ndarray, float]]:
         # v11: never use Gazebo model pose for map layers.  This returns the
         # same TF-based base pose that RViz uses, normally map->base_footprint.
-        return self.ros.get_pose2d(frame_id=(frame_id or self.map_frame or self.pose_frame))
+        #
+        # v135: cache keyed on the wall-clock time of the last /odom callback.
+        # lookup_transform() (inside get_pose2d) can block up to ~0.12s when TF
+        # is still catching up after a Cartographer restart, and this method
+        # has ~30 call sites across reward/terminal/map-update/obs-build code
+        # that all just want "the robot's current pose" with no world-advance
+        # in between them within a single step. last_odom_time only changes
+        # when Gazebo publishes a new odometry reading -- exactly when the
+        # robot's true pose could actually have changed -- so reusing the
+        # cached pose whenever it hasn't moved is safe, not just fast.
+        key = str(frame_id or self.map_frame or self.pose_frame or "")
+        odom_marker = getattr(self.ros, "last_odom_time", None)
+        cache = getattr(self, "_robot_pose2d_cache", None)
+        if cache is None:
+            cache = {}
+            self._robot_pose2d_cache = cache
+        if odom_marker is not None:
+            cached = cache.get(key)
+            if cached is not None and cached[0] == odom_marker:
+                return cached[1]
+        pose = self.ros.get_pose2d(frame_id=(frame_id or self.map_frame or self.pose_frame))
+        if odom_marker is not None:
+            # Only cache when we have a real marker to invalidate on -- never
+            # cache under a None marker, or a later call made before any
+            # /odom has arrived would incorrectly treat "still no odom" as
+            # "same sample" and replay a stale/None result indefinitely.
+            cache[key] = (odom_marker, pose)
+        return pose
 
     def _update_boundary_center_after_reset(self, requested_xy: np.ndarray) -> None:
         # Give /odom callbacks a short chance to reflect the Gazebo teleport.
