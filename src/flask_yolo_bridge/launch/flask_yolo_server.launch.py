@@ -1,12 +1,16 @@
+import os
+
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess
 from launch.substitutions import LaunchConfiguration
-from launch_ros.substitutions import FindPackagePrefix
-from launch.substitutions import PathJoinSubstitution
 
 
 def generate_launch_description():
-    exe = PathJoinSubstitution([FindPackagePrefix('flask_yolo_bridge'), 'lib', 'flask_yolo_bridge', 'flask_yolo_server'])
+    virtual_env = os.environ.get('VIRTUAL_ENV', '').strip()
+    python_exe = (
+        os.path.join(virtual_env, 'bin', 'python3')
+        if virtual_env else 'python3'
+    )
     return LaunchDescription([
         DeclareLaunchArgument('host', default_value='0.0.0.0'),
         DeclareLaunchArgument('port', default_value='5005'),
@@ -24,7 +28,8 @@ def generate_launch_description():
         DeclareLaunchArgument('max_queue_wait_sec', default_value='0.05'),
         ExecuteProcess(
             cmd=[
-                exe,
+                python_exe,
+                '-m', 'flask_yolo_bridge.flask_yolo_server',
                 '--host', LaunchConfiguration('host'),
                 '--port', LaunchConfiguration('port'),
                 '--model-path', LaunchConfiguration('model_path'),

@@ -501,12 +501,11 @@ def generate_launch_description():
                     ]))
 
             if launch_bool(start_yolo_server.perform(context)):
-                flask_yolo_exe = PathJoinSubstitution([
-                    FindPackagePrefix('flask_yolo_bridge'),
-                    'lib',
-                    'flask_yolo_bridge',
-                    'flask_yolo_server',
-                ])
+                virtual_env = os.environ.get('VIRTUAL_ENV', '').strip()
+                python_exe = (
+                    os.path.join(virtual_env, 'bin', 'python3')
+                    if virtual_env else 'python3'
+                )
                 yolo_model_path = yolo_server_model_path.perform(context)
                 if yolo_model_path and not os.path.isabs(yolo_model_path):
                     yolo_model_path = os.path.abspath(yolo_model_path)
@@ -518,7 +517,8 @@ def generate_launch_description():
                 )
                 flask_yolo_server = ExecuteProcess(
                     cmd=[
-                        flask_yolo_exe,
+                        python_exe,
+                        '-m', 'flask_yolo_bridge.flask_yolo_server',
                         '--host', yolo_server_host.perform(context),
                         '--port', yolo_server_port.perform(context),
                         '--model-path', yolo_model_path,
