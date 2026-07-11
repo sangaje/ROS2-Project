@@ -93,6 +93,23 @@ def wrap_angle(a):
     return math.atan2(math.sin(a), math.cos(a))
 
 
+def normalize_label(label):
+    return str(label).strip().lower().replace('_', ' ').replace('-', ' ')
+
+
+def parse_label_aliases(value):
+    if isinstance(value, str):
+        raw_values = value.split(',')
+    else:
+        raw_values = value or []
+    labels = set()
+    for item in raw_values:
+        label = normalize_label(item)
+        if label:
+            labels.add(label)
+    return labels
+
+
 class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
     """
     v2 design:
@@ -130,16 +147,24 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         # YOLO
         self.detection_source = str(self.declare_parameter('detection_source', 'local_yolo').value).strip().lower()
         self.external_detection_topic = self.declare_parameter('external_detection_topic', '/risk/yolo_detections').value
-        # Target model contract: custom best.pt uses 0=ally, 1=enemy (doll).
+        # Target model contract: COCO yolo11n.pt uses class 77 for teddy bear.
         # Keep external_person_only declared for backwards-compatible old launch files,
         # but select detections exclusively by the explicit target class below.
         self.external_person_only = self.declare_bool_parameter('external_person_only', False)
-        self.target_class = int(self.declare_parameter('target_class', 1).value)
-        self.target_label = str(self.declare_parameter('target_label', 'enemy').value).strip().lower()
+        self.target_class = int(self.declare_parameter('target_class', 77).value)
+        self.target_label = normalize_label(
+            self.declare_parameter('target_label', 'teddy bear').value
+        )
+        alias_value = self.declare_parameter(
+            'target_label_aliases',
+            ['teddy bear', 'teddy_bear', 'bear'],
+        ).value
+        self.target_labels = parse_label_aliases(alias_value)
+        self.target_labels.add(self.target_label)
         self.debug_image_topic = self.declare_parameter('debug_image_topic', '/risk/debug_yolo_image').value
         self.enable_yolo = self.declare_bool_parameter('enable_yolo', True)
         self.model_path = self.declare_parameter(
-            'model_path', '/home/seil/omx_aim/models/best.pt'
+            'model_path', 'yolo11n.pt'
         ).value
         self.device = self.declare_parameter('device', 'cpu').value
         self.conf_threshold = float(self.declare_parameter('conf_threshold', 0.20).value)
@@ -180,7 +205,11 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         # Camera prior
         self.camera_hfov_deg = float(self.declare_parameter('camera_hfov_deg', 62.0).value)
         self.camera_vfov_deg = float(self.declare_parameter('camera_vfov_deg', 49.5).value)
-        self.real_person_height_m = float(self.declare_parameter('real_person_height_m', 1.70).value)
+        legacy_target_height_m = float(self.declare_parameter('real_person_height_m', 0.30).value)
+        self.target_real_height_m = float(
+            self.declare_parameter('target_real_height_m', legacy_target_height_m).value
+        )
+        self.real_person_height_m = self.target_real_height_m
         self.min_range_m = float(self.declare_parameter('min_range_m', 0.5).value)
         self.max_range_m = float(self.declare_parameter('max_range_m', 5.0).value)
 
@@ -194,10 +223,10 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
 
         # Bearing-only multi-view localization.
         #
-        # A printed/small person can make bbox-height range estimation collapse to max_range.
+        # A small target can make bbox-height range estimation noisy.
         # In bearing_consensus mode, each spatially distinct robot viewpoint votes along the
-        # detected person's line of sight. Risk is created only where multiple independent
-        # viewpoint maps agree, so moving the robot triangulates the likely person location.
+        # detected teddy bear's line of sight. Risk is created only where multiple
+        # independent viewpoint maps agree, so moving the robot triangulates the target.
         self.positive_projection_mode = str(
             self.declare_parameter('positive_projection_mode', 'bearing_consensus').value
         ).strip().lower()
@@ -716,6 +745,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             f'bearing_min_baseline={self.bearing_viewpoint_min_baseline_m:.2f}m '
             f'bearing_single_gain={self.bearing_single_view_gain:.2f} '
             f'bearing_halo_seed={self.bearing_halo_seed_threshold:.3f} '
+            f'target_class={self.target_class} target_height={self.target_real_height_m:.2f}m '
             f'bayes_hit_gain={self.person_bayes_hit_log_odds_gain:.2f} '
             f'bayes_miss_rate={self.person_bayes_miss_log_odds_per_sec:.3f}/s '
             f'bayes_grace={self.person_bayes_decay_grace_sec:.2f}s '
@@ -1298,7 +1328,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         x1, y1, x2, y2 = bbox
         bbox_h = max(1.0, y2 - y1)
         fy = (image_h / 2.0) / math.tan(math.radians(self.camera_vfov_deg) / 2.0)
-        return clamp(fy * self.real_person_height_m / bbox_h, self.min_range_m, self.max_range_m)
+        return clamp(fy * self.target_real_height_m / bbox_h, self.min_range_m, self.max_range_m)
 
     def opencv_device_arg(self):
         raw = self.opencv_camera_device
@@ -1577,10 +1607,10 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             conf = float(item.get('conf', item.get('confidence', 0.0)))
             if conf < self.conf_threshold:
                 continue
-            label = str(item.get('label', item.get('name', ''))).lower()
+            label = normalize_label(item.get('label', item.get('name', '')))
             cls = item.get('class_id', item.get('class', item.get('cls', None)))
             is_target = (
-                label == self.target_label
+                label in self.target_labels
                 or cls == self.target_class
                 or str(cls) == str(self.target_class)
             )
@@ -1650,7 +1680,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             for det in detections:
                 x1, y1, x2, y2 = [int(v) for v in det.bbox]
                 cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                label = f'doll {det.conf:.2f} r~{det.range_hat_m:.1f}m b={math.degrees(det.bearing_rad):.1f}'
+                label = f'teddy bear {det.conf:.2f} r~{det.range_hat_m:.1f}m b={math.degrees(det.bearing_rad):.1f}'
                 cv2.putText(img, label, (x1, max(15, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
             return img
         except Exception:

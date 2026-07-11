@@ -99,12 +99,12 @@ ibvs:
   derivative_reset_gap_sec: 0.5
 
 yolo:
-  # 인형 표적용 경량 기본값. 별도 학습 가중치는 런치의
+  # COCO teddy bear 표적용 경량 기본값. 별도 학습 가중치는 런치의
   # yolo_node_model_path로 명시적으로 지정한다.
   model_path: yolo11n.pt
   device: 0                 # Jetson CUDA device. cpu로 강제하려면 "cpu"
   half: true                # CUDA에서 FP16 사용
-  target_class: 1           # 프로젝트 인형 표적 class
+  target_class: 77          # COCO teddy bear class
   conf_threshold: 0.5        # 0.0~1.0. 낮을수록 더 많이 검출 (오검출 늘어남)
   imgsz: 640                 # 추론 해상도. 320 = 빠름, 640 = 기본, 1280 = 정확
 
