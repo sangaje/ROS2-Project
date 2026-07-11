@@ -211,8 +211,8 @@ def test_first_predict_exception_does_not_deactivate_active_scout():
     runtime._build_observation = lambda scan, map_snapshot: {
         'map': np.zeros((4, 64, 64), dtype=np.float32),
         'map_seq': np.zeros((8, 4, 64, 64), dtype=np.float32),
-        'seq': np.zeros((8, 69), dtype=np.float32),
-        'vector': np.zeros((69,), dtype=np.float32),
+        'seq': np.zeros((8, 63), dtype=np.float32),
+        'vector': np.zeros((63,), dtype=np.float32),
     }
     runtime.safety = type('Safety', (), {'filter': lambda self, action, scan: action})()
     runtime.enable_velocity_safety_filter = True

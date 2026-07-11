@@ -102,7 +102,7 @@ def generate_launch_description():
         DeclareLaunchArgument('debug_image_topic', default_value='/risk/debug_yolo_image'),
         DeclareLaunchArgument('enable_yolo', default_value='true'),
         DeclareLaunchArgument('enable_fake_detection', default_value='false'),
-        DeclareLaunchArgument('model_path', default_value='/home/seil/omx_aim/models/best.pt'),
+        DeclareLaunchArgument('model_path', default_value='yolo11n.pt'),
         DeclareLaunchArgument('device', default_value='cpu'),
         DeclareLaunchArgument('conf_threshold', default_value='0.25'),
         DeclareLaunchArgument('camera_hfov_deg', default_value='60.0'),

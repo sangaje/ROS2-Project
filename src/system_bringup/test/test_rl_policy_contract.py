@@ -20,11 +20,14 @@ def test_contract_compiles_the_actual_v132_in_process_configuration():
     config = active_scout_config(contract)
 
     assert assets['runner'].name == 'run_train_v132_clean.sh'
-    assert assets['checkpoint'].name == 'sac_turtlebot3_burger.zip'
+    assert assets['checkpoint'].name == 'sac_turtlebot3_burger_emergency.zip'
     assert config.checkpoint == assets['checkpoint']
     assert config.control_dt_sec == 0.2
     assert config.map_substeps_per_action == 2
     assert config.lidar_bins == 60
+    assert config.vector_dim == 63
+    assert config.vector_stats_dim == 3
+    assert config.trim_extra_stats is True
     assert config.map_obs_size == 64
     assert config.action_high == (0.22, 0.7)
     assert config.safety_trigger_distance_m == 0.22
@@ -50,8 +53,8 @@ def test_wrong_observation_contract_fails_fast():
     model.observation_space = Dict({
         'map': Box(-1.0, 1.0, (4, 64, 64), dtype=np.float32),
         'map_seq': Box(-1.0, 1.0, (8, 4, 64, 64), dtype=np.float32),
-        'seq': Box(-1.0, 1.0, (8, 69), dtype=np.float32),
-        'vector': Box(-1.0, 1.0, (69,), dtype=np.float32),
+        'seq': Box(-1.0, 1.0, (8, 63), dtype=np.float32),
+        'vector': Box(-1.0, 1.0, (63,), dtype=np.float32),
     })
     model.action_space = Box(
         low=np.array([0.0, -0.7], dtype=np.float32),
@@ -71,8 +74,8 @@ def test_deployment_checkpoint_predicts_continuously_with_legacy_numpy_pickle():
     observation = {
         'map': np.zeros((4, 64, 64), dtype=np.float32),
         'map_seq': np.zeros((8, 4, 64, 64), dtype=np.float32),
-        'seq': np.zeros((8, 69), dtype=np.float32),
-        'vector': np.zeros((69,), dtype=np.float32),
+        'seq': np.zeros((8, 63), dtype=np.float32),
+        'vector': np.zeros((63,), dtype=np.float32),
     }
 
     actions = [model.predict(observation, deterministic=True)[0] for _ in range(20)]

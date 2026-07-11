@@ -62,6 +62,9 @@ class ActiveScoutPolicyConfig:
     map_obs_size: int
     history_len: int
     lidar_bins: int
+    vector_dim: int
+    vector_stats_dim: int
+    trim_extra_stats: bool
     lidar: LidarPolicyConfig
     action_low: tuple[float, float]
     action_high: tuple[float, float]
@@ -199,6 +202,16 @@ def active_scout_config(
         raise PolicyContractError('checkpoint requires map/map_seq/seq/vector observations')
     if int(observation['map']['shape'][0]) != 4:
         raise PolicyContractError('checkpoint requires the four-channel no-priority map')
+    vector_dim = int(observation['vector']['shape'][0])
+    lidar_bins = int(observation['vector']['lidar_bins'])
+    vector_stats_dim = int(observation['vector']['stats_dim'])
+    if vector_dim != lidar_bins + vector_stats_dim:
+        raise PolicyContractError(
+            'vector shape must equal lidar_bins + stats_dim '
+            f'({vector_dim} != {lidar_bins} + {vector_stats_dim})'
+        )
+    if int(observation['seq']['shape'][1]) != vector_dim:
+        raise PolicyContractError('seq vector width must match vector shape')
     return ActiveScoutPolicyConfig(
         checkpoint=assets['checkpoint'],
         control_dt_sec=float(runtime['control_dt_sec']),
@@ -227,7 +240,10 @@ def active_scout_config(
         map_crop_size_m=float(observation['map']['crop_size_m']),
         map_obs_size=int(observation['map']['shape'][1]),
         history_len=int(observation['temporal']['history_len']),
-        lidar_bins=int(observation['vector']['lidar_bins']),
+        lidar_bins=lidar_bins,
+        vector_dim=vector_dim,
+        vector_stats_dim=vector_stats_dim,
+        trim_extra_stats=bool(observation['vector'].get('trim_extra_stats', False)),
         lidar=LidarPolicyConfig(
             canonical_front_zero=bool(lidar['canonical_front_zero']),
             front_index=int(lidar['front_index']),
