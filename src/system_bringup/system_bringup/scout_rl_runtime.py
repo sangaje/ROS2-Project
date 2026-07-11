@@ -684,6 +684,7 @@ class ActiveScoutRLRuntime:
             scan_angle_increment=scan.angle_increment,
             scan_angle_max=scan.angle_max,
             include_target_priority=False,
+            trim_extra_stats=self.config.trim_extra_stats,
             lidar_config=self.lidar,
         ).astype(np.float32)
         map_observation = self.exploration_map.build_update_need_tensor(
@@ -693,7 +694,7 @@ class ActiveScoutRLRuntime:
             size_m=self.config.map_crop_size_m,
             rotate_to_robot=True,
         ).astype(np.float32)
-        if vector.shape != (self.config.lidar_bins + 9,):
+        if vector.shape != (self.config.vector_dim,):
             raise RuntimeError(f'vector shape mismatch: {vector.shape}')
         if map_observation.shape != (4, self.config.map_obs_size, self.config.map_obs_size):
             raise RuntimeError(f'map shape mismatch: {map_observation.shape}')

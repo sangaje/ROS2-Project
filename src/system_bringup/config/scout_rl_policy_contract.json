@@ -2,7 +2,7 @@
   "source_of_truth": {
     "training_runner": "run_train_v132_clean.sh",
     "train_module": "turtlebot3_rl_training.train_sac",
-    "model_path": "rl_models/pure_velocity_sac_map64_lidar60_h8_deltatcn_domain22_nopriority_gsde_v022_dt02_b128/sac_turtlebot3_burger.zip"
+    "model_path": "rl_models/pure_velocity_sac_map64_lidar60_h8_deltatcn_domain22_nopriority_gsde_v022_dt02_b128_obs63/sac_turtlebot3_burger_emergency.zip"
   },
   "runtime": {
     "control_dt_sec": 0.2,
@@ -76,13 +76,14 @@
       "dtype": "float32"
     },
     "seq": {
-      "shape": [8, 69],
+      "shape": [8, 63],
       "dtype": "float32"
     },
     "vector": {
       "lidar_bins": 60,
-      "stats_dim": 9,
-      "shape": [69],
+      "stats_dim": 3,
+      "trim_extra_stats": true,
+      "shape": [63],
       "dtype": "float32"
     },
     "temporal": {
