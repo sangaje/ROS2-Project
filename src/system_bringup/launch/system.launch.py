@@ -136,6 +136,7 @@ def generate_launch_description():
     yolo_server_port = LaunchConfiguration('yolo_server_port')
     yolo_server_model_path = LaunchConfiguration('yolo_server_model_path')
     yolo_server_target_class = LaunchConfiguration('yolo_server_target_class')
+    yolo_server_conf = LaunchConfiguration('yolo_server_conf')
     yolo_server_device = LaunchConfiguration('yolo_server_device')
     yolo_server_half = LaunchConfiguration('yolo_server_half')
     omx_yolo_node_delay_sec = LaunchConfiguration('omx_yolo_node_delay_sec')
@@ -511,7 +512,7 @@ def generate_launch_description():
                         '--device', yolo_server_device.perform(context),
                         '--half', yolo_server_half.perform(context),
                         '--fast-forward', 'true',
-                        '--conf', '0.20',
+                        '--conf', yolo_server_conf.perform(context),
                         '--iou', '0.45',
                         '--max-det', '64',
                         '--imgsz', '960',
@@ -1300,10 +1301,18 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'yolo_server_target_class',
-            default_value='1',
+            default_value='all',
             description=(
                 'Leader role only: class id for flask_yolo_server. Use '
                 '"all" to disable class filtering while debugging best.pt.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'yolo_server_conf',
+            default_value='0.20',
+            description=(
+                'Leader role only: YOLO confidence threshold for '
+                'flask_yolo_server. Lower this only while debugging misses.'
             ),
         ),
         DeclareLaunchArgument(
