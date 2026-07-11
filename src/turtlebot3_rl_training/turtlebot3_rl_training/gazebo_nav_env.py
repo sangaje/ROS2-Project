@@ -2482,6 +2482,15 @@ class GazeboNavEnv(gym.Env):
         if shape == "cylinder":
             radius = max((float(size_x) + float(size_y)) / 4.0, 0.05)
             geometry = f"<cylinder><radius>{radius:.3f}</radius><length>{size_z:.3f}</length></cylinder>"
+        elif shape == "capsule":
+            # v136: rounded-cap pole/pillar for shape variety beyond
+            # box/cylinder/ellipsoid. <length> in SDF is only the straight
+            # cylindrical section between the two hemispherical caps, so it
+            # has to be size_z minus both caps to make the *total* height
+            # come out to size_z like every other shape here.
+            radius = max(min(float(size_x), float(size_y)) / 2.0, 0.04)
+            length = max(float(size_z) - 2.0 * radius, 0.05)
+            geometry = f"<capsule><radius>{radius:.3f}</radius><length>{length:.3f}</length></capsule>"
         elif shape == "ellipsoid":
             # SDF 1.9+ native <ellipsoid> with independent radii per axis --
             # unlike <cylinder> (one radius, round in X/Y), this can actually
@@ -2568,7 +2577,10 @@ class GazeboNavEnv(gym.Env):
             len(getattr(self, "_random_obstacle_names", [])),
         )
         selected: list[tuple[float, float, float, float, float, float, str]] = []
-        max_place_attempts = max(count * 18, len(candidates))
+        # v136: bigger/longer obstacles fail the clearance check more often,
+        # so more placement attempts are needed to still land close to the
+        # requested `count` instead of silently spawning fewer.
+        max_place_attempts = max(count * 26, len(candidates))
         for attempt_idx in range(max_place_attempts):
             if len(selected) >= count:
                 break
@@ -2579,10 +2591,25 @@ class GazeboNavEnv(gym.Env):
             # through, max is ~3x the old 0.55 ceiling) and an ellipsoid shape
             # option alongside box/cylinder for real shape variety, not just
             # size variety.
-            shape = random.choice(("box", "box", "cylinder", "ellipsoid", "ellipsoid"))
-            sx = random.uniform(0.08, 1.65)
-            sy = random.uniform(0.08, 1.65)
-            sz = random.uniform(0.25, 1.60)
+            # v136: bigger max size again, a capsule shape option, and an
+            # explicit long/thin "panel" aspect ratio on top of that -- a
+            # third of non-cylinder obstacles now stretch one horizontal axis
+            # well past the other (long bench/wall/beam look) instead of only
+            # scaling both axes together, which just makes bigger blobs, not
+            # longer ones. yaw below still randomizes which way each points,
+            # so the long axis doesn't need to be biased toward x or y.
+            shape = random.choice(("box", "box", "cylinder", "ellipsoid", "ellipsoid", "capsule"))
+            if shape != "cylinder" and random.random() < 0.35:
+                long_len = random.uniform(1.8, 3.2)
+                short_len = random.uniform(0.10, 0.40)
+                if random.random() < 0.5:
+                    sx, sy = long_len, short_len
+                else:
+                    sx, sy = short_len, long_len
+            else:
+                sx = random.uniform(0.08, 2.30)
+                sy = random.uniform(0.08, 2.30)
+            sz = random.uniform(0.25, 2.00)
             # Hard safety clamp: training_house.sdf's outer walls are at
             # x=+-6.5/y=+-3.5 with 0.18m thickness, so the inner face is at
             # +-6.41/+-3.41. The +-0.55m noise clip above can otherwise push an
