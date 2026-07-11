@@ -193,7 +193,7 @@ def generate_launch_description():
             'yolo_server_port', default_value='5005',
             description='flask_yolo_server HTTP port.'),
         DeclareLaunchArgument(
-            'yolo_server_model_path', default_value='yolo11n.pt',
+            'yolo_server_model_path', default_value='model/best.pt',
             description='YOLO model path for flask_yolo_server.'),
         DeclareLaunchArgument(
             'yolo_server_device', default_value='0',
@@ -210,7 +210,7 @@ def generate_launch_description():
             'yolo_node_delay_sec', default_value='14.0',
             description='Delay heavy OMX YOLO/camera/model startup on constrained Jetson hardware.'),
         DeclareLaunchArgument(
-            'yolo_node_model_path', default_value='yolo11n.pt',
+            'yolo_node_model_path', default_value='model/best.pt',
             description=(
                 'Model used by omx_yolo_node. Pass an absolute best.pt path '
                 'only when that file exists on this Jetson.'

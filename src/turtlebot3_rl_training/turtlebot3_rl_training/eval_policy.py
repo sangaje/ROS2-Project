@@ -285,7 +285,7 @@ def parse_args():
     parser.add_argument(
         "--model",
         type=str,
-        default="rl_models/sac_turtlebot3_burger.zip",
+        default="model/sac_turtlebot3_burger.zip",
     )
     parser.add_argument("--episodes", type=int, default=5)
     parser.add_argument(

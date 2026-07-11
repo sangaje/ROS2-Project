@@ -54,12 +54,8 @@ def generate_launch_description():
     def make_stack(context):
         member_domain = int(domain_id.perform(context))
         main_domain_value = main_domain_id.perform(context).strip()
-        if not main_domain_value:
-            raise ValueError(
-                'main_domain_id is required for member.launch.py domain_bridge. '
-                'Pass the launch option main_domain_id:=<leader_domain>.'
-            )
-        main_domain = int(main_domain_value)
+        main_domain = int(main_domain_value) if main_domain_value else member_domain
+        standalone = main_domain == member_domain
         process_env = clean_process_environment(str(member_domain))
 
         # Reuses the follower's Burger Nav2/AMCL tuning; a plain member is
@@ -78,37 +74,39 @@ def generate_launch_description():
             convert_types=True,
         )
 
-        main_to_member, member_to_main = write_member_bridge_configs(
-            main_domain,
-            member_domain,
-            forward_map_to_main=launch_bool(forward_map_to_main.perform(context)),
-        )
-        bridges = [
-            Node(
-                package='domain_bridge',
-                executable='domain_bridge',
-                name='bridge_main_to_member',
-                output='screen',
-                arguments=[
-                    str(main_to_member), '--wait-for-publisher', 'false',
-                ],
-                env=process_env,
-                respawn=True,
-                respawn_delay=3.0,
-            ),
-            Node(
-                package='domain_bridge',
-                executable='domain_bridge',
-                name='bridge_member_to_main',
-                output='screen',
-                arguments=[
-                    str(member_to_main), '--wait-for-publisher', 'false',
-                ],
-                env=process_env,
-                respawn=True,
-                respawn_delay=3.0,
-            ),
-        ]
+        bridges = []
+        if not standalone:
+            main_to_member, member_to_main = write_member_bridge_configs(
+                main_domain,
+                member_domain,
+                forward_map_to_main=launch_bool(forward_map_to_main.perform(context)),
+            )
+            bridges = [
+                Node(
+                    package='domain_bridge',
+                    executable='domain_bridge',
+                    name='bridge_main_to_member',
+                    output='screen',
+                    arguments=[
+                        str(main_to_member), '--wait-for-publisher', 'false',
+                    ],
+                    env=process_env,
+                    respawn=True,
+                    respawn_delay=3.0,
+                ),
+                Node(
+                    package='domain_bridge',
+                    executable='domain_bridge',
+                    name='bridge_member_to_main',
+                    output='screen',
+                    arguments=[
+                        str(member_to_main), '--wait-for-publisher', 'false',
+                    ],
+                    env=process_env,
+                    respawn=True,
+                    respawn_delay=3.0,
+                ),
+            ]
 
         map_relay = Node(
             package='fleet_bringup',
@@ -277,17 +275,26 @@ def generate_launch_description():
         bridge_t, relay_t, amcl_t, localization_t, kickstart_t = timing
         actions = [
             base,
-            LogInfo(msg=[
-                'LEADER_EGRESS_BRIDGE | source_domain=', str(main_domain),
-                ' | destination_domain=', str(member_domain),
-                ' | topics=/map,/leader_pose',
-                ' | bridge_topic=/map_bridge',
-                ' | map_type=nav_msgs/msg/OccupancyGrid',
-                ' | pose_type=geometry_msgs/msg/PoseStamped',
-            ]),
-            TimerAction(period=bridge_t, actions=bridges),
-            TimerAction(period=relay_t, actions=[map_relay, member_pose]),
         ]
+        if standalone:
+            actions.append(LogInfo(msg=[
+                'MEMBER_STANDALONE | domain=', str(member_domain),
+                ' | domain_bridge=false | map_relay=false',
+            ]))
+            actions.append(TimerAction(period=relay_t, actions=[member_pose]))
+        else:
+            actions.extend([
+                LogInfo(msg=[
+                    'LEADER_EGRESS_BRIDGE | source_domain=', str(main_domain),
+                    ' | destination_domain=', str(member_domain),
+                    ' | topics=/map,/leader_pose',
+                    ' | bridge_topic=/map_bridge',
+                    ' | map_type=nav_msgs/msg/OccupancyGrid',
+                    ' | pose_type=geometry_msgs/msg/PoseStamped',
+                ]),
+                TimerAction(period=bridge_t, actions=bridges),
+                TimerAction(period=relay_t, actions=[map_relay, member_pose]),
+            ])
         if amcl is not None:
             actions.append(TimerAction(
                 period=amcl_t, actions=[localization_config_log, amcl],
@@ -312,8 +319,8 @@ def generate_launch_description():
             'main_domain_id',
             default_value='',
             description=(
-                'Leader DDS domain used by domain_bridge. Required; pass '
-                'main_domain_id:=<leader_domain>.'
+                'Leader DDS domain used by domain_bridge. Leave empty, or '
+                'set equal to domain_id, for standalone member/scout testing.'
             ),
         ),
         DeclareLaunchArgument(

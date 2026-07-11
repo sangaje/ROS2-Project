@@ -22,14 +22,13 @@ bayesian_risk_map_node:
     # flask_topic: do not subscribe ROS Image; consume compact JSON detections from Flask bridge.
     detection_source: "local_yolo"
     external_detection_topic: "/risk/yolo_detections"
-    # COCO yolo11n.pt teddy bear target. Keep label aliases tolerant for
-    # custom exporters that spell the class differently.
-    target_class: 77
-    target_label: "teddy bear"
-    target_label_aliases: ["teddy bear", "teddy_bear", "bear"]
+    # Project model/best.pt target. Custom labels are ally=0 and enemy=1.
+    target_class: 1
+    target_label: "enemy"
+    target_label_aliases: ["enemy", "doll", "target"]
     external_person_only: false  # Legacy parameter; target_class is used instead.
     enable_yolo: true
-    model_path: "yolo11n.pt"
+    model_path: "model/best.pt"
     device: "cpu"
     conf_threshold: 0.25
     yolo_imgsz: 320
@@ -70,7 +69,7 @@ bayesian_risk_map_node:
 
     # Multi-view bearing consensus.
     # Small targets make bbox-height distance noisy, so range is ignored by
-    # default. A teddy-bear direction is stored at each robot viewpoint, and risk appears
+    # default. A target direction is stored at each robot viewpoint, and risk appears
     # where rays from at least two spatially distinct viewpoints agree.
     positive_projection_mode: "bearing_consensus"
     bearing_consensus_sigma_deg: 6.0
@@ -94,7 +93,7 @@ bayesian_risk_map_node:
     bearing_max_observations_per_viewpoint: 8
     bearing_same_view_angle_merge_deg: 2.0
 
-    # Real-time Bayesian teddy-bear memory.
+    # Real-time Bayesian target memory.
     # Detection adds cell-wise log-odds. A missing detection reduces evidence only
     # inside the current camera FOV, after the grace time; out-of-view cells persist.
     enable_person_probability_map: true

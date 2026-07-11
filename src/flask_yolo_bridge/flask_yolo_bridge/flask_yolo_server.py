@@ -122,7 +122,7 @@ DEBUG_PAGE = """<!doctype html>
     <aside>
       <h2>Live status</h2>
       <div class="cards">
-        <div class="card"><div class="label">Teddy bears</div><div id="people" class="value">—</div></div>
+        <div class="card"><div class="label">Targets</div><div id="people" class="value">—</div></div>
         <div class="card"><div class="label">FPS</div><div id="fps" class="value">—</div></div>
         <div class="card"><div class="label">YOLO</div><div id="latency" class="value">—</div></div>
         <div class="card"><div class="label">Capture age</div><div id="captureAge" class="value">—</div></div>
@@ -178,12 +178,12 @@ DEBUG_PAGE = """<!doctype html>
         const root = document.getElementById('detections');
         const detections = Array.isArray(s.detections) ? s.detections : [];
         if (!detections.length) {
-          root.innerHTML = '<div class="muted">No teddy bear in latest frame.</div>';
+          root.innerHTML = '<div class="muted">No target in latest frame.</div>';
         } else {
           root.innerHTML = detections.map((d, i) => {
             const conf = Number(d.conf ?? d.confidence ?? 0);
             const box = Array.isArray(d.bbox) ? d.bbox.map(v => Number(v).toFixed(0)).join(', ') : 'bbox unavailable';
-            return `<div class="det"><div><b>${i + 1}. ${d.label ?? 'teddy bear'}</b><div class="muted mono">${box}</div></div><div class="mono">${(conf * 100).toFixed(0)}%</div></div>`;
+            return `<div class="det"><div><b>${i + 1}. ${d.label ?? 'target'}</b><div class="muted mono">${box}</div></div><div class="mono">${(conf * 100).toFixed(0)}%</div></div>`;
           }).join('');
         }
       } catch (_) {
@@ -347,12 +347,12 @@ def _draw_yolo_overlay(frame, detections, latency_ms):
         )
     cv2.putText(
         output,
-        f'teddy_bears={len(detections)} inference={latency_ms:.1f}ms',
+        f'targets={len(detections)} inference={latency_ms:.1f}ms',
         (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 255), 2,
     )
     if not detections:
         cv2.putText(
-            output, 'NO TEDDY BEAR', (10, 55),
+            output, 'NO TARGET', (10, 55),
             cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 180, 255), 2,
         )
     return output
@@ -827,7 +827,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--port', type=int, default=5005)
-    parser.add_argument('--model-path', default='yolo11n.pt')
+    parser.add_argument('--model-path', default='model/best.pt')
     parser.add_argument('--device', default='0')
     parser.add_argument('--half', type=as_bool, default=True)
     parser.add_argument('--fast-forward', type=as_bool, default=True)
@@ -839,8 +839,8 @@ def parse_args():
     parser.add_argument('--max-capture-age-sec', type=float, default=0.8)
     parser.add_argument('--max-queue-wait-sec', type=float, default=0.0)
     parser.add_argument(
-        '--target-class', type=int, default=77,
-        help='Only infer this class. COCO teddy bear target class is 77.',
+        '--target-class', type=int, default=1,
+        help='Only infer this class. Project best.pt target class is 1.',
     )
     # Backward-compatible aliases for older launch commands.  New launches use
     # --target-class, so the server no longer hard-codes COCO person (class 0).

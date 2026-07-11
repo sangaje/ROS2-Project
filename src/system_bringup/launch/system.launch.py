@@ -171,13 +171,8 @@ def generate_launch_description():
         main_domain_value = main_domain_id.perform(context).strip()
         main_domain = domain
         if fleet_role_value in ('follower', 'member'):
-            if not main_domain_value:
-                raise ValueError(
-                    'main_domain_id is required for scout/member/follower '
-                    'bridging. Pass the launch option '
-                    'main_domain_id:=<leader_domain>.'
-                )
-            main_domain = int(main_domain_value)
+            if main_domain_value:
+                main_domain = int(main_domain_value)
 
         fleet_share = get_package_share_directory('fleet_bringup')
         fleet_launch_path = os.path.join(
@@ -269,6 +264,13 @@ def generate_launch_description():
                 launch_arguments=fleet_launch_args.items(),
             ),
         ]
+        if fleet_role_value in ('member', 'follower') and not main_domain_value:
+            actions.append(LogInfo(msg=[
+                'SYSTEM_BRINGUP | main_domain_id not set; running ',
+                fleet_role_value,
+                ' standalone on domain ', str(domain),
+                ' without cross-domain fleet bridge.',
+            ]))
         if scout_rl_owns_cmd_vel and launch_bool(start_nav2.perform(context)):
             actions.append(LogInfo(msg=[
                 'SYSTEM_BRINGUP | scout member RL owns /cmd_vel; forcing ',
@@ -861,9 +863,10 @@ def generate_launch_description():
             'main_domain_id',
             default_value='',
             description=(
-                'Leader DDS domain used by domain_bridge. Required for '
-                'scout/member/follower bridging; optional '
-                'for role:=leader. Pass as main_domain_id:=<leader_domain>.'
+                'Leader DDS domain used by domain_bridge. Leave empty for '
+                'single-robot scout/member testing; optional for '
+                'role:=leader. Pass as main_domain_id:=<leader_domain> '
+                'when bridging to a leader.'
             ),
         ),
         DeclareLaunchArgument(
@@ -975,7 +978,7 @@ def generate_launch_description():
                 'needs an interactive terminal.'
             ),
         ),
-        DeclareLaunchArgument('risk_model_path', default_value='yolo11n.pt'),
+        DeclareLaunchArgument('risk_model_path', default_value='model/best.pt'),
         DeclareLaunchArgument(
             'detection_source', default_value='flask_topic',
             description=(
@@ -1253,7 +1256,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'yolo_server_model_path',
-            default_value='yolo11n.pt',
+            default_value='model/best.pt',
             description='Leader role only: YOLO model path for flask_yolo_server.',
         ),
         DeclareLaunchArgument(

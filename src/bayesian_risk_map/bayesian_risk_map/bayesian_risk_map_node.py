@@ -147,24 +147,24 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         # YOLO
         self.detection_source = str(self.declare_parameter('detection_source', 'local_yolo').value).strip().lower()
         self.external_detection_topic = self.declare_parameter('external_detection_topic', '/risk/yolo_detections').value
-        # Target model contract: COCO yolo11n.pt uses class 77 for teddy bear.
+        # Target model contract: project best.pt uses 0=ally, 1=enemy/doll.
         # Keep external_person_only declared for backwards-compatible old launch files,
         # but select detections exclusively by the explicit target class below.
         self.external_person_only = self.declare_bool_parameter('external_person_only', False)
-        self.target_class = int(self.declare_parameter('target_class', 77).value)
+        self.target_class = int(self.declare_parameter('target_class', 1).value)
         self.target_label = normalize_label(
-            self.declare_parameter('target_label', 'teddy bear').value
+            self.declare_parameter('target_label', 'enemy').value
         )
         alias_value = self.declare_parameter(
             'target_label_aliases',
-            ['teddy bear', 'teddy_bear', 'bear'],
+            ['enemy', 'doll', 'target'],
         ).value
         self.target_labels = parse_label_aliases(alias_value)
         self.target_labels.add(self.target_label)
         self.debug_image_topic = self.declare_parameter('debug_image_topic', '/risk/debug_yolo_image').value
         self.enable_yolo = self.declare_bool_parameter('enable_yolo', True)
         self.model_path = self.declare_parameter(
-            'model_path', 'yolo11n.pt'
+            'model_path', 'model/best.pt'
         ).value
         self.device = self.declare_parameter('device', 'cpu').value
         self.conf_threshold = float(self.declare_parameter('conf_threshold', 0.20).value)
@@ -225,7 +225,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         #
         # A small target can make bbox-height range estimation noisy.
         # In bearing_consensus mode, each spatially distinct robot viewpoint votes along the
-        # detected teddy bear's line of sight. Risk is created only where multiple
+        # detected target's line of sight. Risk is created only where multiple
         # independent viewpoint maps agree, so moving the robot triangulates the target.
         self.positive_projection_mode = str(
             self.declare_parameter('positive_projection_mode', 'bearing_consensus').value
@@ -1680,7 +1680,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             for det in detections:
                 x1, y1, x2, y2 = [int(v) for v in det.bbox]
                 cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                label = f'teddy bear {det.conf:.2f} r~{det.range_hat_m:.1f}m b={math.degrees(det.bearing_rad):.1f}'
+                label = f'target {det.conf:.2f} r~{det.range_hat_m:.1f}m b={math.degrees(det.bearing_rad):.1f}'
                 cv2.putText(img, label, (x1, max(15, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
             return img
         except Exception:

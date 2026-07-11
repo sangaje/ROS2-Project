@@ -190,7 +190,7 @@ export TB3_RL_RANDOM_OBSTACLE_NOISE_SIGMA_M=0.35
 # older non-SDE checkpoints (loading would hit a state_dict shape mismatch). Point at a fresh
 # "_gsde" model/log dir instead of touching the existing non-SDE checkpoints in the old dir --
 # the auto-checkpoint scan below will find nothing there and start from scratch automatically.
-export MODEL_DIR="rl_models/pure_velocity_sac_map64_lidar60_h8_deltatcn_domain22_nopriority_gsde_v022_dt02_b128_obs63"
+export MODEL_DIR="model"
 export LOG_DIR="rl_logs/pure_velocity_sac_map64_lidar60_h8_deltatcn_domain22_nopriority_gsde_v022_dt02_b128_obs63"
 mkdir -p "${MODEL_DIR}" "${LOG_DIR}"
 
@@ -201,7 +201,7 @@ import os
 import json
 from pathlib import Path
 
-model_dir = Path(os.environ.get("MODEL_DIR", "rl_models/pure_velocity_sac_map64_lidar60_h8_deltatcn_domain22_nopriority"))
+model_dir = Path(os.environ.get("MODEL_DIR", "model"))
 
 def step(path: Path) -> int:
     # SB3 stores the authoritative counter inside every model archive.  Main
