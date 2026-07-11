@@ -14,6 +14,33 @@ from ultralytics import YOLO
 from omx.config import Config
 
 
+def _resolve_supported_device(requested: str) -> tuple[str, str | None]:
+    """Prevent an unsupported Jetson CUDA binary from killing OMX video."""
+    device = str(requested).strip()
+    if device.isdigit():
+        device = f'cuda:{device}'
+    if device.lower() in ('cpu', 'none', ''):
+        return 'cpu', None
+    if not device.lower().startswith('cuda'):
+        return device, None
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return 'cpu', 'CUDA unavailable'
+        index = int(device.split(':', 1)[1]) if ':' in device else 0
+        major, minor = torch.cuda.get_device_capability(index)
+        needed = f'sm_{major}{minor}'
+        supported = set(torch.cuda.get_arch_list())
+        if not supported or needed not in supported:
+            return 'cpu', (
+                f'GPU CC {major}.{minor} requires {needed}; '
+                f'torch supports {sorted(supported) or ["none"]}'
+            )
+    except Exception as exc:  # noqa: BLE001
+        return 'cpu', f'CUDA capability check failed: {exc}'
+    return device, None
+
+
 class YoloDetector:
     """카메라 프레임 + YOLO 검출 + 영상 중심 기준 정규화 오차 계산.
 
@@ -36,10 +63,13 @@ class YoloDetector:
         self._consecutive_read_failures = 0
         self._open_camera(initial=True)
 
-        self.device = str(os.environ.get(
+        requested_device = str(os.environ.get(
             "OMX_YOLO_DEVICE",
             getattr(cfg.yolo, "device", "0"),
         )).strip()
+        self.device, cpu_fallback_reason = _resolve_supported_device(requested_device)
+        if cpu_fallback_reason:
+            self._warn(f'OMX_YOLO_CUDA_FALLBACK_CPU | {cpu_fallback_reason}')
         self.use_half = bool(getattr(cfg.yolo, "half", True))
         if self.device.lower() in ("cpu", "none", ""):
             self.use_half = False

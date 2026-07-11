@@ -178,12 +178,12 @@ DEBUG_PAGE = """<!doctype html>
         const root = document.getElementById('detections');
         const detections = Array.isArray(s.detections) ? s.detections : [];
         if (!detections.length) {
-          root.innerHTML = '<div class="muted">No person in latest frame.</div>';
+          root.innerHTML = '<div class="muted">No doll in latest frame.</div>';
         } else {
           root.innerHTML = detections.map((d, i) => {
             const conf = Number(d.conf ?? d.confidence ?? 0);
             const box = Array.isArray(d.bbox) ? d.bbox.map(v => Number(v).toFixed(0)).join(', ') : 'bbox unavailable';
-            return `<div class="det"><div><b>${i + 1}. ${d.label ?? 'person'}</b><div class="muted mono">${box}</div></div><div class="mono">${(conf * 100).toFixed(0)}%</div></div>`;
+            return `<div class="det"><div><b>${i + 1}. ${d.label ?? 'doll'}</b><div class="muted mono">${box}</div></div><div class="mono">${(conf * 100).toFixed(0)}%</div></div>`;
           }).join('');
         }
       } catch (_) {
@@ -347,12 +347,12 @@ def _draw_yolo_overlay(frame, detections, latency_ms):
         )
     cv2.putText(
         output,
-        f'people={len(detections)} inference={latency_ms:.1f}ms',
+        f'dolls={len(detections)} inference={latency_ms:.1f}ms',
         (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 255), 2,
     )
     if not detections:
         cv2.putText(
-            output, 'NO PERSON', (10, 55),
+            output, 'NO DOLL', (10, 55),
             cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 180, 255), 2,
         )
     return output
@@ -376,6 +376,38 @@ def _normalize_device(device):
     if text.isdigit():
         return f'cuda:{text}'
     return text
+
+
+def _resolve_inference_device(requested):
+    """Return a CUDA device only when this torch build supports its CC.
+
+    Jetson Orin is compute capability 8.7.  A PyTorch build lacking ``sm_87``
+    emits a warning at startup, then fails asynchronously during inference
+    with a missing CUDA kernel.  Falling back before model/tensor placement
+    keeps the HTTP stream and dashboard responsive.
+    """
+    requested = _normalize_device(requested)
+    if requested.lower() in ('cpu', 'none', ''):
+        return 'cpu', None
+    if not requested.lower().startswith('cuda'):
+        return requested, None
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return 'cpu', 'CUDA unavailable'
+        index = int(requested.split(':', 1)[1]) if ':' in requested else 0
+        major, minor = torch.cuda.get_device_capability(index)
+        required_arch = f'sm_{major}{minor}'
+        supported_arches = set(torch.cuda.get_arch_list())
+        if not supported_arches or required_arch not in supported_arches:
+            available = ','.join(sorted(supported_arches)) or 'none'
+            return 'cpu', (
+                f'GPU CC {major}.{minor} requires {required_arch}, '
+                f'torch supports [{available}]'
+            )
+    except Exception as exc:  # noqa: BLE001
+        return 'cpu', f'CUDA capability check failed: {exc}'
+    return requested, None
 
 
 def _cuda_synchronize_if_needed(device):
@@ -408,7 +440,12 @@ def build_app(args):
     from ultralytics import YOLO
 
     app = Flask(__name__)
-    args.device = _normalize_device(args.device)
+    args.device, cpu_fallback_reason = _resolve_inference_device(args.device)
+    if cpu_fallback_reason:
+        print(
+            '[flask_yolo_server] CUDA_FALLBACK_CPU | '
+            f'{cpu_fallback_reason}', flush=True,
+        )
     model = YOLO(args.model_path)
     use_half = bool(args.half) and str(args.device).lower() not in ('cpu', 'none', '')
     use_fast_forward = bool(args.fast_forward)
@@ -461,7 +498,7 @@ def build_app(args):
                     pred,
                     conf_thres=args.conf,
                     iou_thres=args.iou,
-                    classes=[0] if args.person_only else None,
+                    classes=[args.target_class] if args.target_class is not None else None,
                     max_det=args.max_det,
                 )
         else:
@@ -469,7 +506,7 @@ def build_app(args):
                 source=dummy,
                 imgsz=args.imgsz,
                 conf=args.conf,
-                classes=[0] if args.person_only else None,
+                classes=[args.target_class] if args.target_class is not None else None,
                 device=args.device,
                 half=use_half,
                 verbose=False,
@@ -485,6 +522,21 @@ def build_app(args):
         print(f'[flask_yolo_server] warmup failed: {exc}', flush=True)
     state = DebugState()
     runtime = {'warmup_ms': warmup_ms}
+
+    def update_debug_overlay(frame, width, height, capture_age_ms, status_text):
+        """Keep the overlay MJPEG stream live before/without inference."""
+        import cv2
+
+        overlay = _draw_yolo_overlay(frame, [], 0.0)
+        cv2.putText(
+            overlay, status_text, (10, 82),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 180, 255), 2,
+        )
+        state.update_yolo(
+            _encode_jpeg(overlay, args.debug_jpeg_quality),
+            0, 0.0, width, height, capture_age_ms,
+            detections=[],
+        )
 
     class InferenceWorker:
         def __init__(self):
@@ -563,7 +615,7 @@ def build_app(args):
                         pred,
                         conf_thres=args.conf,
                         iou_thres=args.iou,
-                        classes=[0] if args.person_only else None,
+                        classes=[args.target_class] if args.target_class is not None else None,
                         max_det=args.max_det,
                     )
                 input_shape = tensor.shape[2:]
@@ -572,7 +624,7 @@ def build_app(args):
                     source=frame,
                     imgsz=args.imgsz,
                     conf=args.conf,
-                    classes=[0] if args.person_only else None,
+                    classes=[args.target_class] if args.target_class is not None else None,
                     device=args.device,
                     half=use_half,
                     verbose=False,
@@ -658,8 +710,10 @@ def build_app(args):
 
         # Keep the debug camera view live even when this frame is too old or YOLO is busy.
         state.update_raw(original_jpeg, int(w), int(h), capture_age_ms)
+        update_debug_overlay(frame, int(w), int(h), capture_age_ms, 'YOLO QUEUED')
 
         if args.max_capture_age_sec > 0.0 and raw_age_sec > args.max_capture_age_sec:
+            update_debug_overlay(frame, int(w), int(h), capture_age_ms, 'YOLO STALE FRAME')
             return jsonify({
                 'ok': False,
                 'stale': True,
@@ -673,6 +727,7 @@ def build_app(args):
             results, input_shape, predict_ms = inference_worker.infer(frame)
         except InferenceBusyError as exc:
             busy_age_sec = _request_capture_age_sec(request)
+            update_debug_overlay(frame, int(w), int(h), capture_age_ms, 'YOLO BUSY - RETRYING')
             return jsonify({
                 'ok': False,
                 'stale': True,
@@ -682,6 +737,7 @@ def build_app(args):
                 'detections': [],
             })
         except Exception as exc:
+            update_debug_overlay(frame, int(w), int(h), capture_age_ms, 'YOLO INFERENCE ERROR')
             return jsonify({'ok': False, 'error': f'YOLO inference failed: {exc}'}), 500
 
         t_post0 = time.perf_counter()
@@ -771,7 +827,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--port', type=int, default=5005)
-    parser.add_argument('--model-path', default='yolo11s.pt')
+    parser.add_argument('--model-path', default='yolo11n.pt')
     parser.add_argument('--device', default='0')
     parser.add_argument('--half', type=as_bool, default=True)
     parser.add_argument('--fast-forward', type=as_bool, default=True)
@@ -782,8 +838,14 @@ def parse_args():
     parser.add_argument('--debug-jpeg-quality', type=int, default=80)
     parser.add_argument('--max-capture-age-sec', type=float, default=0.8)
     parser.add_argument('--max-queue-wait-sec', type=float, default=0.0)
-    parser.add_argument('--person-only', action='store_true', default=True)
-    parser.add_argument('--all-classes', action='store_false', dest='person_only')
+    parser.add_argument(
+        '--target-class', type=int, default=1,
+        help='Only infer this class. Project doll target class is 1.',
+    )
+    # Backward-compatible aliases for older launch commands.  New launches use
+    # --target-class, so the server no longer hard-codes COCO person (class 0).
+    parser.add_argument('--person-only', action='store_const', const=0, dest='target_class')
+    parser.add_argument('--all-classes', action='store_const', const=None, dest='target_class')
     return parser.parse_args()
 
 

@@ -231,14 +231,16 @@ Cartographer)이 동시에 주장해서 TF 트리가 두 갈래로 쪼개지고
   같은 역할을 한다.
 
 RL 정책은 `ACTIVE_SCOUT` 역할의 내부 정찰 backend로만 켜진다. 모델 경로,
-map/LiDAR/history/action/safety 파라미터는 `run_train_v125_cube_safety.sh`
+map/LiDAR/history/action/safety 파라미터는 `run_train_v132_clean.sh`
 에서 계산된 contract로 고정되어 있으며 public launch option으로 노출하지
 않는다. 현재 contract manifest는
 `system_bringup/config/scout_rl_policy_contract.json`에 있다.
 
-### 알아둬야 할 통합 이슈: `eval_policy`와 SLAM 소유권
+### ACTIVE_SCOUT RL 구조
 
-`system_bringup`은 내부 env `TB3_RL_INFERENCE_EXTERNAL_SLAM=1`로
-`eval_policy`를 실행한다. 이 모드에서는 fleet/risk stack이 소유한 `/map`과
-TF를 사용하되, RL inference process가 별도의 SLAM backend를 띄우거나
-reset하지 않는다.
+`unified_field_robot` 한 프로세스가 SAC 모델을 한 번만 읽고, `/scan`과
+`/map`의 최신 스냅샷을 유지한다. 0.1초 map callback은 v132의
+`map_substeps_per_action=2`를 유지하고, 0.2초 policy callback은
+`model.predict(..., deterministic=True)`만 사용한다. role이 바뀌거나 scan,
+map, TF, inference가 stale/error이면 같은 `/cmd_vel` publisher로 zero command를
+보낸다. `eval_policy --real-robot`와 PC 원격 RL subprocess는 배포 경로가 아니다.

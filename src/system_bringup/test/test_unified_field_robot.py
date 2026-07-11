@@ -1,7 +1,4 @@
 import json
-import os
-import subprocess
-import time
 
 from builtin_interfaces.msg import Time
 from geometry_msgs.msg import PoseStamped
@@ -76,12 +73,8 @@ class _ActionClient:
         return future
 
 
-class _Process:
-    def __init__(self, return_code=None):
-        self.return_code = return_code
-
-    def poll(self):
-        return self.return_code
+class _Runtime:
+    active = True
 
 
 class _Result:
@@ -114,7 +107,7 @@ def _bare_field(now=10.0):
     node.active_goal_source = None
     node.inflight_goal_ids = set()
     node.cancel_requests = 0
-    node.exploration_process = None
+    node.rl_runtime = None
     node.nav_client = _ActionClient()
     node.last_odom_xy = (0.0, 0.0)
     node.nav_start_odom_xy = None
@@ -222,7 +215,7 @@ def test_recovery_arrival_requires_fresh_matching_frame_pose():
     assert node._at_pose(_pose(1.1, 1.1, frame='map')) is True
 
 
-def test_rl_heartbeat_requires_localization_and_live_authority():
+def test_rl_heartbeat_requires_localization_and_live_runtime():
     node, _ = _bare_field()
     node.role = Role.ACTIVE_SCOUT
     node.robot_name = 'scout22'
@@ -230,7 +223,7 @@ def test_rl_heartbeat_requires_localization_and_live_authority():
     node.require_localization_ready = True
     node.localization_ready = False
     node.motion_authority = MotionAuthority.ACTIVE_SCOUT_RL
-    node.exploration_process = _Process()
+    node.rl_runtime = _Runtime()
     node.heartbeat_seq = 0
     node.heartbeat_pub = _Publisher()
 
@@ -261,56 +254,4 @@ def test_shadow_goal_cancel_is_edge_triggered_on_failover():
     assert len(node.cancel_pub.messages) == 1
     assert node.cancel_pub.messages[0] == Bool(data=True)
     assert node.shadow_goal_active is False
-
-
-def test_kill_stray_exploration_processes_kills_matching_orphan():
-    node, logger = _bare_field()
-    marker = f'UNIQUE_TEST_MARKER_{os.getpid()}_{time.time_ns()}'
-    node.exploration_command = marker
-    node.exploration_process = None
-    stray = subprocess.Popen(
-        ['python3', '-c', f'import time; time.sleep(30)  # {marker}'],
-        start_new_session=True,
-    )
-    try:
-        time.sleep(0.2)
-        assert stray.poll() is None
-
-        node._kill_stray_exploration_processes()
-
-        assert stray.wait(timeout=2.0) is not None
-        assert any(
-            'FIELD_EXPLORATION_STRAY_PROCESS_KILLED' in text
-            for _, text in logger.messages
-        )
-    finally:
-        if stray.poll() is None:
-            stray.kill()
-            stray.wait()
-
-
-def test_kill_stray_exploration_processes_does_not_touch_unrelated_or_tracked():
-    node, logger = _bare_field()
-    marker = f'UNIQUE_TEST_MARKER_{os.getpid()}_{time.time_ns()}'
-    node.exploration_command = marker
-
-    unrelated = subprocess.Popen(['sleep', '30'], start_new_session=True)
-    tracked = subprocess.Popen(
-        ['python3', '-c', f'import time; time.sleep(30)  # {marker}'],
-        start_new_session=True,
-    )
-    node.exploration_process = tracked
-    try:
-        time.sleep(0.2)
-        node._kill_stray_exploration_processes()
-        time.sleep(0.2)
-
-        assert unrelated.poll() is None
-        assert tracked.poll() is None
-        assert logger.messages == []
-    finally:
-        for proc in (unrelated, tracked):
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait()
 

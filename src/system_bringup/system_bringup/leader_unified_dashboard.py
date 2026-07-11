@@ -193,11 +193,15 @@ class LeaderUnifiedDashboard(Node):
             ),
         }
 
+        # /map is published by map_relay with both TRANSIENT_LOCAL and
+        # VOLATILE writers.  Request VOLATILE here: it is compatible with
+        # both writers, while a TRANSIENT_LOCAL subscription silently misses
+        # the live volatile Cartographer/map-relay updates.
         grid_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            durability=DurabilityPolicy.VOLATILE,
         )
         latest_best_effort_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -364,7 +368,10 @@ class LeaderUnifiedDashboard(Node):
                 try:
                     with urllib.request.urlopen(url, timeout=2.0) as upstream:
                         while True:
-                            chunk = upstream.read(65536)
+                            # MJPEG frames are commonly smaller than 64 KiB.
+                            # Waiting for a whole 64 KiB block kept the browser
+                            # panel black despite a healthy upstream stream.
+                            chunk = upstream.read(8192)
                             if not chunk:
                                 break
                             yield chunk
@@ -380,9 +387,120 @@ class LeaderUnifiedDashboard(Node):
                 mimetype='multipart/x-mixed-replace; boundary=frame',
             )
             response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+            response.headers['X-Accel-Buffering'] = 'no'
+            return response
+
+        @app.get('/api/yolo_frame/<kind>.jpg')
+        def yolo_frame(kind):
+            if kind == 'raw':
+                path = '/frame/raw.jpg'
+            elif kind in ('yolo', 'overlay'):
+                path = '/frame/yolo.jpg'
+            else:
+                return jsonify({'ok': False, 'error': 'kind must be raw or yolo'}), 404
+            return self._single_jpeg_proxy(
+                Response,
+                f'http://127.0.0.1:{self.yolo_server_port}{path}',
+                f'Scout {kind} frame waiting',
+            )
+
+        @app.get('/api/omx_frame.jpg')
+        def omx_frame():
+            return self._single_jpeg_proxy(
+                Response,
+                f'http://127.0.0.1:{self.omx_debug_port}/frame.jpg',
+                'OMX frame waiting',
+            )
+
+        @app.get('/api/omx_stream.mjpg')
+        def omx_stream():
+            """Proxy the local OMX debug stream through the dashboard port.
+
+            The dashboard is normally opened from another machine.  Pointing
+            the browser directly at ``<leader-ip>:8080`` made the video panel
+            depend on that extra port being reachable from the client, even
+            though the dashboard itself on 8091 was reachable.  Keep the
+            upstream strictly local and expose it through the already-open
+            dashboard HTTP endpoint instead.
+            """
+            url = f'http://127.0.0.1:{self.omx_debug_port}{self.omx_stream_path}'
+
+            def placeholder_frame(message: str) -> bytes:
+                import cv2
+                import numpy as np
+
+                image = np.zeros((360, 640, 3), dtype=np.uint8)
+                cv2.putText(
+                    image, 'OMX VIDEO WAITING', (155, 160),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 190, 255), 2,
+                )
+                cv2.putText(
+                    image, message[:72], (48, 205),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (220, 220, 220), 1,
+                )
+                ok, encoded = cv2.imencode('.jpg', image)
+                if not ok:
+                    return b''
+                return (
+                    b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+                    + encoded.tobytes() + b'\r\n'
+                )
+
+            def generate():
+                # Keep this response alive while OMX is still loading or
+                # restarting.  A normal proxy emitted no bytes in that state,
+                # leaving a browser image permanently black until a reload.
+                while True:
+                    try:
+                        with urllib.request.urlopen(url, timeout=1.0) as upstream:
+                            while True:
+                                chunk = upstream.read(8192)
+                                if not chunk:
+                                    break
+                                yield chunk
+                    except Exception as exc:  # noqa: BLE001
+                        self.get_logger().warning(
+                            'UNIFIED_DASHBOARD_OMX_STREAM_PROXY_ERROR | '
+                            f'url={url} error={exc}',
+                            throttle_duration_sec=5.0,
+                        )
+                        frame = placeholder_frame(f'upstream reconnecting: {type(exc).__name__}')
+                        if frame:
+                            yield frame
+                        time.sleep(1.0)
+
+            response = Response(
+                stream_with_context(generate()),
+                mimetype='multipart/x-mixed-replace; boundary=frame',
+            )
+            response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+            response.headers['X-Accel-Buffering'] = 'no'
             return response
 
         return app
+
+    def _single_jpeg_proxy(self, response_class: Any, url: str, waiting_label: str) -> Any:
+        """Serve one current frame, never a long-lived MJPEG connection.
+
+        Browser reloads repeatedly interrupted the three concurrent MJPEG
+        proxies, producing panels that appeared only after a lucky F5.  A
+        short single-image request is independent, cache-busted by the UI,
+        and cannot retain a stale stream connection.
+        """
+        try:
+            with urllib.request.urlopen(url, timeout=0.8) as upstream:
+                payload = upstream.read()
+            response = response_class(payload, mimetype='image/jpeg')
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warning(
+                f'UNIFIED_DASHBOARD_FRAME_PROXY_WAIT | url={url} error={exc}',
+                throttle_duration_sec=5.0,
+            )
+            response = response_class(
+                _placeholder_jpeg(waiting_label), mimetype='image/jpeg'
+            )
+        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+        return response
 
     def _grid_response(self, response_class: Any, kind: str) -> Any:
         try:
@@ -835,6 +953,16 @@ def _encode_grid_png(data: list, width: int, height: int, kind: str) -> bytes:
         raise ValueError(f'invalid {kind} grid dimensions/data')
 
     grid = np.asarray(data[: width * height], dtype=np.int16).reshape((height, width))
+    # Cartographer grids grow with explored area.  Encoding their full native
+    # resolution on every dashboard refresh can take longer than the next map
+    # update, so a browser never receives a completed PNG.  Downsample only
+    # the presentation image; world metadata remains full-resolution and the
+    # canvas scales this image back over the correct map extent.
+    max_render_dimension = 1600
+    stride = max(1, int(math.ceil(max(width, height) / max_render_dimension)))
+    if stride > 1:
+        grid = grid[::stride, ::stride]
+        height, width = grid.shape
     grid = np.flipud(grid)
 
     if kind == 'risk':
@@ -851,13 +979,30 @@ def _encode_grid_png(data: list, width: int, height: int, kind: str) -> bytes:
         occupied = grid >= 65
         known = ~unknown & ~occupied
         shade = np.clip(245 - (np.clip(grid, 0, 100) * 1.8), 35, 245).astype(np.uint8)
-        img[unknown] = (58, 55, 50)
+        # Keep unexplored space visibly distinct from the dashboard's black
+        # canvas, otherwise a valid all-unknown fresh map looks like no map.
+        img[unknown] = (96, 91, 82)
         img[known] = np.stack([shade[known], shade[known], shade[known]], axis=-1)
         img[occupied] = (38, 38, 38)
 
     ok, encoded = cv2.imencode('.png', img)
     if not ok:
         raise RuntimeError(f'failed to encode {kind} grid')
+    return encoded.tobytes()
+
+
+def _placeholder_jpeg(label: str) -> bytes:
+    import cv2
+    import numpy as np
+
+    image = np.zeros((360, 640, 3), dtype=np.uint8)
+    cv2.putText(
+        image, label[:62], (72, 185), cv2.FONT_HERSHEY_SIMPLEX,
+        0.72, (0, 190, 255), 2,
+    )
+    ok, encoded = cv2.imencode('.jpg', image)
+    if not ok:
+        raise RuntimeError('failed to create dashboard placeholder')
     return encoded.tobytes()
 
 

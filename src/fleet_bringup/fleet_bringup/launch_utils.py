@@ -4,8 +4,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 from xml.etree import ElementTree as ET
 
-from ament_index_python.packages import get_package_share_directory
-from launch.actions import OpaqueFunction, SetEnvironmentVariable
+from launch.actions import OpaqueFunction
 
 
 REQUIRED_DDS_ENVIRONMENT = (
@@ -91,31 +90,6 @@ def _read_kernel_limit(name: str) -> int | None:
         return None
 
 
-def _packaged_cyclonedds_uri() -> str:
-    path = Path(get_package_share_directory('fleet_bringup')) / 'config' / 'cyclonedds_fleet.xml'
-    return f'file://{path}'
-
-
-def _prepare_process_environment(
-    domain_id: str,
-    base_environment: Dict[str, str] | None = None,
-) -> Dict[str, str]:
-    env = dict(base_environment) if base_environment is not None else os.environ.copy()
-    env['ROS_DOMAIN_ID'] = str(domain_id)
-    if (
-        env.get('RMW_IMPLEMENTATION', '').strip() == 'rmw_cyclonedds_cpp'
-        and not env.get('CYCLONEDDS_URI', '').strip()
-    ):
-        # Do not modify the user's shell, bashrc, or system DDS config. The
-        # integrated robot launch simply has more standalone ROS processes
-        # than CycloneDDS' small participant-index ranges tolerate on some
-        # robot images, so give only these child processes the fleet-local
-        # participant range.
-        env['CYCLONEDDS_URI'] = _packaged_cyclonedds_uri()
-    _validate_cyclonedds_socket_buffers(env)
-    return env
-
-
 def _validate_cyclonedds_socket_buffers(env: Dict[str, str] | None = None) -> None:
     """Fail early for Cyclone configs that the current kernel cannot satisfy.
 
@@ -186,10 +160,7 @@ def validate_shell_environment(expected_domain_id: str | None = None) -> None:
     """Fail fast when launch-time DDS values are missing or conflicting.
 
     Launch files in this workspace intentionally inherit DDS/RMW settings from
-    the user's shell.  They do not patch bashrc or system DDS files.  When the
-    inherited RMW is CycloneDDS and no CYCLONEDDS_URI is set, child processes
-    receive the package-local cyclonedds_fleet.xml to avoid participant-index
-    exhaustion in this large integrated launch.
+    the user's shell. They never add, replace, or unset DDS environment values.
     """
     missing = _missing_required_environment()
     if missing:
@@ -212,41 +183,16 @@ def validate_shell_environment(expected_domain_id: str | None = None) -> None:
 def clean_process_environment(domain_id: str) -> Dict[str, str]:
     """Return the current shell environment after validating it."""
     validate_shell_environment(str(domain_id))
-    return _prepare_process_environment(str(domain_id))
+    return os.environ.copy()
 
 
 def dds_launch_environment(domain_id) -> List:
-    """Validate DDS settings and apply them to the launch environment.
-
-    Returning ``SetEnvironmentVariable`` actions from the opaque callback is
-    important: merely preparing a copied dictionary does not affect nodes or
-    includes that launch afterwards.  Start from the current launch context so
-    an explicitly supplied ``CYCLONEDDS_URI`` remains authoritative; only add
-    the package-local CycloneDDS configuration when no URI is present.
-    """
+    """Validate inherited DDS settings without mutating launch environment."""
 
     def _validate(context, *args, **kwargs):
         expected_domain_id = _perform_if_needed(domain_id, context)
         validate_shell_environment(expected_domain_id)
-        resolved_domain_id = expected_domain_id
-        if resolved_domain_id is None:
-            resolved_domain_id = context.environment.get(
-                'ROS_DOMAIN_ID',
-                os.environ.get('ROS_DOMAIN_ID', ''),
-            )
-        env = _prepare_process_environment(
-            resolved_domain_id,
-            base_environment=context.environment,
-        )
-        actions = [
-            SetEnvironmentVariable('ROS_DOMAIN_ID', env['ROS_DOMAIN_ID']),
-        ]
-        cyclonedds_uri = env.get('CYCLONEDDS_URI', '').strip()
-        if cyclonedds_uri:
-            actions.append(
-                SetEnvironmentVariable('CYCLONEDDS_URI', cyclonedds_uri)
-            )
-        return actions
+        return []
 
     return [OpaqueFunction(function=_validate)]
 

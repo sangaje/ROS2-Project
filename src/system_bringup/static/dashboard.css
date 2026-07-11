@@ -106,7 +106,7 @@ section h2 {
   color: #d7e0e6;
   font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
 }
-.map-panel { display: grid; grid-template-rows: auto minmax(380px, 1fr) auto; }
+.map-panel { display: grid; grid-template-rows: auto auto minmax(380px, 1fr) auto; }
 .map-tools {
   display: flex;
   gap: 12px;

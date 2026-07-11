@@ -43,6 +43,9 @@ def launch_setup(context, *args, **kwargs):
     yolo_node_delay = float(
         LaunchConfiguration('yolo_node_delay_sec').perform(context)
     )
+    yolo_node_model_path = LaunchConfiguration('yolo_node_model_path').perform(context)
+    omx_camera_index = LaunchConfiguration('omx_camera_index').perform(context)
+    yolo_server_device = LaunchConfiguration('yolo_server_device').perform(context)
     patrol_delay = float(
         LaunchConfiguration('patrol_planner_delay_sec').perform(context)
     )
@@ -80,6 +83,13 @@ def launch_setup(context, *args, **kwargs):
             'require_localization_ready': True,
             'localization_ready_topic': '/localization_ready',
         }],
+        additional_env={
+            'OMX_YOLO_MODEL_PATH': yolo_node_model_path,
+            'OMX_YOLO_CAMERA_INDEX': omx_camera_index,
+            # Keep OMX and the Flask server on the same explicitly selected
+            # backend; ``cpu`` is required for the current Orin torch wheel.
+            'OMX_YOLO_DEVICE': yolo_server_device,
+        },
         respawn=True,
         respawn_delay=3.0,
     )
@@ -102,6 +112,14 @@ def launch_setup(context, *args, **kwargs):
         Node(
             package='omx_aim', executable='fire_node', name='fire_node',
             output='screen',
+            parameters=[{
+                # The dashboard/video stack must never implicitly arm the
+                # GPIO actuator.  It remains visible as DISABLED until an
+                # operator deliberately changes the lock state.
+                'start_disabled': _is_true(
+                    LaunchConfiguration('fire_start_disabled').perform(context)
+                ),
+            }],
         ),
         Node(
             package='omx_aim', executable='target_bridge', name='target_bridge',
@@ -175,7 +193,7 @@ def generate_launch_description():
             'yolo_server_port', default_value='5005',
             description='flask_yolo_server HTTP port.'),
         DeclareLaunchArgument(
-            'yolo_server_model_path', default_value='yolo11s.pt',
+            'yolo_server_model_path', default_value='/home/seil/omx_aim/models/best.pt',
             description='YOLO model path for flask_yolo_server.'),
         DeclareLaunchArgument(
             'yolo_server_device', default_value='0',
@@ -191,6 +209,17 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'yolo_node_delay_sec', default_value='14.0',
             description='Delay heavy OMX YOLO/camera/model startup on constrained Jetson hardware.'),
+        DeclareLaunchArgument(
+            'yolo_node_model_path', default_value='yolo11n.pt',
+            description=(
+                'Model used by omx_yolo_node. Pass an absolute best.pt path '
+                'only when that file exists on this Jetson.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'omx_camera_index', default_value='0',
+            description='OpenCV camera index used by OMX debug/YOLO video.',
+        ),
         DeclareLaunchArgument(
             'patrol_planner_delay_sec', default_value='6.0',
             description='Small grace before starting patrol_planner.'),
@@ -212,5 +241,9 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'debug_port', default_value='8080',
             description='디버그 스트림 포트'),
+        DeclareLaunchArgument(
+            'fire_start_disabled', default_value='true',
+            choices=['true', 'false'],
+            description='Start the GPIO fire actuator locked/disabled (safe default).'),
         OpaqueFunction(function=launch_setup),
     ])

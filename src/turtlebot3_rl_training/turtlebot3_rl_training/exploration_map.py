@@ -185,29 +185,32 @@ class ExplorationGridMap:
         path_visual_publish_every_n: int = 5,
         target_lock_steps: int = 16,
         target_switch_margin: float = 0.12,
+        lidar_policy_config=None,
+        deployment_mode: bool = False,
+        clear_confidence_on_slam_occupied: Optional[bool] = None,
+        confidence_occupied_confirm_steps: Optional[int] = None,
+        confidence_decay_near_obstacle_scale: Optional[float] = None,
+        confidence_obstacle_ring_radius: Optional[int] = None,
+        confidence_obstacle_floor_ratio: Optional[float] = None,
+        confidence_lidar_hit_guard_m: Optional[float] = None,
+        confidence_lidar_occlusion_radius_cells: Optional[int] = None,
     ):
         self.node = node
+        self.deployment_mode = bool(deployment_mode)
+        self.lidar_policy_config = lidar_policy_config
         self.resolution = float(resolution)
         self.initial_size_m = float(size_m)
         self.size_m = float(size_m)
         self.origin_x = float(origin_x)
         self.origin_y = float(origin_y)
         self.frame_id = str(frame_id or "odom").strip() or "odom"
-        self.disable_priority_map = bool(disable_priority_map) or (
-            str(os.environ.get("TB3_RL_FORCE_NO_PRIORITY", "0")).strip().lower()
-            not in {"0", "false", "no", "off", "disable", "disabled"}
-        ) or (
-            str(os.environ.get("TB3_RL_NO_PRIORITY_MODEL_INPUT", "0")).strip().lower()
-            in {"1", "true", "yes", "on", "enable", "enabled"}
-        )
+        self.disable_priority_map = bool(disable_priority_map)
         if self.disable_priority_map:
-            os.environ["TB3_RL_FORCE_NO_PRIORITY"] = "1"
-            os.environ["TB3_RL_NO_PRIORITY_MODEL_INPUT"] = "1"
             priority_publish_topic = ""
             priority_recompute_interval = 1_000_000_000
             priority_visit_suppression_gain = 0.0
             priority_observed_suppression_gain = 0.0
-        self.fast_no_priority_stats = (
+        self.fast_no_priority_stats = (not self.deployment_mode) and (
             str(os.environ.get("TB3_RL_FAST_NO_PRIORITY_STATS", "0")).strip().lower()
             in {"1", "true", "yes", "on", "enable", "enabled"}
         )
@@ -267,45 +270,56 @@ class ExplorationGridMap:
         self.seen_confidence_floor = float(
             np.clip(seen_confidence_floor, self.min_known_confidence, 100.0)
         )
-        try:
-            self.clear_confidence_on_slam_occupied = str(
-                os.environ.get("TB3_RL_CLEAR_CONFIDENCE_ON_SLAM_OCCUPIED", "0")
-            ).strip().lower() in {"1", "true", "yes", "on", "enable", "enabled"}
-        except Exception:
-            self.clear_confidence_on_slam_occupied = False
-        try:
-            self.confidence_occupied_confirm_steps = int(
-                os.environ.get("TB3_RL_CONFIDENCE_OCCUPIED_CONFIRM_STEPS", "3")
-            )
-        except Exception:
-            self.confidence_occupied_confirm_steps = 3
+        if clear_confidence_on_slam_occupied is None:
+            try:
+                self.clear_confidence_on_slam_occupied = str(
+                    os.environ.get("TB3_RL_CLEAR_CONFIDENCE_ON_SLAM_OCCUPIED", "0")
+                ).strip().lower() in {"1", "true", "yes", "on", "enable", "enabled"}
+            except Exception:
+                self.clear_confidence_on_slam_occupied = False
+        else:
+            self.clear_confidence_on_slam_occupied = bool(clear_confidence_on_slam_occupied)
+        if confidence_occupied_confirm_steps is None:
+            try:
+                confidence_occupied_confirm_steps = int(
+                    os.environ.get("TB3_RL_CONFIDENCE_OCCUPIED_CONFIRM_STEPS", "3")
+                )
+            except Exception:
+                confidence_occupied_confirm_steps = 3
+        self.confidence_occupied_confirm_steps = int(confidence_occupied_confirm_steps)
         self.confidence_occupied_confirm_steps = int(
             np.clip(self.confidence_occupied_confirm_steps, 1, 20)
         )
-        try:
-            self.confidence_decay_near_obstacle_scale = float(
-                os.environ.get("TB3_RL_CONFIDENCE_DECAY_NEAR_OBSTACLE_SCALE", "0.20")
-            )
-        except Exception:
-            self.confidence_decay_near_obstacle_scale = 0.20
+        if confidence_decay_near_obstacle_scale is None:
+            try:
+                confidence_decay_near_obstacle_scale = float(
+                    os.environ.get("TB3_RL_CONFIDENCE_DECAY_NEAR_OBSTACLE_SCALE", "0.20")
+                )
+            except Exception:
+                confidence_decay_near_obstacle_scale = 0.20
+        self.confidence_decay_near_obstacle_scale = float(confidence_decay_near_obstacle_scale)
         self.confidence_decay_near_obstacle_scale = float(
             np.clip(self.confidence_decay_near_obstacle_scale, 0.0, 1.0)
         )
-        try:
-            self.confidence_decay_obstacle_ring_radius = int(
-                os.environ.get("TB3_RL_CONFIDENCE_OBSTACLE_RING_RADIUS", "3")
-            )
-        except Exception:
-            self.confidence_decay_obstacle_ring_radius = 3
+        if confidence_obstacle_ring_radius is None:
+            try:
+                confidence_obstacle_ring_radius = int(
+                    os.environ.get("TB3_RL_CONFIDENCE_OBSTACLE_RING_RADIUS", "3")
+                )
+            except Exception:
+                confidence_obstacle_ring_radius = 3
+        self.confidence_decay_obstacle_ring_radius = int(confidence_obstacle_ring_radius)
         self.confidence_decay_obstacle_ring_radius = int(
             np.clip(self.confidence_decay_obstacle_ring_radius, 1, 16)
         )
-        try:
-            self.confidence_obstacle_floor_ratio = float(
-                os.environ.get("TB3_RL_CONFIDENCE_OBSTACLE_FLOOR_RATIO", "0.70")
-            )
-        except Exception:
-            self.confidence_obstacle_floor_ratio = 0.70
+        if confidence_obstacle_floor_ratio is None:
+            try:
+                confidence_obstacle_floor_ratio = float(
+                    os.environ.get("TB3_RL_CONFIDENCE_OBSTACLE_FLOOR_RATIO", "0.70")
+                )
+            except Exception:
+                confidence_obstacle_floor_ratio = 0.70
+        self.confidence_obstacle_floor_ratio = float(confidence_obstacle_floor_ratio)
         self.confidence_obstacle_floor_ratio = float(
             np.clip(self.confidence_obstacle_floor_ratio, 0.0, 1.0)
         )
@@ -416,15 +430,19 @@ class ExplorationGridMap:
         self.correction_logodds_grid = np.zeros((self.height, self.width), dtype=np.float32)
         self.confidence_grid = np.zeros((self.height, self.width), dtype=np.float32)
         self._occupied_persistence_grid = np.zeros((self.height, self.width), dtype=np.uint8)
-        try:
-            _hit_guard_m = float(os.environ.get("TB3_RL_CONFIDENCE_LIDAR_HIT_GUARD_M", "0.05"))
-        except Exception:
-            _hit_guard_m = 0.05
+        if confidence_lidar_hit_guard_m is None:
+            try:
+                confidence_lidar_hit_guard_m = float(os.environ.get("TB3_RL_CONFIDENCE_LIDAR_HIT_GUARD_M", "0.05"))
+            except Exception:
+                confidence_lidar_hit_guard_m = 0.05
+        _hit_guard_m = confidence_lidar_hit_guard_m
         self.confidence_lidar_hit_guard_m = float(np.clip(_hit_guard_m, 0.0, 0.50))
-        try:
-            _lidar_occ_radius = int(os.environ.get("TB3_RL_CONFIDENCE_LIDAR_OCCLUSION_RADIUS_CELLS", "2"))
-        except Exception:
-            _lidar_occ_radius = 2
+        if confidence_lidar_occlusion_radius_cells is None:
+            try:
+                confidence_lidar_occlusion_radius_cells = int(os.environ.get("TB3_RL_CONFIDENCE_LIDAR_OCCLUSION_RADIUS_CELLS", "2"))
+            except Exception:
+                confidence_lidar_occlusion_radius_cells = 2
+        _lidar_occ_radius = confidence_lidar_occlusion_radius_cells
         self.confidence_lidar_occlusion_radius_cells = int(np.clip(_lidar_occ_radius, 0, 4))
         self._last_confidence_lidar_blocked_beams = 0
         self._last_confidence_lidar_guarded_cells = 0
@@ -599,28 +617,40 @@ class ExplorationGridMap:
             f"keepalive_publish_period={self.keepalive_publish_period_sec:.2f}s"
         )
 
-        try:
-            _canon_default = str(os.environ.get("TB3_RL_LIDAR_CANONICAL_FRONT_ZERO", "0") or "0")
-            self._cached_use_canonical_scan_angles = str(os.environ.get(
-                "TB3_RL_CONFIDENCE_USE_CANONICAL_SCAN_ANGLES", _canon_default
-            )).strip().lower() in {"1", "true", "yes", "on", "enable", "enabled"}
-        except Exception:
-            self._cached_use_canonical_scan_angles = False
-        try:
-            self._cached_canonical_front_index = int(os.environ.get("TB3_RL_LIDAR_FRONT_INDEX", "0") or 0)
-        except Exception:
-            self._cached_canonical_front_index = 0
-        try:
-            self._cached_canonical_flip_lr = str(os.environ.get("TB3_RL_LIDAR_FLIP_LR", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
-        except Exception:
-            self._cached_canonical_flip_lr = False
-        try:
-            _off_default = str(os.environ.get("TB3_RL_LIDAR_ANGLE_OFFSET_DEG", "0.0") or "0.0")
-            self._cached_canonical_angle_offset_rad = math.radians(float(os.environ.get(
-                "TB3_RL_CONFIDENCE_SCAN_ANGLE_OFFSET_DEG", _off_default
-            ) or 0.0))
-        except Exception:
-            self._cached_canonical_angle_offset_rad = 0.0
+        if self.lidar_policy_config is not None:
+            self._cached_use_canonical_scan_angles = bool(
+                self.lidar_policy_config.canonical_front_zero
+            )
+            self._cached_canonical_front_index = int(
+                self.lidar_policy_config.front_index
+            )
+            self._cached_canonical_flip_lr = bool(self.lidar_policy_config.flip_lr)
+            self._cached_canonical_angle_offset_rad = math.radians(
+                float(self.lidar_policy_config.angle_offset_deg)
+            )
+        else:
+            try:
+                _canon_default = str(os.environ.get("TB3_RL_LIDAR_CANONICAL_FRONT_ZERO", "0") or "0")
+                self._cached_use_canonical_scan_angles = str(os.environ.get(
+                    "TB3_RL_CONFIDENCE_USE_CANONICAL_SCAN_ANGLES", _canon_default
+                )).strip().lower() in {"1", "true", "yes", "on", "enable", "enabled"}
+            except Exception:
+                self._cached_use_canonical_scan_angles = False
+            try:
+                self._cached_canonical_front_index = int(os.environ.get("TB3_RL_LIDAR_FRONT_INDEX", "0") or 0)
+            except Exception:
+                self._cached_canonical_front_index = 0
+            try:
+                self._cached_canonical_flip_lr = str(os.environ.get("TB3_RL_LIDAR_FLIP_LR", "0") or "0").strip().lower() in {"1", "true", "yes", "on"}
+            except Exception:
+                self._cached_canonical_flip_lr = False
+            try:
+                _off_default = str(os.environ.get("TB3_RL_LIDAR_ANGLE_OFFSET_DEG", "0.0") or "0.0")
+                self._cached_canonical_angle_offset_rad = math.radians(float(os.environ.get(
+                    "TB3_RL_CONFIDENCE_SCAN_ANGLE_OFFSET_DEG", _off_default
+                ) or 0.0))
+            except Exception:
+                self._cached_canonical_angle_offset_rad = 0.0
 
     def reset(self):
         self.base_grid.fill(self.UNKNOWN)
@@ -5452,10 +5482,7 @@ class ExplorationGridMap:
         base_free = (struct >= 0) & (struct <= 35)
         base_occupied = struct >= min(float(self.gap_occupied_threshold), 55.0)
 
-        no_priority_policy_input = bool(getattr(self, "disable_priority_map", False)) or (
-            str(os.environ.get("TB3_RL_NO_PRIORITY_MODEL_INPUT", "0")).strip().lower()
-            in {"1", "true", "yes", "on"}
-        )
+        no_priority_policy_input = bool(getattr(self, "disable_priority_map", False))
         channel_count = 4 if no_priority_policy_input else 5
         channels = np.zeros((channel_count, self.height, self.width), dtype=np.float32)
 

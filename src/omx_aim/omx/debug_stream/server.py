@@ -25,6 +25,7 @@ import threading
 import time
 
 import cv2
+import numpy as np
 
 from .state_bus import StateBus
 
@@ -61,6 +62,7 @@ class DebugStream:
         app = Flask(__name__)
         app.add_url_rule('/', 'index', self._index)
         app.add_url_rule('/stream.mjpg', 'stream', self._stream_view)
+        app.add_url_rule('/frame.jpg', 'frame', self._frame_view)
         app.add_url_rule('/events', 'events', self._events_view)
         app.add_url_rule('/state.json', 'state_json', self._state_json_view)
 
@@ -86,6 +88,23 @@ class DebugStream:
         return Response(self._frame_gen(),
                         mimetype='multipart/x-mixed-replace; boundary=frame')
 
+    def _frame_view(self):
+        """Single latest JPEG for polling dashboards (reload-safe)."""
+        from flask import Response
+
+        frame, _ = self.bus.get_frame()
+        if frame is None:
+            return Response('waiting for OMX frame\n', status=503, mimetype='text/plain')
+        ok, encoded = cv2.imencode(
+            '.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
+        )
+        if not ok:
+            return Response('OMX JPEG encode failed\n', status=500, mimetype='text/plain')
+        return Response(
+            encoded.tobytes(), mimetype='image/jpeg',
+            headers={'Cache-Control': 'no-store, no-cache, max-age=0'},
+        )
+
     def _events_view(self):
         from flask import Response
         return Response(
@@ -104,7 +123,12 @@ class DebugStream:
     # ----- generators -----
 
     def _frame_gen(self):
-        """MJPEG generator. seq 비교로 stale frame 스킵."""
+        """MJPEG generator. seq 비교로 stale frame 스킵.
+
+        A camera open/read failure used to yield no bytes at all, which makes
+        browser ``<img>`` elements look permanently black.  Keep the stream
+        alive with a clear diagnostic frame until the detector reconnects.
+        """
         interval = 1.0 / self.fps
         params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
         last_seq = -1
@@ -112,9 +136,23 @@ class DebugStream:
         while True:
             time.sleep(interval)
             frame, seq = self.bus.get_frame()
-            if frame is None or seq == last_seq:
+            if frame is None:
+                frame = np.zeros((360, 640, 3), dtype=np.uint8)
+                cv2.putText(
+                    frame, 'WAITING FOR OMX CAMERA', (78, 160),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 190, 255), 2,
+                )
+                cv2.putText(
+                    frame, 'camera reconnecting / yolo starting', (115, 205),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1,
+                )
+                # Emit the diagnostic periodically even though its source
+                # frame sequence has not changed.
+                last_seq = seq
+            elif seq == last_seq:
                 continue
-            last_seq = seq
+            else:
+                last_seq = seq
 
             ok, buf = cv2.imencode('.jpg', frame, params)
             if not ok:

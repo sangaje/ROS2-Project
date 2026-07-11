@@ -5,11 +5,45 @@
     "model_path": "rl_models/pure_velocity_sac_map64_lidar60_h8_deltatcn_domain22_nopriority_gsde_v022_dt02_b128/sac_turtlebot3_burger.zip"
   },
   "runtime": {
-    "python_executable": "~/venv/ros/bin/python",
     "control_dt_sec": 0.2,
-    "map_live_update_period_sec": 0.0,
-    "map_keepalive_period_sec": 1.0,
-    "seen_confidence_floor": 70.0
+    "map_substeps_per_action": 2,
+    "max_scan_age_sec": 0.5,
+    "max_map_age_sec": 3.0,
+    "max_tf_age_sec": 0.5,
+    "max_inference_sec": 1.0,
+    "command_timeout_sec": 1.5,
+    "topics": {
+      "scan": "/scan",
+      "map": "/map",
+      "map_frame": "map",
+      "base_frame": "base_footprint",
+      "scan_frame": "base_scan"
+    },
+    "map": {
+      "resolution_m": 0.05,
+      "initial_size_m": 8.0,
+      "publish_every_n": 1,
+      "keepalive_period_sec": 1.0,
+      "confidence": {
+        "clear_on_slam_occupied": false,
+        "occupied_confirm_steps": 3,
+        "decay_near_obstacle_scale": 0.0,
+        "obstacle_ring_radius_cells": 5,
+        "obstacle_floor_ratio": 1.0,
+        "lidar_hit_guard_m": 0.05,
+        "lidar_occlusion_radius_cells": 3
+      }
+    },
+    "lidar": {
+      "canonical_front_zero": true,
+      "front_index": 0,
+      "angle_offset_deg": 0.0,
+      "flip_lr": false,
+      "uniform_angle_resample": true,
+      "median_kernel": 3,
+      "lowpass_kernel": 5,
+      "obstacle_margin_m": 0.08
+    }
   },
   "policy": {
     "algorithm": "SAC",
@@ -28,10 +62,10 @@
       "shape": [4, 64, 64],
       "dtype": "float32",
       "channels": [
-        "slam_geometry",
-        "confidence",
-        "stale_or_revisit",
-        "robot_centered_context"
+        "slam_free",
+        "slam_unknown",
+        "slam_occupied",
+        "confidence"
       ],
       "crop_size_m": 6.0,
       "robot_centered": true,
@@ -55,7 +89,7 @@
       "enabled": true,
       "history_len": 8,
       "startup_padding": "repeat first fresh observation, matching GazeboNavEnv history initialization",
-      "takeover_reset": "restart policy backend on ACTIVE_SCOUT entry"
+      "takeover_reset": "clear history and repeat the first fresh observation"
     },
     "feature_dimensions": {
       "map": 48,
@@ -75,36 +109,16 @@
     "smoothing_alpha": 0.65,
     "safety": {
       "backup": true,
-      "slowdown": false,
-      "trigger_distance_m": 0.15,
-      "stop_distance_m": 0.0,
-      "slow_distance_m": 0.0,
+      "slowdown": true,
+      "slow_min_scale": 1.0,
+      "trigger_distance_m": 0.22,
+      "stop_distance_m": 0.22,
+      "slow_distance_m": 0.40,
       "backup_speed_mps": 0.07,
       "turn_speed": 0.3,
       "backup_steps": 4,
-      "cooldown_steps": 8
+      "cooldown_steps": 1
     }
-  },
-  "environment": {
-    "TB3_RL_DISABLE_SHM_TRANSPORT": "1",
-    "TB3_RL_CARTOGRAPHER_RESTART_DELAY_SEC": "0.5",
-    "TB3_RL_DISABLE_BUFFER_GUARD": "0",
-    "TB3_RL_LIDAR_CANONICAL_FRONT_ZERO": "1",
-    "TB3_RL_LIDAR_FRONT_INDEX": "0",
-    "TB3_RL_LIDAR_ANGLE_OFFSET_DEG": "0",
-    "TB3_RL_LIDAR_FLIP_LR": "0",
-    "TB3_RL_LIDAR_UNIFORM_ANGLE_RESAMPLE": "1",
-    "TB3_RL_LIDAR_MEDIAN_KERNEL": "3",
-    "TB3_RL_LIDAR_LOWPASS_KERNEL": "5",
-    "TB3_RL_LIDAR_OBSTACLE_MARGIN_M": "0.08",
-    "TB3_RL_FORCE_NO_PRIORITY": "1",
-    "TB3_RL_NO_PRIORITY_MODEL_INPUT": "1",
-    "TB3_RL_OBS_EXTRA_DIM_OVERRIDE": "9",
-    "TB3_RL_QUIET_MAP_LOGS": "1",
-    "TB3_RL_QUIET_STARTUP_LOGS": "1",
-    "TB3_RL_QUIET_PRIORITY_LOGS": "1",
-    "TB3_RL_QUIET_RESET_LOGS": "1",
-    "TB3_RL_INFERENCE_EXTERNAL_SLAM": "1"
   },
   "system_bringup_integration": {
     "leader_rl": false,

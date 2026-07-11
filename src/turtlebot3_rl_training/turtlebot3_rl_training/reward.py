@@ -253,7 +253,7 @@ def compute_exploration_reward(
     directional_bias_start_accum: float = 3.0,
     directional_bias_growth: float = 0.020,
     directional_bias_power: float = 1.5,
-    directional_bias_max_penalty: float = 3.00,
+    directional_bias_max_penalty: float = 2.00,
     max_linear_speed: float = 0.22,
     max_angular_speed: float = 1.5,
     nearest_obstacle_distance: float = 999.0,

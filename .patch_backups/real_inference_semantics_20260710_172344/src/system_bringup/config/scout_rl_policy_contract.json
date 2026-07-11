@@ -1,0 +1,117 @@
+{
+  "source_of_truth": {
+    "training_runner": "run_train_v132_clean.sh",
+    "train_module": "turtlebot3_rl_training.train_sac",
+    "model_path": "rl_models/pure_velocity_sac_map64_lidar60_h8_deltatcn_domain22_nopriority_gsde_v022_dt02_b128/sac_turtlebot3_burger.zip"
+  },
+  "runtime": {
+    "python_executable": "~/venv/ros/bin/python",
+    "control_dt_sec": 0.2,
+    "map_live_update_period_sec": 0.0,
+    "map_keepalive_period_sec": 1.0,
+    "seen_confidence_floor": 70.0
+  },
+  "policy": {
+    "algorithm": "SAC",
+    "loader": "stable_baselines3.SAC.load",
+    "feature_extractor": "turtlebot3_rl_training.feature_extractor.MapVectorFeatureExtractor",
+    "checkpoint_training_use_sde": true,
+    "deterministic_inference": true,
+    "sde_inference": false,
+    "inference_noise_reset_calls": 0,
+    "role_gate": "ACTIVE_SCOUT"
+  },
+  "observation_contract": {
+    "type": "gymnasium.spaces.Dict",
+    "keys": ["map", "map_seq", "seq", "vector"],
+    "map": {
+      "shape": [4, 64, 64],
+      "dtype": "float32",
+      "channels": [
+        "slam_geometry",
+        "confidence",
+        "stale_or_revisit",
+        "robot_centered_context"
+      ],
+      "crop_size_m": 6.0,
+      "robot_centered": true,
+      "priority_channel": false
+    },
+    "map_seq": {
+      "shape": [8, 4, 64, 64],
+      "dtype": "float32"
+    },
+    "seq": {
+      "shape": [8, 69],
+      "dtype": "float32"
+    },
+    "vector": {
+      "lidar_bins": 60,
+      "stats_dim": 9,
+      "shape": [69],
+      "dtype": "float32"
+    },
+    "temporal": {
+      "enabled": true,
+      "history_len": 8,
+      "startup_padding": "repeat first fresh observation, matching GazeboNavEnv history initialization",
+      "takeover_reset": "restart policy backend on ACTIVE_SCOUT entry"
+    },
+    "feature_dimensions": {
+      "map": 48,
+      "vector": 96,
+      "temporal": 64,
+      "combined": 192
+    }
+  },
+  "action_contract": {
+    "mode": "velocity",
+    "shape": [2],
+    "dtype": "float32",
+    "low": [0.0, -0.7],
+    "high": [0.22, 0.7],
+    "linear_deadband": 0.02,
+    "angular_deadband": 0.04,
+    "smoothing_alpha": 0.65,
+    "safety": {
+      "backup": true,
+      "slowdown": false,
+      "trigger_distance_m": 0.15,
+      "stop_distance_m": 0.0,
+      "slow_distance_m": 0.0,
+      "backup_speed_mps": 0.07,
+      "turn_speed": 0.3,
+      "backup_steps": 4,
+      "cooldown_steps": 8
+    }
+  },
+  "environment": {
+    "TB3_RL_DISABLE_SHM_TRANSPORT": "1",
+    "TB3_RL_CARTOGRAPHER_RESTART_DELAY_SEC": "0.5",
+    "TB3_RL_DISABLE_BUFFER_GUARD": "0",
+    "TB3_RL_LIDAR_CANONICAL_FRONT_ZERO": "1",
+    "TB3_RL_LIDAR_FRONT_INDEX": "0",
+    "TB3_RL_LIDAR_ANGLE_OFFSET_DEG": "0",
+    "TB3_RL_LIDAR_FLIP_LR": "0",
+    "TB3_RL_LIDAR_UNIFORM_ANGLE_RESAMPLE": "1",
+    "TB3_RL_LIDAR_MEDIAN_KERNEL": "3",
+    "TB3_RL_LIDAR_LOWPASS_KERNEL": "5",
+    "TB3_RL_LIDAR_OBSTACLE_MARGIN_M": "0.08",
+    "TB3_RL_FORCE_NO_PRIORITY": "1",
+    "TB3_RL_NO_PRIORITY_MODEL_INPUT": "1",
+    "TB3_RL_OBS_EXTRA_DIM_OVERRIDE": "9",
+    "TB3_RL_QUIET_MAP_LOGS": "1",
+    "TB3_RL_QUIET_STARTUP_LOGS": "1",
+    "TB3_RL_QUIET_PRIORITY_LOGS": "1",
+    "TB3_RL_QUIET_RESET_LOGS": "1",
+    "TB3_RL_INFERENCE_EXTERNAL_SLAM": "1"
+  },
+  "system_bringup_integration": {
+    "leader_rl": false,
+    "follower_rl": false,
+    "recovery_navigation_rl": false,
+    "localization_spin_rl": false,
+    "active_scout_rl": true,
+    "public_rl_launch_arguments": []
+  }
+}

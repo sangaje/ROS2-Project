@@ -823,6 +823,12 @@ def main(args=None):
             _force_mandatory_slam_reset_policy(_apply_rviz_origin_policy(parse_args()))
         )
     )
+    if bool(getattr(cli_args, 'real_robot', False)):
+        raise RuntimeError(
+            'Standalone --real-robot eval_policy is retired. Launch '
+            'system_bringup so UnifiedFieldRobot owns deterministic SAC, '
+            'confidence-map updates, role gating, and /cmd_vel in one process.'
+        )
 
     # Disable FastDDS SHM transport before ROS init (same robust fix as training)
     # so long eval sessions never hit open_and_lock_file / init_port failures.

@@ -207,8 +207,22 @@ class OmxYoloNode(Node):
             f"period={self.cfg.boundary.period_sec}s, "
             f"ttl={self.cfg.boundary.ttl_sec}s")
 
-        self.ctrl.connect()
-        self.ctrl.go_home()
+        try:
+            self.ctrl.connect()
+            self.ctrl.go_home()
+        except Exception as exc:  # noqa: BLE001
+            # The dashboard/video path must remain available when a DXL bus
+            # is disconnected during bringup.  Replace only the actuator
+            # backend with dry-run mode; camera/YOLO/debug streaming continue
+            # and the failure remains explicit in the ROS log.
+            self.get_logger().error(
+                'OMX_CONTROL_FALLBACK_VIDEO_ONLY | '
+                f'controller_error={type(exc).__name__}: {exc}'
+            )
+            self.ctrl = OmxController(self.cfg, dry_run=True,
+                                      logger=self.get_logger())
+            self.ctrl.connect()
+            self.ctrl.go_home()
 
         self.paused = False
         self.control_period = 1.0 / self.cfg.ibvs.control_hz
