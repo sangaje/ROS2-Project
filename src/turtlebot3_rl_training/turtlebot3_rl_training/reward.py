@@ -372,8 +372,13 @@ def compute_exploration_reward(
     # velocity safety terminals/slowdown and collision/fall terminals in the env.
 
     # No penalties for revisit, confidence stall, stale cells, target switching,
-    # rotation, orbit, or wall proximity unless those behaviors become a physical
-    # safety event handled outside this dense reward.
+    # or wall proximity unless those behaviors become a physical safety event
+    # handled outside this dense reward.  Rotation/orbit ARE penalized below --
+    # gazebo_nav_env.py already tracks sustained_rotation_steps/orbit_stall_steps
+    # (both reset the moment the behavior produces real new coverage/confidence
+    # gain, so productive turning is never punished) but nothing previously
+    # consumed them here, so a policy could spin/orbit forever in an
+    # already-explored area for free.
 
     # Explored-stall penalty: escalates only once the robot has gone
     # explored_stall_start_steps consecutive steps with zero new coverage (real
@@ -386,6 +391,33 @@ def compute_exploration_reward(
             float(explored_stall_max_penalty),
         )
         reward -= stall_penalty
+
+    # Sustained in-place spin penalty (low forward speed, high turn rate held
+    # for several consecutive steps).  _update_sustained_rotation_steps() only
+    # accumulates while forward_norm stays low and turn_norm stays high, so a
+    # normal short heading-correction turn never crosses sustained_rotation_start_steps.
+    rotation_over = int(sustained_rotation_steps) - int(sustained_rotation_start_steps)
+    if rotation_over > 0:
+        rotation_penalty = min(
+            float(sustained_rotation_growth) * (float(rotation_over) ** float(sustained_rotation_power)),
+            float(sustained_rotation_max_penalty),
+        )
+        reward -= rotation_penalty
+
+    # Forward arc-loop ("orbit") penalty: driving forward while continuously
+    # turning so path length grows but net displacement/new-information stays
+    # near zero -- the harder-to-detect version of spinning in place, and the
+    # one that specifically matches circling inside an already-covered area.
+    # _update_orbit_stall_steps() already exempts genuine avoidance maneuvers
+    # that create real coverage/confidence/priority gain, so this only fires on
+    # the exploit.
+    orbit_over = int(orbit_stall_steps) - int(orbit_stall_start_steps)
+    if orbit_over > 0:
+        orbit_penalty = min(
+            float(orbit_stall_growth) * (float(orbit_over) ** float(orbit_stall_power)),
+            float(orbit_stall_max_penalty),
+        )
+        reward -= orbit_penalty
 
     # Terminal은 위에서 물리 위험일 때만 따로 반환한다. non-terminal dense reward는 bounded.
     return float(np.clip(reward, -8.0, 8.0))

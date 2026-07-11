@@ -72,7 +72,11 @@ export TB3_RL_CONFIDENCE_LIDAR_OCCLUSION_RADIUS_CELLS=3
 export TB3_RL_MAP_SUBSTEPS_PER_ACTION=2
 export TB3_RL_DEBUG_MAP_UPDATE_COUNT=0
 
-# Throughput mode: disable RViz-only policy scan diagnostics during training.
+# RViz debug visibility: publish policy scan / map overlay diagnostics at a
+# throttled rate (every Nth step) instead of every step, so RViz has something
+# to show without reintroducing a per-step publish bottleneck. Override
+# TB3_RL_*_EVERY_N=1000000 (or blank the topic vars) from the calling shell to
+# go back to throughput-only mode for long unattended runs.
 export TB3_RL_POLICY_SCAN_TOPIC=
 export TB3_RL_POLICY_SCAN_60_TOPIC=
 export TB3_RL_POLICY_SCAN_PUBLISH_EVERY_N=1000000
@@ -94,7 +98,7 @@ export TB3_RL_PRIORITY_BIRTH_DELTA=6.0
 # EPISODE_RESET_REASON, POST_RESET_STABILIZE*, "Unsafe terminal state detected"
 # 등 나머지 개별 QUIET_* 플래그로 안 잡히는 INFO/WARN 로그를 전부 죽이고,
 # tqdm 스타일 "[SAC] ..." 진행 블록(plain print라 이 설정과 무관)만 남긴다.
-export TB3_RL_QUIET_ALL_ROS_LOGS=1
+export TB3_RL_QUIET_ALL_ROS_LOGS="${TB3_RL_QUIET_ALL_ROS_LOGS:-1}"
 export TB3_RL_QUIET_MAP_LOGS=1
 export TB3_RL_QUIET_STARTUP_LOGS=1
 export TB3_RL_QUIET_VELOCITY_SAFETY_LOGS=1
@@ -140,7 +144,7 @@ export TB3_RL_MANUAL_TF_CACHE=1
 # action_execute(cmd_vel 전송)/wait_sync(Gazebo multi_step 응답 대기)/map_update
 # (confidence+SLAM 반영)/reward_compute/obs_build 중 어디에 제일 많이 쓰이는지
 # 먼저 로그로 확인한다. STEP_PROFILE 로그를 몇 분 보고 나서 최적화 대상을 정한다.
-export TB3_RL_STEP_PROFILER=0
+export TB3_RL_STEP_PROFILER="${TB3_RL_STEP_PROFILER:-0}"
 # fps dropped once training passed learning-starts and gradient updates began
 # firing (train-freq-steps=24). Time each SAC.train() call directly to see if
 # gradient updates are really the new bottleneck before touching control_dt.
@@ -445,14 +449,15 @@ python3 -m turtlebot3_rl_training.train_sac \
     --post-reset-ready-min-known-cells 10 \
     --post-reset-ready-min-lidar-beams 20 \
     --no-post-reset-ready-require-priority \
+    --post-reset-stabilize-sec "${TB3_RL_POST_RESET_STABILIZE_SEC:-0.5}" \
     \
     --reset-pose-mode list \
-    --reset-pose-list="-5.30,1.25;-5.30,2.25;-2.80,0.95;-2.20,0.65;-0.60,1.25;0.80,1.55;0.80,1.90;1.50,1.25;3.10,1.25;3.60,1.25;-5.30,-1.25;-5.30,-2.25;-2.80,-0.95;-2.20,-0.65;-0.60,-1.25;0.80,-1.55;0.80,-1.90;1.50,-1.25;3.10,-1.25;3.60,-1.25" \
+    --reset-pose-list="-5.30,1.25;-5.30,1.58;-5.30,1.92;-5.30,2.25;-4.47,1.82;-3.63,1.38;-2.80,0.95;-2.60,0.85;-2.40,0.75;-2.20,0.65;-1.67,0.85;-1.13,1.05;-0.60,1.25;-0.13,1.35;0.33,1.45;0.80,1.55;0.80,1.67;0.80,1.78;0.80,1.90;1.03,1.68;1.27,1.47;1.50,1.25;2.03,1.25;2.57,1.25;3.10,1.25;3.27,1.25;3.43,1.25;3.60,1.25;-5.30,-1.25;-5.30,-1.58;-5.30,-1.92;-5.30,-2.25;-4.47,-1.82;-3.63,-1.38;-2.80,-0.95;-2.60,-0.85;-2.40,-0.75;-2.20,-0.65;-1.67,-0.85;-1.13,-1.05;-0.60,-1.25;-0.13,-1.35;0.33,-1.45;0.80,-1.55;0.80,-1.67;0.80,-1.78;0.80,-1.90;1.03,-1.68;1.27,-1.47;1.50,-1.25;2.03,-1.25;2.57,-1.25;3.10,-1.25;3.27,-1.25;3.43,-1.25;3.60,-1.25" \
     --reset-pose-max-attempts 20 \
     --reset-pose-min-clearance-m 0.30 \
     \
-    --rl-map-topic /rl_task_map \
-    --rl-confidence-topic /rl_confidence_map \
+    --rl-map-topic "" \
+    --rl-confidence-topic "" \
     --rl-priority-topic "" \
     --rl-filtered-slam-topic "" \
     --waypoint-marker-topic "" \

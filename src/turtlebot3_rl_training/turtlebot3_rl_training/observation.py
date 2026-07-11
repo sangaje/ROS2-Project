@@ -658,31 +658,58 @@ def build_exploration_observation(
     scan_angle_increment: Optional[float] = None,
     scan_angle_max: Optional[float] = None,
     include_target_priority: bool = True,
+    trim_extra_stats: bool = True,
 ) -> np.ndarray:
     """
     SLAM-assisted exploration observation.
 
-    [
-      lidar_0 ... lidar_359,
-      coverage_ratio,
-      coverage_delta_norm,
-      frontier_distance_norm,
-      frontier_angle_norm,
-      target_priority,    # omitted when include_target_priority=False
-      mean_confidence_norm,
-      stale_ratio,
-      low_confidence_ratio,
-      prev_linear_norm,
-      prev_angular_norm,
-    ]
+    Full layout (trim_extra_stats=False -- the pre-trim, currently deployed
+    contract in scout_rl_policy_contract.json):
+      [
+        lidar_0 ... lidar_359,
+        coverage_ratio,
+        coverage_delta_norm,
+        frontier_distance_norm,
+        frontier_angle_norm,
+        target_priority,    # omitted when include_target_priority=False
+        mean_confidence_norm,
+        stale_ratio,
+        low_confidence_ratio,
+        prev_linear_norm,
+        prev_angular_norm,
+      ]                      # lidar+10, or lidar+9 without target_priority
 
-    The currently deployed checkpoint (scout_rl_policy_contract.json) was
-    trained on this full-width vector. A later commit trimmed this to
-    lidar+3/6 for a new checkpoint family (see git history: "RL training:
-    trim dead observation stats"); that trim is reverted here because it
-    silently broke the deployed contract and no local training currently
-    depends on the trimmed width. Re-trim only alongside training and
-    shipping a new checkpoint, not on this shared function alone.
+    Trimmed layout (trim_extra_stats=True -- default, new training):
+      [
+        lidar_0 ... lidar_359,
+        coverage_ratio,
+        frontier_distance_norm,  # omitted when include_target_priority=False
+        frontier_angle_norm,     # omitted when include_target_priority=False
+        target_priority,         # omitted when include_target_priority=False
+        prev_linear_norm,
+        prev_angular_norm,
+      ]                      # lidar+6, or lidar+3 without target_priority
+
+    frontier_distance/frontier_angle are only real signal when the priority
+    map is enabled (compute_frontier_info() runs).  In no-priority/fast-stats
+    mode (include_target_priority=False), exploration_map.py hardcodes them to
+    constants (frontier_distance=size_m, frontier_angle=0.0) every step -- a
+    dead, zero-information input to the policy -- so they are dropped from the
+    trimmed vector together with target_priority in that mode.
+
+    coverage_delta_norm / mean_confidence_norm / stale_ratio /
+    low_confidence_ratio are dropped from the trimmed vector: coverage_delta
+    and confidence_gain (the CSV-logged proxies) do have real variance, but
+    none of these four had a directly-verifiable CSV column and mean_confidence
+    in particular is largely redundant with what the map CNN's
+    global-average-pool branch already sees in the confidence channel.
+
+    A checkpoint already trained (and frozen behind a policy contract, e.g.
+    system_bringup/config/scout_rl_policy_contract.json) on the full-width
+    vector needs trim_extra_stats=False to match; gazebo_nav_env.py derives
+    this from TB3_RL_OBS_EXTRA_DIM_OVERRIDE so a frozen inference contract
+    gets the full vector while new training gets the trimmed default without
+    changing this shared function's behavior for both at once.
     """
     lidar = downsample_lidar(
         scan_ranges=scan_ranges,
@@ -726,7 +753,35 @@ def build_exploration_observation(
         1.0,
     )
 
-    if include_target_priority:
+    if trim_extra_stats:
+        if include_target_priority:
+            extra = np.array(
+                [
+                    coverage_ratio_norm,
+                    frontier_distance_norm,
+                    frontier_angle_norm,
+                    target_priority_norm,
+                    prev_linear_norm,
+                    prev_angular_norm,
+                ],
+                dtype=np.float32,
+            )
+        else:
+            # No-priority policy input: remove target_priority AND frontier_* from
+            # the actor/critic vector.  target_priority is dropped because there is
+            # no priority map to score in this mode; frontier_distance/frontier_angle
+            # are dropped because exploration_map.py's fast-stats path hardcodes them
+            # to constants here (dead input, see docstring).  This is the lidar+3
+            # trimmed layout.
+            extra = np.array(
+                [
+                    coverage_ratio_norm,
+                    prev_linear_norm,
+                    prev_angular_norm,
+                ],
+                dtype=np.float32,
+            )
+    elif include_target_priority:
         extra = np.array(
             [
                 coverage_ratio_norm,

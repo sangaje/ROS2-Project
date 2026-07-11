@@ -1391,27 +1391,30 @@ class GazeboNavEnv(gym.Env):
             str(os.environ.get("TB3_RL_NO_PRIORITY_MODEL_INPUT", "0")).strip().lower()
             in {"1", "true", "yes", "on", "enable", "enabled"}
         )
-        # Normal vector extras are 6 (mean_confidence_norm/stale_ratio/
-        # low_confidence_ratio/coverage_delta_norm were dropped for both modes
-        # -- unverified or redundant signal, see build_exploration_observation
-        # docstring). No-priority mode additionally removes target_priority AND
-        # frontier_distance/frontier_angle (dead constants when the priority
-        # map is off), so the actor/critic sees lidar+3 instead.
+        # New training gets the trimmed vector extras: 6 normally
+        # (coverage_ratio/frontier_distance/frontier_angle/target_priority/
+        # prev_linear/prev_angular), or 3 in no-priority mode (drops
+        # target_priority AND frontier_distance/frontier_angle, which are
+        # dead constants there -- see build_exploration_observation()
+        # docstring, the single source of truth for this layout).
         #
         # A checkpoint already trained (and frozen behind a policy contract,
         # e.g. system_bringup/config/scout_rl_policy_contract.json) on the
-        # pre-trim vector layout expects its original obs_extra_dim and will
-        # fail SB3's observation-space check against the trimmed default
-        # below. TB3_RL_OBS_EXTRA_DIM_OVERRIDE lets a frozen inference
-        # contract pin its own value without changing what new training runs
-        # get by default.
+        # older full-width vector expects its own obs_extra_dim and will fail
+        # SB3's observation-space check against the trimmed default below.
+        # TB3_RL_OBS_EXTRA_DIM_OVERRIDE lets that frozen inference contract
+        # pin its own value (and switch build_exploration_observation() back
+        # to the full, untrimmed layout via trim_extra_stats below) without
+        # changing what new training runs get by default.
         obs_extra_dim_override = str(
             os.environ.get("TB3_RL_OBS_EXTRA_DIM_OVERRIDE", "")
         ).strip()
         if obs_extra_dim_override:
             self.obs_extra_dim = int(obs_extra_dim_override)
+            self.trim_extra_stats = False
         else:
             self.obs_extra_dim = 3 if self.no_priority_model_input else 6
+            self.trim_extra_stats = True
         self.obs_dim = self.num_lidar_bins + self.obs_extra_dim
         self.map_channels = 4 if self.no_priority_model_input else 5
 
@@ -12142,6 +12145,7 @@ class GazeboNavEnv(gym.Env):
             scan_angle_increment=scan_angle_increment,
             scan_angle_max=scan_angle_max,
             include_target_priority=not bool(getattr(self, "no_priority_model_input", False)),
+            trim_extra_stats=bool(getattr(self, "trim_extra_stats", True)),
         ).astype(np.float32)
 
         self._update_scan_geometry_debug(scan_msg, vector_obs)
