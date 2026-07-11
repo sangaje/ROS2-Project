@@ -16,7 +16,7 @@ from enum import Enum
 from typing import Optional, Tuple
 
 import rclpy
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Twist, TwistStamped
 from nav_msgs.msg import OccupancyGrid
 from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
 from rcl_interfaces.srv import SetParameters
@@ -64,6 +64,9 @@ class LeaderShadowFollow(Node):
         self.declare_parameter('follower_scout_pose_topic', '/burger_pose')
         self.declare_parameter('leader_goal_topic', '/fleet/leader_coord_goal')
         self.declare_parameter('leader_cancel_topic', '/fleet/leader_nav_cancel')
+        self.declare_parameter('cmd_vel_topic', '/cmd_vel')
+        self.declare_parameter('use_stamped_cmd_vel', True)
+        self.declare_parameter('direct_shadow_cmd_vel', True)
         self.declare_parameter(
             'controller_set_parameters_service',
             '/controller_server/set_parameters',
@@ -89,6 +92,10 @@ class LeaderShadowFollow(Node):
         self.declare_parameter('leader_restore_max_angular_vel', 0.90)
         self.declare_parameter('leader_shadow_goal_update_period_sec', 0.6)
         self.declare_parameter('leader_shadow_goal_min_change_m', 0.25)
+        self.declare_parameter('leader_shadow_cmd_goal_tolerance_m', 0.16)
+        self.declare_parameter('leader_shadow_linear_kp', 0.70)
+        self.declare_parameter('leader_shadow_angular_kp', 1.40)
+        self.declare_parameter('leader_shadow_heading_slowdown_rad', 0.75)
         self.declare_parameter('leader_shadow_heading_min_motion_m', 0.15)
         self.declare_parameter('leader_shadow_heading_alpha', 0.35)
         self.declare_parameter('leader_shadow_map_clearance_m', 0.22)
@@ -110,6 +117,9 @@ class LeaderShadowFollow(Node):
         self.follower_pose_topic = str(get('follower_scout_pose_topic').value)
         self.leader_goal_topic = str(get('leader_goal_topic').value)
         self.leader_cancel_topic = str(get('leader_cancel_topic').value)
+        self.cmd_vel_topic = str(get('cmd_vel_topic').value)
+        self.use_stamped_cmd_vel = bool(get('use_stamped_cmd_vel').value)
+        self.direct_shadow_cmd_vel = bool(get('direct_shadow_cmd_vel').value)
         self.controller_set_parameters_service = str(
             get('controller_set_parameters_service').value
         )
@@ -137,6 +147,12 @@ class LeaderShadowFollow(Node):
         self.restore_angular_vel = max(self.shadow_angular_vel, float(get('leader_restore_max_angular_vel').value))
         self.goal_period = max(0.3, float(get('leader_shadow_goal_update_period_sec').value))
         self.goal_min_change = max(0.05, float(get('leader_shadow_goal_min_change_m').value))
+        self.cmd_goal_tolerance = max(0.03, float(get('leader_shadow_cmd_goal_tolerance_m').value))
+        self.linear_kp = max(0.01, float(get('leader_shadow_linear_kp').value))
+        self.angular_kp = max(0.01, float(get('leader_shadow_angular_kp').value))
+        self.heading_slowdown_rad = max(
+            0.05, float(get('leader_shadow_heading_slowdown_rad').value)
+        )
         self.heading_min_motion = max(0.02, float(get('leader_shadow_heading_min_motion_m').value))
         self.heading_alpha = min(1.0, max(0.01, float(get('leader_shadow_heading_alpha').value)))
         self.map_clearance = max(0.05, float(get('leader_shadow_map_clearance_m').value))
@@ -166,6 +182,10 @@ class LeaderShadowFollow(Node):
 
         self.goal_pub = self.create_publisher(PoseStamped, self.leader_goal_topic, 10)
         self.cancel_pub = self.create_publisher(Bool, self.leader_cancel_topic, latched_qos)
+        if self.use_stamped_cmd_vel:
+            self.cmd_pub = self.create_publisher(TwistStamped, self.cmd_vel_topic, 10)
+        else:
+            self.cmd_pub = self.create_publisher(Twist, self.cmd_vel_topic, 10)
         self.state_pub = self.create_publisher(String, '/leader_shadow/state', latched_qos)
         self.goal_debug_pub = self.create_publisher(PoseStamped, '/leader_shadow/goal', 10)
         self.scan_state_pub = self.create_publisher(String, '/leader_scan/state', latched_qos)
@@ -215,6 +235,7 @@ class LeaderShadowFollow(Node):
         self.shadow_active = True
         self.last_goal: Optional[PoseStamped] = None
         self.shadow_goal_active = False
+        self.direct_cmd_active = False
         self.last_goal_wall = -1.0e9
         self.last_nominal_target: Optional[Point2] = None
         self.speed_profile: Optional[str] = None
@@ -229,6 +250,7 @@ class LeaderShadowFollow(Node):
             f'enabled={self.enabled} scout={self.original_scout_id}:{self.active_pose_topic} '
             f'follower_scout={self.follower_robot_name}:{self.follower_pose_topic} '
             f'distance={self.follow_distance:.2f}m fov={self.scan_fov_deg:.1f}deg '
+            f'direct_cmd={self.direct_shadow_cmd_vel}:{self.cmd_vel_topic} '
             f'controller_service={self.controller_set_parameters_service} '
             f'localization_gate={self.require_localization_ready}:{self.localization_ready_topic}'
         )
@@ -293,6 +315,7 @@ class LeaderShadowFollow(Node):
     def _tick(self) -> None:
         if not self.enabled:
             self._cancel_shadow_goal('disabled')
+            self._stop_direct_cmd('disabled')
             self._set_controller_speed_limit(False)
             self.mode = LeaderMode.IDLE
             self._publish_state('disabled')
@@ -302,6 +325,7 @@ class LeaderShadowFollow(Node):
             return
         if self.require_localization_ready and not self.localization_ready:
             self._cancel_shadow_goal('waiting_localization_ready')
+            self._stop_direct_cmd('waiting_localization_ready')
             self.mode = LeaderMode.IDLE
             self._set_controller_speed_limit(False)
             self._publish_state('waiting_localization_ready')
@@ -314,6 +338,7 @@ class LeaderShadowFollow(Node):
         scout_pose, scout_wall = self._active_scout_pose()
         if self.leader_pose is None or scout_pose is None:
             self._cancel_shadow_goal('waiting_pose')
+            self._stop_direct_cmd('waiting_pose')
             self.mode = LeaderMode.IDLE
             self._set_controller_speed_limit(False)
             self._publish_state('waiting_pose')
@@ -321,6 +346,7 @@ class LeaderShadowFollow(Node):
         scout_age = self._now() - scout_wall
         if scout_age > self.scout_pose_timeout:
             self._cancel_shadow_goal('scout_pose_stale')
+            self._stop_direct_cmd('scout_pose_stale')
             self.mode = LeaderMode.SCOUT_SUSPECTED_DEAD
             self._set_controller_speed_limit(False)
             self._publish_state(f'scout_pose_stale_{scout_age:.2f}s')
@@ -335,6 +361,7 @@ class LeaderShadowFollow(Node):
 
         if not self.shadow_active:
             self._cancel_shadow_goal('inside_standoff_hysteresis')
+            self._stop_direct_cmd('inside_standoff_hysteresis')
             self.mode = LeaderMode.IDLE
             self._set_controller_speed_limit(False)
             self._publish_state('inside_standoff_hysteresis')
@@ -346,13 +373,27 @@ class LeaderShadowFollow(Node):
             else LeaderMode.SHADOW_FOLLOW
         )
         catchup = distance_to_scout >= self.far_distance
-        self._set_controller_speed_limit(True, catchup=catchup)
-
         goal = self._build_shadow_goal(scout_pose)
         if goal is None:
             self._cancel_shadow_goal('no_feasible_shadow_target')
+            self._stop_direct_cmd('no_feasible_shadow_target')
             self._publish_state('no_feasible_shadow_target')
             return
+        if self.direct_shadow_cmd_vel:
+            self._cancel_shadow_goal('direct_shadow_cmd_vel')
+            if not self.direct_cmd_active:
+                self._pulse_cancel()
+            self._set_controller_speed_limit(False)
+            self._publish_direct_shadow_cmd(goal, catchup=catchup)
+            self.goal_debug_pub.publish(goal)
+            self.last_goal = goal
+            self.last_goal_wall = self._now()
+            self._publish_state('direct_cmd', goal=goal, distance_to_scout=distance_to_scout)
+            return
+
+        self._stop_direct_cmd('nav2_shadow_goal_mode')
+        self._publish_cancel(False)
+        self._set_controller_speed_limit(True, catchup=catchup)
         if not self._should_publish_goal(goal):
             self._publish_state('goal_rate_limited')
             return
@@ -388,6 +429,7 @@ class LeaderShadowFollow(Node):
 
     def _stop_shadow_for_failover(self) -> None:
         self._cancel_shadow_goal(f'failover_{self.failover_state}')
+        self._stop_direct_cmd(f'failover_{self.failover_state}')
         self.shadow_active = False
         self.last_goal = None
         self._set_controller_speed_limit(False)
@@ -528,6 +570,58 @@ class LeaderShadowFollow(Node):
         )
         return distance >= self.goal_min_change
 
+    def _publish_direct_shadow_cmd(self, goal: PoseStamped, *, catchup: bool) -> None:
+        leader = self.leader_pose
+        if leader is None:
+            self._stop_direct_cmd('missing_leader_pose')
+            return
+        dx = goal.pose.position.x - leader.pose.position.x
+        dy = goal.pose.position.y - leader.pose.position.y
+        distance = math.hypot(dx, dy)
+        target_heading = math.atan2(dy, dx) if distance > 1e-6 else yaw_from_quaternion(
+            leader.pose.orientation
+        )
+        heading_error = math.atan2(
+            math.sin(target_heading - yaw_from_quaternion(leader.pose.orientation)),
+            math.cos(target_heading - yaw_from_quaternion(leader.pose.orientation)),
+        )
+        max_linear = self.catchup_linear_vel if catchup else self.shadow_linear_vel
+        linear = 0.0
+        if distance > self.cmd_goal_tolerance:
+            linear = min(max_linear, self.linear_kp * (distance - self.cmd_goal_tolerance))
+            if abs(heading_error) > self.heading_slowdown_rad:
+                linear *= max(0.0, 1.0 - min(abs(heading_error), math.pi) / math.pi)
+            if abs(heading_error) > 1.35:
+                linear = 0.0
+        angular = max(
+            -self.shadow_angular_vel,
+            min(self.shadow_angular_vel, self.angular_kp * heading_error),
+        )
+        self._publish_twist(linear, angular)
+        self.direct_cmd_active = True
+
+    def _publish_twist(self, linear_x: float, angular_z: float) -> None:
+        if self.use_stamped_cmd_vel:
+            msg = TwistStamped()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = 'base_footprint'
+            msg.twist.linear.x = float(linear_x)
+            msg.twist.angular.z = float(angular_z)
+        else:
+            msg = Twist()
+            msg.linear.x = float(linear_x)
+            msg.angular.z = float(angular_z)
+        self.cmd_pub.publish(msg)
+
+    def _stop_direct_cmd(self, reason: str) -> None:
+        if not self.direct_cmd_active:
+            return
+        self._publish_twist(0.0, 0.0)
+        self.direct_cmd_active = False
+        self.get_logger().warning(
+            f'[LEADER_SHADOW] DIRECT_CMD_STOP | reason={reason}'
+        )
+
     def _set_controller_speed_limit(self, limited: bool, *, catchup: bool = False) -> None:
         profile = 'restore'
         if limited:
@@ -594,11 +688,15 @@ class LeaderShadowFollow(Node):
         msg.data = bool(value)
         self.cancel_pub.publish(msg)
 
+    def _pulse_cancel(self) -> None:
+        self._publish_cancel(True)
+        self._publish_cancel(False)
+
     def _cancel_shadow_goal(self, reason: str) -> None:
         """Cancel the previous shadow goal once when shadow loses authority."""
         if not self.shadow_goal_active:
             return
-        self._publish_cancel(True)
+        self._pulse_cancel()
         self.shadow_goal_active = False
         self.last_goal = None
         self.get_logger().warning(

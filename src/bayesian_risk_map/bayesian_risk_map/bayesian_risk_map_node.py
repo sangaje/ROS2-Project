@@ -1529,7 +1529,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                 source=frame,
                 imgsz=self.yolo_imgsz,
                 conf=self.conf_threshold,
-                classes=[self.target_class],
+                classes=[self.target_class] if self.target_class >= 0 else None,
                 device=self.device,
                 verbose=False,
             )
@@ -1610,7 +1610,8 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             label = normalize_label(item.get('label', item.get('name', '')))
             cls = item.get('class_id', item.get('class', item.get('cls', None)))
             is_target = (
-                label in self.target_labels
+                self.target_class < 0
+                or label in self.target_labels
                 or cls == self.target_class
                 or str(cls) == str(self.target_class)
             )

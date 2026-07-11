@@ -66,6 +66,7 @@ def generate_launch_description():
     start_camera = LaunchConfiguration('start_camera')
     start_teleop = LaunchConfiguration('start_teleop')
     risk_model_path = LaunchConfiguration('risk_model_path')
+    risk_target_class = LaunchConfiguration('risk_target_class')
     detection_source = LaunchConfiguration('detection_source')
     enable_yolo = LaunchConfiguration('enable_yolo')
     external_detection_topic = LaunchConfiguration('external_detection_topic')
@@ -93,6 +94,7 @@ def generate_launch_description():
     scout_pose_topic = LaunchConfiguration('scout_pose_topic')
     scout_pose_timeout_sec = LaunchConfiguration('scout_pose_timeout_sec')
     enable_leader_shadow_follow = LaunchConfiguration('enable_leader_shadow_follow')
+    leader_shadow_direct_cmd_vel = LaunchConfiguration('leader_shadow_direct_cmd_vel')
     leader_shadow_follow_distance_m = LaunchConfiguration('leader_shadow_follow_distance_m')
     leader_shadow_stop_distance_m = LaunchConfiguration('leader_shadow_stop_distance_m')
     leader_shadow_resume_distance_m = LaunchConfiguration('leader_shadow_resume_distance_m')
@@ -602,6 +604,11 @@ def generate_launch_description():
                             'follower_scout_pose_topic': '/burger_pose',
                             'leader_goal_topic': '/fleet/leader_coord_goal',
                             'leader_cancel_topic': '/fleet/leader_nav_cancel',
+                            'cmd_vel_topic': '/cmd_vel',
+                            'use_stamped_cmd_vel': True,
+                            'direct_shadow_cmd_vel': launch_bool(
+                                leader_shadow_direct_cmd_vel.perform(context)
+                            ),
                             'map_topic': '/map',
                             'failover_state_topic': '/failover/state',
                             'active_scout_id_topic': '/failover/active_scout_id',
@@ -812,6 +819,7 @@ def generate_launch_description():
                     'start_camera': risk_start_camera,
                     'start_teleop': start_teleop.perform(context),
                     'model_path': risk_model_path.perform(context),
+                    'target_class': risk_target_class.perform(context),
                     'detection_source': risk_detection_source,
                     'enable_yolo': risk_enable_yolo,
                     'external_detection_topic': (
@@ -836,17 +844,17 @@ def generate_launch_description():
                     'output_topic': external_detection_topic.perform(context),
                     'width': '1920',
                     'height': '1080',
-                    'send_width': '960',
-                    'send_height': '540',
+                    'send_width': '1280',
+                    'send_height': '720',
                     'camera_fps': '15.0',
                     'max_rate_hz': '5.0',
                     'http_worker_count': '1',
-                    'jpeg_quality': '65',
+                    'jpeg_quality': '80',
                     'timeout_sec': '1.0',
                     'connect_timeout_sec': '0.3',
-                    'read_timeout_sec': '1.2',
-                    'max_http_roundtrip_sec': '1.5',
-                    'max_frame_age_sec': '1.0',
+                    'read_timeout_sec': '1.8',
+                    'max_http_roundtrip_sec': '2.0',
+                    'max_frame_age_sec': '1.5',
                     'enable_role_gating': 'true' if role_gating_on else 'false',
                     'robot_name': scout_robot_name,
                     'role_topic': f'/{scout_robot_name}/role',
@@ -1015,6 +1023,14 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument('risk_model_path', default_value='model/best.pt'),
         DeclareLaunchArgument(
+            'risk_target_class',
+            default_value='-1',
+            description=(
+                'Scout only: target class accepted by the risk map. -1 '
+                'accepts all YOLO classes while debugging best.pt class ids.'
+            ),
+        ),
+        DeclareLaunchArgument(
             'detection_source', default_value='flask_topic',
             description=(
                 'Scout only, passed through to real_robot_risk_slam.'
@@ -1159,6 +1175,15 @@ def generate_launch_description():
             default_value='true',
             choices=['true', 'false'],
             description='Leader role only: move behind the active scout during normal operation.',
+        ),
+        DeclareLaunchArgument(
+            'leader_shadow_direct_cmd_vel',
+            default_value='true',
+            choices=['true', 'false'],
+            description=(
+                'Leader role only: use continuous /cmd_vel for normal '
+                'shadow follow instead of repeatedly preempting Nav2 goals.'
+            ),
         ),
         DeclareLaunchArgument(
             'leader_shadow_follow_distance_m',
