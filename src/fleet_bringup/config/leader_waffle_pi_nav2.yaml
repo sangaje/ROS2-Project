@@ -11,11 +11,11 @@ amcl:
     # The leader Waffle Pi is heavier/slower than the nominal TB3 model.  Its
     # commanded rotation/acceleration can lag the odom model, so let AMCL trust
     # odom a little less and smooth corrections over real scan evidence.
-    alpha1: 0.30
-    alpha2: 0.14
-    alpha3: 0.18
-    alpha4: 0.24
-    alpha5: 0.05
+    alpha1: 0.34
+    alpha2: 0.16
+    alpha3: 0.20
+    alpha4: 0.28
+    alpha5: 0.06
     base_frame_id: "base_footprint"
     beam_skip_distance: 0.35
     beam_skip_error_threshold: 0.9
@@ -42,8 +42,8 @@ amcl:
     sigma_hit: 0.10
     tf_broadcast: true
     transform_tolerance: 1.0
-    update_min_a: 0.04
-    update_min_d: 0.04
+    update_min_a: 0.03
+    update_min_d: 0.03
     z_hit: 0.82
     z_max: 0.03
     z_rand: 0.12
@@ -72,7 +72,7 @@ controller_server:
     # accelerations and longer trajectory rollout so DWB chooses commands the
     # hardware can actually realize instead of constantly asking for impossible
     # catch-up motion.
-    controller_frequency: 15.0
+    controller_frequency: 18.0
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.001
     min_theta_velocity_threshold: 0.001
@@ -85,8 +85,8 @@ controller_server:
 
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      required_movement_radius: 0.02
-      movement_time_allowance: 70.0
+      required_movement_radius: 0.025
+      movement_time_allowance: 80.0
 
     goal_checker:
       stateful: true
@@ -99,24 +99,24 @@ controller_server:
       debug_trajectory_details: true
       min_vel_x: 0.0
       min_vel_y: 0.0
-      max_vel_x: 0.34
+      max_vel_x: 0.40
       max_vel_y: 0.0
       # Keep rotation below the range where the loaded chassis arcs wide and
       # diverges from the differential-drive model.
-      max_vel_theta: 0.65
+      max_vel_theta: 0.75
       min_speed_xy: 0.0
-      max_speed_xy: 0.34
+      max_speed_xy: 0.40
       min_speed_theta: 0.0
-      acc_lim_x: 0.55
+      acc_lim_x: 0.75
       acc_lim_y: 0.0
-      acc_lim_theta: 0.90
-      decel_lim_x: -0.65
+      acc_lim_theta: 1.10
+      decel_lim_x: -0.85
       decel_lim_y: 0.0
-      decel_lim_theta: -1.00
-      vx_samples: 16
+      decel_lim_theta: -1.20
+      vx_samples: 18
       vy_samples: 1
-      vtheta_samples: 32
-      sim_time: 1.6
+      vtheta_samples: 36
+      sim_time: 1.8
       linear_granularity: 0.05
       angular_granularity: 0.025
       transform_tolerance: 0.5
@@ -172,9 +172,9 @@ behavior_server:
     transform_tolerance: 0.5
     transform_timeout: 0.1
     simulate_ahead_time: 2.0
-    max_rotational_vel: 0.65
+    max_rotational_vel: 0.75
     min_rotational_vel: 0.25
-    rotational_acc_lim: 0.90
+    rotational_acc_lim: 1.10
     enable_stamped_cmd_vel: true
 
 bt_navigator:
