@@ -2458,6 +2458,14 @@ class GazeboNavEnv(gym.Env):
         if shape == "cylinder":
             radius = max((float(size_x) + float(size_y)) / 4.0, 0.05)
             geometry = f"<cylinder><radius>{radius:.3f}</radius><length>{size_z:.3f}</length></cylinder>"
+        elif shape == "ellipsoid":
+            # SDF 1.9+ native <ellipsoid> with independent radii per axis --
+            # unlike <cylinder> (one radius, round in X/Y), this can actually
+            # be oval/elongated in the horizontal plane, not just tall/short.
+            rx = max(float(size_x) / 2.0, 0.04)
+            ry = max(float(size_y) / 2.0, 0.04)
+            rz = max(float(size_z) / 2.0, 0.04)
+            geometry = f"<ellipsoid><radii>{rx:.3f} {ry:.3f} {rz:.3f}</radii></ellipsoid>"
         else:
             geometry = f"<box><size>{size_x:.3f} {size_y:.3f} {size_z:.3f}</size></box>"
         return (
@@ -2528,10 +2536,14 @@ class GazeboNavEnv(gym.Env):
             base_x, base_y = candidates[attempt_idx % len(candidates)] if candidates else (0.0, 0.0)
             x = float(base_x) + float(np.clip(random.gauss(0.0, float(self.random_obstacle_noise_sigma_m)), -0.55, 0.55))
             y = float(base_y) + float(np.clip(random.gauss(0.0, float(self.random_obstacle_noise_sigma_m)), -0.55, 0.55))
-            shape = random.choice(("box", "box", "cylinder"))
-            sx = random.uniform(0.20, 0.55)
-            sy = random.uniform(0.20, 0.55)
-            sz = random.uniform(0.30, 0.90)
+            # v135: wider size range (min lets thin panel-like obstacles
+            # through, max is ~3x the old 0.55 ceiling) and an ellipsoid shape
+            # option alongside box/cylinder for real shape variety, not just
+            # size variety.
+            shape = random.choice(("box", "box", "cylinder", "ellipsoid", "ellipsoid"))
+            sx = random.uniform(0.08, 1.65)
+            sy = random.uniform(0.08, 1.65)
+            sz = random.uniform(0.25, 1.60)
             # Hard safety clamp: training_house.sdf's outer walls are at
             # x=+-6.5/y=+-3.5 with 0.18m thickness, so the inner face is at
             # +-6.41/+-3.41. The +-0.55m noise clip above can otherwise push an
@@ -2542,9 +2554,23 @@ class GazeboNavEnv(gym.Env):
             # regardless of which candidate row/column produced it.
             x = float(np.clip(x, -(6.41 - 0.08 - sx / 2.0), 6.41 - 0.08 - sx / 2.0))
             y = float(np.clip(y, -(3.41 - 0.08 - sy / 2.0), 3.41 - 0.08 - sy / 2.0))
-            if float(np.linalg.norm(np.asarray([x, y], dtype=np.float32) - reset_arr)) < float(self.random_obstacle_robot_clearance_m):
+            # v135: obstacles can now be up to 3x bigger, so clearance must
+            # scale with size too -- a fixed clearance sized for the old
+            # ~0.55m max would let big obstacles visually overlap each other
+            # or spawn with an edge uncomfortably close to the robot. Use the
+            # half-diagonal (hypot(sx,sy)/2) as a yaw-independent conservative
+            # radius estimate for each obstacle.
+            own_half_extent = math.hypot(sx, sy) / 2.0
+            if float(np.linalg.norm(np.asarray([x, y], dtype=np.float32) - reset_arr)) < (
+                float(self.random_obstacle_robot_clearance_m) + own_half_extent
+            ):
                 continue
-            if any(math.hypot(x - ox, y - oy) < float(self.random_obstacle_pair_clearance_m) for ox, oy, *_ in selected):
+            if any(
+                math.hypot(x - ox, y - oy) < (
+                    float(self.random_obstacle_pair_clearance_m) + own_half_extent + math.hypot(osx, osy) / 2.0
+                )
+                for ox, oy, osx, osy, *_ in selected
+            ):
                 continue
             yaw = random.uniform(-math.pi, math.pi)
             selected.append((x, y, sx, sy, sz, yaw, shape))
