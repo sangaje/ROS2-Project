@@ -11,11 +11,11 @@ amcl:
     # The leader Waffle Pi is heavier/slower than the nominal TB3 model.  Its
     # commanded rotation/acceleration can lag the odom model, so let AMCL trust
     # odom a little less and smooth corrections over real scan evidence.
-    alpha1: 0.34
-    alpha2: 0.16
-    alpha3: 0.20
-    alpha4: 0.28
-    alpha5: 0.06
+    alpha1: 0.38
+    alpha2: 0.18
+    alpha3: 0.23
+    alpha4: 0.32
+    alpha5: 0.08
     base_frame_id: "base_footprint"
     beam_skip_distance: 0.35
     beam_skip_error_threshold: 0.9
@@ -42,8 +42,8 @@ amcl:
     sigma_hit: 0.10
     tf_broadcast: true
     transform_tolerance: 1.0
-    update_min_a: 0.03
-    update_min_d: 0.03
+    update_min_a: 0.025
+    update_min_d: 0.025
     z_hit: 0.82
     z_max: 0.03
     z_rand: 0.12
@@ -91,36 +91,36 @@ controller_server:
     goal_checker:
       stateful: true
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.25
-      yaw_goal_tolerance: 0.25
+      xy_goal_tolerance: 0.35
+      yaw_goal_tolerance: 0.60
 
     FollowPath:
       plugin: "dwb_core::DWBLocalPlanner"
       debug_trajectory_details: true
       min_vel_x: 0.0
       min_vel_y: 0.0
-      max_vel_x: 0.40
+      max_vel_x: 0.46
       max_vel_y: 0.0
       # Keep rotation below the range where the loaded chassis arcs wide and
       # diverges from the differential-drive model.
-      max_vel_theta: 0.75
+      max_vel_theta: 0.90
       min_speed_xy: 0.0
-      max_speed_xy: 0.40
+      max_speed_xy: 0.46
       min_speed_theta: 0.0
-      acc_lim_x: 0.75
+      acc_lim_x: 1.00
       acc_lim_y: 0.0
-      acc_lim_theta: 1.10
-      decel_lim_x: -0.85
+      acc_lim_theta: 1.40
+      decel_lim_x: -1.10
       decel_lim_y: 0.0
-      decel_lim_theta: -1.20
-      vx_samples: 18
+      decel_lim_theta: -1.50
+      vx_samples: 20
       vy_samples: 1
-      vtheta_samples: 36
-      sim_time: 1.8
+      vtheta_samples: 40
+      sim_time: 1.5
       linear_granularity: 0.05
       angular_granularity: 0.025
       transform_tolerance: 0.5
-      xy_goal_tolerance: 0.25
+      xy_goal_tolerance: 0.35
       trans_stopped_velocity: 0.03
       short_circuit_trajectory_evaluation: true
       stateful: true
@@ -132,8 +132,8 @@ controller_server:
       GoalAlign.forward_point_distance: 0.1
       PathDist.scale: 32.0
       GoalDist.scale: 24.0
-      RotateToGoal.scale: 32.0
-      RotateToGoal.slowing_factor: 5.0
+      RotateToGoal.scale: 10.0
+      RotateToGoal.slowing_factor: 2.0
       RotateToGoal.lookahead_time: -1.0
 
 planner_server:
@@ -172,9 +172,9 @@ behavior_server:
     transform_tolerance: 0.5
     transform_timeout: 0.1
     simulate_ahead_time: 2.0
-    max_rotational_vel: 0.75
+    max_rotational_vel: 0.90
     min_rotational_vel: 0.25
-    rotational_acc_lim: 1.10
+    rotational_acc_lim: 1.40
     enable_stamped_cmd_vel: true
 
 bt_navigator:

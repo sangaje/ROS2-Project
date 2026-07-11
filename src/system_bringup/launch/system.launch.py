@@ -1182,27 +1182,27 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'leader_shadow_max_linear_vel',
-            default_value='0.30',
+            default_value='0.38',
             description='Best-effort DWB linear velocity cap while shadow following.',
         ),
         DeclareLaunchArgument(
             'leader_shadow_catchup_max_linear_vel',
-            default_value='0.38',
+            default_value='0.46',
             description='Best-effort DWB linear velocity cap when the leader is far behind the active scout.',
         ),
         DeclareLaunchArgument(
             'leader_shadow_max_angular_vel',
-            default_value='0.68',
+            default_value='0.85',
             description='Best-effort DWB angular velocity cap while shadow following.',
         ),
         DeclareLaunchArgument(
             'leader_shadow_goal_update_period_sec',
-            default_value='1.0',
+            default_value='0.6',
             description='Minimum time between leader shadow Nav2 goal updates.',
         ),
         DeclareLaunchArgument(
             'leader_shadow_goal_min_change_m',
-            default_value='0.5',
+            default_value='0.25',
             description='Minimum shadow target displacement before sending another leader goal.',
         ),
         DeclareLaunchArgument(
