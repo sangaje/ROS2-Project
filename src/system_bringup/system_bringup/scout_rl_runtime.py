@@ -172,6 +172,18 @@ class VelocitySafetyFilter:
                 dtype=np.float32,
             )
 
+        if (
+            front <= self.config.safety_stop_distance_m
+            and rear > self.config.safety_stop_distance_m
+            and self.cooldown_remaining == 0
+        ):
+            self.turn_sign = 0.0
+            self.backup_remaining = max(min(self.config.safety_backup_steps, 2) - 1, 0)
+            return np.array(
+                [-self.config.safety_backup_speed_mps, 0.0],
+                dtype=np.float32,
+            )
+
         if forward_requested and front < self.config.safety_stop_distance_m:
             action[0] = 0.0
         elif (

@@ -54,6 +54,29 @@ def test_runtime_keeps_v132_backup_sequence_nonblocking():
     assert safety.cooldown_remaining == config.safety_cooldown_steps
 
 
+def test_runtime_backs_up_briefly_when_front_is_already_pinned():
+    config = active_scout_config()
+    lidar = LidarPreprocessorConfig(
+        canonical_front_zero=config.lidar.canonical_front_zero,
+        front_index=config.lidar.front_index,
+        angle_offset_deg=config.lidar.angle_offset_deg,
+        flip_lr=config.lidar.flip_lr,
+        uniform_angle_resample=config.lidar.uniform_angle_resample,
+        median_kernel=config.lidar.median_kernel,
+        lowpass_kernel=config.lidar.lowpass_kernel,
+        obstacle_margin_m=config.lidar.obstacle_margin_m,
+    )
+    safety = VelocitySafetyFilter(config, lidar)
+
+    first = safety.filter(np.array([0.0, 0.0], dtype=np.float32), _scan(0.15))
+    second = safety.filter(np.array([0.0, 0.0], dtype=np.float32), _scan(0.15))
+
+    assert np.allclose(first, [-config.safety_backup_speed_mps, 0.0])
+    assert np.allclose(second, [-config.safety_backup_speed_mps, 0.0])
+    assert safety.backup_remaining == 0
+    assert safety.cooldown_remaining == config.safety_cooldown_steps
+
+
 def test_raw_policy_command_only_clips_to_the_trained_action_box():
     runtime = ActiveScoutRLRuntime.__new__(ActiveScoutRLRuntime)
     runtime.config = active_scout_config()
