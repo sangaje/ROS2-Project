@@ -12305,7 +12305,13 @@ class GazeboNavEnv(gym.Env):
             except Exception:
                 pass
 
-        self._last_tf_pose_ok = self._get_robot_pose2d() is not None
+        # v135: single TF lookup reused below instead of two independent
+        # lookup_transform() calls per _get_obs() -- each one can block up to
+        # ~0.12s (get_pose2d's per-base-frame timeout/fallback) when TF is
+        # slow to resolve, which happens right after every Cartographer
+        # restart. Paying that twice, every step, was a real cost.
+        robot_pose_for_obs = self._get_robot_pose2d()
+        self._last_tf_pose_ok = robot_pose_for_obs is not None
 
         stats = self.last_map_stats
 
@@ -12342,7 +12348,7 @@ class GazeboNavEnv(gym.Env):
             self._push_vector_history(vector_obs)
             return vector_obs
 
-        robot_pose = self._get_robot_pose2d()
+        robot_pose = robot_pose_for_obs
 
         if robot_pose is None:
             map_obs = np.zeros(
