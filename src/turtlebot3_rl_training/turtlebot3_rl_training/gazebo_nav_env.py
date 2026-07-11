@@ -660,6 +660,25 @@ class GazeboNavEnv(gym.Env):
             )
         except Exception:
             self.world_step_contract_wait_sec = 0.25
+        # Hard ceiling on how long a single step will keep retrying to actually
+        # reach target_delta_sec of sim time before giving up and accepting a
+        # stale/short step. Previously the contract wait ran exactly once
+        # (world_step_contract_wait_sec) and then silently continued even if
+        # sim time had not advanced by the requested control_dt -- under load
+        # (many obstacles, gradient updates competing for CPU) this meant
+        # individual steps could represent less than control_dt of sim time
+        # while step_count still incremented 1:1, breaking the fixed
+        # steps-per-sim-second contract. Retrying in a loop up to this ceiling
+        # actually enforces it; wall-clock throughput drops instead of
+        # correctness. The ceiling itself only exists to avoid hanging forever
+        # if Gazebo has genuinely died.
+        try:
+            self.world_step_contract_max_wait_sec = max(
+                float(os.environ.get("TB3_RL_WORLD_STEP_CONTRACT_MAX_WAIT_SEC", "5.0") or 5.0),
+                0.0,
+            )
+        except Exception:
+            self.world_step_contract_max_wait_sec = 5.0
         self.realtime_spin_steps = max(int(realtime_spin_steps), 0)
         self.realtime_spin_timeout_sec = max(float(realtime_spin_timeout_sec), 0.0)
         self.realtime_sleep_sec = max(float(realtime_sleep_sec), 0.0)
@@ -9650,15 +9669,25 @@ class GazeboNavEnv(gym.Env):
                     timeout_wall_sec=self.world_step_wait_timeout_sec,
                 )
                 if not time_advanced and self.world_step_contract_wait_sec > 0.0:
-                    # Enforce the sim-time control contract before the next action.
-                    # If Gazebo/RViz/SLAM cannot keep up, wall-clock throughput drops,
-                    # but each env step still represents the requested simulated dt.
-                    time_advanced = self.ros.wait_for_time_advance(
-                        start_sim_time_sec=prev_sim_time,
-                        start_odom_stamp_sec=prev_odom_stamp,
-                        target_delta_sec=target_delta,
-                        timeout_wall_sec=self.world_step_contract_wait_sec,
-                    )
+                    # Enforce the sim-time control contract before the next action:
+                    # keep retrying (not just once) until sim time has actually
+                    # advanced by target_delta, up to world_step_contract_max_wait_sec
+                    # total. If Gazebo/RViz/SLAM cannot keep up, wall-clock
+                    # throughput drops, but each env step still represents the
+                    # requested simulated dt -- a single retry does not guarantee
+                    # that under sustained load, only a bounded loop does.
+                    _contract_wait_start = time.time()
+                    while not time_advanced:
+                        time_advanced = self.ros.wait_for_time_advance(
+                            start_sim_time_sec=prev_sim_time,
+                            start_odom_stamp_sec=prev_odom_stamp,
+                            target_delta_sec=target_delta,
+                            timeout_wall_sec=self.world_step_contract_wait_sec,
+                        )
+                        if time_advanced:
+                            break
+                        if (time.time() - _contract_wait_start) >= self.world_step_contract_max_wait_sec:
+                            break
             if _prof_on:
                 _t2 = time.perf_counter()
                 self._last_advance_wait_time_adv_sec = _t2 - _t1
