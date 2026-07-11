@@ -33,6 +33,7 @@ from fleet_bringup.launch_utils import (
     clean_process_environment,
     dds_launch_environment,
     launch_bool,
+    with_virtualenv_site_packages,
 )
 
 
@@ -177,7 +178,9 @@ def generate_launch_description():
             )
 
         domain = int(domain_id.perform(context))
-        process_env = clean_process_environment(str(domain))
+        process_env = with_virtualenv_site_packages(
+            clean_process_environment(str(domain))
+        )
 
         fleet_role_value = fleet_role.perform(context).strip().lower()
         if not fleet_role_value:

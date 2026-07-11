@@ -1,4 +1,5 @@
 import os
+import sys
 from typing import Dict, List
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -184,6 +185,35 @@ def clean_process_environment(domain_id: str) -> Dict[str, str]:
     """Return the current shell environment after validating it."""
     validate_shell_environment(str(domain_id))
     return os.environ.copy()
+
+
+def with_virtualenv_site_packages(env: Dict[str, str]) -> Dict[str, str]:
+    """Expose an activated venv's pip packages to ROS Python entry points.
+
+    ament_python console scripts keep the interpreter used at build/install time,
+    so activating a venv is not always enough for Node(...) actions to see pip
+    packages such as Flask or ultralytics.  Prepending the venv site-packages to
+    PYTHONPATH preserves the ROS entry point while still using the user's venv
+    dependencies.
+    """
+    virtual_env = env.get('VIRTUAL_ENV', '').strip()
+    if not virtual_env:
+        return env
+
+    version = f'python{sys.version_info.major}.{sys.version_info.minor}'
+    candidates = [
+        Path(virtual_env) / 'lib' / version / 'site-packages',
+        Path(virtual_env) / 'lib64' / version / 'site-packages',
+    ]
+    existing = [str(path) for path in candidates if path.is_dir()]
+    if not existing:
+        return env
+
+    updated = env.copy()
+    current = updated.get('PYTHONPATH', '').strip()
+    parts = existing + ([current] if current else [])
+    updated['PYTHONPATH'] = os.pathsep.join(parts)
+    return updated
 
 
 def dds_launch_environment(domain_id) -> List:
