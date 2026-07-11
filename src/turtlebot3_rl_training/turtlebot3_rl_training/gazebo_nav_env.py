@@ -1381,7 +1381,6 @@ class GazeboNavEnv(gym.Env):
         self.debug_input_map_publishers = {}
 
         self.vector_history = deque(maxlen=self.temporal_history_len)
-        self.map_history = deque(maxlen=self.temporal_history_len)
 
         # 이미 확인한 영역에서 새 정보 없이 머무는 시간을 누적한다.
         # 이 값은 reward에서 시간 증가형 penalty로 사용한다.
@@ -1637,16 +1636,16 @@ class GazeboNavEnv(gym.Env):
             }
 
             if self.use_temporal_cnn:
+                # v135: no map_seq. Map/confidence state is cumulative and the
+                # crop is re-centered/rotated to the robot every step, so a
+                # sequence of past crops is mostly redundant with the current
+                # map and confounded by ego-motion -- see feature_extractor.py.
+                # Only LiDAR+stats history drives the temporal branch now; the
+                # current "map" entry above still covers the map input.
                 obs_spaces["seq"] = spaces.Box(
                     low=-1.0,
                     high=1.0,
                     shape=(self.temporal_history_len, self.obs_dim),
-                    dtype=np.float32,
-                )
-                obs_spaces["map_seq"] = spaces.Box(
-                    low=0.0,
-                    high=1.0,
-                    shape=(self.temporal_history_len, self.map_channels, self.map_obs_size, self.map_obs_size),
                     dtype=np.float32,
                 )
 
@@ -4005,10 +4004,6 @@ class GazeboNavEnv(gym.Env):
         self._last_orbit_reason = "reset"
         self.last_map_stats = self._empty_map_stats()
         self.vector_history.clear()
-        try:
-            self.map_history.clear()
-        except Exception:
-            pass
         self._waypoint_history.clear()
         self._clear_waypoint_visualization()
         self._last_terminal_reason = "none"
@@ -12366,7 +12361,7 @@ class GazeboNavEnv(gym.Env):
 
         self._publish_debug_input_map(map_obs)
 
-        self._push_observation_history(vector_obs, map_obs)
+        self._push_vector_history(vector_obs)
 
         obs = {
             "vector": vector_obs,
@@ -12375,7 +12370,6 @@ class GazeboNavEnv(gym.Env):
 
         if self.use_temporal_cnn:
             obs["seq"] = self._sequence_observation()
-            obs["map_seq"] = self._map_sequence_observation()
 
         return obs
 
@@ -12398,10 +12392,6 @@ class GazeboNavEnv(gym.Env):
                 (self.temporal_history_len, self.obs_dim),
                 dtype=np.float32,
             )
-            obs["map_seq"] = np.zeros(
-                (self.temporal_history_len, self.map_channels, self.map_obs_size, self.map_obs_size),
-                dtype=np.float32,
-            )
 
         return obs
 
@@ -12416,19 +12406,6 @@ class GazeboNavEnv(gym.Env):
             return
         self.vector_history.append(vector_obs.copy())
 
-    def _push_observation_history(self, vector_obs: np.ndarray, map_obs: np.ndarray):
-        if not self.use_temporal_cnn:
-            return
-        vector_obs = np.asarray(vector_obs, dtype=np.float32)
-        map_obs = np.asarray(map_obs, dtype=np.float32)
-        if not self.vector_history:
-            for _ in range(self.temporal_history_len):
-                self.vector_history.append(vector_obs.copy())
-                self.map_history.append(map_obs.copy())
-        else:
-            self.vector_history.append(vector_obs.copy())
-            self.map_history.append(map_obs.copy())
-
     def _sequence_observation(self) -> np.ndarray:
         if not self.vector_history:
             return np.zeros(
@@ -12439,27 +12416,6 @@ class GazeboNavEnv(gym.Env):
         while len(seq) < self.temporal_history_len:
             seq.insert(0, seq[0].copy())
         return np.stack(seq[-self.temporal_history_len :], axis=0).astype(np.float32)
-
-    def _map_sequence_observation(self) -> np.ndarray:
-        shape = (self.temporal_history_len, self.map_channels, self.map_obs_size, self.map_obs_size)
-        if not hasattr(self, "map_history") or not self.map_history:
-            return np.zeros(shape, dtype=np.float32)
-        seq = list(self.map_history)
-        while len(seq) < self.temporal_history_len:
-            seq.insert(0, seq[0].copy())
-        out = np.stack(seq[-self.temporal_history_len :], axis=0).astype(np.float32)
-        if out.shape != shape:
-            fixed = np.zeros(shape, dtype=np.float32)
-            try:
-                t = min(fixed.shape[0], out.shape[0])
-                c = min(fixed.shape[1], out.shape[1])
-                h = min(fixed.shape[2], out.shape[2])
-                w = min(fixed.shape[3], out.shape[3])
-                fixed[-t:, :c, :h, :w] = out[-t:, :c, :h, :w]
-            except Exception:
-                pass
-            return fixed
-        return np.clip(out, 0.0, 1.0)
 
     def _distance_to_goal(self, robot_xy: Optional[np.ndarray]) -> float:
         if robot_xy is None:

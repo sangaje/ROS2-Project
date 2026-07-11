@@ -61,11 +61,17 @@ class MapVectorFeatureExtractor(BaseFeaturesExtractor):
         concat(m_k, l_k, s_k) -> Step Fusion MLP      -> z_k
 
       Temporal branch (only when use_temporal_cnn=True):
-        From the post-fusion feature history Z = [z_{t-H+1}, ..., z_t]
-        and the delta history dZ_k = z_k - z_{k-1}, build a per-step token
-        and run a Map-conditioned Delta-TCN, FiLM-modulated by the CURRENT map
-        feature m_t:
-            S = [ concat(z_k, dz_k) ]_{k}
+        v135: map history was dropped from this branch. Map/confidence state
+        is cumulative (episode-monotonic under zero confidence decay) and the
+        map crop is re-centered/rotated to the robot every step, so a raw
+        sequence of past crops is mostly redundant with the current map and
+        confounded by ego-motion rather than carrying a clean trend signal --
+        while costing a full Map CNN forward pass per history step. Only the
+        CURRENT map feature m_t is encoded (once), for both FiLM conditioning
+        and building every history step's fusion token, so the Map CNN cost
+        no longer scales with history length:
+            z_k = Step Fusion(m_t, vector_token_k)   for k in history
+            S   = [ concat(z_k, dz_k) ]_k,  dz_k = z_k - z_{k-1}
             h_t = FiLM-TCN(S | m_t)
         The current-step fusion token z_t is ALSO passed straight to the final
         fusion as a skip connection, so the policy/critic never lose direct
@@ -91,7 +97,6 @@ class MapVectorFeatureExtractor(BaseFeaturesExtractor):
     Expected observation:
       map     : (5, 32, 32)
       vector  : (vector_dim,) = lidar(L) + stats(S)
-      map_seq : (H, 5, 32, 32)   [only when use_temporal_cnn]
       seq     : (H, vector_dim)  [only when use_temporal_cnn]
     """
 
@@ -130,21 +135,13 @@ class MapVectorFeatureExtractor(BaseFeaturesExtractor):
         self.use_temporal_cnn = bool(
             use_temporal_cnn
             and ("seq" in observation_space.spaces)
-            and ("map_seq" in observation_space.spaces)
         )
         self.history_len = 0
         if self.use_temporal_cnn:
             seq_space = observation_space.spaces["seq"]
-            map_seq_space = observation_space.spaces["map_seq"]
             if len(seq_space.shape) != 2:
                 raise ValueError(f"obs['seq'] must have shape (H, vector_dim), got {seq_space.shape}")
-            if len(map_seq_space.shape) != 4:
-                raise ValueError(f"obs['map_seq'] must have shape (H,C,H,W), got {map_seq_space.shape}")
             self.history_len = int(seq_space.shape[0])
-            if int(map_seq_space.shape[0]) != self.history_len:
-                raise ValueError(
-                    f"seq history length {seq_space.shape[0]} != map_seq history length {map_seq_space.shape[0]}"
-                )
 
         vector_features_dim = int(vector_features_dim)
         map_features_dim = int(map_features_dim)
@@ -333,55 +330,46 @@ class MapVectorFeatureExtractor(BaseFeaturesExtractor):
         vector_token = self._encode_vector_token_flat(vector_flat)
         return self.step_fusion(torch.cat([map_features, vector_token], dim=1))
 
-    def _encode_full_step_flat_with_map(
-        self, map_flat: torch.Tensor, vector_flat: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Same as _encode_full_step_flat but also returns the map feature vector.
-
-        Used by the temporal branch to avoid recomputing the current-step map CNN.
-        Returns (step_token, map_features) both with shape (B, *_features_dim).
-        """
-        map_features = self._encode_map_flat(map_flat)
-        vector_token = self._encode_vector_token_flat(vector_flat)
-        step_token = self.step_fusion(torch.cat([map_features, vector_token], dim=1))
-        return step_token, map_features
-
     # ------------------------------------------------------------------ #
     # Temporal branch: Map-conditioned Delta-TCN with FiLM
     # ------------------------------------------------------------------ #
-    def _encode_temporal_map_conditioned_delta_tcn(
-        self, map_seq: torch.Tensor, seq_obs: torch.Tensor
+    def _encode_temporal_delta_tcn_current_map(
+        self, map_flat: torch.Tensor, seq_obs: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return (h_t temporal summary, z_t current-step skip token).
 
-        Raw map_seq/seq are NOT fed to the temporal module directly. Each history
-        item first becomes z_k via the same learned step encoders, then the TCN
-        operates on [z_k, dz_k] with FiLM conditioning from the current map m_t.
+        v135: no map history. Only the current map is encoded (once) and
+        reused as the map term when fusing every history step's vector
+        (LiDAR+stats) token into z_k, and as the FiLM conditioning signal --
+        matching what FiLM already used exclusively before this change. The
+        TCN's actual temporal signal comes from the LiDAR+stats deltas.
         """
         if self.temporal_input_proj is None:
             raise RuntimeError("Delta-TCN requested but temporal modules are None")
 
-        map_seq = self._sanitize_map(map_seq)
+        map_flat = self._sanitize_map(map_flat)
         seq_obs = self._sanitize_vector(seq_obs)
 
         batch_size = int(seq_obs.shape[0])
         history_len = int(seq_obs.shape[1])
-        flat_maps = map_seq.reshape(batch_size * history_len, *map_seq.shape[2:])
-        flat_vecs = seq_obs.reshape(batch_size * history_len, -1)
 
-        # z_k for every history step.  Also retrieve the last-step map feature
-        # m_t so the FiLM conditioning does NOT require a second CNN forward pass.
-        z_flat = self._encode_full_step_flat(flat_maps, flat_vecs)
+        # Map CNN runs once per batch element, not once per history step.
+        m_t = self._encode_map_flat(map_flat)  # (B, map_features_dim)
+
+        # Vector (LiDAR+stats) token for every history step.
+        flat_vecs = seq_obs.reshape(batch_size * history_len, -1)
+        vector_tokens_flat = self._encode_vector_token_flat(flat_vecs)  # (B*H, vector_token_dim)
+
+        # Fuse each history step's vector token with the same current map
+        # feature (the map term no longer varies across the history window).
+        m_t_expanded = (
+            m_t.unsqueeze(1).expand(-1, history_len, -1).reshape(batch_size * history_len, -1)
+        )
+        z_flat = self.step_fusion(torch.cat([m_t_expanded, vector_tokens_flat], dim=1))
         z_seq = z_flat.reshape(batch_size, history_len, self.vector_features_dim)  # (B,H,D)
 
         # Current-step token z_t (last in history) for the skip connection.
         z_t = z_seq[:, -1, :]  # (B, D)
-
-        # FiLM conditioning uses the CURRENT map feature m_t.
-        # Re-encode only the last-step map (avoids duplicating the full batch).
-        last_map_flat = map_seq[:, -1]                          # (B, C, H, W)
-        last_vec_flat = seq_obs[:, -1, :]                       # (B, vector_dim)
-        _, m_t = self._encode_full_step_flat_with_map(last_map_flat, last_vec_flat)  # (B, map_features_dim)
 
         # Delta over time: dz_k = z_k - z_{k-1}, with dz_0 = 0.
         dz_seq = torch.zeros_like(z_seq)
@@ -399,13 +387,63 @@ class MapVectorFeatureExtractor(BaseFeaturesExtractor):
         h_t = self.temporal_head(x)                     # (B, temporal_features_dim)
         return h_t, z_t
 
+    def _encode_temporal_map_conditioned_delta_tcn(
+        self, map_seq: torch.Tensor, seq_obs: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pre-v135 temporal path: real map history, kept for checkpoints
+        trained before v135 (e.g. the frozen deployed contract in
+        scout_rl_policy_contract.json). New training no longer produces
+        map_seq -- see _encode_temporal_delta_tcn_current_map -- but a
+        checkpoint trained on this path has the exact same layer shapes (only
+        the data flow differs), so it loads fine and must keep running this
+        computation to match what it was actually trained on. Do not delete
+        this without retiring that checkpoint's contract override too.
+        """
+        if self.temporal_input_proj is None:
+            raise RuntimeError("Delta-TCN requested but temporal modules are None")
+
+        map_seq = self._sanitize_map(map_seq)
+        seq_obs = self._sanitize_vector(seq_obs)
+
+        batch_size = int(seq_obs.shape[0])
+        history_len = int(seq_obs.shape[1])
+        flat_maps = map_seq.reshape(batch_size * history_len, *map_seq.shape[2:])
+        flat_vecs = seq_obs.reshape(batch_size * history_len, -1)
+
+        z_flat = self._encode_full_step_flat(flat_maps, flat_vecs)
+        z_seq = z_flat.reshape(batch_size, history_len, self.vector_features_dim)  # (B,H,D)
+        z_t = z_seq[:, -1, :]  # (B, D)
+
+        last_map_flat = map_seq[:, -1]
+        m_t = self._encode_map_flat(last_map_flat)
+
+        dz_seq = torch.zeros_like(z_seq)
+        if history_len > 1:
+            dz_seq[:, 1:, :] = z_seq[:, 1:, :] - z_seq[:, :-1, :]
+
+        s_seq = torch.cat([z_seq, dz_seq], dim=-1)
+        s_proj = self.temporal_input_proj(s_seq)
+        x = s_proj.transpose(1, 2).contiguous()
+
+        x = self.temporal_block1(x, m_t)
+        x = self.temporal_block2(x, m_t)
+        x = self.temporal_pool(x)
+        h_t = self.temporal_head(x)
+        return h_t, z_t
+
     # ------------------------------------------------------------------ #
     # Forward
     # ------------------------------------------------------------------ #
     def forward(self, observations: dict[str, torch.Tensor]) -> torch.Tensor:
-        if self.use_temporal_cnn and "map_seq" in observations and "seq" in observations:
+        if self.use_temporal_cnn and "map_seq" in observations:
+            # Frozen pre-v135 checkpoint contract: real map history present.
             h_t, z_t = self._encode_temporal_map_conditioned_delta_tcn(
                 observations["map_seq"].float(), observations["seq"].float()
+            )
+            features = torch.cat([h_t, z_t], dim=1)
+        elif self.use_temporal_cnn and "seq" in observations:
+            h_t, z_t = self._encode_temporal_delta_tcn_current_map(
+                observations["map"].float(), observations["seq"].float()
             )
             features = torch.cat([h_t, z_t], dim=1)
         else:
