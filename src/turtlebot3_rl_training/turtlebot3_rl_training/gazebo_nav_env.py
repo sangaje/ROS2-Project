@@ -1421,6 +1421,10 @@ class GazeboNavEnv(gym.Env):
         self.directional_bias_accum = 0.0
         self._directional_bias_sign = 0
 
+        # v134: set at each episode reset; consumed (and cleared) by the next
+        # confidence update to paint a full circle around the spawn point.
+        self._pending_omnidirectional_confidence_seed = False
+
         # Policy 출력은 바로 cmd_vel로 보내지 않고, 물리적으로 가능한 제어 신호로 필터링한다.
         # 목적:
         #   - 좌우 각속도 sign flip으로 생기는 본체 떨림 억제
@@ -4129,6 +4133,10 @@ class GazeboNavEnv(gym.Env):
         # this episode anchors real odometry to this episode's map pose.
         self._sync_exploration_canvas_to_current_slam(reason="after_exploration_reset", publish=True)
         self._reset_confidence_pose_runtime_state()
+        # v134: the next confidence update (this episode's first) paints a
+        # full circle around the spawn point instead of the normal
+        # front_fov_deg forward cone -- see _update_exploration_map_with_unified_tf().
+        self._pending_omnidirectional_confidence_seed = True
         if _reset_prof_on:
             _reset_prof_mark("map_reset")
 
@@ -9682,6 +9690,16 @@ class GazeboNavEnv(gym.Env):
                     # throughput drops, but each env step still represents the
                     # requested simulated dt -- a single retry does not guarantee
                     # that under sustained load, only a bounded loop does.
+                    #
+                    # cmd_vel is not re-sent while this loop runs, so without an
+                    # explicit stop here Gazebo keeps executing whatever velocity
+                    # was commanded for the *previous* action for the entire wait
+                    # (up to world_step_contract_max_wait_sec) -- a policy turning
+                    # in place would keep turning, uncontrolled, for seconds of
+                    # real time instead of the intended control_dt. Freeze the
+                    # robot before waiting; the next real command is sent once
+                    # this step actually completes.
+                    self.ros.stop_robot()
                     _contract_wait_start = time.time()
                     while not time_advanced:
                         time_advanced = self.ros.wait_for_time_advance(
@@ -13976,28 +13994,50 @@ class GazeboNavEnv(gym.Env):
         if slam_map is None:
             slam_map = self._filtered_slam_map_for_update()
 
+        # v134: the very first confidence update of an episode paints a full
+        # 360 degree circle around the robot instead of the normal
+        # front_fov_deg forward cone. The forward-only gate exists to keep the
+        # per-step reward-relevant confidence signal forward-facing, but it
+        # means the robot's own sides/rear are otherwise never marked
+        # confident even though the robot is physically standing there,
+        # leaving a permanent unconfident gap at every spawn point. Reuse the
+        # exact same wall-aware/occlusion LiDAR ray-painting logic in
+        # exploration_map.update() -- just temporarily widen the angular gate
+        # so no direction is excluded -- rather than a separate naive disk
+        # fill that could paint through walls.
+        _seed_full_circle = bool(getattr(self, "_pending_omnidirectional_confidence_seed", False))
+        _orig_front_fov_rad = None
+        if _seed_full_circle:
+            _orig_front_fov_rad = self.exploration_map.front_fov_rad
+            self.exploration_map.front_fov_rad = 2.0 * math.pi
+
         try:
-            stats = self.exploration_map.update(
-                scan=self.ros.scan,
-                robot_xy=robot_xy,
-                robot_yaw=robot_yaw,
-                publish=True,
-                slam_map=slam_map,
-                sensor_xy=sensor_xy,
-                sensor_yaw=sensor_yaw,
-            )
-        except TypeError as exc:
-            # Do not silently fall back to the old robot_yaw-only update path.
-            # If this fires, colcon/symlink-install is still loading an older
-            # ExplorationGridMap and confidence direction/pose will be wrong.
             try:
-                self.ros.get_logger().error(
-                    "CONFIDENCE_UPDATE_API_MISMATCH | "
-                    f"ExplorationGridMap.update() does not accept sensor_xy/sensor_yaw: {exc}"
+                stats = self.exploration_map.update(
+                    scan=self.ros.scan,
+                    robot_xy=robot_xy,
+                    robot_yaw=robot_yaw,
+                    publish=True,
+                    slam_map=slam_map,
+                    sensor_xy=sensor_xy,
+                    sensor_yaw=sensor_yaw,
                 )
-            except Exception:
-                pass
-            return self.last_map_stats
+            except TypeError as exc:
+                # Do not silently fall back to the old robot_yaw-only update path.
+                # If this fires, colcon/symlink-install is still loading an older
+                # ExplorationGridMap and confidence direction/pose will be wrong.
+                try:
+                    self.ros.get_logger().error(
+                        "CONFIDENCE_UPDATE_API_MISMATCH | "
+                        f"ExplorationGridMap.update() does not accept sensor_xy/sensor_yaw: {exc}"
+                    )
+                except Exception:
+                    pass
+                return self.last_map_stats
+        finally:
+            if _seed_full_circle:
+                self.exploration_map.front_fov_rad = _orig_front_fov_rad
+                self._pending_omnidirectional_confidence_seed = False
 
         try:
             if self._force_map_publish_every_update:
