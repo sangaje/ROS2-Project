@@ -2583,6 +2583,33 @@ class GazeboNavEnv(gym.Env):
         if removed > 0:
             self.ros.get_logger().debug(f"RANDOM_OBSTACLES_REMOVED | removed={removed}/{len(active_names)}")
 
+    @staticmethod
+    def _obb_too_close(
+        x1: float, y1: float, hx1: float, hy1: float, yaw1: float,
+        x2: float, y2: float, hx2: float, hy2: float, yaw2: float,
+        margin: float,
+    ) -> bool:
+        """Separating-axis test for two yawed rectangles plus a clearance margin.
+
+        Returns True if the rectangles (inflated by `margin` on each side) are
+        overlapping/too close, False if a separating axis proves they are not.
+        Exact for box footprints; a safe (if mildly conservative) over-
+        approximation for cylinder/ellipsoid/capsule, whose footprint is
+        bounded by their own hx/hy rectangle.
+        """
+        ax1, ay1 = math.cos(yaw1), math.sin(yaw1)
+        bx1, by1 = -ay1, ax1
+        ax2, ay2 = math.cos(yaw2), math.sin(yaw2)
+        bx2, by2 = -ay2, ax2
+        dx, dy = x2 - x1, y2 - y1
+        for lx, ly in ((ax1, ay1), (bx1, by1), (ax2, ay2), (bx2, by2)):
+            dist = abs(dx * lx + dy * ly)
+            r1 = hx1 * abs(ax1 * lx + ay1 * ly) + hy1 * abs(bx1 * lx + by1 * ly)
+            r2 = hx2 * abs(ax2 * lx + ay2 * ly) + hy2 * abs(bx2 * lx + by2 * ly)
+            if dist >= r1 + r2 + margin:
+                return False
+        return True
+
     def _reset_random_episode_obstacles(self, reset_xy: np.ndarray | None = None) -> None:
         if not bool(getattr(self, "random_obstacles_enabled", False)):
             return
@@ -2683,20 +2710,33 @@ class GazeboNavEnv(gym.Env):
             # ~0.55m max would let big obstacles visually overlap each other
             # or spawn with an edge uncomfortably close to the robot. Use the
             # half-diagonal (hypot(sx,sy)/2) as a yaw-independent conservative
-            # radius estimate for each obstacle.
+            # radius estimate against the robot spawn point (small area, not
+            # worth the extra precision below).
             own_half_extent = math.hypot(sx, sy) / 2.0
             if float(np.linalg.norm(np.asarray([x, y], dtype=np.float32) - reset_arr)) < (
                 float(self.random_obstacle_robot_clearance_m) + own_half_extent
             ):
                 continue
+            yaw = random.uniform(-math.pi, math.pi)
+            # v139: obstacle-obstacle clearance used to also use the
+            # half-diagonal circle above, which is very conservative for a
+            # long/thin panel (a 4.2m x 0.1m panel got treated like a 2.1m-
+            # radius disk) -- with the v136-v137 size increases this made the
+            # room geometrically unable to fit anywhere near the requested
+            # 40-50 count (measured: ~16-17 actually placed). A proper
+            # oriented-rectangle separating-axis check respects each
+            # obstacle's real footprint/orientation instead of its worst-case
+            # diagonal, which roughly doubles how many actually fit (measured
+            # ~25).
             if any(
-                math.hypot(x - ox, y - oy) < (
-                    float(self.random_obstacle_pair_clearance_m) + own_half_extent + math.hypot(osx, osy) / 2.0
+                self._obb_too_close(
+                    x, y, sx / 2.0, sy / 2.0, yaw,
+                    ox, oy, osx / 2.0, osy / 2.0, oyaw,
+                    float(self.random_obstacle_pair_clearance_m),
                 )
-                for ox, oy, osx, osy, *_ in selected
+                for ox, oy, osx, osy, _osz, oyaw, _oshape in selected
             ):
                 continue
-            yaw = random.uniform(-math.pi, math.pi)
             selected.append((x, y, sx, sy, sz, yaw, shape))
 
         pose_service = f"/world/{self.random_obstacle_world_name}/set_pose"
@@ -2833,9 +2873,22 @@ class GazeboNavEnv(gym.Env):
             print(f"OBSTACLE_DIAG | placed={placed}/{len(selected)} known_after={len(self._known_random_obstacle_names)}", flush=True)
         if placed > 0:
             self.ros.get_logger().info(
-                f"RANDOM_OBSTACLES_RESET | placed={placed}/{len(selected)} "
+                f"RANDOM_OBSTACLES_RESET | placed={placed}/{len(selected)} requested={count} "
                 f"reset=({float(reset_arr[0]):+.2f},{float(reset_arr[1]):+.2f})"
             )
+            # v139: `selected` (how many valid, non-overlapping spots the
+            # placement loop actually found) can end up well under `count`
+            # (how many were asked for) once obstacle sizes get big/long
+            # enough that the room runs out of clearance-satisfying room --
+            # more max_place_attempts does not fix that, since the room is
+            # geometrically full, not under-sampled. Surface it instead of
+            # letting the shortfall pass by silently.
+            if len(selected) < count * 0.75:
+                self.ros.get_logger().warn(
+                    f"RANDOM_OBSTACLES_UNDERFILLED | only found {len(selected)}/{count} "
+                    "non-overlapping spots -- current obstacle sizes likely leave the "
+                    "room too full to fit the requested count regardless of retries."
+                )
             try:
                 self.ros.spin_steps(num_spins=8, timeout_sec=0.002)
                 self._advance_world_after_command(target_delta_sec=0.04)
