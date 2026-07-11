@@ -322,7 +322,7 @@ function updateYoloPanel(y) {
     ['Targets', data.people ?? '--', data.people > 0 ? 'OK' : 'NO DATA', `${detections.length} detections`],
     ['Latency', `${fmt(data.latency_ms, 1)} ms`, data.inference_frames ? 'OK' : 'NO DATA', `pred ${fmt(data.predict_ms, 1)} ms`],
     ['Frame Age', `${fmt(data.raw_frame_age_sec, 2)} s`, data.raw_frame_age_sec < 2 ? 'OK' : 'STALE', `${data.image_width || '--'}x${data.image_height || '--'}`],
-    ['Runtime', data.device || '--', data.device === 'cpu' ? 'STALE' : 'OK', `conf ${fmt(data.conf, 2)} / cls ${target}`],
+    ['Runtime', data.backend || data.device || '--', data.device === 'cpu' ? 'STALE' : 'OK', `${data.device || '--'} / conf ${fmt(data.conf, 2)} / cls ${target}`],
     ['YOLO State', statusText || '--', data.last_error ? 'STALE' : data.inference_frames ? 'OK' : 'NO DATA', data.model_path || ''],
   ];
   document.getElementById('yoloCards').innerHTML = cards

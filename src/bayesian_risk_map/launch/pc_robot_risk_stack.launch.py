@@ -64,7 +64,7 @@ def generate_launch_description():
 
         DeclareLaunchArgument('flask_host', default_value='0.0.0.0'),
         DeclareLaunchArgument('flask_port', default_value='5005'),
-        DeclareLaunchArgument('model_path', default_value='model/best.pt'),
+        DeclareLaunchArgument('model_path', default_value='model/best.engine'),
         DeclareLaunchArgument('device', default_value='0'),
         DeclareLaunchArgument('half', default_value='true'),
         DeclareLaunchArgument('conf', default_value='0.20'),

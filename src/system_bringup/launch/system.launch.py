@@ -1045,13 +1045,13 @@ def generate_launch_description():
                 'needs an interactive terminal.'
             ),
         ),
-        DeclareLaunchArgument('risk_model_path', default_value='model/best.pt'),
+        DeclareLaunchArgument('risk_model_path', default_value='model/best.engine'),
         DeclareLaunchArgument(
             'risk_target_class',
             default_value='-1',
             description=(
                 'Scout only: target class accepted by the risk map. -1 '
-                'accepts all YOLO classes while debugging best.pt class ids.'
+                'accepts all YOLO classes while debugging best engine class ids.'
             ),
         ),
         DeclareLaunchArgument(
@@ -1368,15 +1368,18 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'yolo_server_model_path',
-            default_value='model/best.pt',
-            description='Leader role only: YOLO model path for flask_yolo_server.',
+            default_value='model/best.engine',
+            description=(
+                'Leader role only: YOLO model path for flask_yolo_server. '
+                'Use model/best.engine on Jetson to avoid PyTorch CUDA sm_87 issues.'
+            ),
         ),
         DeclareLaunchArgument(
             'yolo_server_target_class',
             default_value='all',
             description=(
                 'Leader role only: class id for flask_yolo_server. Use '
-                '"all" to disable class filtering while debugging best.pt.'
+                '"all" to disable class filtering while debugging best engine.'
             ),
         ),
         DeclareLaunchArgument(

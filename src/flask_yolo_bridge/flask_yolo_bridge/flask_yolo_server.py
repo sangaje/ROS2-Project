@@ -9,6 +9,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 
@@ -412,6 +413,28 @@ def _normalize_device(device):
     return text
 
 
+def _model_backend(model_path):
+    suffix = Path(str(model_path)).suffix.lower()
+    if suffix in ('.engine', '.plan'):
+        return 'tensorrt'
+    return 'pytorch'
+
+
+def _validate_model_path(model_path, backend):
+    path = Path(str(model_path)).expanduser()
+    if path.is_file():
+        return
+    if backend == 'tensorrt':
+        source_pt = path.with_suffix('.pt')
+        hint = (
+            f'TensorRT engine not found: {path}. '
+            f'Generate it on Jetson with: python3 tools/export_best_engine.py '
+            f'--pt {source_pt} --engine {path}'
+        )
+        raise FileNotFoundError(hint)
+    raise FileNotFoundError(f'YOLO model not found: {path}')
+
+
 def _resolve_inference_device(requested):
     """Return a CUDA device only when this torch build supports its CC.
 
@@ -474,15 +497,25 @@ def build_app(args):
     from ultralytics import YOLO
 
     app = Flask(__name__)
-    args.device, cpu_fallback_reason = _resolve_inference_device(args.device)
-    if cpu_fallback_reason:
+    backend = _model_backend(args.model_path)
+    if backend == 'pytorch':
+        args.device, cpu_fallback_reason = _resolve_inference_device(args.device)
+        if cpu_fallback_reason:
+            print(
+                '[flask_yolo_server] CUDA_FALLBACK_CPU | '
+                f'{cpu_fallback_reason}', flush=True,
+            )
+    else:
         print(
-            '[flask_yolo_server] CUDA_FALLBACK_CPU | '
-            f'{cpu_fallback_reason}', flush=True,
+            '[flask_yolo_server] TENSORRT_BACKEND | '
+            f'model={args.model_path} device={args.device} '
+            'skipping torch CUDA capability fallback',
+            flush=True,
         )
+    _validate_model_path(args.model_path, backend)
     model = YOLO(args.model_path)
-    use_half = bool(args.half) and str(args.device).lower() not in ('cpu', 'none', '')
-    use_fast_forward = bool(args.fast_forward)
+    use_half = bool(args.half) and backend == 'pytorch' and str(args.device).lower() not in ('cpu', 'none', '')
+    use_fast_forward = bool(args.fast_forward) and backend == 'pytorch'
     fast_net = None
     letterbox = None
     non_max_suppression = None
@@ -509,7 +542,7 @@ def build_app(args):
             use_fast_forward = False
     warmup_ms = -1.0
     try:
-        if 'cuda' in str(args.device).lower():
+        if torch is not None and 'cuda' in str(args.device).lower():
             torch.backends.cudnn.benchmark = True
             try:
                 torch.set_float32_matmul_precision('high')
@@ -545,10 +578,11 @@ def build_app(args):
                 half=use_half,
                 verbose=False,
             )
-        _cuda_synchronize_if_needed(args.device)
+        if backend == 'pytorch':
+            _cuda_synchronize_if_needed(args.device)
         warmup_ms = (time.perf_counter() - t_warmup) * 1000.0
         print(
-            f'[flask_yolo_server] model ready | device={args.device} half={use_half} '
+            f'[flask_yolo_server] model ready | backend={backend} device={args.device} half={use_half} '
             f'imgsz={args.imgsz} fast_forward={use_fast_forward} warmup_ms={warmup_ms:.1f}',
             flush=True,
         )
@@ -560,6 +594,7 @@ def build_app(args):
     def runtime_status():
         return {
             'model_path': args.model_path,
+            'backend': backend,
             'device': args.device,
             'half': use_half,
             'imgsz': args.imgsz,
@@ -611,7 +646,7 @@ def build_app(args):
             self.run_predict(dummy)
             runtime['warmup_ms'] = (time.perf_counter() - t_warmup) * 1000.0
             print(
-                f'[flask_yolo_server] inference worker ready | device={args.device} half={use_half} '
+                f'[flask_yolo_server] inference worker ready | backend={backend} device={args.device} half={use_half} '
                 f'imgsz={args.imgsz} fast_forward={use_fast_forward} worker_warmup_ms={runtime["warmup_ms"]:.1f}',
                 flush=True,
             )
@@ -684,7 +719,8 @@ def build_app(args):
                     verbose=False,
                 )
                 input_shape = None
-            _cuda_synchronize_if_needed(args.device)
+            if backend == 'pytorch':
+                _cuda_synchronize_if_needed(args.device)
             predict_ms = (time.perf_counter() - t_predict0) * 1000.0
             return results, input_shape, predict_ms
 
@@ -881,7 +917,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--port', type=int, default=5005)
-    parser.add_argument('--model-path', default='model/best.pt')
+    parser.add_argument('--model-path', default='model/best.engine')
     parser.add_argument('--device', default='0')
     parser.add_argument('--half', type=as_bool, default=True)
     parser.add_argument('--fast-forward', type=as_bool, default=True)
@@ -894,7 +930,7 @@ def parse_args():
     parser.add_argument('--max-queue-wait-sec', type=float, default=0.0)
     parser.add_argument(
         '--target-class', type=int, default=1,
-        help='Only infer this class. Project best.pt target class is 1.',
+        help='Only infer this class. Project best engine target class is 1.',
     )
     # Backward-compatible aliases for older launch commands.  New launches use
     # --target-class, so the server no longer hard-codes COCO person (class 0).

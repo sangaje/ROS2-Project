@@ -7,11 +7,19 @@ from __future__ import annotations
 
 import os
 import time
+from pathlib import Path
 
 import cv2
 from ultralytics import YOLO
 
 from omx.config import Config
+
+
+def _model_backend(model_path: str) -> str:
+    suffix = Path(str(model_path)).suffix.lower()
+    if suffix in ('.engine', '.plan'):
+        return 'tensorrt'
+    return 'pytorch'
 
 
 def _resolve_supported_device(requested: str) -> tuple[str, str | None]:
@@ -63,14 +71,22 @@ class YoloDetector:
         self._consecutive_read_failures = 0
         self._open_camera(initial=True)
 
+        self.backend = _model_backend(cfg.yolo.model_path)
         requested_device = str(os.environ.get(
             "OMX_YOLO_DEVICE",
             getattr(cfg.yolo, "device", "0"),
         )).strip()
-        self.device, cpu_fallback_reason = _resolve_supported_device(requested_device)
-        if cpu_fallback_reason:
-            self._warn(f'OMX_YOLO_CUDA_FALLBACK_CPU | {cpu_fallback_reason}')
-        self.use_half = bool(getattr(cfg.yolo, "half", True))
+        if self.backend == 'pytorch':
+            self.device, cpu_fallback_reason = _resolve_supported_device(requested_device)
+            if cpu_fallback_reason:
+                self._warn(f'OMX_YOLO_CUDA_FALLBACK_CPU | {cpu_fallback_reason}')
+        else:
+            self.device = requested_device
+            self._log(
+                f'OMX_YOLO_TENSORRT_BACKEND | model={cfg.yolo.model_path} '
+                f'device={self.device}; skipping torch CUDA capability fallback'
+            )
+        self.use_half = bool(getattr(cfg.yolo, "half", True)) and self.backend == 'pytorch'
         if self.device.lower() in ("cpu", "none", ""):
             self.use_half = False
 
@@ -80,7 +96,7 @@ class YoloDetector:
             self.target_class, f"cls_{self.target_class}")
         self._log(f"YOLO 로드: {cfg.yolo.model_path}, "
                   f"클래스 {self.target_class} ({self.class_name}), "
-                  f"device={self.device}, half={self.use_half}")
+                  f"backend={self.backend}, device={self.device}, half={self.use_half}")
 
     def _log(self, msg):
         if self.logger:

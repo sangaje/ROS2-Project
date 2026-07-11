@@ -87,7 +87,7 @@ def launch_setup(context, *args, **kwargs):
             'OMX_YOLO_MODEL_PATH': yolo_node_model_path,
             'OMX_YOLO_CAMERA_INDEX': omx_camera_index,
             # Keep OMX and the Flask server on the same explicitly selected
-            # backend; ``cpu`` is required for the current Orin torch wheel.
+            # device. TensorRT engine models skip PyTorch CUDA capability checks.
             'OMX_YOLO_DEVICE': yolo_server_device,
         },
         respawn=True,
@@ -193,8 +193,8 @@ def generate_launch_description():
             'yolo_server_port', default_value='5005',
             description='flask_yolo_server HTTP port.'),
         DeclareLaunchArgument(
-            'yolo_server_model_path', default_value='model/best.pt',
-            description='YOLO model path for flask_yolo_server.'),
+            'yolo_server_model_path', default_value='model/best.engine',
+            description='YOLO TensorRT engine path for flask_yolo_server.'),
         DeclareLaunchArgument(
             'yolo_server_device', default_value='0',
             description='YOLO device for flask_yolo_server.'),
@@ -210,10 +210,10 @@ def generate_launch_description():
             'yolo_node_delay_sec', default_value='14.0',
             description='Delay heavy OMX YOLO/camera/model startup on constrained Jetson hardware.'),
         DeclareLaunchArgument(
-            'yolo_node_model_path', default_value='model/best.pt',
+            'yolo_node_model_path', default_value='model/best.engine',
             description=(
-                'Model used by omx_yolo_node. Pass an absolute best.pt path '
-                'only when that file exists on this Jetson.'
+                'Model used by omx_yolo_node. Pass an absolute best.engine '
+                'path only when that file exists on this Jetson.'
             ),
         ),
         DeclareLaunchArgument(

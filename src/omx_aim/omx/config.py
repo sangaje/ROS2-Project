@@ -321,7 +321,7 @@ def load_config(path=None):
                     searched = "\n".join(f"  - {c}" for c in candidates)
                     raise FileNotFoundError(
                         "YOLO model file not found. Set OMX_YOLO_MODEL_PATH "
-                        f"to an absolute .pt path, or place {model_path.name} "
+                        f"to an absolute .engine/.pt path, or place {model_path.name} "
                         f"in one of:\n{searched}"
                     )
                 yolo_cfg.model_path = model_path.name

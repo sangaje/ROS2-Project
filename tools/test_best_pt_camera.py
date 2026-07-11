@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Quick OpenCV camera smoke test for model/best.pt.
+"""Quick OpenCV camera smoke test for model/best.engine.
 
 Example:
-  python3 tools/test_best_pt_camera.py --camera /dev/video0 --model model/best.pt
+  python3 tools/test_best_pt_camera.py --camera /dev/video0 --model model/best.engine
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from pathlib import Path
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', default='model/best.pt')
+    parser.add_argument('--model', default='model/best.engine')
     parser.add_argument('--camera', default='/dev/video0')
     parser.add_argument('--width', type=int, default=1280)
     parser.add_argument('--height', type=int, default=720)
@@ -93,7 +93,7 @@ def main() -> int:
         count = 0 if result.boxes is None else len(result.boxes)
         cv2.putText(
             annotated,
-            f'best.pt detections={count} fps={fps_ema:.1f}',
+            f'{model_path.name} detections={count} fps={fps_ema:.1f}',
             (16, 32),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.8,
@@ -102,7 +102,7 @@ def main() -> int:
             cv2.LINE_AA,
         )
 
-        cv2.imshow('best.pt camera test', annotated)
+        cv2.imshow(f'{model_path.name} camera test', annotated)
         key = cv2.waitKey(1) & 0xFF
         if key in (27, ord('q')):
             break
