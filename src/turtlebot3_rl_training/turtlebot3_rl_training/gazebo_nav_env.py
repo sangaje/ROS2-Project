@@ -1301,6 +1301,15 @@ class GazeboNavEnv(gym.Env):
         self._last_orbit_yaw_accum = 0.0
         self._last_orbit_reason = "init"
 
+        # 방향 편향: 전진 여부/정보 획득 여부와 무관하게, 같은 방향(+/-)으로
+        # 몇 step 연속 도는지와 그 누적 회전량을 추적한다. sustained_rotation_steps는
+        # 저속 제자리 회전만, orbit_stall_steps는 정보 이득이 없을 때만 잡는 반면,
+        # 이건 "전진하면서 한쪽으로 계속 도는" 큰 원/스파이럴도 무조건 잡기 위한
+        # 별도의 무조건적(unconditional) 카운터다.
+        self.directional_bias_steps = 0
+        self.directional_bias_accum = 0.0
+        self._directional_bias_sign = 0
+
         # Policy 출력은 바로 cmd_vel로 보내지 않고, 물리적으로 가능한 제어 신호로 필터링한다.
         # 목적:
         #   - 좌우 각속도 sign flip으로 생기는 본체 떨림 억제
@@ -3867,6 +3876,9 @@ class GazeboNavEnv(gym.Env):
         self.confidence_stall_steps = 0
         self.sustained_rotation_steps = 0
         self.orbit_stall_steps = 0
+        self.directional_bias_steps = 0
+        self.directional_bias_accum = 0.0
+        self._directional_bias_sign = 0
         try:
             self._orbit_pose_history.clear()
         except Exception:
@@ -4856,6 +4868,7 @@ class GazeboNavEnv(gym.Env):
         self._update_confidence_stall_steps(map_stats=map_stats, action=action_for_reward)
         self._update_sustained_rotation_steps(action=action_for_reward)
         self._update_orbit_stall_steps(map_stats=map_stats, action=action_for_reward)
+        self._update_directional_bias_steps(action=action_for_reward)
         if _prof_on:
             _prof_mark("map_update")
 
@@ -5021,6 +5034,8 @@ class GazeboNavEnv(gym.Env):
             orbit_path_efficiency=float(getattr(self, "_last_orbit_path_efficiency", 1.0)),
             orbit_path_length=float(getattr(self, "_last_orbit_path_length", 0.0)),
             orbit_yaw_accum=float(getattr(self, "_last_orbit_yaw_accum", 0.0)),
+            directional_bias_steps=int(getattr(self, "directional_bias_steps", 0)),
+            directional_bias_accum=float(getattr(self, "directional_bias_accum", 0.0)),
             max_linear_speed=self.max_linear_speed,
             max_angular_speed=self.max_angular_speed,
             nearest_obstacle_distance=reward_map_stats.nearest_obstacle_distance,
@@ -9267,6 +9282,51 @@ class GazeboNavEnv(gym.Env):
             self.sustained_rotation_steps = max(int(self.sustained_rotation_steps) - 1, 0)
 
         return int(self.sustained_rotation_steps)
+
+    def _update_directional_bias_steps(self, action: np.ndarray) -> tuple[int, float]:
+        """Track consecutive steps turning the same direction, forward motion included.
+
+        sustained_rotation_steps only catches low-forward in-place spin;
+        orbit_stall_steps only fires once new coverage/confidence has actually
+        stopped. Neither one catches a policy that drives *forward* while
+        steadily curving the same way for a long time (a wide circle or
+        spiral) as long as it keeps grazing a little new information each
+        pass. This counter is unconditional on info gain -- it only looks at
+        whether the commanded turn direction has stayed the same sign.
+
+        A small deadzone lets minor corrections/noise through without
+        counting as "turning". A sign flip (a real correction back the other
+        way) resets the run immediately; dropping below the deadzone decays
+        it gradually instead of resetting, so a brief straight blip inside a
+        real curve does not erase accumulated bias.
+        """
+        try:
+            angular_z = float(action[1])
+        except Exception:
+            angular_z = 0.0
+
+        turn_norm = float(
+            np.clip(abs(angular_z) / max(float(self.max_angular_speed), 1e-6), 0.0, 1.0)
+        )
+        deadzone = 0.12
+
+        if turn_norm <= deadzone:
+            self.directional_bias_steps = max(int(getattr(self, "directional_bias_steps", 0)) - 2, 0)
+            self.directional_bias_accum = float(getattr(self, "directional_bias_accum", 0.0)) * 0.85
+            self._directional_bias_sign = 0
+            return int(self.directional_bias_steps), float(self.directional_bias_accum)
+
+        sign = 1 if angular_z > 0.0 else -1
+        prev_sign = int(getattr(self, "_directional_bias_sign", 0))
+        if prev_sign != 0 and sign != prev_sign:
+            self.directional_bias_steps = 0
+            self.directional_bias_accum = 0.0
+        else:
+            self.directional_bias_steps = int(getattr(self, "directional_bias_steps", 0)) + 1
+            self.directional_bias_accum = float(getattr(self, "directional_bias_accum", 0.0)) + turn_norm
+        self._directional_bias_sign = sign
+
+        return int(self.directional_bias_steps), float(self.directional_bias_accum)
 
     def _update_orbit_stall_steps(self, map_stats: MapUpdateStats, action: np.ndarray) -> int:
         """Track forward arc-loops around the same local area.

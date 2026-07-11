@@ -237,17 +237,23 @@ def compute_exploration_reward(
     confidence_stall_low_ratio_threshold: float = 0.20,
     sustained_rotation_steps: int = 0,
     sustained_rotation_start_steps: int = 6,
-    sustained_rotation_growth: float = 0.055,
+    sustained_rotation_growth: float = 0.050,
     sustained_rotation_power: float = 1.45,
-    sustained_rotation_max_penalty: float = 5.00,
+    sustained_rotation_max_penalty: float = 2.50,
     orbit_stall_steps: int = 0,
     orbit_stall_start_steps: int = 4,
-    orbit_stall_growth: float = 0.040,
+    orbit_stall_growth: float = 0.035,
     orbit_stall_power: float = 1.45,
-    orbit_stall_max_penalty: float = 2.00,
+    orbit_stall_max_penalty: float = 1.75,
     orbit_path_efficiency: float = 1.0,
     orbit_path_length: float = 0.0,
     orbit_yaw_accum: float = 0.0,
+    directional_bias_steps: int = 0,
+    directional_bias_accum: float = 0.0,
+    directional_bias_start_accum: float = 3.0,
+    directional_bias_growth: float = 0.020,
+    directional_bias_power: float = 1.5,
+    directional_bias_max_penalty: float = 3.00,
     max_linear_speed: float = 0.22,
     max_angular_speed: float = 1.5,
     nearest_obstacle_distance: float = 999.0,
@@ -418,6 +424,24 @@ def compute_exploration_reward(
             float(orbit_stall_max_penalty),
         )
         reward -= orbit_penalty
+
+    # One-direction bias penalty: unlike sustained_rotation (low-forward only)
+    # and orbit_stall (only fires once info gain has actually stopped), this
+    # is unconditional -- it fires purely from having steadily turned the same
+    # sign (left or right) regardless of forward speed or incidental info
+    # gain, so a policy cannot avoid it by driving a wide circle/spiral that
+    # keeps grazing a little new coverage each pass. directional_bias_accum
+    # grows with both the degree of each turn and how many consecutive steps
+    # it has held the same direction, so the penalty scales with both severity
+    # and persistence at once; a real correction (sign flip) or going straight
+    # resets/decays it, so ordinary heading corrections are never penalized.
+    directional_bias_over = float(directional_bias_accum) - float(directional_bias_start_accum)
+    if directional_bias_over > 0.0 and int(directional_bias_steps) > 0:
+        directional_bias_penalty = min(
+            float(directional_bias_growth) * (float(directional_bias_over) ** float(directional_bias_power)),
+            float(directional_bias_max_penalty),
+        )
+        reward -= directional_bias_penalty
 
     # Terminal은 위에서 물리 위험일 때만 따로 반환한다. non-terminal dense reward는 bounded.
     return float(np.clip(reward, -8.0, 8.0))
