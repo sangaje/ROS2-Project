@@ -505,6 +505,39 @@ def generate_launch_description():
                         ],
                     )
                 )
+                # global_localize_kickstart never runs in this branch (its
+                # whole state machine is AMCL-specific), so nothing else
+                # would ever publish ready_topic here -- a downstream
+                # bootstrap gate (e.g. scout_failover_coordinator) would
+                # wait forever. Watch Cartographer's own map/TF/scan
+                # instead.
+                actions.append(
+                    TimerAction(
+                        period=6.0,
+                        actions=[
+                            LogInfo(msg=[
+                                'LEADER_STAGE | starting SLAM localization '
+                                'ready watcher',
+                            ]),
+                            Node(
+                                package='fleet_bringup',
+                                executable='slam_localization_ready',
+                                name='leader_slam_localization_ready',
+                                output='screen',
+                                parameters=[{
+                                    'map_topic': '/map',
+                                    'scan_topic': scan_topic_value,
+                                    'global_frame': 'map',
+                                    'base_frame': 'base_footprint',
+                                    'ready_topic': 'localization_ready',
+                                }],
+                                env=process_env,
+                                respawn=True,
+                                respawn_delay=3.0,
+                            ),
+                        ],
+                    )
+                )
             else:
                 actions.append(
                     TimerAction(

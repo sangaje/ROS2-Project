@@ -44,6 +44,7 @@ setup(
             'pose_to_nav2 = fleet_bringup.pose_to_nav2:main',
             'pose_to_tf = fleet_bringup.pose_to_tf:main',
             'scan_frame_relay = fleet_bringup.scan_frame_relay:main',
+            'slam_localization_ready = fleet_bringup.slam_localization_ready:main',
             'sim_burger_scan_relay = fleet_bringup.sim_burger_scan_relay:main',
             'sim_burger_tf_relay = fleet_bringup.sim_burger_tf_relay:main',
             'tf_pose_publisher = fleet_bringup.tf_pose_publisher:main',
