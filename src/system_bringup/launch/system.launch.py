@@ -56,6 +56,7 @@ def generate_launch_description():
     require_follower_pose = LaunchConfiguration('require_follower_pose')
     enable_cartographer = LaunchConfiguration('enable_cartographer')
     auto_localize = LaunchConfiguration('auto_localize')
+    leader_auto_localize = LaunchConfiguration('leader_auto_localize')
     enable_amcl = LaunchConfiguration('enable_amcl')
     start_risk_map = LaunchConfiguration('start_risk_map')
     start_cartographer = LaunchConfiguration('start_cartographer')
@@ -131,6 +132,7 @@ def generate_launch_description():
     yolo_server_host = LaunchConfiguration('yolo_server_host')
     yolo_server_port = LaunchConfiguration('yolo_server_port')
     yolo_server_model_path = LaunchConfiguration('yolo_server_model_path')
+    yolo_server_target_class = LaunchConfiguration('yolo_server_target_class')
     yolo_server_device = LaunchConfiguration('yolo_server_device')
     yolo_server_half = LaunchConfiguration('yolo_server_half')
     omx_yolo_node_delay_sec = LaunchConfiguration('omx_yolo_node_delay_sec')
@@ -211,7 +213,10 @@ def generate_launch_description():
             fleet_launch_args['enable_cartographer'] = (
                 enable_cartographer.perform(context)
             )
-        if fleet_role_value in ('follower', 'member', 'leader'):
+            fleet_launch_args['auto_localize'] = (
+                leader_auto_localize.perform(context)
+            )
+        if fleet_role_value in ('follower', 'member'):
             fleet_launch_args['auto_localize'] = (
                 auto_localize.perform(context)
             )
@@ -480,13 +485,22 @@ def generate_launch_description():
                     'flask_yolo_bridge',
                     'flask_yolo_server',
                 ])
+                yolo_model_path = yolo_server_model_path.perform(context)
+                if yolo_model_path and not os.path.isabs(yolo_model_path):
+                    yolo_model_path = os.path.abspath(yolo_model_path)
+                target_class_value = yolo_server_target_class.perform(context).strip().lower()
+                target_class_args = (
+                    ['--all-classes']
+                    if target_class_value in ('', 'all', 'none', '-1')
+                    else ['--target-class', target_class_value]
+                )
                 flask_yolo_server = ExecuteProcess(
                     cmd=[
                         flask_yolo_exe,
                         '--host', yolo_server_host.perform(context),
                         '--port', yolo_server_port.perform(context),
-                        '--model-path', yolo_server_model_path.perform(context),
-                        '--target-class', '1',
+                        '--model-path', yolo_model_path,
+                        *target_class_args,
                         '--device', yolo_server_device.perform(context),
                         '--half', yolo_server_half.perform(context),
                         '--fast-forward', 'true',
@@ -916,8 +930,18 @@ def generate_launch_description():
             choices=['true', 'false'],
             description=(
                 'Passed through to follower/member AMCL global '
-                'localization, and to leader AMCL when '
-                'enable_cartographer:=false.'
+                'localization. Leader uses leader_auto_localize so a '
+                'stationary leader does not drift by default.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'leader_auto_localize', default_value='false',
+            choices=['true', 'false'],
+            description=(
+                'Leader fleet_role only: enable AMCL scout-pose seed plus '
+                'verified in-place spin. Default false keeps the leader '
+                'map pose anchored to leader_initial_x/y/yaw while the '
+                'robot is standing still.'
             ),
         ),
         DeclareLaunchArgument(
@@ -1258,6 +1282,14 @@ def generate_launch_description():
             'yolo_server_model_path',
             default_value='model/best.pt',
             description='Leader role only: YOLO model path for flask_yolo_server.',
+        ),
+        DeclareLaunchArgument(
+            'yolo_server_target_class',
+            default_value='1',
+            description=(
+                'Leader role only: class id for flask_yolo_server. Use '
+                '"all" to disable class filtering while debugging best.pt.'
+            ),
         ),
         DeclareLaunchArgument(
             'yolo_server_device',

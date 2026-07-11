@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 from typing import Iterable, Optional
 
 import rclpy
@@ -36,6 +37,14 @@ def _frame_candidates(raw: object, primary: str) -> list[str]:
     return frames or ['base_footprint']
 
 
+def _yaw_from_xyzw(x: float, y: float, z: float, w: float) -> float:
+    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
+def _angle_delta(a: float, b: float) -> float:
+    return math.atan2(math.sin(a - b), math.cos(a - b))
+
+
 class TfPosePublisher(Node):
     """Publish PoseStamped from a TF transform.
 
@@ -61,6 +70,22 @@ class TfPosePublisher(Node):
         self.publish_rate_hz = max(1.0, float(_safe_declare(self, 'publish_rate_hz', 10.0)))
         self.timeout_sec = max(0.01, float(_safe_declare(self, 'timeout_sec', 0.05)))
         self.log_every_n = max(0, int(_safe_declare(self, 'log_every_n', 200)))
+        self.freeze_when_stationary = bool(
+            _safe_declare(self, 'freeze_when_stationary', False)
+        )
+        self.stationary_target_frame = str(
+            _safe_declare(self, 'stationary_target_frame', 'odom')
+        )
+        self.stationary_linear_threshold_m = max(
+            0.0, float(_safe_declare(self, 'stationary_linear_threshold_m', 0.02))
+        )
+        self.stationary_angular_threshold_rad = max(
+            0.0,
+            float(_safe_declare(self, 'stationary_angular_threshold_rad', 0.035)),
+        )
+        self.stationary_freeze_warmup_sec = max(
+            0.0, float(_safe_declare(self, 'stationary_freeze_warmup_sec', 10.0))
+        )
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -68,11 +93,17 @@ class TfPosePublisher(Node):
         self.count = 0
         self.miss_count = 0
         self.first_pose_logged = False
+        self._start_wall = time.monotonic()
+        self._last_motion_pose: Optional[tuple[float, float, float]] = None
+        self._last_accepted_pose: Optional[PoseStamped] = None
+        self._freeze_count = 0
+        self._last_freeze_log_wall = 0.0
         self.create_timer(1.0 / self.publish_rate_hz, self._tick)
         self.get_logger().info(
             f'V44_TF_POSE_PUBLISHER_READY | target={self.target_frame} '
             f'sources={self.source_frame_candidates} -> {self.output_topic} '
-            f'rate={self.publish_rate_hz:.1f}Hz'
+            f'rate={self.publish_rate_hz:.1f}Hz '
+            f'freeze_stationary={self.freeze_when_stationary}'
         )
 
     @staticmethod
@@ -107,9 +138,124 @@ class TfPosePublisher(Node):
                 )
             return
 
-        self._publish_pose(tf, selected_source)
+        motion_pose = None
+        if self.freeze_when_stationary:
+            motion_pose = self._lookup_motion_pose(selected_source)
 
-    def _publish_pose(self, tf, selected_source: str) -> None:
+        self._publish_pose(tf, selected_source, motion_pose)
+
+    def _lookup_motion_pose(
+        self,
+        selected_source: str,
+    ) -> Optional[tuple[float, float, float]]:
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.stationary_target_frame,
+                selected_source,
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=self.timeout_sec),
+            )
+        except TransformException as exc:
+            now = time.monotonic()
+            if now - self._last_freeze_log_wall > 5.0:
+                self._last_freeze_log_wall = now
+                self.get_logger().warn(
+                    'V44_TF_POSE_STATIONARY_FILTER_WAIT | '
+                    f'target={self.stationary_target_frame} '
+                    f'source={selected_source} reason={exc}'
+                )
+            return None
+
+        return self._motion_pose_from_tf(tf)
+
+    @staticmethod
+    def _motion_pose_from_tf(tf) -> tuple[float, float, float]:
+        q = tf.transform.rotation
+        return (
+            float(tf.transform.translation.x),
+            float(tf.transform.translation.y),
+            _yaw_from_xyzw(float(q.x), float(q.y), float(q.z), float(q.w)),
+        )
+
+    @staticmethod
+    def _copy_pose_with_header(source: PoseStamped, header) -> PoseStamped:
+        msg = PoseStamped()
+        msg.header = header
+        msg.pose.position.x = source.pose.position.x
+        msg.pose.position.y = source.pose.position.y
+        msg.pose.position.z = source.pose.position.z
+        msg.pose.orientation.x = source.pose.orientation.x
+        msg.pose.orientation.y = source.pose.orientation.y
+        msg.pose.orientation.z = source.pose.orientation.z
+        msg.pose.orientation.w = source.pose.orientation.w
+        return msg
+
+    def _select_pose_for_publish(
+        self,
+        candidate: PoseStamped,
+        motion_pose: Optional[tuple[float, float, float]],
+    ) -> tuple[PoseStamped, bool]:
+        if not self.freeze_when_stationary or motion_pose is None:
+            self._last_accepted_pose = self._copy_pose_with_header(
+                candidate,
+                candidate.header,
+            )
+            if motion_pose is not None:
+                self._last_motion_pose = motion_pose
+            return candidate, False
+
+        warmup_done = (
+            time.monotonic() - self._start_wall
+        ) >= self.stationary_freeze_warmup_sec
+        if (
+            not warmup_done
+            or self._last_motion_pose is None
+            or self._last_accepted_pose is None
+        ):
+            self._last_motion_pose = motion_pose
+            self._last_accepted_pose = self._copy_pose_with_header(
+                candidate,
+                candidate.header,
+            )
+            return candidate, False
+
+        dx = motion_pose[0] - self._last_motion_pose[0]
+        dy = motion_pose[1] - self._last_motion_pose[1]
+        dyaw = _angle_delta(motion_pose[2], self._last_motion_pose[2])
+        stationary = (
+            math.hypot(dx, dy) <= self.stationary_linear_threshold_m
+            and abs(dyaw) <= self.stationary_angular_threshold_rad
+        )
+        if stationary:
+            self._freeze_count += 1
+            now = time.monotonic()
+            if self._freeze_count <= 3 or now - self._last_freeze_log_wall > 5.0:
+                self._last_freeze_log_wall = now
+                self.get_logger().info(
+                    'V44_TF_POSE_STATIONARY_FREEZE | '
+                    f'topic={self.output_topic} count={self._freeze_count} '
+                    f'odom_delta=({math.hypot(dx, dy):.3f}m,'
+                    f'{abs(dyaw):.3f}rad)'
+                )
+            return self._copy_pose_with_header(
+                self._last_accepted_pose,
+                candidate.header,
+            ), True
+
+        self._freeze_count = 0
+        self._last_motion_pose = motion_pose
+        self._last_accepted_pose = self._copy_pose_with_header(
+            candidate,
+            candidate.header,
+        )
+        return candidate, False
+
+    def _publish_pose(
+        self,
+        tf,
+        selected_source: str,
+        motion_pose: Optional[tuple[float, float, float]],
+    ) -> None:
         if self.miss_count:
             self.get_logger().info(
                 f'V44_TF_POSE_RECOVERED | target={self.target_frame} '
@@ -124,6 +270,7 @@ class TfPosePublisher(Node):
         msg.pose.position.y = tf.transform.translation.y
         msg.pose.position.z = tf.transform.translation.z
         msg.pose.orientation = tf.transform.rotation
+        msg, frozen = self._select_pose_for_publish(msg, motion_pose)
         self.pub.publish(msg)
 
         self.count += 1
@@ -141,10 +288,11 @@ class TfPosePublisher(Node):
             )
         if self.log_every_n and self.count % self.log_every_n == 0:
             q = msg.pose.orientation
-            yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+            yaw = _yaw_from_xyzw(q.x, q.y, q.z, q.w)
             self.get_logger().info(
                 f'V44_TF_POSE | topic={self.output_topic} source={selected_source} '
-                f'n={self.count} xy=({msg.pose.position.x:.2f},{msg.pose.position.y:.2f}) yaw={yaw:.2f}'
+                f'n={self.count} xy=({msg.pose.position.x:.2f},{msg.pose.position.y:.2f}) '
+                f'yaw={yaw:.2f} stationary_freeze={frozen}'
             )
 
 def main() -> None:

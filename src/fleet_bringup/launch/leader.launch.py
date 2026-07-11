@@ -261,6 +261,11 @@ def generate_launch_description():
                 'source_frame': 'base_footprint',
                 'source_frame_candidates': ['base_footprint', 'base_link'],
                 'publish_rate_hz': 10.0,
+                'freeze_when_stationary': True,
+                'stationary_target_frame': 'odom',
+                'stationary_linear_threshold_m': 0.02,
+                'stationary_angular_threshold_rad': 0.035,
+                'stationary_freeze_warmup_sec': 12.0,
                 'log_every_n': 100,
             }],
             env=process_env,
@@ -601,12 +606,13 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'auto_localize',
-            default_value='true',
+            default_value='false',
             choices=['true', 'false'],
             description=(
                 'Only used when enable_cartographer:=false. Let AMCL '
                 'start from a one-shot scout-pose /initialpose seed when '
-                'available, then refine via verified in-place spin.'
+                'available, then refine via verified in-place spin. Default '
+                'false keeps a stationary leader on its fixed initial pose.'
             ),
         ),
         DeclareLaunchArgument(
