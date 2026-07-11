@@ -313,13 +313,17 @@ function updateOmxPanel(s) {
 function updateYoloPanel(y) {
   const data = y && y.data ? y.data : {};
   const detections = Array.isArray(data.detections) ? data.detections : [];
+  const target = data.all_classes ? 'all' : data.target_class ?? '--';
+  const statusText = data.last_error || data.last_status || '';
   const cards = [
     ['Server', y ? y.status : 'NO DATA', y ? y.status : 'NO DATA', y ? `${fmt(y.latency_ms, 0)} ms` : ''],
     ['Raw FPS', fmt(data.raw_fps, 1), data.ok ? 'OK' : 'NO DATA', `${data.raw_frames ?? 0} frames`],
-    ['YOLO FPS', fmt(data.yolo_fps, 1), data.yolo_frames ? 'OK' : 'NO DATA', `${data.yolo_frames ?? 0} frames`],
-    ['People', data.people ?? '--', data.people > 0 ? 'OK' : 'NO DATA', `${detections.length} detections`],
-    ['Latency', `${fmt(data.latency_ms, 1)} ms`, data.yolo_frames ? 'OK' : 'NO DATA', `pred ${fmt(data.predict_ms, 1)} ms`],
+    ['Infer FPS', fmt(data.inference_fps, 1), data.inference_frames ? 'OK' : 'NO DATA', `${data.inference_frames ?? 0} ok frames`],
+    ['Targets', data.people ?? '--', data.people > 0 ? 'OK' : 'NO DATA', `${detections.length} detections`],
+    ['Latency', `${fmt(data.latency_ms, 1)} ms`, data.inference_frames ? 'OK' : 'NO DATA', `pred ${fmt(data.predict_ms, 1)} ms`],
     ['Frame Age', `${fmt(data.raw_frame_age_sec, 2)} s`, data.raw_frame_age_sec < 2 ? 'OK' : 'STALE', `${data.image_width || '--'}x${data.image_height || '--'}`],
+    ['Runtime', data.device || '--', data.device === 'cpu' ? 'STALE' : 'OK', `conf ${fmt(data.conf, 2)} / cls ${target}`],
+    ['YOLO State', statusText || '--', data.last_error ? 'STALE' : data.inference_frames ? 'OK' : 'NO DATA', data.model_path || ''],
   ];
   document.getElementById('yoloCards').innerHTML = cards
     .map(([label, value, status, sub]) => metricCard(label, value, status, sub))

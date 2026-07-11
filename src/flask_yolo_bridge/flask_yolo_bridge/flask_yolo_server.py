@@ -207,6 +207,7 @@ class DebugState:
     yolo_version: int = 0
     raw_frames: int = 0
     yolo_frames: int = 0
+    inference_frames: int = 0
     people: int = 0
     latency_ms: float = 0.0
     decode_ms: float = 0.0
@@ -217,9 +218,14 @@ class DebugState:
     capture_age_ms: float = -1.0
     last_raw_wall_sec: float = 0.0
     last_yolo_wall_sec: float = 0.0
+    last_inference_wall_sec: float = 0.0
+    last_status: str = 'waiting for first frame'
+    last_error: str = ''
+    last_error_wall_sec: float = 0.0
     detections: list = field(default_factory=list)
     raw_wall_times: deque = field(default_factory=lambda: deque(maxlen=90))
     yolo_wall_times: deque = field(default_factory=lambda: deque(maxlen=90))
+    inference_wall_times: deque = field(default_factory=lambda: deque(maxlen=90))
 
     def update_raw(self, raw_jpeg, width, height, capture_age_ms):
         with self.condition:
@@ -236,6 +242,7 @@ class DebugState:
     def update_yolo(
         self, yolo_jpeg, people, latency_ms, width, height, capture_age_ms,
         detections=None, decode_ms=0.0, predict_ms=0.0, post_ms=0.0,
+        inference_ok=False, status_text='',
     ):
         with self.condition:
             self.yolo_jpeg = yolo_jpeg
@@ -252,6 +259,20 @@ class DebugState:
             self.last_yolo_wall_sec = time.time()
             self.detections = list(detections or [])
             self.yolo_wall_times.append(self.last_yolo_wall_sec)
+            if status_text:
+                self.last_status = status_text
+            if inference_ok:
+                self.inference_frames += 1
+                self.last_inference_wall_sec = self.last_yolo_wall_sec
+                self.inference_wall_times.append(self.last_inference_wall_sec)
+                self.last_error = ''
+            self.condition.notify_all()
+
+    def set_error(self, message):
+        with self.condition:
+            self.last_status = message
+            self.last_error = message
+            self.last_error_wall_sec = time.time()
             self.condition.notify_all()
 
     def status(self):
@@ -269,15 +290,24 @@ class DebugState:
                 dt = self.yolo_wall_times[-1] - self.yolo_wall_times[0]
                 if dt > 1e-6:
                     yolo_fps = (len(self.yolo_wall_times) - 1) / dt
+            inference_fps = 0.0
+            if len(self.inference_wall_times) >= 2:
+                dt = self.inference_wall_times[-1] - self.inference_wall_times[0]
+                if dt > 1e-6:
+                    inference_fps = (len(self.inference_wall_times) - 1) / dt
+            inference_age = now - self.last_inference_wall_sec if self.last_inference_wall_sec else -1.0
+            error_age = now - self.last_error_wall_sec if self.last_error_wall_sec else -1.0
             return {
                 'ok': self.raw_frames > 0,
                 'frames': self.raw_frames,
                 'raw_frames': self.raw_frames,
                 'yolo_frames': self.yolo_frames,
+                'inference_frames': self.inference_frames,
                 'people': self.people,
                 'fps': raw_fps,
                 'raw_fps': raw_fps,
                 'yolo_fps': yolo_fps,
+                'inference_fps': inference_fps,
                 'latency_ms': self.latency_ms,
                 'decode_ms': self.decode_ms,
                 'predict_ms': self.predict_ms,
@@ -288,6 +318,10 @@ class DebugState:
                 'frame_age_sec': raw_age,
                 'raw_frame_age_sec': raw_age,
                 'yolo_frame_age_sec': yolo_age,
+                'inference_frame_age_sec': inference_age,
+                'last_status': self.last_status,
+                'last_error': self.last_error,
+                'last_error_age_sec': error_age,
                 'detections': self.detections,
             }
 
@@ -523,6 +557,24 @@ def build_app(args):
     state = DebugState()
     runtime = {'warmup_ms': warmup_ms}
 
+    def runtime_status():
+        return {
+            'model_path': args.model_path,
+            'device': args.device,
+            'half': use_half,
+            'imgsz': args.imgsz,
+            'conf': args.conf,
+            'iou': args.iou,
+            'max_det': args.max_det,
+            'target_class': args.target_class,
+            'all_classes': args.target_class is None,
+            'fast_forward': use_fast_forward,
+            'max_capture_age_sec': args.max_capture_age_sec,
+            'max_queue_wait_sec': args.max_queue_wait_sec,
+            'warmup_ms': runtime.get('warmup_ms', -1.0),
+            'debug_url': f'http://127.0.0.1:{args.port}/',
+        }
+
     def update_debug_overlay(frame, width, height, capture_age_ms, status_text):
         """Keep the overlay MJPEG stream live before/without inference."""
         import cv2
@@ -536,6 +588,8 @@ def build_app(args):
             _encode_jpeg(overlay, args.debug_jpeg_quality),
             0, 0.0, width, height, capture_age_ms,
             detections=[],
+            inference_ok=False,
+            status_text=status_text,
         )
 
     class InferenceWorker:
@@ -646,20 +700,15 @@ def build_app(args):
 
     @app.get('/health')
     def health():
-        return jsonify({
-            'ok': True,
-            'model_path': args.model_path,
-            'device': args.device,
-            'half': use_half,
-            'imgsz': args.imgsz,
-            'fast_forward': use_fast_forward,
-            'warmup_ms': runtime.get('warmup_ms', -1.0),
-            'debug_url': f'http://127.0.0.1:{args.port}/',
-        })
+        payload = runtime_status()
+        payload['ok'] = True
+        return jsonify(payload)
 
     @app.get('/api/status')
     def status():
-        return jsonify(state.status())
+        payload = state.status()
+        payload.update(runtime_status())
+        return jsonify(payload)
 
     @app.get('/stream/<kind>.mjpg')
     def stream(kind):
@@ -714,6 +763,7 @@ def build_app(args):
 
         if args.max_capture_age_sec > 0.0 and raw_age_sec > args.max_capture_age_sec:
             update_debug_overlay(frame, int(w), int(h), capture_age_ms, 'YOLO STALE FRAME')
+            state.set_error('stale frame rejected before inference')
             return jsonify({
                 'ok': False,
                 'stale': True,
@@ -728,6 +778,7 @@ def build_app(args):
         except InferenceBusyError as exc:
             busy_age_sec = _request_capture_age_sec(request)
             update_debug_overlay(frame, int(w), int(h), capture_age_ms, 'YOLO BUSY - RETRYING')
+            state.set_error(str(exc))
             return jsonify({
                 'ok': False,
                 'stale': True,
@@ -738,6 +789,7 @@ def build_app(args):
             })
         except Exception as exc:
             update_debug_overlay(frame, int(w), int(h), capture_age_ms, 'YOLO INFERENCE ERROR')
+            state.set_error(f'YOLO inference failed: {exc}')
             return jsonify({'ok': False, 'error': f'YOLO inference failed: {exc}'}), 500
 
         t_post0 = time.perf_counter()
@@ -779,6 +831,7 @@ def build_app(args):
             and capture_age_ms >= 0.0
             and capture_age_ms > args.max_capture_age_sec * 1000.0
         ):
+            state.set_error('stale frame rejected after inference')
             return jsonify({
                 'ok': False,
                 'stale': True,
@@ -796,6 +849,7 @@ def build_app(args):
             annotated_jpeg, len(detections),
             inference_ms, w, h, capture_age_ms, detections,
             decode_ms=decode_ms, predict_ms=predict_ms, post_ms=post_ms,
+            inference_ok=True, status_text='YOLO OK',
         )
 
         return jsonify({
