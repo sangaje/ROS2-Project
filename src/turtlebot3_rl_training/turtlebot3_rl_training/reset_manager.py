@@ -265,6 +265,32 @@ class ResetManager:
                     results.append(False)
         return results
 
+    def set_model_poses_batch_nowait(
+        self,
+        requests: list[tuple[str, ResetPose]],
+    ) -> bool:
+        """Enqueue SetEntityPose calls without blocking on their responses.
+
+        set_model_poses_batch spins until every future resolves (or times
+        out), which is fine for a once-per-episode reset but would put a
+        network round-trip back on the hot per-step path for anything that
+        needs to move continuously (e.g. wandering obstacles) -- exactly the
+        per-step overhead earlier profiling worked to remove elsewhere.
+        Responses are still consumed by whatever rclpy spin call runs next
+        in the normal step loop; this just does not wait here for them.
+        """
+        if not requests:
+            return True
+        if not self.client.service_is_ready():
+            return False
+        for entity_name, reset_pose in requests:
+            req = SetEntityPose.Request()
+            req.entity.name = str(entity_name)
+            req.entity.type = Entity.MODEL
+            req.pose = self.build_pose(reset_pose)
+            self.client.call_async(req)
+        return True
+
     def reset_to_pose(
         self,
         reset_pose: ResetPose,

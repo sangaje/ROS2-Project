@@ -185,6 +185,19 @@ export TB3_RL_RANDOM_OBSTACLE_REFRESH_EPISODES=5
 export TB3_RL_RANDOM_OBSTACLE_ROBOT_CLEARANCE_M=0.85
 export TB3_RL_RANDOM_OBSTACLE_PAIR_CLEARANCE_M=0.34
 export TB3_RL_RANDOM_OBSTACLE_NOISE_SIGMA_M=0.35
+# v138: small circular obstacles that keep wandering for the whole episode
+# (separate from the static layout above -- always reset fresh every episode,
+# not throttled by RANDOM_OBSTACLE_REFRESH_EPISODES). Movement is pushed via
+# a fire-and-forget pose call once per RL step, not the CLI-based helpers
+# used for per-episode static layout changes, so it does not reintroduce the
+# per-step overhead that TB3_RL_RANDOM_OBSTACLE_REFRESH_EPISODES was added to
+# avoid.
+export TB3_RL_RANDOM_MOVING_OBSTACLE_ENABLED=1
+export TB3_RL_RANDOM_MOVING_OBSTACLE_COUNT=5
+export TB3_RL_RANDOM_MOVING_OBSTACLE_RADIUS_MIN_M=0.12
+export TB3_RL_RANDOM_MOVING_OBSTACLE_RADIUS_MAX_M=0.25
+export TB3_RL_RANDOM_MOVING_OBSTACLE_SPEED_MIN_MPS=0.08
+export TB3_RL_RANDOM_MOVING_OBSTACLE_SPEED_MAX_MPS=0.22
 # Coverage/confidence 부족은 종료 조건이 아니라 reward/diagnostic 신호로만 사용한다.
 # v132: SLAM/confidence/coverage 업데이트가 같이 멈춘 episode tail은 penalty 없이 reset한다.
 

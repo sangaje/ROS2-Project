@@ -644,6 +644,53 @@ class GazeboNavEnv(gym.Env):
         self._active_random_obstacle_names: list[str] = []
         self._known_random_obstacle_names: set[str] = set()
 
+        # v138: a handful of small circular obstacles that keep wandering for
+        # the whole episode instead of sitting still like the obstacles above.
+        # Deliberately a separate name pool/prefix so they never get swept up
+        # by the static obstacle refresh/remove logic. Positions are updated
+        # every RL step via a fire-and-forget pose call (set_model_poses_batch_nowait)
+        # rather than the CLI-based helpers used for per-episode static layout
+        # changes -- those spawn a `gz service` subprocess per call, which is
+        # fine once per episode but would reintroduce real per-step overhead
+        # if called every control_dt.
+        self.random_moving_obstacle_enabled = str(
+            os.environ.get("TB3_RL_RANDOM_MOVING_OBSTACLE_ENABLED", "0")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        try:
+            self.random_moving_obstacle_count = max(
+                int(os.environ.get("TB3_RL_RANDOM_MOVING_OBSTACLE_COUNT", "5") or 5), 0
+            )
+        except Exception:
+            self.random_moving_obstacle_count = 5
+        self.random_moving_obstacle_radius_min_m = max(
+            float(os.environ.get("TB3_RL_RANDOM_MOVING_OBSTACLE_RADIUS_MIN_M", "0.12") or 0.12), 0.04
+        )
+        self.random_moving_obstacle_radius_max_m = max(
+            float(os.environ.get("TB3_RL_RANDOM_MOVING_OBSTACLE_RADIUS_MAX_M", "0.25") or 0.25),
+            self.random_moving_obstacle_radius_min_m,
+        )
+        self.random_moving_obstacle_height_m = max(
+            float(os.environ.get("TB3_RL_RANDOM_MOVING_OBSTACLE_HEIGHT_M", "0.35") or 0.35), 0.10
+        )
+        self.random_moving_obstacle_speed_min_mps = max(
+            float(os.environ.get("TB3_RL_RANDOM_MOVING_OBSTACLE_SPEED_MIN_MPS", "0.08") or 0.08), 0.0
+        )
+        self.random_moving_obstacle_speed_max_mps = max(
+            float(os.environ.get("TB3_RL_RANDOM_MOVING_OBSTACLE_SPEED_MAX_MPS", "0.22") or 0.22),
+            self.random_moving_obstacle_speed_min_mps,
+        )
+        self.random_moving_obstacle_heading_noise_rad = max(
+            float(os.environ.get("TB3_RL_RANDOM_MOVING_OBSTACLE_HEADING_NOISE_RAD", "0.25") or 0.25), 0.0
+        )
+        self.random_moving_obstacle_prefix = str(
+            os.environ.get("TB3_RL_RANDOM_MOVING_OBSTACLE_PREFIX", "tb3_rl_mov_obs")
+        ).strip() or "tb3_rl_mov_obs"
+        self._random_moving_obstacle_names = [
+            f"{self.random_moving_obstacle_prefix}_{idx}" for idx in range(int(self.random_moving_obstacle_count))
+        ]
+        self._known_moving_obstacle_names: set[str] = set()
+        self._moving_obstacle_state: list[dict] = []
+
         self.control_dt = float(control_dt)
         # v133: decouple confidence-map sampling density from the SAC decision
         # rate. With N>1, every control_dt advance is internally split into N
@@ -2477,7 +2524,8 @@ class GazeboNavEnv(gym.Env):
                 return
 
     def _random_obstacle_sdf(
-        self, name: str, size_x: float, size_y: float, size_z: float, shape: str = "box"
+        self, name: str, size_x: float, size_y: float, size_z: float, shape: str = "box",
+        color: str = "0.70 0.36 0.22 1",
     ) -> str:
         if shape == "cylinder":
             radius = max((float(size_x) + float(size_y)) / 4.0, 0.05)
@@ -2506,7 +2554,7 @@ class GazeboNavEnv(gym.Env):
             "<link name='link'>"
             f"<collision name='collision'><geometry>{geometry}</geometry></collision>"
             f"<visual name='visual'><geometry>{geometry}</geometry>"
-            "<material><ambient>0.70 0.36 0.22 1</ambient><diffuse>0.70 0.36 0.22 1</diffuse></material></visual>"
+            f"<material><ambient>{color}</ambient><diffuse>{color}</diffuse></material></visual>"
             "</link></model></sdf>"
         )
 
@@ -2795,6 +2843,161 @@ class GazeboNavEnv(gym.Env):
                 pass
         elif selected:
             self.ros.get_logger().warn(f"RANDOM_OBSTACLES_RESET_FAILED | requested={len(selected)} service={create_service}")
+
+    def _reset_moving_obstacles(self, reset_xy: np.ndarray | None = None) -> None:
+        """(Re)spawn the small wandering circular obstacles for a fresh episode.
+
+        Unlike the static layout above, these always get a fresh random start
+        position/heading every single episode regardless of
+        random_obstacle_refresh_episodes -- they are moving targets, not a
+        memorizable layout, so there is no "episode independence" reason to
+        throttle their reset, and repositioning 0-8 of them is cheap.
+        """
+        if not self.random_moving_obstacle_enabled or self.random_moving_obstacle_count <= 0:
+            return
+        try:
+            reset_arr = np.asarray(
+                reset_xy if reset_xy is not None else getattr(self, "current_reset_xy", np.zeros(2)),
+                dtype=np.float32,
+            )
+        except Exception:
+            reset_arr = np.zeros(2, dtype=np.float32)
+
+        margin = 0.10
+        x_bound = 6.41 - margin
+        y_bound = 3.41 - margin
+
+        state: list[dict] = []
+        for _idx in range(int(self.random_moving_obstacle_count)):
+            radius = random.uniform(
+                self.random_moving_obstacle_radius_min_m, self.random_moving_obstacle_radius_max_m
+            )
+            x = y = 0.0
+            for _attempt in range(40):
+                cand_x = random.uniform(-(x_bound - radius), x_bound - radius)
+                cand_y = random.uniform(-(y_bound - radius), y_bound - radius)
+                if float(np.hypot(cand_x - reset_arr[0], cand_y - reset_arr[1])) < (
+                    float(self.random_obstacle_robot_clearance_m) + radius
+                ):
+                    continue
+                if any(
+                    math.hypot(cand_x - s["x"], cand_y - s["y"]) < (radius + s["radius"] + 0.15)
+                    for s in state
+                ):
+                    continue
+                x, y = cand_x, cand_y
+                break
+            else:
+                # Fell through 40 attempts (very cluttered spawn area) -- keep
+                # the last candidate rather than skipping the obstacle
+                # entirely; it will bounce/wander away from any overlap on
+                # the very next step.
+                x, y = cand_x, cand_y
+            heading = random.uniform(-math.pi, math.pi)
+            speed = random.uniform(
+                self.random_moving_obstacle_speed_min_mps, self.random_moving_obstacle_speed_max_mps
+            )
+            state.append({"x": x, "y": y, "heading": heading, "speed": speed, "radius": radius})
+
+        self._moving_obstacle_state = state
+
+        create_service = f"/world/{self.random_obstacle_world_name}/create"
+
+        names = list(self._random_moving_obstacle_names[: len(state)])
+        known_idx = [i for i, name in enumerate(names) if name in self._known_moving_obstacle_names]
+        if known_idx and self.reset_manager is not None and hasattr(self.reset_manager, "set_model_poses_batch"):
+            pose_requests = [
+                (
+                    names[i],
+                    ResetPose(x=state[i]["x"], y=state[i]["y"], z=self.random_moving_obstacle_height_m / 2.0, yaw=state[i]["heading"]),
+                )
+                for i in known_idx
+            ]
+            results = self.reset_manager.set_model_poses_batch(pose_requests, timeout_sec=1.0, chunk_size=6)
+            for i, ok in zip(known_idx, results, strict=True):
+                if not ok:
+                    self._known_moving_obstacle_names.discard(names[i])
+
+        need_create_idx = [i for i in range(len(names)) if names[i] not in self._known_moving_obstacle_names]
+        if need_create_idx:
+            reqs = []
+            for i in need_create_idx:
+                diameter = state[i]["radius"] * 2.0
+                sdf = self._textproto_quote(
+                    self._random_obstacle_sdf(
+                        names[i], diameter, diameter, self.random_moving_obstacle_height_m,
+                        shape="cylinder", color="0.15 0.45 0.85 1",
+                    )
+                )
+                req = (
+                    f'name: "{self._textproto_quote(names[i])}" allow_renaming: false '
+                    f'sdf: "{sdf}" '
+                    f'pose {{ position {{ x: {state[i]["x"]:.6f} y: {state[i]["y"]:.6f} z: {self.random_moving_obstacle_height_m / 2.0:.6f} }} '
+                    f'orientation {{ z: {math.sin(state[i]["heading"] / 2.0):.6f} w: {math.cos(state[i]["heading"] / 2.0):.6f} }} }}'
+                )
+                reqs.append((create_service, "gz.msgs.EntityFactory", req, 1200))
+            results = self._gz_service_bool_batch(reqs)
+            for i, ok in zip(need_create_idx, results, strict=True):
+                if ok:
+                    self._known_moving_obstacle_names.add(names[i])
+                else:
+                    # Most likely already exists from a previous process
+                    # (crash/restart) -- fall back to a pose call.
+                    if self._set_random_obstacle_pose(
+                        names[i], state[i]["x"], state[i]["y"], self.random_moving_obstacle_height_m / 2.0, state[i]["heading"]
+                    ):
+                        self._known_moving_obstacle_names.add(names[i])
+
+    def _update_moving_obstacles(self, dt: float) -> None:
+        """Advance the wandering obstacles by dt seconds and push new poses.
+
+        Called once per env.step() (not per world sub-tick) so this adds
+        exactly one extra, non-blocking pose request per RL step regardless
+        of action mode or how many internal _advance_world_after_command
+        calls that step ends up making (backup/spin-breaker sequences can
+        call it several times). Fire-and-forget (set_model_poses_batch_nowait)
+        on purpose -- waiting on the reply every control_dt would put a
+        network round trip back on the hot per-step path.
+        """
+        if not self.random_moving_obstacle_enabled or not self._moving_obstacle_state:
+            return
+        if dt <= 0.0:
+            return
+        margin = 0.10
+        x_bound = 6.41 - margin
+        y_bound = 3.41 - margin
+        heading_noise = self.random_moving_obstacle_heading_noise_rad
+
+        requests = []
+        names = self._random_moving_obstacle_names
+        for i, st in enumerate(self._moving_obstacle_state):
+            if heading_noise > 0.0:
+                st["heading"] = float(st["heading"] + random.gauss(0.0, heading_noise))
+            r = float(st["radius"])
+            nx = float(st["x"] + math.cos(st["heading"]) * st["speed"] * dt)
+            ny = float(st["y"] + math.sin(st["heading"]) * st["speed"] * dt)
+            bx = x_bound - r
+            by = y_bound - r
+            if nx > bx:
+                nx = bx
+                st["heading"] = math.pi - st["heading"]
+            elif nx < -bx:
+                nx = -bx
+                st["heading"] = math.pi - st["heading"]
+            if ny > by:
+                ny = by
+                st["heading"] = -st["heading"]
+            elif ny < -by:
+                ny = -by
+                st["heading"] = -st["heading"]
+            st["x"], st["y"] = nx, ny
+            if i < len(names) and names[i] in self._known_moving_obstacle_names:
+                requests.append(
+                    (names[i], ResetPose(x=nx, y=ny, z=self.random_moving_obstacle_height_m / 2.0, yaw=st["heading"]))
+                )
+
+        if requests and self.reset_manager is not None and hasattr(self.reset_manager, "set_model_poses_batch_nowait"):
+            self.reset_manager.set_model_poses_batch_nowait(requests)
 
     def _wait_for_rviz_map_origin_after_reset(self) -> bool:
         """Verify that map-frame base pose is near (0, 0) after SLAM reset."""
@@ -3949,6 +4152,7 @@ class GazeboNavEnv(gym.Env):
         self.current_reset_xy = np.array([reset_x, reset_y], dtype=np.float32)
         _obstacles_t0 = time.perf_counter() if _reset_prof_on else 0.0
         self._reset_random_episode_obstacles(reset_xy=self.current_reset_xy.copy())
+        self._reset_moving_obstacles(reset_xy=self.current_reset_xy.copy())
         if _reset_prof_on:
             print(f"OBSTACLE_RESET_DIAG | {(time.perf_counter()-_obstacles_t0)*1000.0:.1f}ms", flush=True)
             _reset_prof_mark("obstacle_reset")
@@ -4921,6 +5125,10 @@ class GazeboNavEnv(gym.Env):
 
     def _step_impl(self, action):
         self._map_update_call_count_this_step = 0
+        # v138: advance the wandering obstacles exactly once per env.step(),
+        # regardless of action mode, so their movement stays bounded to one
+        # extra (non-blocking) pose request per RL step.
+        self._update_moving_obstacles(self.control_dt)
         if not hasattr(self, "_step_profiler_initialized"):
             raw = str(os.environ.get("TB3_RL_STEP_PROFILER", "0")).strip().lower()
             self._step_profiler_enabled = raw in {"1", "true", "yes", "on"}
