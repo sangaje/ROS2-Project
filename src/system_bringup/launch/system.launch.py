@@ -98,6 +98,9 @@ def generate_launch_description():
     leader_shadow_resume_distance_m = LaunchConfiguration('leader_shadow_resume_distance_m')
     leader_shadow_far_distance_m = LaunchConfiguration('leader_shadow_far_distance_m')
     leader_shadow_max_linear_vel = LaunchConfiguration('leader_shadow_max_linear_vel')
+    leader_shadow_catchup_max_linear_vel = LaunchConfiguration(
+        'leader_shadow_catchup_max_linear_vel'
+    )
     leader_shadow_max_angular_vel = LaunchConfiguration('leader_shadow_max_angular_vel')
     leader_shadow_goal_update_period_sec = LaunchConfiguration(
         'leader_shadow_goal_update_period_sec'
@@ -623,6 +626,9 @@ def generate_launch_description():
                             ),
                             'leader_shadow_max_linear_vel': float(
                                 leader_shadow_max_linear_vel.perform(context)
+                            ),
+                            'leader_shadow_catchup_max_linear_vel': float(
+                                leader_shadow_catchup_max_linear_vel.perform(context)
                             ),
                             'leader_shadow_max_angular_vel': float(
                                 leader_shadow_max_angular_vel.perform(context)
@@ -1151,7 +1157,7 @@ def generate_launch_description():
             'enable_leader_shadow_follow',
             default_value='true',
             choices=['true', 'false'],
-            description='Leader role only: move slowly behind the active scout during normal operation.',
+            description='Leader role only: move behind the active scout during normal operation.',
         ),
         DeclareLaunchArgument(
             'leader_shadow_follow_distance_m',
@@ -1175,12 +1181,17 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'leader_shadow_max_linear_vel',
-            default_value='0.12',
+            default_value='0.28',
             description='Best-effort DWB linear velocity cap while shadow following.',
         ),
         DeclareLaunchArgument(
+            'leader_shadow_catchup_max_linear_vel',
+            default_value='0.40',
+            description='Best-effort DWB linear velocity cap when the leader is far behind the active scout.',
+        ),
+        DeclareLaunchArgument(
             'leader_shadow_max_angular_vel',
-            default_value='0.35',
+            default_value='0.70',
             description='Best-effort DWB angular velocity cap while shadow following.',
         ),
         DeclareLaunchArgument(
