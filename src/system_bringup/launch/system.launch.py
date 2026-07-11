@@ -367,6 +367,10 @@ def generate_launch_description():
             ))
 
         if role_value == 'leader':
+            leader_localization_ready_gate = (
+                not launch_bool(enable_cartographer.perform(context))
+                and launch_bool(leader_auto_localize.perform(context))
+            )
             risk_domain_value = risk_domain_id.perform(context).strip()
             if (
                 launch_bool(enable_risk_to_leader_bridge.perform(context))
@@ -599,7 +603,7 @@ def generate_launch_description():
                             'active_scout_id_topic': '/failover/active_scout_id',
                             'active_scout_robot_name': active_scout_robot_name.perform(context),
                             'follower_robot_name': follower_robot_name.perform(context),
-                            'require_localization_ready': True,
+                            'require_localization_ready': leader_localization_ready_gate,
                             'localization_ready_topic': '/localization_ready',
                             'scout_pose_timeout_sec': float(
                                 scout_pose_timeout_sec.perform(context)
