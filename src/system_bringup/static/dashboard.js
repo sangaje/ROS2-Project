@@ -114,7 +114,9 @@ function scheduleFramePoll(id, delayMs) {
 
 function updateImages(s) {
   queueGridLoad('map', s.map.seq, s.map.status);
-  queueGridLoad('risk', s.risk.seq, s.risk.status);
+  if (s.risk.metadata_matches_map || !riskReady) {
+    queueGridLoad('risk', s.risk.seq, s.risk.status);
+  }
 }
 
 function queueGridLoad(kind, seq, status) {
@@ -291,6 +293,7 @@ function formatPoint(p) {
 function updateOmxPanel(s) {
   const err = s.omx.aim_error_norm || {};
   const cmd = s.omx.leader_cmd_vel || {};
+  const navCmd = s.omx.leader_cmd_vel_nav || {};
   const detected = s.omx.target_detected === true;
   const fireDisabled = s.omx.fire_disabled;
   const cards = [
@@ -303,7 +306,8 @@ function updateOmxPanel(s) {
     ['Fire Lock', fireDisabled === true ? 'DISABLED' : fireDisabled === false ? 'ARMED' : '--', fireDisabled === false ? 'OK' : fireDisabled === true ? 'STALE' : 'NO DATA', ageText(topicAge(s, 'fire_disabled'))],
     ['Nav Result', s.omx.waffle_nav_result || '--', s.omx.waffle_nav_result ? 'OK' : 'NO DATA', ageText(topicAge(s, 'waffle_nav_result'))],
     ['Waffle', s.omx.waffle_status || '--', s.omx.waffle_status ? 'OK' : 'NO DATA', ageText(topicAge(s, 'waffle_status'))],
-    ['Cmd Vel', `x ${fmt(cmd.linear_x)} / z ${fmt(cmd.angular_z)}`, s.omx.leader_cmd_vel ? 'OK' : 'NO DATA', ageText(topicAge(s, 'leader_cmd_vel'))],
+    ['Cmd Final', `x ${fmt(cmd.linear_x)} / z ${fmt(cmd.angular_z)}`, s.omx.leader_cmd_vel ? 'OK' : 'NO DATA', ageText(topicAge(s, 'leader_cmd_vel'))],
+    ['Cmd Nav', `x ${fmt(navCmd.linear_x)} / z ${fmt(navCmd.angular_z)}`, s.omx.leader_cmd_vel_nav ? 'OK' : 'NO DATA', ageText(topicAge(s, 'leader_cmd_vel_nav'))],
   ];
   document.getElementById('omxCards').innerHTML = cards
     .map(([label, value, status, sub]) => metricCard(label, value, status, sub))
@@ -408,7 +412,7 @@ function draw() {
   if (document.getElementById('layerMap').checked && mapReady) {
     ctx.drawImage(mapImg, vp.x, vp.y, vp.w, vp.h);
   }
-  if (document.getElementById('layerRisk').checked && riskReady && latest.risk.metadata_matches_map) {
+  if (document.getElementById('layerRisk').checked && riskReady) {
     ctx.save();
     ctx.globalAlpha = Number(document.getElementById('riskOpacity').value);
     ctx.drawImage(riskImg, vp.x, vp.y, vp.w, vp.h);
@@ -475,7 +479,7 @@ function updateTop(s) {
   rp.className = `pill ${online ? 'online' : 'no-data'}`;
   rp.innerHTML = `<span class="dot"></span>Robots ${online}/${s.robots.length}`;
   document.getElementById('mapWarning').textContent = (!s.risk.metadata_matches_map && s.risk.status !== 'NO DATA')
-    ? 'Risk overlay metadata does not match /map, so overlay rendering is suppressed.'
+    ? 'Risk overlay metadata is updating; holding the last available risk image.'
     : '';
 }
 

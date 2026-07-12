@@ -15,7 +15,14 @@ from typing import Any, Dict, Optional
 
 import rclpy
 from ament_index_python.packages import get_package_share_directory
-from geometry_msgs.msg import Point, PointStamped, PoseArray, PoseStamped, Twist
+from geometry_msgs.msg import (
+    Point,
+    PointStamped,
+    PoseArray,
+    PoseStamped,
+    Twist,
+    TwistStamped,
+)
 from nav_msgs.msg import OccupancyGrid, Path as NavPath
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -169,6 +176,7 @@ class LeaderUnifiedDashboard(Node):
             'fire_disabled': None,
             'aim_error_norm': None,
             'leader_cmd_vel': None,
+            'leader_cmd_vel_nav': None,
         }
         self._events: Dict[str, Dict[str, Any]] = {
             'fire': self._empty_event('/omx/fire', 'std_msgs/msg/Empty'),
@@ -239,6 +247,8 @@ class LeaderUnifiedDashboard(Node):
         self.create_subscription(Bool, '/omx/fire_disable', lambda msg: self._set_omx('fire_disabled', bool(msg.data), '/omx/fire_disable', 'std_msgs/msg/Bool'), 10)
         self.create_subscription(Point, '/omx/error_norm', self._on_aim_error, 10)
         self.create_subscription(Twist, '/cmd_vel', self._on_cmd_vel, 10)
+        self.create_subscription(TwistStamped, '/cmd_vel', self._on_cmd_vel_stamped, 10)
+        self.create_subscription(TwistStamped, '/cmd_vel_nav', self._on_cmd_vel_nav_stamped, 10)
         self.create_subscription(Empty, '/omx/fire', lambda msg: self._on_empty_event('fire'), 10)
         self.create_subscription(Empty, '/omx/nav_cancel', lambda msg: self._on_empty_event('nav_cancel'), 10)
         self.create_subscription(Empty, '/omx/patrol_complete', lambda msg: self._on_empty_event('patrol_complete'), 10)
@@ -646,13 +656,34 @@ class LeaderUnifiedDashboard(Node):
             'geometry_msgs/msg/Point',
         )
 
-    def _on_cmd_vel(self, msg: Twist) -> None:
-        value = {
+    def _cmd_vel_value(self, msg: Twist) -> Dict[str, float]:
+        return {
             'linear_x': float(msg.linear.x),
             'linear_y': float(msg.linear.y),
             'angular_z': float(msg.angular.z),
         }
+
+    def _on_cmd_vel(self, msg: Twist) -> None:
+        value = self._cmd_vel_value(msg)
         self._set_omx('leader_cmd_vel', value, '/cmd_vel', 'geometry_msgs/msg/Twist')
+
+    def _on_cmd_vel_stamped(self, msg: TwistStamped) -> None:
+        value = self._cmd_vel_value(msg.twist)
+        self._set_omx(
+            'leader_cmd_vel',
+            value,
+            '/cmd_vel',
+            'geometry_msgs/msg/TwistStamped',
+        )
+
+    def _on_cmd_vel_nav_stamped(self, msg: TwistStamped) -> None:
+        value = self._cmd_vel_value(msg.twist)
+        self._set_omx(
+            'leader_cmd_vel_nav',
+            value,
+            '/cmd_vel_nav',
+            'geometry_msgs/msg/TwistStamped',
+        )
 
     def _on_empty_event(self, key: str) -> None:
         now = time.time()

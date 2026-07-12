@@ -1269,17 +1269,17 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'leader_shadow_max_linear_vel',
-            default_value='0.38',
+            default_value='0.22',
             description='Best-effort DWB linear velocity cap while shadow following.',
         ),
         DeclareLaunchArgument(
             'leader_shadow_catchup_max_linear_vel',
-            default_value='0.46',
+            default_value='0.28',
             description='Best-effort DWB linear velocity cap when the leader is far behind the active scout.',
         ),
         DeclareLaunchArgument(
             'leader_shadow_max_angular_vel',
-            default_value='0.85',
+            default_value='0.65',
             description='Best-effort DWB angular velocity cap while shadow following.',
         ),
         DeclareLaunchArgument(
@@ -1312,7 +1312,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'leader_shadow_cmd_max_angular_vel',
-            default_value='1.20',
+            default_value='0.80',
             description='Hard cap for compensated direct /cmd_vel angular.z.',
         ),
         DeclareLaunchArgument(
