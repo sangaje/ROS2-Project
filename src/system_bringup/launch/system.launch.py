@@ -104,6 +104,15 @@ def generate_launch_description():
     leader_robot_name = LaunchConfiguration('leader_robot_name')
     active_scout_robot_name = LaunchConfiguration('active_scout_robot_name')
     follower_robot_name = LaunchConfiguration('follower_robot_name')
+    leader_initial_x = LaunchConfiguration('leader_initial_x')
+    leader_initial_y = LaunchConfiguration('leader_initial_y')
+    leader_initial_yaw = LaunchConfiguration('leader_initial_yaw')
+    scout_initial_x = LaunchConfiguration('scout_initial_x')
+    scout_initial_y = LaunchConfiguration('scout_initial_y')
+    scout_initial_yaw = LaunchConfiguration('scout_initial_yaw')
+    follower_initial_x = LaunchConfiguration('follower_initial_x')
+    follower_initial_y = LaunchConfiguration('follower_initial_y')
+    follower_initial_yaw = LaunchConfiguration('follower_initial_yaw')
     scout_liveness_topic = LaunchConfiguration('scout_liveness_topic')
     scout_liveness_timeout_sec = LaunchConfiguration('scout_liveness_timeout_sec')
     scout_failure_confirm_sec = LaunchConfiguration('scout_failure_confirm_sec')
@@ -256,6 +265,9 @@ def generate_launch_description():
             fleet_launch_args['require_follower_pose'] = (
                 require_follower_pose.perform(context)
             )
+            fleet_launch_args['leader_initial_x'] = leader_initial_x.perform(context)
+            fleet_launch_args['leader_initial_y'] = leader_initial_y.perform(context)
+            fleet_launch_args['leader_initial_yaw'] = leader_initial_yaw.perform(context)
             fleet_launch_args['enable_cartographer'] = (
                 enable_cartographer.perform(context)
             )
@@ -267,6 +279,14 @@ def generate_launch_description():
             fleet_launch_args['auto_localize'] = (
                 auto_localize.perform(context)
             )
+        if fleet_role_value == 'member':
+            fleet_launch_args['member_initial_x'] = scout_initial_x.perform(context)
+            fleet_launch_args['member_initial_y'] = scout_initial_y.perform(context)
+            fleet_launch_args['member_initial_yaw'] = scout_initial_yaw.perform(context)
+        if fleet_role_value == 'follower':
+            fleet_launch_args['follower_initial_x'] = follower_initial_x.perform(context)
+            fleet_launch_args['follower_initial_y'] = follower_initial_y.perform(context)
+            fleet_launch_args['follower_initial_yaw'] = follower_initial_yaw.perform(context)
         if (
             role_value == 'scout'
             and fleet_role_value == 'follower'
@@ -1206,6 +1226,57 @@ def generate_launch_description():
         DeclareLaunchArgument('leader_robot_name', default_value='leader'),
         DeclareLaunchArgument('active_scout_robot_name', default_value='scout22'),
         DeclareLaunchArgument('follower_robot_name', default_value='follower21'),
+        DeclareLaunchArgument(
+            'leader_initial_x',
+            default_value='0.0',
+            description='Leader AMCL initial x in the shared map frame.',
+        ),
+        DeclareLaunchArgument(
+            'leader_initial_y',
+            default_value='0.10',
+            description=(
+                'Leader AMCL initial y. Default is 10 cm left of scout22 '
+                'when all robots face +x.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'leader_initial_yaw',
+            default_value='0.0',
+            description='Leader AMCL initial yaw radians; 0 means facing +x.',
+        ),
+        DeclareLaunchArgument(
+            'scout_initial_x',
+            default_value='0.0',
+            description='Active scout/member AMCL initial x in the shared map frame.',
+        ),
+        DeclareLaunchArgument(
+            'scout_initial_y',
+            default_value='0.0',
+            description='Active scout/member AMCL initial y in the shared map frame.',
+        ),
+        DeclareLaunchArgument(
+            'scout_initial_yaw',
+            default_value='0.0',
+            description='Active scout/member AMCL initial yaw radians.',
+        ),
+        DeclareLaunchArgument(
+            'follower_initial_x',
+            default_value='0.0',
+            description='Follower AMCL initial x in the shared map frame.',
+        ),
+        DeclareLaunchArgument(
+            'follower_initial_y',
+            default_value='-0.10',
+            description=(
+                'Follower AMCL initial y. Default is 10 cm right of scout22 '
+                'when all robots face +x.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'follower_initial_yaw',
+            default_value='0.0',
+            description='Follower AMCL initial yaw radians; 0 means facing +x.',
+        ),
         DeclareLaunchArgument(
             'scout_liveness_topic',
             default_value='/scout/signal',
