@@ -413,34 +413,10 @@ def _normalize_device(device):
     return text
 
 
-def _model_backend(model_path):
-    suffix = Path(str(model_path)).suffix.lower()
-    if suffix in ('.engine', '.plan'):
-        return 'tensorrt'
-    return 'pytorch'
-
-
-def _validate_model_path(model_path, backend):
+def _validate_model_path(model_path):
     path = Path(str(model_path)).expanduser()
-    if path.is_file():
-        return
-    if backend == 'tensorrt':
-        source_pt = path.with_suffix('.pt')
-        hint = (
-            f'TensorRT engine not found: {path}. '
-            f'Generate it on Jetson with: python3 tools/export_best_engine.py '
-            f'--pt {source_pt} --engine {path}'
-        )
-        raise FileNotFoundError(hint)
-    raise FileNotFoundError(f'YOLO model not found: {path}')
-
-
-def _safe_model_names(model):
-    try:
-        names = getattr(model, 'names', {}) or {}
-    except Exception:
-        names = {}
-    return names if isinstance(names, dict) else {}
+    if not path.is_file():
+        raise FileNotFoundError(f'YOLO model not found: {path}')
 
 
 def _resolve_inference_device(requested):
@@ -505,93 +481,33 @@ def build_app(args):
     from ultralytics import YOLO
 
     app = Flask(__name__)
-    backend = _model_backend(args.model_path)
-    if backend == 'pytorch':
-        args.device, cpu_fallback_reason = _resolve_inference_device(args.device)
-        if cpu_fallback_reason:
-            print(
-                '[flask_yolo_server] CUDA_FALLBACK_CPU | '
-                f'{cpu_fallback_reason}', flush=True,
-            )
-    else:
+    args.device, cpu_fallback_reason = _resolve_inference_device(args.device)
+    if cpu_fallback_reason:
         print(
-            '[flask_yolo_server] TENSORRT_BACKEND | '
-            f'model={args.model_path} device={args.device} '
-            'skipping torch CUDA capability fallback',
-            flush=True,
+            '[flask_yolo_server] CUDA_FALLBACK_CPU | '
+            f'{cpu_fallback_reason}', flush=True,
         )
-    _validate_model_path(args.model_path, backend)
+    _validate_model_path(args.model_path)
     model = YOLO(args.model_path, task='detect')
-    use_half = bool(args.half) and backend == 'pytorch' and str(args.device).lower() not in ('cpu', 'none', '')
-    use_fast_forward = bool(args.fast_forward) and backend == 'pytorch'
-    fast_net = None
-    letterbox = None
-    non_max_suppression = None
-    scale_boxes = None
-    torch = None
-    class_names = _safe_model_names(model)
-    if use_fast_forward:
-        try:
-            import torch as _torch
-            from ultralytics.data.augment import LetterBox
-            from ultralytics.utils.nms import non_max_suppression as _nms
-            from ultralytics.utils.ops import scale_boxes as _scale_boxes
-
-            torch = _torch
-            fast_net = model.model.to(args.device).eval()
-            if use_half:
-                fast_net = fast_net.half()
-            letterbox = LetterBox(new_shape=(int(args.imgsz), int(args.imgsz)), auto=False, stride=32)
-            non_max_suppression = _nms
-            scale_boxes = _scale_boxes
-            class_names = getattr(model.model, 'names', class_names) or class_names
-        except Exception as exc:
-            print(f'[flask_yolo_server] fast forward setup failed; falling back to model.predict: {exc}', flush=True)
-            use_fast_forward = False
+    use_half = bool(args.half) and str(args.device).lower() not in ('cpu', 'none', '')
     warmup_ms = -1.0
     try:
-        if torch is not None and 'cuda' in str(args.device).lower():
-            torch.backends.cudnn.benchmark = True
-            try:
-                torch.set_float32_matmul_precision('high')
-            except Exception:
-                pass
         dummy = np.zeros((max(32, int(args.imgsz)), max(32, int(args.imgsz)), 3), dtype=np.uint8)
         t_warmup = time.perf_counter()
-        if use_fast_forward:
-            im = letterbox(image=dummy)
-            im = im[..., ::-1].transpose(2, 0, 1)
-            im = np.ascontiguousarray(im)
-            tensor = torch.from_numpy(im).to(args.device, non_blocking=True)
-            tensor = tensor.half() if use_half else tensor.float()
-            tensor = tensor.unsqueeze(0) / 255.0
-            with torch.inference_mode():
-                pred = fast_net(tensor)
-                if isinstance(pred, (tuple, list)):
-                    pred = pred[0]
-                non_max_suppression(
-                    pred,
-                    conf_thres=args.conf,
-                    iou_thres=args.iou,
-                    classes=[args.target_class] if args.target_class is not None else None,
-                    max_det=args.max_det,
-                )
-        else:
-            model.predict(
-                source=dummy,
-                imgsz=args.imgsz,
-                conf=args.conf,
-                classes=[args.target_class] if args.target_class is not None else None,
-                device=args.device,
-                half=use_half,
-                verbose=False,
-            )
-        if backend == 'pytorch':
-            _cuda_synchronize_if_needed(args.device)
+        model.predict(
+            source=dummy,
+            imgsz=args.imgsz,
+            conf=args.conf,
+            classes=[args.target_class] if args.target_class is not None else None,
+            device=args.device,
+            half=use_half,
+            verbose=False,
+        )
+        _cuda_synchronize_if_needed(args.device)
         warmup_ms = (time.perf_counter() - t_warmup) * 1000.0
         print(
-            f'[flask_yolo_server] model ready | backend={backend} device={args.device} half={use_half} '
-            f'imgsz={args.imgsz} fast_forward={use_fast_forward} warmup_ms={warmup_ms:.1f}',
+            f'[flask_yolo_server] model ready | device={args.device} half={use_half} '
+            f'imgsz={args.imgsz} warmup_ms={warmup_ms:.1f}',
             flush=True,
         )
     except Exception as exc:
@@ -602,7 +518,6 @@ def build_app(args):
     def runtime_status():
         return {
             'model_path': args.model_path,
-            'backend': backend,
             'device': args.device,
             'half': use_half,
             'imgsz': args.imgsz,
@@ -611,7 +526,6 @@ def build_app(args):
             'max_det': args.max_det,
             'target_class': args.target_class,
             'all_classes': args.target_class is None,
-            'fast_forward': use_fast_forward,
             'max_capture_age_sec': args.max_capture_age_sec,
             'max_queue_wait_sec': args.max_queue_wait_sec,
             'warmup_ms': runtime.get('warmup_ms', -1.0),
@@ -654,8 +568,8 @@ def build_app(args):
             self.run_predict(dummy)
             runtime['warmup_ms'] = (time.perf_counter() - t_warmup) * 1000.0
             print(
-                f'[flask_yolo_server] inference worker ready | backend={backend} device={args.device} half={use_half} '
-                f'imgsz={args.imgsz} fast_forward={use_fast_forward} worker_warmup_ms={runtime["warmup_ms"]:.1f}',
+                f'[flask_yolo_server] inference worker ready | device={args.device} half={use_half} '
+                f'imgsz={args.imgsz} worker_warmup_ms={runtime["warmup_ms"]:.1f}',
                 flush=True,
             )
 
@@ -697,40 +611,18 @@ def build_app(args):
 
         def run_predict(self, frame):
             t_predict0 = time.perf_counter()
-            if use_fast_forward:
-                im = letterbox(image=frame)
-                im = im[..., ::-1].transpose(2, 0, 1)
-                im = np.ascontiguousarray(im)
-                tensor = torch.from_numpy(im).to(args.device, non_blocking=True)
-                tensor = tensor.half() if use_half else tensor.float()
-                tensor = tensor.unsqueeze(0) / 255.0
-                with torch.inference_mode():
-                    pred = fast_net(tensor)
-                    if isinstance(pred, (tuple, list)):
-                        pred = pred[0]
-                    results = non_max_suppression(
-                        pred,
-                        conf_thres=args.conf,
-                        iou_thres=args.iou,
-                        classes=[args.target_class] if args.target_class is not None else None,
-                        max_det=args.max_det,
-                    )
-                input_shape = tensor.shape[2:]
-            else:
-                results = model.predict(
-                    source=frame,
-                    imgsz=args.imgsz,
-                    conf=args.conf,
-                    classes=[args.target_class] if args.target_class is not None else None,
-                    device=args.device,
-                    half=use_half,
-                    verbose=False,
-                )
-                input_shape = None
-            if backend == 'pytorch':
-                _cuda_synchronize_if_needed(args.device)
+            results = model.predict(
+                source=frame,
+                imgsz=args.imgsz,
+                conf=args.conf,
+                classes=[args.target_class] if args.target_class is not None else None,
+                device=args.device,
+                half=use_half,
+                verbose=False,
+            )
+            _cuda_synchronize_if_needed(args.device)
             predict_ms = (time.perf_counter() - t_predict0) * 1000.0
-            return results, input_shape, predict_ms
+            return results, predict_ms
 
     inference_worker = InferenceWorker()
 
@@ -818,7 +710,7 @@ def build_app(args):
             })
 
         try:
-            results, input_shape, predict_ms = inference_worker.infer(frame)
+            results, predict_ms = inference_worker.infer(frame)
         except InferenceBusyError as exc:
             busy_age_sec = _request_capture_age_sec(request)
             update_debug_overlay(frame, int(w), int(h), capture_age_ms, 'YOLO BUSY - RETRYING')
@@ -838,21 +730,7 @@ def build_app(args):
 
         t_post0 = time.perf_counter()
         detections = []
-        if use_fast_forward:
-            det = results[0] if results else None
-            if det is not None and len(det):
-                det = det.clone()
-                det[:, :4] = scale_boxes(input_shape, det[:, :4], frame.shape).round()
-                for row in det.detach().float().cpu().numpy():
-                    x1, y1, x2, y2, conf, cls = row[:6]
-                    class_id = int(cls)
-                    detections.append({
-                        'bbox': [float(x1), float(y1), float(x2), float(y2)],
-                        'conf': float(conf),
-                        'class_id': class_id,
-                        'label': str(class_names.get(class_id, class_id)),
-                    })
-        elif results and results[0].boxes is not None:
+        if results and results[0].boxes is not None:
             boxes = results[0].boxes
             xyxy = boxes.xyxy.cpu().numpy()
             confs = boxes.conf.cpu().numpy()
@@ -925,10 +803,9 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--port', type=int, default=5005)
-    parser.add_argument('--model-path', default='model/best.engine')
+    parser.add_argument('--model-path', default='model/best.pt')
     parser.add_argument('--device', default='0')
     parser.add_argument('--half', type=as_bool, default=True)
-    parser.add_argument('--fast-forward', type=as_bool, default=True)
     parser.add_argument('--conf', type=float, default=0.20)
     parser.add_argument('--iou', type=float, default=0.45)
     parser.add_argument('--max-det', type=int, default=64)

@@ -528,7 +528,6 @@ def generate_launch_description():
                         *target_class_args,
                         '--device', yolo_server_device.perform(context),
                         '--half', yolo_server_half.perform(context),
-                        '--fast-forward', 'true',
                         '--conf', yolo_server_conf.perform(context),
                         '--iou', '0.45',
                         '--max-det', '64',
@@ -1048,7 +1047,7 @@ def generate_launch_description():
                 'needs an interactive terminal.'
             ),
         ),
-        DeclareLaunchArgument('risk_model_path', default_value='model/best.engine'),
+        DeclareLaunchArgument('risk_model_path', default_value='model/best.pt'),
         DeclareLaunchArgument(
             'risk_target_class',
             default_value='-1',
@@ -1371,10 +1370,12 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'yolo_server_model_path',
-            default_value='model/best.engine',
+            default_value='model/best.pt',
             description=(
-                'Leader role only: YOLO model path for flask_yolo_server. '
-                'Use model/best.engine on Jetson to avoid PyTorch CUDA sm_87 issues.'
+                'Leader role only: Ultralytics YOLO checkpoint for '
+                'flask_yolo_server. If the Jetson torch build lacks the '
+                'sm_87 CUDA kernel, it falls back to CPU automatically '
+                '(see CUDA_FALLBACK_CPU log) rather than failing.'
             ),
         ),
         DeclareLaunchArgument(

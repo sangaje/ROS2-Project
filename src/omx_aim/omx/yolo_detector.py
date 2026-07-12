@@ -1,25 +1,20 @@
 """YOLO 기반 표적 검출.
 
-OpenCV VideoCapture + Ultralytics YOLO. ROS 의존성 없음.
+OpenCV VideoCapture + Ultralytics YOLO (.pt checkpoint). ROS 의존성 없음.
 """
 
 from __future__ import annotations
 
 import os
 import time
-from pathlib import Path
 
 import cv2
-from ultralytics import YOLO
 
 from omx.config import Config
 
 
-def _model_backend(model_path: str) -> str:
-    suffix = Path(str(model_path)).suffix.lower()
-    if suffix in ('.engine', '.plan'):
-        return 'tensorrt'
-    return 'pytorch'
+class YoloRuntimeDependencyError(RuntimeError):
+    """ultralytics/numpy/torch import failed -- not a missing model file."""
 
 
 def _safe_model_names(model) -> dict:
@@ -28,6 +23,43 @@ def _safe_model_names(model) -> dict:
     except Exception:
         names = {}
     return names if isinstance(names, dict) else {}
+
+
+def _import_yolo():
+    """Import ultralytics.YOLO lazily and report *why* it failed.
+
+    A bare `from ultralytics import YOLO` at module level meant one broken
+    dependency (e.g. a NumPy 1.x binary extension shadowing NumPy 2.x on
+    Jetson) crashed on import of this module, before the ROS node even
+    started -- so the failure looked like "the whole node is gone" instead
+    of a diagnosable dependency problem.
+    """
+    try:
+        from ultralytics import YOLO
+        return YOLO
+    except Exception as exc:  # noqa: BLE001
+        import sys
+        numpy_version = numpy_path = matplotlib_path = 'unavailable'
+        try:
+            import numpy
+            numpy_version = numpy.__version__
+            numpy_path = numpy.__file__
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            import matplotlib
+            matplotlib_path = matplotlib.__file__
+        except Exception:  # noqa: BLE001
+            pass
+        raise YoloRuntimeDependencyError(
+            'YOLO_DEPENDENCY_ERROR | '
+            f'python={sys.executable} '
+            f'numpy_version={numpy_version} '
+            f'numpy_path={numpy_path} '
+            f'matplotlib_path={matplotlib_path} '
+            f'ultralytics_path=unavailable '
+            f'error={type(exc).__name__}: {exc}'
+        ) from exc
 
 
 def _resolve_supported_device(requested: str) -> tuple[str, str | None]:
@@ -79,32 +111,25 @@ class YoloDetector:
         self._consecutive_read_failures = 0
         self._open_camera(initial=True)
 
-        self.backend = _model_backend(cfg.yolo.model_path)
         requested_device = str(os.environ.get(
             "OMX_YOLO_DEVICE",
             getattr(cfg.yolo, "device", "0"),
         )).strip()
-        if self.backend == 'pytorch':
-            self.device, cpu_fallback_reason = _resolve_supported_device(requested_device)
-            if cpu_fallback_reason:
-                self._warn(f'OMX_YOLO_CUDA_FALLBACK_CPU | {cpu_fallback_reason}')
-        else:
-            self.device = requested_device
-            self._log(
-                f'OMX_YOLO_TENSORRT_BACKEND | model={cfg.yolo.model_path} '
-                f'device={self.device}; skipping torch CUDA capability fallback'
-            )
-        self.use_half = bool(getattr(cfg.yolo, "half", True)) and self.backend == 'pytorch'
+        self.device, cpu_fallback_reason = _resolve_supported_device(requested_device)
+        if cpu_fallback_reason:
+            self._warn(f'OMX_YOLO_CUDA_FALLBACK_CPU | {cpu_fallback_reason}')
+        self.use_half = bool(getattr(cfg.yolo, "half", True))
         if self.device.lower() in ("cpu", "none", ""):
             self.use_half = False
 
+        YOLO = _import_yolo()
         self.model = YOLO(cfg.yolo.model_path, task="detect")
         self.target_class = cfg.yolo.target_class
         self.class_name = _safe_model_names(self.model).get(
             self.target_class, f"cls_{self.target_class}")
         self._log(f"YOLO 로드: {cfg.yolo.model_path}, "
                   f"클래스 {self.target_class} ({self.class_name}), "
-                  f"backend={self.backend}, device={self.device}, half={self.use_half}")
+                  f"device={self.device}, half={self.use_half}")
 
     def _log(self, msg):
         if self.logger:
