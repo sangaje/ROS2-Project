@@ -107,7 +107,7 @@ def generate_launch_description():
         DeclareLaunchArgument('conf_threshold', default_value='0.25'),
         DeclareLaunchArgument('target_class', default_value='0'),
         DeclareLaunchArgument('camera_hfov_deg', default_value='60.0'),
-        DeclareLaunchArgument('yolo_imgsz', default_value='320'),
+        DeclareLaunchArgument('yolo_imgsz', default_value='960'),
         DeclareLaunchArgument('yolo_max_rate_hz', default_value='1.0'),
         DeclareLaunchArgument('yolo_async', default_value='true'),
         DeclareLaunchArgument('detection_timeout_sec', default_value='2.0'),

@@ -180,7 +180,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             )
         self.device = self.declare_parameter('device', '0').value
         self.conf_threshold = float(self.declare_parameter('conf_threshold', 0.20).value)
-        self.yolo_imgsz = int(self.declare_parameter('yolo_imgsz', 640).value)
+        self.yolo_imgsz = int(self.declare_parameter('yolo_imgsz', 960).value)
         self.yolo_max_rate_hz = float(self.declare_parameter('yolo_max_rate_hz', 3.0).value)
         self.yolo_async = self.declare_bool_parameter('yolo_async', True)
         self.detection_timeout_sec = float(self.declare_parameter('detection_timeout_sec', 0.8).value)

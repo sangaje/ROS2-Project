@@ -31,7 +31,7 @@ bayesian_risk_map_node:
     model_path: "model/target_v3.engine"
     device: "cpu"
     conf_threshold: 0.25
-    yolo_imgsz: 320
+    yolo_imgsz: 960
     yolo_max_rate_hz: 1.0
     detection_timeout_sec: 2.0
     detection_reuse_max_distance_m: 0.50

@@ -828,7 +828,7 @@ def parse_args():
     parser.add_argument('--conf', type=float, default=0.20)
     parser.add_argument('--iou', type=float, default=0.45)
     parser.add_argument('--max-det', type=int, default=64)
-    parser.add_argument('--imgsz', type=int, default=640)
+    parser.add_argument('--imgsz', type=int, default=960)
     parser.add_argument('--debug-jpeg-quality', type=int, default=80)
     parser.add_argument('--max-capture-age-sec', type=float, default=0.8)
     parser.add_argument('--max-queue-wait-sec', type=float, default=0.0)

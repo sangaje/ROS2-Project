@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--width', type=int, default=1280)
     parser.add_argument('--height', type=int, default=720)
     parser.add_argument('--conf', type=float, default=0.25)
-    parser.add_argument('--imgsz', type=int, default=640)
+    parser.add_argument('--imgsz', type=int, default=960)
     parser.add_argument(
         '--class-id', type=int, default=None,
         help='Optional class id filter. Omit to show all classes.',
