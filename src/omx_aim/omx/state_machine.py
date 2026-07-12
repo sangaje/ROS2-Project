@@ -446,6 +446,8 @@ class StateMachine:
             'focus_is_boundary': False,     # H2: 시각화용
             'target_not_found_coord': None, # H3
             'scan_sweep': False,
+            'cancel_navigation': False,
+            'cancel_reason': '',
         }
 
         # 1. nav_result 처리

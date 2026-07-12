@@ -131,6 +131,8 @@ def launch_setup(context, *args, **kwargs):
                 'require_localization_ready': True,
                 'localization_ready_topic': '/localization_ready',
                 'max_pending_goal_age_sec': 300.0,
+                'goal_ack_timeout_sec': 5.0,
+                'cancel_timeout_sec': 3.0,
             }],
         ),
         Node(

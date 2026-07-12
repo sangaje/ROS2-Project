@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import sys
 import heapq
+import json
 import math
 import time
 from typing import Optional
@@ -38,7 +39,7 @@ from rclpy.duration import Duration
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from std_msgs.msg import String, Bool, Float32, Empty, Int32
-from geometry_msgs.msg import Point, PointStamped, PoseStamped, Quaternion, TwistStamped
+from geometry_msgs.msg import Point, PointStamped, PoseStamped, Quaternion
 from sensor_msgs.msg import JointState
 from nav_msgs.msg import OccupancyGrid, Path as NavPath
 from visualization_msgs.msg import Marker, MarkerArray
@@ -261,6 +262,8 @@ class OmxYoloNode(Node):
         # H3 신규
         self.pub_nav_cancel = self.create_publisher(
             Empty, '/omx/nav_cancel', 10)
+        self.pub_nav_goal_meta = self.create_publisher(
+            String, '/omx/nav_goal_meta', 10)
         cancel_qos = QoSProfile(
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
@@ -269,10 +272,6 @@ class OmxYoloNode(Node):
         )
         self.pub_leader_nav_cancel = self.create_publisher(
             Bool, '/fleet/leader_nav_cancel', cancel_qos)
-        self.pub_cmd_vel_nav_stop = self.create_publisher(
-            TwistStamped, '/cmd_vel_nav', 10)
-        self.pub_cmd_vel_stop = self.create_publisher(
-            TwistStamped, '/cmd_vel', 10)
         self.pub_target_not_found = self.create_publisher(
             PointStamped, '/omx/target_not_found', 10)
 
@@ -297,6 +296,8 @@ class OmxYoloNode(Node):
                                  self.on_nav_result, 10)
         self.create_subscription(String, '/waffle/status',
                                  self.on_waffle_status, 10)
+        self.create_subscription(String, '/waffle/nav_goal_ack',
+                                 self.on_waffle_nav_goal_ack, 10)
         if self.require_localization_ready:
             latched_qos = QoSProfile(
                 depth=1,
@@ -330,9 +331,16 @@ class OmxYoloNode(Node):
         self._fire_enable_detection_active = False
         self._fire_enable_republish_sec = 1.0
         self._detection_nav_stop_active = False
+        self._detection_streak = 0
         self._last_detection_cancel_t = -1.0e9
         self._detection_cancel_period_sec = 0.5
         self.waffle_status = "unknown"
+        self.waffle_state = "UNKNOWN"
+        self._nav_goal_seq = 0
+        self._nav_goal_epoch = 0
+        self._active_nav_goal_id = None
+        self._active_nav_publish_count = 0
+        self._active_nav_acked = False
         self._last_nav_retry_t = 0.0
         self._nav_retry_period_sec = 1.0
 
@@ -1031,10 +1039,34 @@ class OmxYoloNode(Node):
 
     def on_nav_result(self, msg: String):
         """H2: waffle_node 가 발행한 Nav2 액션 결과."""
+        self._active_nav_acked = False
+        self._active_nav_goal_id = None
         self.sm.on_nav_result(msg.data)
 
     def on_waffle_status(self, msg: String):
         self.waffle_status = msg.data
+        self.waffle_state = self._parse_waffle_state(msg.data)
+
+    def on_waffle_nav_goal_ack(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+        except (json.JSONDecodeError, TypeError):
+            return
+        goal_id = data.get('goal_id')
+        if goal_id == self._active_nav_goal_id:
+            self._active_nav_acked = True
+            self.waffle_state = str(data.get('state', self.waffle_state)).upper()
+
+    @staticmethod
+    def _parse_waffle_state(raw: str) -> str:
+        text = str(raw or '').strip()
+        if text.startswith('{'):
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                return 'UNKNOWN'
+            return str(data.get('state', 'UNKNOWN')).upper()
+        return text.upper()
 
     def on_localization_ready(self, msg: Bool):
         previous = self.localization_ready
@@ -1183,12 +1215,30 @@ class OmxYoloNode(Node):
         self.get_logger().info(
             "[fire_enable] 조준 확인 중 -> /omx/fire_disable=false 발행")
 
-    def maybe_stop_nav_on_detection(self, detected: bool, now: float) -> bool:
-        """카메라가 표적을 보면 Nav2 이동부터 멈춘다."""
+    def maybe_stop_nav_on_detection(
+        self,
+        detected: bool,
+        error_norm,
+        confidence,
+        now: float,
+    ) -> bool:
+        """Cancel Nav2 only after state-machine-level target confirmation."""
         if not detected:
             self._detection_nav_stop_active = False
+            self._detection_streak = 0
             return False
-        self.publish_detection_stop_cmd()
+        if error_norm is None:
+            self._detection_streak = 0
+            return False
+        self._detection_streak += 1
+        if self.sm.state not in (State.TRACKING, State.CONFIRMING):
+            return False
+        if self._detection_streak < 3:
+            return False
+        if confidence is not None and confidence < float(self.cfg.yolo.conf_threshold):
+            return False
+        if not self._waffle_nav_busy():
+            return False
         should_cancel = (
             not self._detection_nav_stop_active
             or now - self._last_detection_cancel_t >= self._detection_cancel_period_sec
@@ -1201,7 +1251,7 @@ class OmxYoloNode(Node):
         self._last_detection_cancel_t = now
         self._detection_nav_stop_active = True
         self.get_logger().warn(
-            "[detection_stop] 표적 식별 -> Nav2/leader 이동 정지")
+            "[detection_stop] confirmed target -> Nav2/leader cancel")
         return True
 
     def _make_point_stamped(self, coord_map):
@@ -1233,9 +1283,30 @@ class OmxYoloNode(Node):
         self.pub_patrol_complete.publish(Empty())
         self.get_logger().info("[patrol_complete] 발행")
 
-    def publish_nav_goal(self, view_pose):
+    def publish_nav_goal(self, view_pose, *, retry: bool = False):
         """H2: VIEW_POSE 를 PoseStamped 로 발행."""
         x, y, yaw = view_pose
+        if retry and self._active_nav_goal_id is not None:
+            goal_id = self._active_nav_goal_id
+            self._active_nav_publish_count += 1
+        else:
+            self._nav_goal_seq += 1
+            self._nav_goal_epoch += 1
+            goal_id = self._nav_goal_seq
+            self._active_nav_goal_id = goal_id
+            self._active_nav_publish_count = 1
+            self._active_nav_acked = False
+        meta = {
+            'goal_id': goal_id,
+            'goal_epoch': self._nav_goal_epoch,
+            'created_at': time.time(),
+            'goal_type': 'OMX_VIEW_POSE',
+            'pose': {'x': x, 'y': y, 'yaw': yaw},
+            'publish_count': self._active_nav_publish_count,
+        }
+        meta_msg = String()
+        meta_msg.data = json.dumps(meta, sort_keys=True)
+        self.pub_nav_goal_meta.publish(meta_msg)
         msg = PoseStamped()
         msg.header.frame_id = 'map'
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -1248,8 +1319,12 @@ class OmxYoloNode(Node):
         self.pub_nav_goal.publish(msg)
         self._last_nav_retry_t = time.time()
         self.get_logger().info(
-            f"[nav_goal] 발행: ({x:+.2f}, {y:+.2f}) "
-            f"yaw={math.degrees(yaw):+.1f}°")
+            'OMX_NAV_GOAL_CREATED | '
+            f'id={goal_id} epoch={self._nav_goal_epoch} type=OMX_VIEW_POSE '
+            f'pose=({x:.3f},{y:.3f},{yaw:.3f})')
+        self.get_logger().info(
+            'OMX_NAV_GOAL_PUBLISHED | '
+            f'id={goal_id} topic=/omx/nav_goal count={self._active_nav_publish_count}')
         # H3.2: 새 nav 시작 → 옛 nav_result 폐기 (race 방지)
         if self.sm.nav_pending_result is not None:
             self.get_logger().warn(
@@ -1294,14 +1369,6 @@ class OmxYoloNode(Node):
         self.pub_leader_nav_cancel.publish(msg)
         self.get_logger().info("[leader_nav_cancel] 발행")
 
-    def publish_detection_stop_cmd(self):
-        """Force a short zero command so detection immediately halts motion."""
-        msg = TwistStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'base_footprint'
-        self.pub_cmd_vel_nav_stop.publish(msg)
-        self.pub_cmd_vel_stop.publish(msg)
-
     def maybe_retry_waiting_nav_goal(self, now: float):
         """WAITING_NAV 인데 waffle 이 안 움직이면 현재 goal 을 다시 찌른다."""
         if self.sm.state != State.WAITING_NAV:
@@ -1316,8 +1383,11 @@ class OmxYoloNode(Node):
             )
             return
 
-        status = (self.waffle_status or "unknown").lower()
-        if "navigating" in status:
+        if self._waffle_nav_busy():
+            return
+        if self._active_nav_goal_id is not None and self._active_nav_acked:
+            return
+        if self._active_nav_publish_count >= 2:
             return
 
         vp = self.sm._next_hop_pose()
@@ -1328,7 +1398,23 @@ class OmxYoloNode(Node):
         self.get_logger().warn(
             f"[nav_retry] WAITING_NAV but waffle_status={self.waffle_status}; "
             "nav_goal 재발행")
-        self.publish_nav_goal(vp)
+        self.publish_nav_goal(vp, retry=True)
+
+    def _waffle_nav_busy(self) -> bool:
+        busy_states = {
+            'GOAL_RECEIVED',
+            'WAITING_SERVER',
+            'WAITING_LOCALIZATION',
+            'SENDING_GOAL',
+            'WAITING_ACCEPT',
+            'NAVIGATING',
+            'CANCELING',
+        }
+        state = self.waffle_state
+        if state in busy_states:
+            return True
+        status = (self.waffle_status or '').lower()
+        return any(token.lower() in status for token in busy_states)
 
     def publish_target_not_found(self, coord_map):
         """H3: TARGET 좌표에서 scan_timeout 안에 표적 못 찾음."""
@@ -1443,8 +1529,11 @@ class OmxYoloNode(Node):
             detected, error_norm, bbox, conf = self.detector.detect(frame)
 
         now = time.time()
-        stopped_for_detection = self.maybe_stop_nav_on_detection(detected, now)
         action = self.sm.update(detected, error_norm, now)
+        if action.get('cancel_navigation'):
+            self.publish_nav_cancel()
+            self.publish_leader_nav_cancel()
+        self.maybe_stop_nav_on_detection(detected, error_norm, conf, now)
         self.publish_fire_enable_for_aim_state(action, now)
 
         # blocked entries 알림
