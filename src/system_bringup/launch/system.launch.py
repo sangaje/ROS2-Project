@@ -1370,7 +1370,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'yolo_server_model_path',
-            default_value='model/best.pt',
+            default_value='model/target_v3.pt',
             description=(
                 'Leader role only: Ultralytics YOLO checkpoint for '
                 'flask_yolo_server. If the Jetson torch build lacks the '
