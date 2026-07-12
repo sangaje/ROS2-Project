@@ -338,6 +338,32 @@ def test_worker_gate_blocks_recovery_navigation_before_rl_activation():
     assert reason == 'recovery_or_non_scout_role'
 
 
+def test_worker_gate_manual_active_scout_skips_failover_localization_gate():
+    state, reason = evaluate_activation_gate(_gate(
+        role_epoch=0,
+        failover_epoch=1,
+        active_scout_matches=False,
+        failover_state='RECOVERY_NAVIGATING',
+        localization_ready=False,
+        recovery_complete=False,
+        motion_authority='FAILOVER_RECOVERY_NAV',
+        require_failover_activation=False,
+    ))
+
+    assert state == RLWorkerState.ACTIVE
+    assert reason == 'activation_gate_passed'
+
+
+def test_worker_gate_manual_mode_still_requires_active_scout_role():
+    state, reason = evaluate_activation_gate(_gate(
+        role='FOLLOWER',
+        require_failover_activation=False,
+    ))
+
+    assert state == RLWorkerState.RECOVERY_NAVIGATING
+    assert reason == 'recovery_or_non_scout_role'
+
+
 def test_worker_gate_rejects_stale_active_scout_role_epoch():
     state, reason = evaluate_activation_gate(_gate(role_epoch=0, failover_epoch=1))
 

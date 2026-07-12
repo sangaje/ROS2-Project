@@ -110,25 +110,37 @@ def evaluate_activation_gate(gate: GateInputs) -> tuple[RLWorkerState, str]:
     role = gate.role.strip().upper()
     failover_state = gate.failover_state.strip().upper()
     motion_authority = gate.motion_authority.strip().upper()
+    require_failover = gate.require_failover_activation
     if role in ('FAILED',):
         return RLWorkerState.FAILED, 'role_failed'
     if (
         role in ('RECOVERY_NAVIGATING', 'FOLLOWER', 'IDLE')
-        or failover_state in ('RECOVERY_NAVIGATING', 'FAILOVER_TRIGGERED')
-        or motion_authority == 'FAILOVER_RECOVERY_NAV'
+        or (
+            require_failover
+            and (
+                failover_state in ('RECOVERY_NAVIGATING', 'FAILOVER_TRIGGERED')
+                or motion_authority == 'FAILOVER_RECOVERY_NAV'
+            )
+        )
     ):
         return RLWorkerState.RECOVERY_NAVIGATING, 'recovery_or_non_scout_role'
     if role != 'ACTIVE_SCOUT' or not gate.role_robot_matches:
         return RLWorkerState.STANDBY, 'role_not_active_scout'
-    if gate.role_epoch < gate.failover_epoch:
+    if require_failover and gate.role_epoch < gate.failover_epoch:
         return RLWorkerState.STANDBY, 'stale_epoch'
-    if gate.require_failover_activation and not gate.active_scout_matches:
+    if require_failover and not gate.active_scout_matches:
         return RLWorkerState.STANDBY, 'active_scout_id_mismatch'
-    if not gate.localization_ready:
+    if require_failover and not gate.localization_ready:
         return RLWorkerState.WAIT_LOCALIZATION, 'localization_not_ready'
-    if gate.require_failover_activation and not gate.recovery_complete:
+    if require_failover and not gate.recovery_complete:
         return RLWorkerState.WAIT_LOCALIZATION, 'recovery_not_complete'
-    if not gate.nav_goal_inactive or motion_authority not in ('NONE', 'ACTIVE_SCOUT_RL', ''):
+    if (
+        not gate.nav_goal_inactive
+        or (
+            require_failover
+            and motion_authority not in ('NONE', 'ACTIVE_SCOUT_RL', '')
+        )
+    ):
         return RLWorkerState.WAIT_MOTION_RELEASE, 'motion_authority_busy'
     if not gate.model_ready or not gate.sensor_ready or not gate.tf_ready:
         return RLWorkerState.WAIT_SENSOR_READY, 'runtime_inputs_not_ready'
