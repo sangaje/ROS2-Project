@@ -149,8 +149,9 @@ fire:
 # ===========================================================
 autotrack:
   # IDLE 상태에서 카메라가 표적 검출 시 자율 추적 시작?
-  # 안전: 기본 비활성, /omx/arm_enable 또는 'a' 키로 활성화
-  default_armed: false
+  # true: 별도 무장 없이 부팅 즉시 armed 상태로 시작 (탐지 즉시 격발).
+  # /omx/arm_enable 로 언제든 false 로 다시 잠글 수 있음.
+  default_armed: true
   
   # 중복 표적 방지: 처리한 표적 좌표와 비교
   duplicate_threshold_m: 0.5    # 이 거리 안 표적은 중복 간주
