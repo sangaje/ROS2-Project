@@ -9,6 +9,7 @@ role:=leader -> fleet bringup (default fleet_role=leader) + shared-map
 
 import os
 
+import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (
@@ -47,11 +48,25 @@ DEFAULT_FLEET_ROLE = {
     'leader': 'leader',
 }
 
+
+def _tracked_cmd_vel_adapter_enabled(param_file: str) -> bool:
+    if not param_file:
+        return False
+    try:
+        with open(param_file, 'r', encoding='utf-8') as handle:
+            data = yaml.safe_load(handle) or {}
+    except OSError:
+        return False
+    params = data.get('tracked_cmd_vel_adapter', {}).get('ros__parameters', {})
+    return bool(params.get('enabled', False))
+
+
 def generate_launch_description():
     role = LaunchConfiguration('role')
     domain_id = LaunchConfiguration('domain_id')
     main_domain_id = LaunchConfiguration('main_domain_id')
     fleet_role = LaunchConfiguration('fleet_role')
+    leader_hardware_param_file = LaunchConfiguration('leader_hardware_param_file')
     start_robot_bringup = LaunchConfiguration('start_robot_bringup')
     start_nav2 = LaunchConfiguration('start_nav2')
     require_follower_pose = LaunchConfiguration('require_follower_pose')
@@ -201,6 +216,16 @@ def generate_launch_description():
         fleet_launch_path = os.path.join(
             fleet_share, 'launch', FLEET_LAUNCH_FILES[fleet_role_value]
         )
+        leader_hardware_file = ''
+        leader_cmd_vel_topic = '/cmd_vel'
+        if fleet_role_value == 'leader':
+            leader_hardware_file = leader_hardware_param_file.perform(context).strip()
+            if not leader_hardware_file:
+                leader_hardware_file = os.path.join(
+                    fleet_share, 'config', 'tracked_waffle_kinematics.yaml'
+                )
+            if _tracked_cmd_vel_adapter_enabled(leader_hardware_file):
+                leader_cmd_vel_topic = '/cmd_vel_nav'
 
         # Will this scout end up owning its own SLAM (risk map's
         # Cartographer, via start_cartographer:=true + enable_amcl:=false)?
@@ -237,6 +262,7 @@ def generate_launch_description():
             fleet_launch_args['auto_localize'] = (
                 leader_auto_localize.perform(context)
             )
+            fleet_launch_args['hardware_param_file'] = leader_hardware_file
         if fleet_role_value in ('follower', 'member'):
             fleet_launch_args['auto_localize'] = (
                 auto_localize.perform(context)
@@ -618,7 +644,7 @@ def generate_launch_description():
                             'follower_scout_pose_topic': '/burger_pose',
                             'leader_goal_topic': '/fleet/leader_coord_goal',
                             'leader_cancel_topic': '/fleet/leader_nav_cancel',
-                            'cmd_vel_topic': '/cmd_vel',
+                            'cmd_vel_topic': leader_cmd_vel_topic,
                             'use_stamped_cmd_vel': True,
                             'direct_shadow_cmd_vel': launch_bool(
                                 leader_shadow_direct_cmd_vel.perform(context)
@@ -942,6 +968,15 @@ def generate_launch_description():
             choices=['true', 'false'],
         ),
         DeclareLaunchArgument(
+            'leader_hardware_param_file',
+            default_value='',
+            description=(
+                'Leader hardware parameter YAML. Empty uses '
+                'fleet_bringup/config/tracked_waffle_kinematics.yaml; pass '
+                'the stock Waffle YAML only to roll back tracked kinematics.'
+            ),
+        ),
+        DeclareLaunchArgument(
             'start_nav2', default_value='true',
             choices=['true', 'false'],
             description=(
@@ -1259,10 +1294,10 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'leader_shadow_cmd_linear_scale',
-            default_value='3.0',
+            default_value='1.0',
             description=(
-                'Direct /cmd_vel compensation for a loaded leader that only '
-                'achieves a fraction of commanded linear speed.'
+                'Application-level shadow controller scale. Keep at 1.0; '
+                'tracked chassis compensation belongs in tracked_waffle_kinematics.yaml.'
             ),
         ),
         DeclareLaunchArgument(
@@ -1272,8 +1307,8 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'leader_shadow_cmd_max_linear_vel',
-            default_value='0.75',
-            description='Hard cap for compensated direct /cmd_vel linear.x.',
+            default_value='0.22',
+            description='Hard cap for direct shadow-follow linear.x before tracked adapter.',
         ),
         DeclareLaunchArgument(
             'leader_shadow_cmd_max_angular_vel',

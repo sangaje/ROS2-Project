@@ -33,6 +33,18 @@ from fleet_bringup.launch_utils import (
 )
 
 
+def _tracked_cmd_vel_adapter_enabled(param_file: str) -> bool:
+    if not param_file:
+        return False
+    try:
+        with open(param_file, 'r', encoding='utf-8') as handle:
+            data = yaml.safe_load(handle) or {}
+    except OSError:
+        return False
+    params = data.get('tracked_cmd_vel_adapter', {}).get('ros__parameters', {})
+    return bool(params.get('enabled', False))
+
+
 def generate_launch_description():
     package_share = get_package_share_directory('fleet_bringup')
     base_launch = os.path.join(package_share, 'launch', 'base.launch.py')
@@ -73,8 +85,14 @@ def generate_launch_description():
             leader_hardware_param_file = os.path.join(
                 package_share,
                 'config',
-                'turtlebot3_waffle_pi_stamped_cmd_vel.yaml',
+                'tracked_waffle_kinematics.yaml',
             )
+        tracked_adapter_enabled = _tracked_cmd_vel_adapter_enabled(
+            leader_hardware_param_file
+        )
+        leader_cmd_vel_topic = (
+            '/cmd_vel_nav' if tracked_adapter_enabled else '/cmd_vel'
+        )
 
         nav2_params = RewrittenYaml(
             source_file=os.path.join(
@@ -234,7 +252,7 @@ def generate_launch_description():
                         'require_amcl_before_spin': True,
                         'max_scan_age_sec': 1.2,
                         'max_odom_age_sec': 1.2,
-                        'cmd_vel_topic': '/cmd_vel',
+                        'cmd_vel_topic': leader_cmd_vel_topic,
                         'use_stamped_cmd_vel': True,
                         'amcl_pose_topic': '/amcl_pose',
                         'localization_cov_xy_threshold': 1.0,
@@ -664,7 +682,7 @@ def generate_launch_description():
             default_value='',
             description=(
                 'Optional TurtleBot3 hardware params. Empty uses the '
-                'fleet_bringup Waffle Pi stamped /cmd_vel override.'
+                'tracked Waffle kinematics profile.'
             ),
         ),
         DeclareLaunchArgument('leader_initial_x', default_value='0.0'),

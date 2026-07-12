@@ -12,6 +12,7 @@ fleet coordination instead).
 
 import os
 
+import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (
@@ -26,6 +27,18 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 from fleet_bringup.launch_utils import clean_process_environment, launch_bool
+
+
+def _tracked_cmd_vel_adapter_enabled(param_file: str) -> bool:
+    if not param_file:
+        return False
+    try:
+        with open(param_file, 'r', encoding='utf-8') as handle:
+            data = yaml.safe_load(handle) or {}
+    except OSError:
+        return False
+    params = data.get('tracked_cmd_vel_adapter', {}).get('ros__parameters', {})
+    return bool(params.get('enabled', False))
 
 
 def generate_launch_description():
@@ -58,6 +71,13 @@ def generate_launch_description():
                 'resolved Nav2 parameters YAML) -- the caller decides '
                 'which localization params (AMCL vs Cartographer) apply.'
             )
+        hardware_params_file = hardware_param_file.perform(context).strip()
+        adapter_enabled = _tracked_cmd_vel_adapter_enabled(hardware_params_file)
+        command_remappings = (
+            [('cmd_vel', '/cmd_vel_nav'), ('/cmd_vel', '/cmd_vel_nav')]
+            if adapter_enabled
+            else []
+        )
 
         navigation = [
             Node(
@@ -66,6 +86,7 @@ def generate_launch_description():
                 name='controller_server',
                 output='screen',
                 parameters=[params_file],
+                remappings=command_remappings,
                 env=process_env,
             ),
             Node(
@@ -82,6 +103,7 @@ def generate_launch_description():
                 name='behavior_server',
                 output='screen',
                 parameters=[params_file],
+                remappings=command_remappings,
                 env=process_env,
             ),
             Node(
@@ -119,12 +141,23 @@ def generate_launch_description():
         )
 
         actions = []
+        if adapter_enabled:
+            actions.append(Node(
+                package='fleet_bringup',
+                executable='tracked_cmd_vel_adapter',
+                name='tracked_cmd_vel_adapter',
+                output='screen',
+                parameters=[hardware_params_file],
+                env=process_env,
+                respawn=True,
+                respawn_delay=1.0,
+            ))
         if launch_bool(start_robot_bringup.perform(context)):
             robot_launch_args = {
                 'use_sim_time': 'false',
                 'namespace': '',
             }
-            param_file = hardware_param_file.perform(context)
+            param_file = hardware_params_file
             if param_file:
                 # Overrides turtlebot3_bringup's own default hardware
                 # params, e.g. to disable the wheel odometry's own
