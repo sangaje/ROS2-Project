@@ -104,7 +104,7 @@ yolo:
   model_path: model/target_v3.pt
   device: 0                 # Jetson CUDA device. cpu로 강제하려면 "cpu"
   half: true                # CUDA에서 FP16 사용
-  target_class: 1           # TODO: target_v3.pt 클래스 목록 기준으로 재확인 필요
+  target_class: 0           # target_v3.pt 클래스 0 = 표적 (실기 테스트로 확인됨)
   conf_threshold: 0.5        # 0.0~1.0. 낮을수록 더 많이 검출 (오검출 늘어남)
   imgsz: 640                 # 추론 해상도. 320 = 빠름, 640 = 기본, 1280 = 정확
 

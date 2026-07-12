@@ -147,11 +147,11 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         # YOLO
         self.detection_source = str(self.declare_parameter('detection_source', 'local_yolo').value).strip().lower()
         self.external_detection_topic = self.declare_parameter('external_detection_topic', '/risk/yolo_detections').value
-        # Target model contract: project best engine uses 0=ally, 1=enemy/doll.
+        # Target model contract: model/target_v3.pt class 0 is the target.
         # Keep external_person_only declared for backwards-compatible old launch files,
         # but select detections exclusively by the explicit target class below.
         self.external_person_only = self.declare_bool_parameter('external_person_only', False)
-        self.target_class = int(self.declare_parameter('target_class', 1).value)
+        self.target_class = int(self.declare_parameter('target_class', 0).value)
         self.target_label = normalize_label(
             self.declare_parameter('target_label', 'enemy').value
         )
@@ -164,7 +164,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.debug_image_topic = self.declare_parameter('debug_image_topic', '/risk/debug_yolo_image').value
         self.enable_yolo = self.declare_bool_parameter('enable_yolo', True)
         self.model_path = self.declare_parameter(
-            'model_path', 'model/best.engine'
+            'model_path', 'model/target_v3.pt'
         ).value
         self.device = self.declare_parameter('device', 'cpu').value
         self.conf_threshold = float(self.declare_parameter('conf_threshold', 0.20).value)

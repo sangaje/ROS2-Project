@@ -15,7 +15,7 @@ def generate_launch_description():
         DeclareLaunchArgument('host', default_value='0.0.0.0'),
         DeclareLaunchArgument('port', default_value='5005'),
         DeclareLaunchArgument('model_path', default_value='model/target_v3.pt'),
-        DeclareLaunchArgument('target_class', default_value='1'),
+        DeclareLaunchArgument('target_class', default_value='0'),
         DeclareLaunchArgument('device', default_value='0'),
         DeclareLaunchArgument('half', default_value='true'),
         DeclareLaunchArgument('conf', default_value='0.20'),

@@ -1047,13 +1047,14 @@ def generate_launch_description():
                 'needs an interactive terminal.'
             ),
         ),
-        DeclareLaunchArgument('risk_model_path', default_value='model/best.pt'),
+        DeclareLaunchArgument('risk_model_path', default_value='model/target_v3.pt'),
         DeclareLaunchArgument(
             'risk_target_class',
-            default_value='-1',
+            default_value='0',
             description=(
-                'Scout only: target class accepted by the risk map. -1 '
-                'accepts all YOLO classes while debugging best engine class ids.'
+                'Scout only: target class accepted by the risk map. '
+                'model/target_v3.pt class 0 is the target. Use -1 to '
+                'accept all YOLO classes.'
             ),
         ),
         DeclareLaunchArgument(
@@ -1380,10 +1381,11 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'yolo_server_target_class',
-            default_value='all',
+            default_value='0',
             description=(
-                'Leader role only: class id for flask_yolo_server. Use '
-                '"all" to disable class filtering while debugging best engine.'
+                'Leader role only: class id for flask_yolo_server. '
+                'model/target_v3.pt class 0 is the target. Use "all" to '
+                'disable class filtering.'
             ),
         ),
         DeclareLaunchArgument(

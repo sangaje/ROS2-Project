@@ -814,8 +814,8 @@ def parse_args():
     parser.add_argument('--max-capture-age-sec', type=float, default=0.8)
     parser.add_argument('--max-queue-wait-sec', type=float, default=0.0)
     parser.add_argument(
-        '--target-class', type=int, default=1,
-        help='Only infer this class. Project best engine target class is 1.',
+        '--target-class', type=int, default=0,
+        help='Only infer this class. model/target_v3.pt target class is 0.',
     )
     # Backward-compatible aliases for older launch commands.  New launches use
     # --target-class, so the server no longer hard-codes COCO person (class 0).
