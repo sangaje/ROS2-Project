@@ -317,8 +317,6 @@ class OmxYoloNode(Node):
         self._last_fire_enable_t = 0.0
         self._fire_enable_detection_active = False
         self._fire_enable_republish_sec = 1.0
-        self._last_immediate_fire_t = 0.0
-        self._immediate_fire_detection_active = False
         self._detection_nav_stop_active = False
         self.waffle_status = "unknown"
         self._last_nav_retry_t = 0.0
@@ -1128,20 +1126,29 @@ class OmxYoloNode(Node):
     def publish_fire(self):
         self.pub_fire.publish(Empty())
 
-    def publish_fire_enable_if_detected(self, detected: bool, now: float):
-        """Enemy seen -> immediately clear fire_node safety disable.
+    def publish_fire_enable_for_aim_state(self, action: dict, now: float):
+        """Clear fire_node safety only after the target is actually aimed.
 
-        fire_node's actual gate is /omx/fire_disable Bool:
-            false = armed/enabled, true = disabled.
-        Publish on the first frame of each detection streak, then republish
-        slowly while the target remains visible so a late/restarted fire_node
-        still gets armed without flooding its logs.
+        Detection alone must not unlock the GPIO fire path.  The safety lock is
+        cleared while CONFIRMING/FIRING, then re-locked when that aimed window
+        ends.  This keeps the physical fire node aligned with the state machine:
+        TRACKING -> CONFIRMING -> FIRING, never "seen -> fire".
         """
-        if not detected or not self.sm.armed:
-            # Detection alone must never clear the safety lock -- only an
-            # operator-armed system may unlock fire_node. Without this check
-            # a mere YOLO detection would clear /omx/fire_disable even while
-            # DISARMED, making the on-screen arm state non-authoritative.
+        should_enable = (
+            self.sm.armed
+            and (
+                self.sm.state in (State.CONFIRMING, State.FIRING)
+                or action.get('action') == 'fire'
+            )
+        )
+
+        if not should_enable:
+            if self._fire_enable_detection_active:
+                msg = Bool()
+                msg.data = True
+                self.pub_fire_disable.publish(msg)
+                self.get_logger().info(
+                    "[fire_enable] 조준/격발 창 종료 -> /omx/fire_disable=true")
             self._fire_enable_detection_active = False
             return
 
@@ -1158,48 +1165,7 @@ class OmxYoloNode(Node):
         self._last_fire_enable_t = now
         self._fire_enable_detection_active = True
         self.get_logger().info(
-            "[fire_enable] 적 식별 -> /omx/fire_disable=false 발행")
-
-    def maybe_fire_immediately_on_detection(self, detected: bool,
-                                            now: float) -> bool:
-        fire_cfg = self.cfg.fire
-        if not detected:
-            self._immediate_fire_detection_active = False
-            return False
-
-        if fire_cfg is None or not fire_cfg.immediate_on_detection:
-            return False
-        if self.paused:
-            return False
-        if fire_cfg.immediate_requires_armed and not self.sm.armed:
-            return False
-        if self.sm.state in (State.FIRING, State.COOLDOWN):
-            self._immediate_fire_detection_active = True
-            return False
-        if self._immediate_fire_detection_active:
-            return False
-        if now - self._last_immediate_fire_t < fire_cfg.immediate_min_interval_sec:
-            return False
-
-        navigating = self.sm._is_waffle_navigating()
-        if navigating and not fire_cfg.immediate_during_nav:
-            return False
-
-        if not self.sm.force_fire_now(
-                now,
-                cancel_nav=(navigating and fire_cfg.immediate_cancel_nav),
-                reason="immediate_detection"):
-            return False
-
-        self.publish_fire()
-        self.ctrl.fire()
-        self.publish_processed(None)
-        self._last_immediate_fire_t = now
-        self._immediate_fire_detection_active = True
-        self.get_logger().info(
-            "[immediate_fire] 적 식별 즉시 격발"
-            + (" (Nav2 cancel)" if navigating else ""))
-        return True
+            "[fire_enable] 조준 확인 중 -> /omx/fire_disable=false 발행")
 
     def maybe_stop_nav_on_detection(self, detected: bool) -> bool:
         """카메라가 표적을 보면 Nav2 이동부터 멈춘다."""
@@ -1439,11 +1405,9 @@ class OmxYoloNode(Node):
             detected, error_norm, bbox, conf = self.detector.detect(frame)
 
         now = time.time()
-        self.publish_fire_enable_if_detected(detected, now)
         stopped_for_detection = self.maybe_stop_nav_on_detection(detected)
-        if not stopped_for_detection:
-            self.maybe_fire_immediately_on_detection(detected, now)
         action = self.sm.update(detected, error_norm, now)
+        self.publish_fire_enable_for_aim_state(action, now)
 
         # blocked entries 알림
         for entry in action.get('blocked_entries', []):

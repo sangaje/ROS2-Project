@@ -98,8 +98,9 @@ class FireConfig:
     # COOLDOWN 진입 후 이 시간이 지나야 home 명령이 발사됨.
     # cooldown_sec 보다 작아야 home 이 실행됨.
     fire_pulse_sec: float = 1.5
-    # 카메라가 적을 식별한 즉시 격발한다. Boundary/Nav2 처리보다 우선한다.
-    immediate_on_detection: bool = True
+    # Legacy config compatibility only. Runtime ignores immediate fire and
+    # always requires TRACKING -> CONFIRMING -> FIRING.
+    immediate_on_detection: bool = False
     immediate_during_nav: bool = True
     immediate_cancel_nav: bool = True
     immediate_min_interval_sec: float = 1.0

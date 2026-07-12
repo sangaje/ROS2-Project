@@ -133,17 +133,9 @@ fire:
   cooldown_sec: 3.0
   lost_timeout_sec: 1.5
 
-  # 적 식별 즉시 격발. Boundary scan/Nav2 이동 중이어도 적 탐지가 최우선.
-  # immediate_requires_armed 는 반드시 true 여야 한다 -- false 면 DISARMED
-  # 상태에서도 탐지 즉시 force_fire_now()가 COOLDOWN 으로 강제 진입시켜서
-  # (a) 화면상 "DISARMED"가 실제 안전 상태와 무관해지고, (b) COOLDOWN 동안
-  # yolo_node.loop() 가 detect() 자체를 스킵하므로 표적이 화면에 그대로
-  # 있어도 한 프레임만 잡히고 그 뒤로는 안 잡히는 것처럼 보인다.
-  immediate_on_detection: true
-  immediate_during_nav: true
-  immediate_cancel_nav: true
-  immediate_min_interval_sec: 1.0
-  immediate_requires_armed: true
+  # 탐지 즉시 격발 경로는 사용하지 않는다. 표적이 보이면 TRACKING 으로 들어가
+  # IBVS 로 조준하고, deadband 안에서 hold_time_sec 동안 유지된 뒤
+  # CONFIRMING -> FIRING 으로만 격발한다.
 # ===========================================================
 # Auto-track (자율 검출)
 # ===========================================================
