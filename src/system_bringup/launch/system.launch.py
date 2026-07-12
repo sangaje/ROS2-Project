@@ -1015,13 +1015,12 @@ def generate_launch_description():
             ),
         ),
         DeclareLaunchArgument(
-            'leader_auto_localize', default_value='false',
+            'leader_auto_localize', default_value='true',
             choices=['true', 'false'],
             description=(
                 'Leader fleet_role only: enable AMCL scout-pose seed plus '
-                'verified in-place spin. Default false keeps the leader '
-                'map pose anchored to leader_initial_x/y/yaw while the '
-                'robot is standing still.'
+                'verified in-place spin. Default true forces the leader to '
+                'turn in place once before Nav2/fleet goals are allowed.'
             ),
         ),
         DeclareLaunchArgument(

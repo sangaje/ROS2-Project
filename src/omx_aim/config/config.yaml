@@ -131,7 +131,9 @@ fire:
   # 격발 후 cooldown (FIRING 진입 후 총 휴지 시간)
   # 흐름: fire_pulse_sec 동안 조준 유지 → home 이동 → 나머지 시간 휴지 → IDLE
   cooldown_sec: 3.0
-  lost_timeout_sec: 1.5
+  # 표적이 잠깐 사라져도 바로 scan_sweep 로 복귀하지 않고, 현재 조준 자세를
+  # 유지하며 재검출을 기다린다.
+  lost_timeout_sec: 4.0
 
   # 탐지 즉시 격발 경로는 사용하지 않는다. 표적이 보이면 TRACKING 으로 들어가
   # IBVS 로 조준하고, deadband 안에서 hold_time_sec 동안 유지된 뒤

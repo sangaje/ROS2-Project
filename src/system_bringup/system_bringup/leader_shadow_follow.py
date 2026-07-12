@@ -78,6 +78,8 @@ class LeaderShadowFollow(Node):
         self.declare_parameter('follower_robot_name', 'follower21')
         self.declare_parameter('require_localization_ready', True)
         self.declare_parameter('localization_ready_topic', '/localization_ready')
+        self.declare_parameter('target_detected_topic', '/omx/target_detected')
+        self.declare_parameter('target_detected_stop_hold_sec', 1.0)
         self.declare_parameter('scout_pose_timeout_sec', 2.5)
         self.declare_parameter('startup_grace_sec', 8.0)
 
@@ -134,6 +136,10 @@ class LeaderShadowFollow(Node):
         self.follower_robot_name = str(get('follower_robot_name').value)
         self.require_localization_ready = bool(get('require_localization_ready').value)
         self.localization_ready_topic = str(get('localization_ready_topic').value)
+        self.target_detected_topic = str(get('target_detected_topic').value)
+        self.target_stop_hold = max(
+            0.1, float(get('target_detected_stop_hold_sec').value)
+        )
         self.scout_pose_timeout = max(0.2, float(get('scout_pose_timeout_sec').value))
         self.startup_grace = max(0.0, float(get('startup_grace_sec').value))
 
@@ -215,6 +221,12 @@ class LeaderShadowFollow(Node):
                 self._on_localization_ready,
                 latched_qos,
             )
+        self.create_subscription(
+            Bool,
+            self.target_detected_topic,
+            self._on_target_detected,
+            10,
+        )
         if self.scan_enabled:
             self.create_subscription(LaserScan, self.scan_topic, self._on_scan, 10)
 
@@ -227,6 +239,8 @@ class LeaderShadowFollow(Node):
         self.active_scout_id = self.original_scout_id
         self.failover_state = 'NORMAL_OPERATION'
         self.localization_ready = not self.require_localization_ready
+        self.target_detected = False
+        self.target_detected_wall = -1.0e9
         self.leader_pose: Optional[PoseStamped] = None
         self.original_scout_pose: Optional[PoseStamped] = None
         self.follower_scout_pose: Optional[PoseStamped] = None
@@ -321,6 +335,11 @@ class LeaderShadowFollow(Node):
                 f'[LEADER_SHADOW] LOCALIZATION_READY | topic={self.localization_ready_topic}'
             )
 
+    def _on_target_detected(self, msg: Bool) -> None:
+        self.target_detected = bool(msg.data)
+        if self.target_detected:
+            self.target_detected_wall = self._now()
+
     def _on_scan(self, msg: LaserScan) -> None:
         self.last_scan_wall = self._now()
         stamp = msg.header.stamp
@@ -343,6 +362,15 @@ class LeaderShadowFollow(Node):
             self.mode = LeaderMode.IDLE
             self._set_controller_speed_limit(False)
             self._publish_state('waiting_localization_ready')
+            return
+        if self._now() - self.target_detected_wall <= self.target_stop_hold:
+            self._cancel_shadow_goal('target_detected')
+            self._stop_direct_cmd('target_detected')
+            self._publish_twist(0.0, 0.0)
+            self.shadow_active = False
+            self.mode = LeaderMode.IDLE
+            self._set_controller_speed_limit(False)
+            self._publish_state('target_detected_hold')
             return
         if not self._failover_allows_shadow():
             self._stop_shadow_for_failover()

@@ -59,8 +59,8 @@ tracked_cmd_vel_adapter:
     max_linear_velocity: 0.22
     max_angular_velocity: 0.9
 
-    max_linear_acceleration: 0.20
-    max_angular_acceleration: 0.8
+    max_linear_acceleration: 0.16
+    max_angular_acceleration: 0.6
 
     command_timeout_sec: 0.5
     control_rate_hz: 30.0

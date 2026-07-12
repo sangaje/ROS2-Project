@@ -472,19 +472,21 @@ class StateMachine:
         detection_preempted_nav = (
             detected
             and error_norm is not None
-            and self._is_waffle_navigating()
-            and self.state not in (State.FIRING, State.COOLDOWN)
+            and self.state
+            not in (State.TRACKING, State.CONFIRMING, State.FIRING, State.COOLDOWN)
         )
         if detection_preempted_nav:
             self.boundary_queue.clear()
             self.current_focus = None
             self.nav_waypoints = []
             self.nav_final_view_pose = None
-            self.pending_cancel_for_preempt = True
+            self.pending_cancel_for_preempt = self._is_waffle_navigating()
+            self.confirm_progress = 0.0
+            self.lost_start_t = 0.0
             action['action'] = 'track'
             action['error'] = error_norm
             self.transition(State.TRACKING)
-            self._log("카메라 탐지: Nav 작업 중단 -> 즉시 TRACKING")
+            self._log("카메라 탐지: 기존 작업 중단 -> 즉시 PD TRACKING")
 
         # 2. State 분기
         elif self.state == State.IDLE:

@@ -259,7 +259,7 @@ def generate_launch_description():
                         'localization_cov_yaw_threshold': 0.8,
                         'localization_stable_duration_sec': 2.5,
                         'localization_check_timeout_sec': 9.0,
-                        'max_spin_retries': 0,
+                        'max_spin_retries': 2,
                         'force_spin_after_sec': 14.0,
                     }],
                     env=process_env,
@@ -657,13 +657,13 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'auto_localize',
-            default_value='false',
+            default_value='true',
             choices=['true', 'false'],
             description=(
                 'Only used when enable_cartographer:=false. Let AMCL '
                 'start from a one-shot scout-pose /initialpose seed when '
                 'available, then refine via verified in-place spin. Default '
-                'false keeps a stationary leader on its fixed initial pose.'
+                'true forces a startup spin before Nav2/fleet goals.'
             ),
         ),
         DeclareLaunchArgument(

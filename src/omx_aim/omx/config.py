@@ -92,7 +92,7 @@ class FireConfig:
     gripper_close_duration: float
     gripper_open_duration: float
     cooldown_sec: float
-    lost_timeout_sec: float = 1.5
+    lost_timeout_sec: float = 4.0
     aim_settle_sec: float = 0.7
     # 격발 펄스 동안 조준 유지 시간. fire_node 의 fire_duration_sec 와 일치 권장.
     # COOLDOWN 진입 후 이 시간이 지나야 home 명령이 발사됨.
