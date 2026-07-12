@@ -417,9 +417,20 @@ def _validate_model_path(model_path):
     path = Path(str(model_path)).expanduser()
     if not path.is_file():
         raise FileNotFoundError(f'YOLO model not found: {path}')
+    suffix = path.suffix.lower()
+    if suffix == '.pt':
+        raise ValueError(
+            f'PyTorch YOLO checkpoints are not allowed at runtime: {path}. '
+            'Export and launch with model/target_v3.engine instead.'
+        )
+    if suffix not in ('.engine', '.plan'):
+        raise ValueError(
+            f'YOLO runtime model must be a TensorRT .engine/.plan file, got: {path}'
+        )
+    return path
 
 
-def _resolve_inference_device(requested):
+def _resolve_inference_device(requested, model_path):
     """Return a CUDA device only when this torch build supports its CC.
 
     Jetson Orin is compute capability 8.7.  A PyTorch build lacking ``sm_87``
@@ -428,6 +439,11 @@ def _resolve_inference_device(requested):
     keeps the HTTP stream and dashboard responsive.
     """
     requested = _normalize_device(requested)
+    suffix = Path(str(model_path)).suffix.lower()
+    if suffix in ('.engine', '.plan'):
+        if requested.lower() in ('cpu', 'none', ''):
+            raise ValueError('TensorRT YOLO engines require a CUDA device, not cpu.')
+        return requested, None
     if requested.lower() in ('cpu', 'none', ''):
         return 'cpu', None
     if not requested.lower().startswith('cuda'):
@@ -481,13 +497,16 @@ def build_app(args):
     from ultralytics import YOLO
 
     app = Flask(__name__)
-    args.device, cpu_fallback_reason = _resolve_inference_device(args.device)
+    _validate_model_path(args.model_path)
+    args.device, cpu_fallback_reason = _resolve_inference_device(
+        args.device,
+        args.model_path,
+    )
     if cpu_fallback_reason:
         print(
             '[flask_yolo_server] CUDA_FALLBACK_CPU | '
             f'{cpu_fallback_reason}', flush=True,
         )
-    _validate_model_path(args.model_path)
     model = YOLO(args.model_path, task='detect')
     use_half = bool(args.half) and str(args.device).lower() not in ('cpu', 'none', '')
     warmup_ms = -1.0
@@ -803,7 +822,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--port', type=int, default=5005)
-    parser.add_argument('--model-path', default='model/target_v3.pt')
+    parser.add_argument('--model-path', default='model/target_v3.engine')
     parser.add_argument('--device', default='0')
     parser.add_argument('--half', type=as_bool, default=True)
     parser.add_argument('--conf', type=float, default=0.20)
@@ -815,7 +834,7 @@ def parse_args():
     parser.add_argument('--max-queue-wait-sec', type=float, default=0.0)
     parser.add_argument(
         '--target-class', type=int, default=0,
-        help='Only infer this class. model/target_v3.pt target class is 0.',
+        help='Only infer this class. model/target_v3 target class is 0.',
     )
     # Backward-compatible aliases for older launch commands.  New launches use
     # --target-class, so the server no longer hard-codes COCO person (class 0).

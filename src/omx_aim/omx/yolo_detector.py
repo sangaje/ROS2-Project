@@ -1,6 +1,6 @@
 """YOLO 기반 표적 검출.
 
-OpenCV VideoCapture + Ultralytics YOLO (.pt checkpoint). ROS 의존성 없음.
+OpenCV VideoCapture + Ultralytics YOLO TensorRT engine. ROS 의존성 없음.
 """
 
 from __future__ import annotations
@@ -62,11 +62,29 @@ def _import_yolo():
         ) from exc
 
 
-def _resolve_supported_device(requested: str) -> tuple[str, str | None]:
+def _validate_runtime_model_path(model_path: str) -> None:
+    suffix = os.path.splitext(str(model_path))[1].lower()
+    if suffix == ".pt":
+        raise ValueError(
+            f"PyTorch YOLO checkpoints are not allowed at runtime: {model_path}. "
+            "Export and launch with model/target_v3.engine instead."
+        )
+    if suffix not in (".engine", ".plan"):
+        raise ValueError(
+            f"YOLO runtime model must be a TensorRT .engine/.plan file, got: {model_path}"
+        )
+
+
+def _resolve_supported_device(requested: str, model_path: str) -> tuple[str, str | None]:
     """Prevent an unsupported Jetson CUDA binary from killing OMX video."""
     device = str(requested).strip()
     if device.isdigit():
         device = f'cuda:{device}'
+    suffix = os.path.splitext(str(model_path))[1].lower()
+    if suffix in (".engine", ".plan"):
+        if device.lower() in ("cpu", "none", ""):
+            raise ValueError("TensorRT YOLO engines require a CUDA device, not cpu.")
+        return device, None
     if device.lower() in ('cpu', 'none', ''):
         return 'cpu', None
     if not device.lower().startswith('cuda'):
@@ -115,7 +133,11 @@ class YoloDetector:
             "OMX_YOLO_DEVICE",
             getattr(cfg.yolo, "device", "0"),
         )).strip()
-        self.device, cpu_fallback_reason = _resolve_supported_device(requested_device)
+        _validate_runtime_model_path(cfg.yolo.model_path)
+        self.device, cpu_fallback_reason = _resolve_supported_device(
+            requested_device,
+            cfg.yolo.model_path,
+        )
         if cpu_fallback_reason:
             self._warn(f'OMX_YOLO_CUDA_FALLBACK_CPU | {cpu_fallback_reason}')
         self.use_half = bool(getattr(cfg.yolo, "half", True))

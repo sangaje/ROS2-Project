@@ -308,25 +308,26 @@ def load_config(path=None):
                     yolo_cfg.model_path = str(candidate.resolve())
                     break
             else:
-                # Keep known Ultralytics model names unresolved so the library
-                # can use its normal cache/download path. Custom models should
-                # fail early with a useful path list instead of dying later.
-                known_ultralytics = {
-                    "yolo11n.pt", "yolo11s.pt", "yolo11m.pt",
-                    "yolo11l.pt", "yolo11x.pt",
-                    "yolov8n.pt", "yolov8s.pt", "yolov8m.pt",
-                    "yolov8l.pt", "yolov8x.pt",
-                }
-                if model_path.name not in known_ultralytics:
-                    searched = "\n".join(f"  - {c}" for c in candidates)
-                    raise FileNotFoundError(
-                        "YOLO model file not found. Set OMX_YOLO_MODEL_PATH "
-                        f"to an absolute .engine/.pt path, or place {model_path.name} "
-                        f"in one of:\n{searched}"
-                    )
-                yolo_cfg.model_path = model_path.name
+                searched = "\n".join(f"  - {c}" for c in candidates)
+                raise FileNotFoundError(
+                    "YOLO TensorRT engine file not found. Set OMX_YOLO_MODEL_PATH "
+                    f"to an absolute .engine/.plan path, or place {model_path.name} "
+                    f"in one of:\n{searched}"
+                )
         else:
             yolo_cfg.model_path = str(model_path)
+
+        suffix = Path(str(yolo_cfg.model_path)).suffix.lower()
+        if suffix == ".pt":
+            raise ValueError(
+                "PyTorch YOLO checkpoints are not allowed at runtime. "
+                "Use model/target_v3.engine."
+            )
+        if suffix not in (".engine", ".plan"):
+            raise ValueError(
+                "YOLO runtime model must be a TensorRT .engine/.plan file, "
+                f"got: {yolo_cfg.model_path}"
+            )
 
     camera_index_override = os.environ.get("OMX_YOLO_CAMERA_INDEX", "").strip()
     if camera_index_override:

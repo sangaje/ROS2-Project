@@ -9,7 +9,7 @@ line.
 
 Example:
   python3 tools/omx_camera_yolo_dashboard.py --camera /dev/video0 \
-      --model model/target_v3.pt --device 0 --port 8082
+      --model model/target_v3.engine --device 0 --port 8082
 
 Then open http://<jetson-host>:8082/ in a browser.
 """
@@ -24,7 +24,7 @@ from pathlib import Path
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', default='model/target_v3.pt')
+    parser.add_argument('--model', default='model/target_v3.engine')
     parser.add_argument('--camera', default='/dev/video0')
     parser.add_argument('--width', type=int, default=1280)
     parser.add_argument('--height', type=int, default=720)
@@ -101,6 +101,12 @@ class InferenceLoop:
             model_path = Path.cwd() / model_path
         if not model_path.exists():
             self._set_error(f'model not found: {model_path}')
+            return
+        if model_path.suffix.lower() == '.pt':
+            self._set_error('PyTorch .pt models are not allowed; use target_v3.engine.')
+            return
+        if model_path.suffix.lower() not in ('.engine', '.plan'):
+            self._set_error(f'expected TensorRT .engine/.plan model, got {model_path}')
             return
 
         print(f'OMX_CAMERA_YOLO_TEST | loading model {model_path}', flush=True)

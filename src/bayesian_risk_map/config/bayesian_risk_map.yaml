@@ -22,13 +22,13 @@ bayesian_risk_map_node:
     # flask_topic: do not subscribe ROS Image; consume compact JSON detections from Flask bridge.
     detection_source: "local_yolo"
     external_detection_topic: "/risk/yolo_detections"
-    # Project model/target_v3.pt target class.
+    # Project model/target_v3 target class.
     target_class: 0
     target_label: "enemy"
     target_label_aliases: ["enemy", "doll", "target"]
     external_person_only: false  # Legacy parameter; target_class is used instead.
     enable_yolo: true
-    model_path: "model/target_v3.pt"
+    model_path: "model/target_v3.engine"
     device: "cpu"
     conf_threshold: 0.25
     yolo_imgsz: 320

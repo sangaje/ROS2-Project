@@ -16,7 +16,7 @@ setup(
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
         (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
         (os.path.join('share', package_name, 'models'), (
-            glob('models/*.pt') + glob('models/*.engine') + glob('models/*.plan')
+            glob('models/*.engine') + glob('models/*.plan')
         )),
     ],
     package_data={

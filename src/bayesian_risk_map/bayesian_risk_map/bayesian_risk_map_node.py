@@ -6,6 +6,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -147,7 +148,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         # YOLO
         self.detection_source = str(self.declare_parameter('detection_source', 'local_yolo').value).strip().lower()
         self.external_detection_topic = self.declare_parameter('external_detection_topic', '/risk/yolo_detections').value
-        # Target model contract: model/target_v3.pt class 0 is the target.
+        # Target model contract: model/target_v3 class 0 is the target.
         # Keep external_person_only declared for backwards-compatible old launch files,
         # but select detections exclusively by the explicit target class below.
         self.external_person_only = self.declare_bool_parameter('external_person_only', False)
@@ -164,9 +165,20 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.debug_image_topic = self.declare_parameter('debug_image_topic', '/risk/debug_yolo_image').value
         self.enable_yolo = self.declare_bool_parameter('enable_yolo', True)
         self.model_path = self.declare_parameter(
-            'model_path', 'model/target_v3.pt'
+            'model_path', 'model/target_v3.engine'
         ).value
-        self.device = self.declare_parameter('device', 'cpu').value
+        model_suffix = Path(str(self.model_path)).suffix.lower()
+        if model_suffix == '.pt':
+            raise ValueError(
+                'PyTorch YOLO checkpoints are not allowed at runtime. '
+                'Use model/target_v3.engine.'
+            )
+        if model_suffix not in ('.engine', '.plan'):
+            raise ValueError(
+                'YOLO runtime model must be a TensorRT .engine/.plan file, '
+                f'got: {self.model_path}'
+            )
+        self.device = self.declare_parameter('device', '0').value
         self.conf_threshold = float(self.declare_parameter('conf_threshold', 0.20).value)
         self.yolo_imgsz = int(self.declare_parameter('yolo_imgsz', 640).value)
         self.yolo_max_rate_hz = float(self.declare_parameter('yolo_max_rate_hz', 3.0).value)

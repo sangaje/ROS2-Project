@@ -1047,13 +1047,13 @@ def generate_launch_description():
                 'needs an interactive terminal.'
             ),
         ),
-        DeclareLaunchArgument('risk_model_path', default_value='model/target_v3.pt'),
+        DeclareLaunchArgument('risk_model_path', default_value='model/target_v3.engine'),
         DeclareLaunchArgument(
             'risk_target_class',
             default_value='0',
             description=(
                 'Scout only: target class accepted by the risk map. '
-                'model/target_v3.pt class 0 is the target. Use -1 to '
+                'model/target_v3 class 0 is the target. Use -1 to '
                 'accept all YOLO classes.'
             ),
         ),
@@ -1371,12 +1371,11 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'yolo_server_model_path',
-            default_value='model/target_v3.pt',
+            default_value='model/target_v3.engine',
             description=(
-                'Leader role only: Ultralytics YOLO checkpoint for '
-                'flask_yolo_server. If the Jetson torch build lacks the '
-                'sm_87 CUDA kernel, it falls back to CPU automatically '
-                '(see CUDA_FALLBACK_CPU log) rather than failing.'
+                'Leader role only: YOLO TensorRT engine for '
+                'flask_yolo_server. Create model/target_v3.engine on the '
+                'Jetson before launching.'
             ),
         ),
         DeclareLaunchArgument(
@@ -1384,7 +1383,7 @@ def generate_launch_description():
             default_value='0',
             description=(
                 'Leader role only: class id for flask_yolo_server. '
-                'model/target_v3.pt class 0 is the target. Use "all" to '
+                'model/target_v3 class 0 is the target. Use "all" to '
                 'disable class filtering.'
             ),
         ),
