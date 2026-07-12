@@ -209,7 +209,11 @@ def test_original_active_status_does_not_disarm_normal_watchdog():
     node._on_field_status(_string({
         'robot': 'scout22',
         'epoch': 0,
-        'status': 'ACTIVE_SCOUT',
+        'status': 'ACTIVE_SCOUT_READY',
+        'active_scout_ready': True,
+        'recovery_complete': True,
+        'localization_ready': True,
+        'motion_authority': 'NONE',
     }))
 
     assert node.state == FailoverState.NORMAL_OPERATION
@@ -224,19 +228,34 @@ def test_only_current_epoch_follower_completes_valid_takeover_once():
 
     # Reconnecting original scout, stale follower, and malformed status are ignored.
     node._on_field_status(_string({
-        'robot': 'scout22', 'epoch': 2, 'status': 'ACTIVE_SCOUT'
+        'robot': 'scout22', 'epoch': 2, 'status': 'ACTIVE_SCOUT_READY',
+        'active_scout_ready': True, 'recovery_complete': True,
+        'localization_ready': True, 'motion_authority': 'NONE',
     }))
     node._on_field_status(_string({
-        'robot': 'follower21', 'epoch': 1, 'status': 'ACTIVE_SCOUT'
+        'robot': 'follower21', 'epoch': 1, 'status': 'ACTIVE_SCOUT_READY',
+        'active_scout_ready': True, 'recovery_complete': True,
+        'localization_ready': True, 'motion_authority': 'NONE',
     }))
     node._on_field_status(_string({
-        'robot': 'follower21', 'epoch': 2.0, 'status': 'ACTIVE_SCOUT'
+        'robot': 'follower21', 'epoch': 2.0, 'status': 'ACTIVE_SCOUT_READY',
+        'active_scout_ready': True, 'recovery_complete': True,
+        'localization_ready': True, 'motion_authority': 'NONE',
     }))
     assert node.state == FailoverState.FOLLOWER_SCOUT_TAKEOVER
     assert node.active_scout_id == 'scout22'
 
     completion = _string({
-        'robot': 'follower21', 'epoch': 2, 'status': 'ACTIVE_SCOUT'
+        'robot': 'follower21',
+        'epoch': 2,
+        'status': 'ACTIVE_SCOUT_READY',
+        'active_scout_ready': True,
+        'recovery_complete': True,
+        'localization_ready': True,
+        'motion_authority': 'NONE',
+        'nav_goal_active': False,
+        'pending_goal_count': 0,
+        'active_goal_count': 0,
     })
     node._on_field_status(completion)
     node._on_field_status(completion)
@@ -254,7 +273,13 @@ def test_follower_completion_is_rejected_before_takeover_state():
     node.state = FailoverState.RECOVERY_NAVIGATING
 
     node._on_field_status(_string({
-        'robot': 'follower21', 'epoch': 1, 'status': 'ACTIVE_SCOUT'
+        'robot': 'follower21',
+        'epoch': 1,
+        'status': 'ACTIVE_SCOUT_READY',
+        'active_scout_ready': True,
+        'recovery_complete': True,
+        'localization_ready': True,
+        'motion_authority': 'NONE',
     }))
 
     assert node.state == FailoverState.RECOVERY_NAVIGATING

@@ -19,6 +19,12 @@ def generate_launch_description():
     robot_name = LaunchConfiguration('robot_name')
     role_topic = LaunchConfiguration('role_topic')
     initial_role_active = LaunchConfiguration('initial_role_active')
+    failover_state_topic = LaunchConfiguration('failover_state_topic')
+    active_scout_id_topic = LaunchConfiguration('active_scout_id_topic')
+    scout_epoch_topic = LaunchConfiguration('scout_epoch_topic')
+    localization_ready_topic = LaunchConfiguration('localization_ready_topic')
+    field_robot_status_topic = LaunchConfiguration('field_robot_status_topic')
+    require_failover_activation = LaunchConfiguration('require_failover_activation')
     cmd_vel_topic = LaunchConfiguration('cmd_vel_topic')
     use_stamped_cmd_vel = LaunchConfiguration('use_stamped_cmd_vel')
     enable_velocity_safety_filter = LaunchConfiguration(
@@ -43,9 +49,40 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'initial_role_active',
+            default_value='false',
+            choices=['true', 'false'],
+            description='Debug only: start inference without the failover activation gate.',
+        ),
+        DeclareLaunchArgument(
+            'failover_state_topic',
+            default_value='/failover/state',
+            description='Latched failover state topic used by the activation gate.',
+        ),
+        DeclareLaunchArgument(
+            'active_scout_id_topic',
+            default_value='/failover/active_scout_id',
+            description='Latched active scout owner topic used by the activation gate.',
+        ),
+        DeclareLaunchArgument(
+            'scout_epoch_topic',
+            default_value='/failover/scout_epoch',
+            description='Latched scout ownership epoch topic.',
+        ),
+        DeclareLaunchArgument(
+            'localization_ready_topic',
+            default_value='/localization_ready',
+            description='Localization readiness topic for this robot domain.',
+        ),
+        DeclareLaunchArgument(
+            'field_robot_status_topic',
+            default_value='/fleet/field_robot_status',
+            description='Field robot status topic carrying motion authority state.',
+        ),
+        DeclareLaunchArgument(
+            'require_failover_activation',
             default_value='true',
             choices=['true', 'false'],
-            description='Start inference immediately instead of waiting for ACTIVE_SCOUT.',
+            description='Require active scout id, epoch, localization and motion-release gates.',
         ),
         DeclareLaunchArgument(
             'cmd_vel_topic',
@@ -80,6 +117,15 @@ def generate_launch_description():
                 'role_topic': role_topic,
                 'initial_role_active': ParameterValue(
                     initial_role_active,
+                    value_type=bool,
+                ),
+                'failover_state_topic': failover_state_topic,
+                'active_scout_id_topic': active_scout_id_topic,
+                'scout_epoch_topic': scout_epoch_topic,
+                'localization_ready_topic': localization_ready_topic,
+                'field_robot_status_topic': field_robot_status_topic,
+                'require_failover_activation': ParameterValue(
+                    require_failover_activation,
                     value_type=bool,
                 ),
                 'cmd_vel_topic': cmd_vel_topic,

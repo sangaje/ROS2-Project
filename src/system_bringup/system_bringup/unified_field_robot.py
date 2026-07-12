@@ -129,6 +129,8 @@ class UnifiedFieldRobot(Node):
         self.declare_parameter('movement_start_samples', 3)
         self.declare_parameter('max_recovery_nav_retries', 3)
         self.declare_parameter('recovery_nav_retry_sec', 1.0)
+        self.declare_parameter('recovery_stop_linear_epsilon_mps', 0.03)
+        self.declare_parameter('recovery_stop_angular_epsilon_radps', 0.08)
         self.declare_parameter('max_xy_covariance', 0.22)
         self.declare_parameter('max_yaw_covariance', 0.16)
         self.declare_parameter('max_amcl_pose_age_sec', 3.0)
@@ -180,6 +182,12 @@ class UnifiedFieldRobot(Node):
         self.recovery_nav_retry_sec = max(
             0.1, float(get('recovery_nav_retry_sec').value)
         )
+        self.recovery_stop_linear_epsilon = max(
+            0.0, float(get('recovery_stop_linear_epsilon_mps').value)
+        )
+        self.recovery_stop_angular_epsilon = max(
+            0.0, float(get('recovery_stop_angular_epsilon_radps').value)
+        )
         self.max_xy_cov = max(0.0, float(get('max_xy_covariance').value))
         self.max_yaw_cov = max(0.0, float(get('max_yaw_covariance').value))
         self.max_amcl_age = max(0.1, float(get('max_amcl_pose_age_sec').value))
@@ -227,6 +235,8 @@ class UnifiedFieldRobot(Node):
         self.pending_nav_source: Optional[str] = None
         self.nav_retry_not_before = -1.0e9
         self.recovery_nav_failures = 0
+        self.recovery_nav_succeeded = False
+        self.recovery_arrived = False
         self.leader_pose: Optional[PoseStamped] = None
         self.self_pose: Optional[PoseStamped] = None
         self.self_pose_wall: Optional[float] = None
@@ -239,6 +249,8 @@ class UnifiedFieldRobot(Node):
         self.yaw_cov = float('inf')
         self.last_odom_yaw: Optional[float] = None
         self.last_odom_xy: Optional[tuple[float, float]] = None
+        self.last_linear_speed = 0.0
+        self.last_angular_speed = 0.0
         self.nav_start_odom_xy: Optional[tuple[float, float]] = None
         self.movement_started = False
         self.movement_sample_count = 0
@@ -301,6 +313,9 @@ class UnifiedFieldRobot(Node):
                 'FIELD_LOCALIZATION_READY | '
                 f'topic={self.localization_ready_topic}'
             )
+            self.get_logger().warning(
+                f'SCOUT_LOCALIZATION_READY | robot={self.robot_name}'
+            )
             if self.role == Role.ACTIVE_SCOUT:
                 self._activate_rl()
 
@@ -312,6 +327,8 @@ class UnifiedFieldRobot(Node):
 
     def _on_odom(self, msg: Odometry) -> None:
         yaw = yaw_from_quaternion(msg.pose.pose.orientation)
+        self.last_linear_speed = abs(float(msg.twist.twist.linear.x))
+        self.last_angular_speed = abs(float(msg.twist.twist.angular.z))
         if self.role == Role.LOCALIZATION_SPIN and self.last_odom_yaw is not None:
             delta = wrap_angle(yaw - self.last_odom_yaw)
             self.accumulated_yaw += self.spin_direction * delta
@@ -392,6 +409,8 @@ class UnifiedFieldRobot(Node):
                 return
             self.recovery_target = target_pose
             self.recovery_nav_failures = 0
+            self.recovery_nav_succeeded = False
+            self.recovery_arrived = False
             self.nav_retry_not_before = -1.0e9
             self.spin_attempt = 0
             self.spin_last_attempt_completed = False
@@ -441,9 +460,8 @@ class UnifiedFieldRobot(Node):
         if self.recovery_target is None:
             self._enter_role(Role.FAILED, reason='missing_recovery_target')
             return
-        if self._at_pose(self.recovery_target):
-            self._enter_role(Role.ARRIVED_AT_FAILURE_POSE, reason='arrival_distance')
-            self._enter_role(Role.LOCALIZATION_CHECK, reason='arrived')
+        if self._recovery_arrival_verified(require_nav_result=True):
+            self._mark_recovery_arrived('nav_result_and_pose')
             return
         if self._now() < self.nav_retry_not_before:
             return
@@ -458,6 +476,7 @@ class UnifiedFieldRobot(Node):
     def _tick_localization_check(self) -> None:
         self.get_logger().warning(
             'FIELD_LOCALIZATION_CHECK | '
+            f'localization_ready={self.localization_ready} '
             f'xy_cov={self.xy_cov:.4f} yaw_cov={self.yaw_cov:.4f}',
             throttle_duration_sec=2.0,
         )
@@ -468,6 +487,14 @@ class UnifiedFieldRobot(Node):
                 self._start_spin()
             return
         if self._localization_ok():
+            if not self._nav_motion_quiesced():
+                self.get_logger().warning(
+                    'SCOUT_WAIT_MOTION_RELEASE | source=localization_check',
+                    throttle_duration_sec=2.0,
+                )
+                return
+            self._publish_command(0.0, 0.0)
+            self._set_authority(MotionAuthority.NONE, 'active_scout_takeover_ready')
             self._enter_role(Role.ACTIVE_SCOUT, reason='localization_ok')
             return
         if not self.enable_spin or self.spin_attempt > self.max_spin_retries:
@@ -668,13 +695,14 @@ class UnifiedFieldRobot(Node):
         self.get_logger().warning(f'FIELD_NAV_RESULT | source={source} status={status}')
         if source != 'RECOVERY' or self.role != Role.RECOVERY_NAVIGATING:
             return
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            self.recovery_nav_succeeded = True
         if (
             status == GoalStatus.STATUS_SUCCEEDED
             and self.recovery_target is not None
-            and self._at_pose(self.recovery_target)
+            and self._recovery_arrival_verified(require_nav_result=True)
         ):
-            self._enter_role(Role.ARRIVED_AT_FAILURE_POSE, reason='nav2_succeeded_at_pose')
-            self._enter_role(Role.LOCALIZATION_CHECK, reason='recovery_arrival_verified')
+            self._mark_recovery_arrived('recovery_arrival_verified')
             return
         reason = error or f'status_{status}'
         if status == GoalStatus.STATUS_SUCCEEDED:
@@ -752,6 +780,8 @@ class UnifiedFieldRobot(Node):
         return self._nav_motion_quiesced()
 
     def _localization_ok(self) -> bool:
+        if self.require_localization_ready and not self.localization_ready:
+            return False
         if self.last_amcl_wall is None:
             return False
         if self._now() - self.last_amcl_wall > self.max_amcl_age:
@@ -774,6 +804,40 @@ class UnifiedFieldRobot(Node):
             and math.isfinite(dy)
             and math.hypot(dx, dy) <= self.arrival_tolerance
         )
+
+    def _recovery_motion_stopped(self) -> bool:
+        return (
+            self.last_linear_speed <= self.recovery_stop_linear_epsilon
+            and self.last_angular_speed <= self.recovery_stop_angular_epsilon
+        )
+
+    def _recovery_arrival_verified(self, *, require_nav_result: bool) -> bool:
+        if self.recovery_target is None:
+            return False
+        if require_nav_result and not self.recovery_nav_succeeded:
+            return False
+        return (
+            self._at_pose(self.recovery_target)
+            and self._nav_motion_quiesced()
+            and self.movement_started
+            and self._recovery_motion_stopped()
+        )
+
+    def _mark_recovery_arrived(self, reason: str) -> None:
+        if self.recovery_arrived:
+            return
+        self.recovery_arrived = True
+        distance = float('nan')
+        if self.self_pose is not None and self.recovery_target is not None:
+            dx = self.self_pose.pose.position.x - self.recovery_target.pose.position.x
+            dy = self.self_pose.pose.position.y - self.recovery_target.pose.position.y
+            distance = math.hypot(dx, dy)
+        self.get_logger().warning(
+            'SCOUT_RECOVERY_ARRIVED | '
+            f'robot={self.robot_name} distance={distance:.3f} reason={reason}'
+        )
+        self._enter_role(Role.ARRIVED_AT_FAILURE_POSE, reason=reason)
+        self._enter_role(Role.LOCALIZATION_CHECK, reason='recovery_arrival_verified')
 
     def _activate_rl(self) -> None:
         if self.rl_runtime is None or self.role != Role.ACTIVE_SCOUT:
@@ -842,18 +906,57 @@ class UnifiedFieldRobot(Node):
         }, sort_keys=True)
         self.heartbeat_pub.publish(msg)
 
+    def _recovery_complete_for_role(self) -> bool:
+        return bool(
+            self.recovery_arrived
+            or (
+                self.role == Role.ACTIVE_SCOUT
+                and self.recovery_target is None
+                and self.epoch == 0
+            )
+        )
+
+    def _active_scout_ready_status(self) -> bool:
+        return bool(
+            self.role == Role.ACTIVE_SCOUT
+            and self._localization_ok()
+            and self._nav_motion_quiesced()
+            and self._recovery_complete_for_role()
+            and self.motion_authority in (
+                MotionAuthority.NONE,
+                MotionAuthority.ACTIVE_SCOUT_RL,
+            )
+        )
+
     def _publish_status(self) -> None:
         runtime = self.rl_runtime
+        active_goal_count = (
+            1 if self.active_goal_handle is not None else 0
+        ) + len(self.inflight_goal_ids)
+        nav_goal_active = bool(
+            active_goal_count > 0
+            or self.pending_nav_goal is not None
+            or self.cancel_requests > 0
+        )
+        recovery_complete = self._recovery_complete_for_role()
+        active_scout_ready = self._active_scout_ready_status()
+        status = 'ACTIVE_SCOUT_READY' if active_scout_ready else self.role.value
         data = {
             'robot': self.robot_name,
             'epoch': self.epoch,
             'role': self.role.value,
-            'status': self.role.value,
+            'status': status,
             'motion_authority': self.motion_authority.value,
             'cmd_source': self.motion_authority.value,
             'goal_generation': self.goal_epoch,
             'pending_goal_count': 1 if self.pending_nav_goal is not None else 0,
+            'active_goal_count': active_goal_count,
+            'nav_goal_active': nav_goal_active,
             'movement_started': self.movement_started,
+            'localization_ready': self.localization_ready,
+            'recovery_arrived': self.recovery_arrived,
+            'recovery_complete': recovery_complete,
+            'active_scout_ready': active_scout_ready,
             'xy_cov': None if math.isinf(self.xy_cov) else self.xy_cov,
             'yaw_cov': None if math.isinf(self.yaw_cov) else self.yaw_cov,
             'rl_enabled': self.scout_rl_enabled,
@@ -867,7 +970,15 @@ class UnifiedFieldRobot(Node):
         self.status_pub.publish(msg)
         self.legacy_status_pub.publish(msg)
         role_msg = String()
-        role_msg.data = self.role.value
+        role_msg.data = json.dumps({
+            'robot': self.robot_name,
+            'epoch': self.epoch,
+            'role': self.role.value,
+            'localization_ready': self.localization_ready,
+            'recovery_complete': recovery_complete,
+            'active_scout_ready': active_scout_ready,
+            'motion_authority': self.motion_authority.value,
+        }, sort_keys=True)
         self.role_pub.publish(role_msg)
 
     def _publish_rl_command(self, linear_x: float, angular_z: float) -> None:

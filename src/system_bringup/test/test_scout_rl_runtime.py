@@ -12,6 +12,12 @@ from system_bringup.scout_rl_runtime import (
     SensorSnapshot,
     VelocitySafetyFilter,
 )
+from system_bringup.scout_rl_policy_worker import (
+    GateInputs,
+    RLWorkerState,
+    evaluate_activation_gate,
+    parse_role_update,
+)
 from turtlebot3_rl_training.exploration_map import ExplorationGridMap
 from turtlebot3_rl_training.observation import LidarPreprocessorConfig, downsample_lidar
 
@@ -299,6 +305,74 @@ def test_standalone_policy_worker_is_registered_as_the_separate_process():
 
     assert worker.is_file()
     assert 'scout_rl_policy_worker = system_bringup.scout_rl_policy_worker:main' in setup
+
+
+def _gate(**overrides):
+    values = {
+        'role': 'ACTIVE_SCOUT',
+        'role_robot_matches': True,
+        'role_epoch': 1,
+        'failover_epoch': 1,
+        'active_scout_matches': True,
+        'failover_state': 'NEW_SCOUT_EXPLORING',
+        'localization_ready': True,
+        'recovery_complete': True,
+        'nav_goal_inactive': True,
+        'motion_authority': 'NONE',
+        'model_ready': True,
+        'sensor_ready': True,
+        'tf_ready': True,
+        'require_failover_activation': True,
+    }
+    values.update(overrides)
+    return GateInputs(**values)
+
+
+def test_worker_gate_blocks_recovery_navigation_before_rl_activation():
+    state, reason = evaluate_activation_gate(_gate(
+        failover_state='RECOVERY_NAVIGATING',
+        motion_authority='FAILOVER_RECOVERY_NAV',
+    ))
+
+    assert state == RLWorkerState.RECOVERY_NAVIGATING
+    assert reason == 'recovery_or_non_scout_role'
+
+
+def test_worker_gate_rejects_stale_active_scout_role_epoch():
+    state, reason = evaluate_activation_gate(_gate(role_epoch=0, failover_epoch=1))
+
+    assert state == RLWorkerState.STANDBY
+    assert reason == 'stale_epoch'
+
+
+def test_worker_gate_requires_localization_motion_release_and_runtime_inputs():
+    assert evaluate_activation_gate(_gate(localization_ready=False))[0] == RLWorkerState.WAIT_LOCALIZATION
+    assert evaluate_activation_gate(_gate(nav_goal_inactive=False))[0] == RLWorkerState.WAIT_MOTION_RELEASE
+    assert evaluate_activation_gate(_gate(sensor_ready=False))[0] == RLWorkerState.WAIT_SENSOR_READY
+
+
+def test_worker_gate_accepts_only_fully_ready_failover_owner():
+    state, reason = evaluate_activation_gate(_gate())
+
+    assert state == RLWorkerState.ACTIVE
+    assert reason == 'activation_gate_passed'
+
+
+def test_worker_role_parser_supports_json_and_simple_strings():
+    update = parse_role_update(
+        '{"role":"ACTIVE_SCOUT","robot":"follower21","epoch":2,'
+        '"localization_ready":true,"recovery_complete":true}',
+        'follower21',
+    )
+    assert update.role == 'ACTIVE_SCOUT'
+    assert update.robot == 'follower21'
+    assert update.epoch == 2
+    assert update.localization_ready is True
+    assert update.recovery_complete is True
+
+    simple = parse_role_update('RECOVERY_NAVIGATING', 'follower21')
+    assert simple.role == 'RECOVERY_NAVIGATING'
+    assert simple.robot == 'follower21'
 
 
 def test_runtime_map_subscription_accepts_cartographer_volatile_maps():

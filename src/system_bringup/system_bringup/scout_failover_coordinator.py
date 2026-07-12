@@ -341,9 +341,29 @@ class ScoutFailoverCoordinator(Node):
             return
         if self.require_bootstrap_complete and not self.bootstrap_ready:
             return
-        status = str(data.get('status', '')).strip().upper()
         robot = str(data.get('robot', '')).strip()
-        if status != 'ACTIVE_SCOUT' or robot != self.follower_name:
+        if robot != self.follower_name:
+            return
+        status = str(data.get('status', data.get('role', ''))).strip().upper()
+        motion_authority = str(data.get('motion_authority', '')).strip().upper()
+        ready = bool(
+            data.get('active_scout_ready', False)
+            or status == 'ACTIVE_SCOUT_READY'
+        )
+        recovery_complete = bool(data.get('recovery_complete', False))
+        localization_ready = bool(data.get('localization_ready', False))
+        nav_goal_active = bool(data.get('nav_goal_active', False))
+        pending_goal_count = int(data.get('pending_goal_count', 0) or 0)
+        active_goal_count = int(data.get('active_goal_count', 0) or 0)
+        if not (
+            ready
+            and recovery_complete
+            and localization_ready
+            and not nav_goal_active
+            and pending_goal_count == 0
+            and active_goal_count == 0
+            and motion_authority in ('', 'NONE', 'ACTIVE_SCOUT_RL')
+        ):
             return
         self.active_scout_id = robot
         self._transition(FailoverState.NEW_SCOUT_EXPLORING)
@@ -463,6 +483,10 @@ class ScoutFailoverCoordinator(Node):
         self.get_logger().warning(
             '[FAILOVER] SCOUT_DEAD_CONFIRMED | '
             f'epoch={self.scout_epoch} pose_age={pose_age:.2f}s'
+        )
+        self.get_logger().warning(
+            'SCOUT_FAILOVER_DETECTED | '
+            f'previous={self.original_scout_id} epoch={self.scout_epoch}'
         )
         self.get_logger().warning(
             '[FAILOVER] LAST_POSE_FROZEN | '

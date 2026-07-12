@@ -97,6 +97,7 @@ def _bare_field(now=10.0):
     node.get_logger = lambda: logger
     node.get_clock = lambda: _Clock()
     node._now = lambda: float(now)
+    node.robot_name = 'follower21'
     node.epoch = 2
     node.goal_epoch = 0
     node.role = Role.RECOVERY_NAVIGATING
@@ -113,12 +114,22 @@ def _bare_field(now=10.0):
     node.nav_start_odom_xy = None
     node.movement_started = False
     node.movement_sample_count = 0
+    node.self_pose = None
+    node.self_pose_wall = None
+    node.self_pose_timeout = 2.0
+    node.arrival_tolerance = 0.4
     node.navigate_action = '/field_b/navigate_to_pose'
     node.require_localization_ready = True
     node.localization_ready = True
     node.recovery_nav_failures = 0
+    node.recovery_nav_succeeded = False
+    node.recovery_arrived = False
     node.max_recovery_nav_retries = 3
     node.recovery_nav_retry_sec = 1.0
+    node.recovery_stop_linear_epsilon = 0.03
+    node.recovery_stop_angular_epsilon = 0.08
+    node.last_linear_speed = 0.0
+    node.last_angular_speed = 0.0
     node.nav_retry_not_before = -1.0e9
     return node, logger
 
@@ -213,6 +224,47 @@ def test_recovery_arrival_requires_fresh_matching_frame_pose():
     node.self_pose_wall = 10.0
     assert node._at_pose(_pose(1.0, 1.0, frame='odom')) is False
     assert node._at_pose(_pose(1.1, 1.1, frame='map')) is True
+
+
+def test_recovery_does_not_advance_on_pose_distance_before_nav_success():
+    node, _ = _bare_field(now=10.0)
+    node.role = Role.RECOVERY_NAVIGATING
+    node.recovery_target = _pose(1.0, 1.0)
+    node.self_pose = _pose(1.0, 1.0)
+    node.self_pose_wall = 10.0
+    node.movement_started = True
+    node.recovery_nav_succeeded = False
+    node._queue_nav_goal = lambda pose, source: None
+    transitions = []
+    node._enter_role = lambda role, reason: transitions.append((role, reason))
+
+    node._tick_recovery()
+
+    assert transitions == []
+
+
+def test_recovery_nav_success_pose_and_stop_mark_arrival():
+    node, _ = _bare_field(now=10.0)
+    node.role = Role.RECOVERY_NAVIGATING
+    node.goal_epoch = 3
+    node.active_goal_handle = object()
+    node.active_goal_source = 'RECOVERY'
+    node.recovery_target = _pose(1.0, 1.0)
+    node.self_pose = _pose(1.0, 1.0)
+    node.self_pose_wall = 10.0
+    node.movement_started = True
+    node.last_linear_speed = 0.0
+    node.last_angular_speed = 0.0
+    transitions = []
+    node._enter_role = lambda role, reason: transitions.append((role, reason))
+
+    node._goal_result_cb(_Future(_Result(4)), goal_id=3, source='RECOVERY')
+
+    assert node.recovery_arrived is True
+    assert transitions == [
+        (Role.ARRIVED_AT_FAILURE_POSE, 'recovery_arrival_verified'),
+        (Role.LOCALIZATION_CHECK, 'recovery_arrival_verified'),
+    ]
 
 
 def test_rl_heartbeat_requires_localization_and_live_runtime():

@@ -367,6 +367,22 @@ class ActiveScoutRLRuntime:
     def last_stop_reason(self) -> str:
         return self._last_stop_reason
 
+    def sensor_ready(self) -> bool:
+        return self._fresh(self._sensor_snapshot(), time.monotonic())
+
+    def tf_ready(self) -> bool:
+        snapshot = self._sensor_snapshot()
+        if snapshot.scan is None:
+            return False
+        scan_frame = str(snapshot.scan.header.frame_id or self.config.scan_frame).lstrip('/')
+        try:
+            stamp = _stamp_time(snapshot.scan)
+            self._lookup_pose(self.config.map_frame, self.config.base_frame, stamp)
+            self._lookup_pose(self.config.map_frame, scan_frame, stamp)
+        except TransformException:
+            return False
+        return True
+
     def activate(self) -> None:
         self._reset_episode_state()
         self._active = True
