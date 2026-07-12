@@ -1,24 +1,21 @@
 #!/usr/bin/env python3
 """AMCL initial-localization spin state machine.
 
-A hardcoded initial pose only works when it matches where the robot was
-actually placed. Rather than fall back straight to AMCL's blind
-`/reinitialize_global_localization` particle scatter -- which has nothing to
-disambiguate against on a sparse/partial map -- this node first tries to
-seed AMCL's initial pose from the fleet's currently active scout (already
-localized on the same shared map, via /member_pose or /burger_pose) using
-`/initialpose` with a loose covariance. Blind global reinit is kept only as
-the fallback when no scout pose is available. Either way, it then drives a
-verified in-place rotation so scan matching gets more than one viewpoint to
-refine against, and only declares "ready" once `/amcl_pose` covariance has
-genuinely settled.
+A hardcoded initial pose only works when it matches where this robot was
+actually placed. This node therefore treats the robot's own fixed initial pose
+or a manually supplied RViz 2D Pose Estimate as the default source of truth,
+then drives a verified in-place rotation so scan matching gets more than one
+viewpoint to refine against. Scout-pose seeding is opt-in only: a scout pose is
+another robot's map-frame pose, not proof of the leader Waffle's pose. Blind
+global reinitialization is also opt-in because a sparse/partial map may not
+disambiguate particle scatter. The node declares "ready" only once verified
+spin completed and `/amcl_pose` covariance has genuinely settled.
 
 State machine:
 
     WAIT_MAP -> WAIT_AMCL_ACTIVE -> WAIT_SCOUT_POSE -> PUBLISH_INITIAL_POSE
-      (seeds /initialpose from the active scout's pose at most once; bounded
-       wait falls through to an unseeded local spin, not a navigation goal and
-       not a repeated /initialpose publish)
+      (optional scout-pose seed only when enable_scout_pose_seed is explicitly
+       true; otherwise this falls through to this robot's own local spin)
       -> WAIT_SCAN -> WAIT_ODOM
       -> CHECK_LOCALIZATION_QUALITY (skips the spin only on a re-entry that
          is already converged -- never on a true first pass, since AMCL's
@@ -102,10 +99,11 @@ class GlobalLocalizeKickstart(Node):
         self.declare_parameter('global_frame', 'map')
         self.declare_parameter('ready_topic', 'localization_ready')
 
-        # Seed AMCL's initial pose from the currently active scout (already
-        # localized on the same shared map) instead of scattering blind --
-        # see module docstring. Falls back to blind reinit when unavailable.
-        self.declare_parameter('enable_scout_pose_seed', True)
+        # A pose on the shared map is not interchangeable across robots. Keep
+        # scout-pose seeding opt-in only for fixtures where the leader and
+        # scout are explicitly co-located or a calibrated relative transform is
+        # applied upstream.
+        self.declare_parameter('enable_scout_pose_seed', False)
         self.declare_parameter('active_scout_id_topic', '/failover/active_scout_id')
         self.declare_parameter('active_scout_robot_name', 'scout22')
         self.declare_parameter('follower_robot_name', 'follower21')

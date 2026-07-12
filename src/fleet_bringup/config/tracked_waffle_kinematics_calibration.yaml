@@ -56,11 +56,20 @@ tracked_cmd_vel_adapter:
     linear_gain: 0.825
     angular_gain: 1.286
 
-    max_linear_velocity: 0.22
-    max_angular_velocity: 0.9
+    left_wheel_command_scale: 0.5
+    right_wheel_command_scale: 0.5
+    linear_command_scale: 0.5
+    angular_command_scale: 0.5
+    effective_wheel_radius: 0.040
+    effective_track_separation: 0.447
 
-    max_linear_acceleration: 0.16
-    max_angular_acceleration: 0.6
+    max_linear_velocity: 0.14
+    max_angular_velocity: 0.35
+
+    max_linear_acceleration: 0.20
+    max_linear_deceleration: 0.25
+    max_angular_acceleration: 0.40
+    max_angular_deceleration: 0.50
 
     command_timeout_sec: 0.5
     control_rate_hz: 30.0

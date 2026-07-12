@@ -28,8 +28,18 @@ def test_critical_launches_do_not_gate_on_process_exit():
         assert forbidden.isdisjoint(_names_used(path)), path
 
 
-def test_leader_localization_defaults_to_raw_scan():
+def test_leader_localization_splits_amcl_and_costmap_scans():
     text = (LAUNCH_DIR / 'leader.launch.py').read_text(encoding='utf-8')
-    assert "'localization_scan_topic'," in text
+    assert "'amcl_scan_topic'," in text
+    assert "'costmap_scan_topic'," in text
     assert "default_value='/scan'" in text
-    assert "default_value='/scan_filtered'" not in text
+    assert "default_value='/scan_filtered'" in text
+    assert "'topic': scan_topic_value" not in text
+    assert "'scan_topic': scan_topic_value" not in text
+
+
+def test_leader_does_not_seed_from_scout_pose_by_default():
+    text = (LAUNCH_DIR / 'leader.launch.py').read_text(encoding='utf-8')
+    assert "'enable_scout_pose_seed': False" in text
+    assert "'allow_blind_global_reinit': False" in text
+    assert "'freeze_when_stationary': False" in text

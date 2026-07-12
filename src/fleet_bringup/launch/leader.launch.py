@@ -24,7 +24,6 @@ from launch.actions import (
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import Node
-from nav2_common.launch import RewrittenYaml
 
 from fleet_bringup.launch_utils import (
     clean_process_environment,
@@ -45,6 +44,86 @@ def _tracked_cmd_vel_adapter_enabled(param_file: str) -> bool:
     return bool(params.get('enabled', False))
 
 
+def _rewrite_common_nav2_params(value, *, simulation: bool) -> None:
+    if not isinstance(value, dict):
+        return
+    for key, child in value.items():
+        if key == 'use_sim_time':
+            value[key] = simulation
+        elif key == 'odom_topic':
+            value[key] = '/odom'
+        elif key == 'enable_stamped_cmd_vel':
+            value[key] = True
+        else:
+            _rewrite_common_nav2_params(child, simulation=simulation)
+
+
+def _set_nested(data: dict, keys: list[str], value) -> None:
+    current = data
+    for key in keys[:-1]:
+        current = current.setdefault(key, {})
+    current[keys[-1]] = value
+
+
+def _leader_nav2_params_file(
+    *,
+    package_share: str,
+    domain: str,
+    source_name: str,
+    simulation: bool,
+    amcl_scan_topic: str,
+    costmap_scan_topic: str,
+) -> str:
+    source_path = os.path.join(package_share, 'config', source_name)
+    with open(source_path, 'r', encoding='utf-8') as handle:
+        data = yaml.safe_load(handle) or {}
+
+    _rewrite_common_nav2_params(data, simulation=simulation)
+    _set_nested(data, ['amcl', 'ros__parameters', 'scan_topic'], amcl_scan_topic)
+    _set_nested(data, ['amcl', 'ros__parameters', 'map_topic'], '/map')
+    _set_nested(
+        data,
+        [
+            'local_costmap',
+            'local_costmap',
+            'ros__parameters',
+            'obstacle_layer',
+            'scan',
+            'topic',
+        ],
+        costmap_scan_topic,
+    )
+    _set_nested(
+        data,
+        [
+            'global_costmap',
+            'global_costmap',
+            'ros__parameters',
+            'obstacle_layer',
+            'scan',
+            'topic',
+        ],
+        costmap_scan_topic,
+    )
+    _set_nested(
+        data,
+        [
+            'global_costmap',
+            'global_costmap',
+            'ros__parameters',
+            'static_layer',
+            'map_topic',
+        ],
+        '/map',
+    )
+
+    output_path = Path(tempfile.gettempdir()) / (
+        f'leader_{domain}_nav2_{source_name}'
+    )
+    output_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding='utf-8')
+    return str(output_path)
+
+
 def generate_launch_description():
     package_share = get_package_share_directory('fleet_bringup')
     base_launch = os.path.join(package_share, 'launch', 'base.launch.py')
@@ -57,6 +136,8 @@ def generate_launch_description():
     enable_cartographer = LaunchConfiguration('enable_cartographer')
     auto_localize = LaunchConfiguration('auto_localize')
     localization_scan_topic = LaunchConfiguration('localization_scan_topic')
+    amcl_scan_topic = LaunchConfiguration('amcl_scan_topic')
+    costmap_scan_topic = LaunchConfiguration('costmap_scan_topic')
     hardware_param_file = LaunchConfiguration('hardware_param_file')
     initial_x = LaunchConfiguration('leader_initial_x')
     initial_y = LaunchConfiguration('leader_initial_y')
@@ -71,10 +152,18 @@ def generate_launch_description():
         cartographer_owned = simulation or launch_bool(
             enable_cartographer.perform(context)
         )
-        scan_topic_value = (
+        legacy_localization_scan = localization_scan_topic.perform(context).strip()
+        amcl_scan_topic_value = (
             '/scan'
             if simulation
-            else localization_scan_topic.perform(context).strip() or '/scan'
+            else amcl_scan_topic.perform(context).strip()
+            or legacy_localization_scan
+            or '/scan'
+        )
+        costmap_scan_topic_value = (
+            '/scan'
+            if simulation
+            else costmap_scan_topic.perform(context).strip() or '/scan_filtered'
         )
         auto_localize_enabled = (
             not cartographer_owned
@@ -94,25 +183,17 @@ def generate_launch_description():
             '/cmd_vel_nav' if tracked_adapter_enabled else '/cmd_vel'
         )
 
-        nav2_params = RewrittenYaml(
-            source_file=os.path.join(
-                package_share,
-                'config',
-                (
-                    'leader_nav2.yaml'
-                    if cartographer_owned
-                    else 'leader_waffle_pi_nav2.yaml'
-                ),
+        nav2_params = _leader_nav2_params_file(
+            package_share=package_share,
+            domain=domain,
+            source_name=(
+                'leader_nav2.yaml'
+                if cartographer_owned
+                else 'leader_waffle_pi_nav2.yaml'
             ),
-            param_rewrites={
-                'use_sim_time': str(simulation).lower(),
-                'odom_topic': '/odom',
-                'scan_topic': scan_topic_value,
-                'map_topic': '/map',
-                'topic': scan_topic_value,
-                'enable_stamped_cmd_vel': 'true',
-            },
-            convert_types=True,
+            simulation=simulation,
+            amcl_scan_topic=amcl_scan_topic_value,
+            costmap_scan_topic=costmap_scan_topic_value,
         )
 
         cartographer = None
@@ -190,10 +271,11 @@ def generate_launch_description():
                 ' | odom_frame=odom',
                 ' | base_frame=base_footprint',
                 ' | map_topic=/map',
-                ' | scan_topic=', scan_topic_value,
+                ' | amcl_scan_topic=', amcl_scan_topic_value,
+                ' | costmap_scan_topic=', costmap_scan_topic_value,
                 ' | tf_broadcast=true',
                 ' | initial_pose_mode=',
-                'seeded_global_localize' if auto else 'fixed_seed',
+                'fixed_seed_spin' if auto else 'fixed_seed',
                 ' | x=', str(initial_pose['x']),
                 ' | y=', str(initial_pose['y']),
                 ' | yaw=', str(initial_pose['yaw']),
@@ -215,13 +297,11 @@ def generate_launch_description():
                     name='leader_global_localize',
                     output='screen',
                     parameters=[{
-                        'scan_topic': scan_topic_value,
-                        # Seed AMCL's initial pose from the active scout's
-                        # known map-frame pose before spinning, instead of
-                        # blindly scattering particles across a still-sparse
-                        # shared map -- falls back to blind reinit if no
-                        # scout pose is available in time.
-                        'enable_scout_pose_seed': True,
+                        'scan_topic': amcl_scan_topic_value,
+                        # The leader Waffle must localize from its own
+                        # initial pose, scan and odom. A scout pose is a pose
+                        # on the same map, not the Waffle's pose.
+                        'enable_scout_pose_seed': False,
                         'active_scout_id_topic': '/failover/active_scout_id',
                         'active_scout_robot_name': 'scout22',
                         'follower_robot_name': 'follower21',
@@ -279,7 +359,7 @@ def generate_launch_description():
                 'source_frame': 'base_footprint',
                 'source_frame_candidates': ['base_footprint', 'base_link'],
                 'publish_rate_hz': 10.0,
-                'freeze_when_stationary': True,
+                'freeze_when_stationary': False,
                 'stationary_target_frame': 'odom',
                 'stationary_linear_threshold_m': 0.02,
                 'stationary_angular_threshold_rad': 0.035,
@@ -306,7 +386,7 @@ def generate_launch_description():
             name='leader_fleet_scan_relay',
             output='screen',
             parameters=[{
-                'input_topic': scan_topic_value,
+                'input_topic': amcl_scan_topic_value,
                 'output_topic': '/leader/scan',
                 'output_frame': 'base_scan',
                 'input_reliability': 'best_effort',
@@ -544,7 +624,7 @@ def generate_launch_description():
                                 output='screen',
                                 parameters=[{
                                     'map_topic': '/map',
-                                    'scan_topic': scan_topic_value,
+                                    'scan_topic': amcl_scan_topic_value,
                                     'global_frame': 'map',
                                     'base_frame': 'base_footprint',
                                     'ready_topic': 'localization_ready',
@@ -660,21 +740,34 @@ def generate_launch_description():
             default_value='true',
             choices=['true', 'false'],
             description=(
-                'Only used when enable_cartographer:=false. Let AMCL '
-                'start from a one-shot scout-pose /initialpose seed when '
-                'available, then refine via verified in-place spin. Default '
-                'true forces a startup spin before Nav2/fleet goals.'
+                'Only used when enable_cartographer:=false. Start AMCL from '
+                'leader_initial_x/y/yaw or RViz 2D Pose Estimate, then refine '
+                'via verified in-place spin. Scout pose seeding is disabled '
+                'by default because scout pose != leader pose.'
             ),
         ),
         DeclareLaunchArgument(
             'localization_scan_topic',
+            default_value='',
+            description=(
+                'Deprecated compatibility alias for amcl_scan_topic. Leave '
+                'empty and use amcl_scan_topic/costmap_scan_topic.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'amcl_scan_topic',
             default_value='/scan',
             description=(
-                'Real external-map leader mode: LaserScan topic consumed by '
-                'AMCL/Nav2. Defaults to raw /scan so localization does not '
-                'deadlock when optional OMX scan_processor (/scan_filtered) '
-                'is not running. Pass /scan_filtered only after verifying it '
-                'is publishing.'
+                'Real external-map leader mode: raw LaserScan consumed by '
+                'AMCL and global localization spin.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'costmap_scan_topic',
+            default_value='/scan_filtered',
+            description=(
+                'Real external-map leader mode: filtered LaserScan consumed '
+                'only by Nav2 obstacle layers.'
             ),
         ),
         DeclareLaunchArgument(

@@ -34,8 +34,8 @@ OMX Auto-Aim 프로젝트의 lidar 전처리 노드. 와플의 자기 구조물
     mask_ranges_deg   (double[]) [lo1, hi1, lo2, hi2, ...]. 단위 degree.
                                  wrap-around 지원 (예: [170, -170] = ±180°).
                                  sentinel [0.0] 또는 짝수 길이 아니면 비활성.
-    min_valid_range   (double)   이 미만 거리는 inf. 0 이면 비활성.
-    max_valid_range   (double)   이 초과 거리는 inf. 0 이면 비활성.
+    min_valid_range   (double)   이 미만 거리는 NaN. 0 이면 비활성.
+    max_valid_range   (double)   이 초과 거리는 NaN. 0 이면 비활성.
     log_period_sec    (double)   통계 로그 주기. 0 이면 끔.
 """
 from __future__ import annotations
@@ -104,8 +104,10 @@ class ScanProcessor(Node):
         # ===== 통계 카운터 =====
         self.n_scans = 0
         self.n_points_total = 0
-        self.n_points_masked_angle = 0
-        self.n_points_masked_range = 0
+        self.n_self_masked_nan = 0
+        self.n_real_inf = 0
+        self.n_finite_marking = 0
+        self.n_range_rejected = 0
 
         # ===== ROS I/O =====
         self.sub = self.create_subscription(
@@ -165,16 +167,24 @@ class ScanProcessor(Node):
                 intensities = intensities[half:] + intensities[:half]
 
         # 2) 마스킹 + 거리 필터
-        inf = float('inf')
-        n_angle = 0
-        n_range = 0
+        nan = float('nan')
+        n_self_masked = 0
+        n_real_inf = 0
+        n_finite = 0
+        n_range_rejected = 0
         for i in range(n):
+            r = ranges[i]
+            if math.isinf(r):
+                n_real_inf += 1
+            elif not math.isnan(r):
+                n_finite += 1
+
             # 각도 마스킹 우선
             if self.mask:
                 ang = msg.angle_min + i * msg.angle_increment
                 if self._in_mask(ang):
-                    ranges[i] = inf
-                    n_angle += 1
+                    ranges[i] = nan
+                    n_self_masked += 1
                     continue
 
             # 거리 필터
@@ -182,17 +192,19 @@ class ScanProcessor(Node):
             if math.isnan(r) or math.isinf(r):
                 continue
             if self.min_valid > 0 and 0 < r < self.min_valid:
-                ranges[i] = inf
-                n_range += 1
+                ranges[i] = nan
+                n_range_rejected += 1
             elif self.max_valid > 0 and r > self.max_valid:
-                ranges[i] = inf
-                n_range += 1
+                ranges[i] = nan
+                n_range_rejected += 1
 
         # 3) 통계 누적
         self.n_scans += 1
         self.n_points_total += n
-        self.n_points_masked_angle += n_angle
-        self.n_points_masked_range += n_range
+        self.n_self_masked_nan += n_self_masked
+        self.n_real_inf += n_real_inf
+        self.n_finite_marking += n_finite
+        self.n_range_rejected += n_range_rejected
 
         # 4) 발행 — header(timestamp) 그대로 보존
         out = LaserScan()
@@ -216,18 +228,24 @@ class ScanProcessor(Node):
                 "/scan 메시지 수신 없음 - bringup 또는 lidar 노드 확인")
             return
         n = self.n_points_total
-        pct_a = 100.0 * self.n_points_masked_angle / n if n else 0.0
-        pct_r = 100.0 * self.n_points_masked_range / n if n else 0.0
+        pct_self = 100.0 * self.n_self_masked_nan / n if n else 0.0
+        pct_inf = 100.0 * self.n_real_inf / n if n else 0.0
+        pct_finite = 100.0 * self.n_finite_marking / n if n else 0.0
+        pct_reject = 100.0 * self.n_range_rejected / n if n else 0.0
         self.get_logger().info(
             f"통계 ({self.n_scans} scan): "
-            f"angle 마스킹 {pct_a:.2f}%, "
-            f"range 마스킹 {pct_r:.2f}%, "
+            f"self_masked_nan {pct_self:.2f}%, "
+            f"real_inf {pct_inf:.2f}%, "
+            f"finite_marking {pct_finite:.2f}%, "
+            f"range_rejected_nan {pct_reject:.2f}%, "
             f"FPS≈{self.n_scans / 5.0:.1f}")
         # 리셋
         self.n_scans = 0
         self.n_points_total = 0
-        self.n_points_masked_angle = 0
-        self.n_points_masked_range = 0
+        self.n_self_masked_nan = 0
+        self.n_real_inf = 0
+        self.n_finite_marking = 0
+        self.n_range_rejected = 0
 
 
 def main():
