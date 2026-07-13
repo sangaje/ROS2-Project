@@ -231,17 +231,22 @@ def active_scout_config(
         max_inference_sec=float(runtime['max_inference_sec']),
         command_timeout_sec=float(runtime['command_timeout_sec']),
         # Fast observation tick runs at control_dt_sec / map_substeps_per_action
-        # (10 Hz at the frozen v132 values). Allow a handful of missed ticks
-        # before treating the snapshot as stale, floored at 0.6s per the
-        # startup-gate design target, without tying this to max_scan_age_sec.
+        # (10 Hz at the frozen v132 values). Real-hardware SCOUT_MAP_TICK_TIMING
+        # telemetry showed the heavy confidence_tick's own exploration_map.
+        # update() call (an external, unmodifiable turtlebot3_rl_training cost)
+        # taking up to ~1.1s on a Pi, and the fast tick's lock wait spiking to
+        # ~750ms while that's in flight -- both well past the original 0.6s
+        # guess. Floored higher to tolerate that measured worst case with
+        # margin, without tying this to max_scan_age_sec.
         max_observation_snapshot_age_sec=max(
-            0.6,
-            (float(runtime['control_dt_sec']) / int(runtime['map_substeps_per_action'])) * 6.0,
+            1.5,
+            (float(runtime['control_dt_sec']) / int(runtime['map_substeps_per_action'])) * 15.0,
         ),
-        # Heavy confidence-grid update + external map publish is bounded to
-        # ~2 Hz so it never blocks the fast observation tick from committing
-        # a fresh snapshot every cycle.
-        confidence_update_period_sec=max(0.5, float(runtime['control_dt_sec']) * 2.5),
+        # Heavy confidence-grid update + external map publish: slowed down
+        # from ~2 Hz so it has real idle time between runs instead of racing
+        # back-to-back (its own cost can exceed 1s), which is what was
+        # driving the fast tick's lock-wait tail up in the first place.
+        confidence_update_period_sec=max(1.5, float(runtime['control_dt_sec']) * 7.5),
         scan_topic=str(topics['scan']),
         odom_topic=str(topics.get('odom', '/odom')),
         map_topic=str(topics['map']),
