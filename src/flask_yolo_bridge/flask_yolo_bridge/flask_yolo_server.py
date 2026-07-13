@@ -421,7 +421,7 @@ def _validate_model_path(model_path):
     if suffix == '.pt':
         raise ValueError(
             f'PyTorch YOLO checkpoints are not allowed at runtime: {path}. '
-            'Export and launch with model/target_v3.engine instead.'
+            'Export and launch with model/target_v3_640.engine instead.'
         )
     if suffix not in ('.engine', '.plan'):
         raise ValueError(
@@ -822,13 +822,13 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--port', type=int, default=5005)
-    parser.add_argument('--model-path', default='model/target_v3.engine')
+    parser.add_argument('--model-path', default='model/target_v3_640.engine')
     parser.add_argument('--device', default='0')
     parser.add_argument('--half', type=as_bool, default=True)
     parser.add_argument('--conf', type=float, default=0.20)
     parser.add_argument('--iou', type=float, default=0.45)
     parser.add_argument('--max-det', type=int, default=64)
-    parser.add_argument('--imgsz', type=int, default=960)
+    parser.add_argument('--imgsz', type=int, default=640)
     parser.add_argument('--debug-jpeg-quality', type=int, default=80)
     parser.add_argument('--max-capture-age-sec', type=float, default=0.8)
     parser.add_argument('--max-queue-wait-sec', type=float, default=0.0)

@@ -9,7 +9,7 @@ line.
 
 Example:
   python3 tools/omx_camera_yolo_dashboard.py --camera /dev/video0 \
-      --model model/target_v3.engine --device 0 --port 8082
+      --model model/target_v3_640.engine --device 0 --port 8082
 
 Then open http://<jetson-host>:8082/ in a browser.
 """
@@ -24,12 +24,12 @@ from pathlib import Path
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', default='model/target_v3.engine')
+    parser.add_argument('--model', default='model/target_v3_640.engine')
     parser.add_argument('--camera', default='/dev/video0')
     parser.add_argument('--width', type=int, default=1280)
     parser.add_argument('--height', type=int, default=720)
     parser.add_argument('--conf', type=float, default=0.25)
-    parser.add_argument('--imgsz', type=int, default=960)
+    parser.add_argument('--imgsz', type=int, default=640)
     parser.add_argument(
         '--class-id', type=int, default=None,
         help='Optional class id filter. Omit to show all classes.',
@@ -103,7 +103,7 @@ class InferenceLoop:
             self._set_error(f'model not found: {model_path}')
             return
         if model_path.suffix.lower() == '.pt':
-            self._set_error('PyTorch .pt models are not allowed; use target_v3.engine.')
+            self._set_error('PyTorch .pt models are not allowed; use target_v3_640.engine.')
             return
         if model_path.suffix.lower() not in ('.engine', '.plan'):
             self._set_error(f'expected TensorRT .engine/.plan model, got {model_path}')

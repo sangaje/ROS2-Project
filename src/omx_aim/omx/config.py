@@ -341,7 +341,7 @@ def load_config(path=None):
         if suffix == ".pt":
             raise ValueError(
                 "PyTorch YOLO checkpoints are not allowed at runtime. "
-                "Use model/target_v3.engine."
+                "Use model/target_v3_640.engine."
             )
         if suffix not in (".engine", ".plan"):
             raise ValueError(
