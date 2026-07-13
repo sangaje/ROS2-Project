@@ -798,6 +798,20 @@ class ActiveScoutRLRuntime:
                 self._model_loading = False
                 if model is not None and self._model_ready_at_ms is None:
                     self._model_ready_at_ms = self._event_ms()
+            self.node.get_logger().warning(
+                'SCOUT_MODEL_READY_PIPELINE | '
+                f'robot={getattr(self.node, "robot_name", "")} '
+                f'model_path={self.config.checkpoint} '
+                'load_attempted=true '
+                f'load_success={model is not None} '
+                f'warmup_success={model is not None} '
+                f'local_model_ready={model is not None} '
+                'published_ready=false '
+                f'topic={getattr(self.node, "motion_readiness_detail_topic", "")} '
+                f'publisher_count={getattr(self.node, "count_publishers", lambda _topic: 0)(getattr(self.node, "motion_readiness_detail_topic", ""))} '
+                f'epoch={getattr(self.node, "role_epoch", 0)} '
+                f'error={self._model_error or ""}'
+            )
 
         threading.Thread(
             target=load,
@@ -997,8 +1011,10 @@ class ActiveScoutRLRuntime:
     def _fresh(self, snapshot: SensorSnapshot, now: float) -> bool:
         return bool(
             snapshot.scan is not None
+            and snapshot.odom is not None
             and snapshot.slam_map is not None
             and now - snapshot.scan_received_at <= self.config.max_scan_age_sec
+            and now - snapshot.odom_received_at <= self.config.max_odom_age_sec
         )
 
     def _blocking_inputs(
@@ -1014,6 +1030,8 @@ class ActiveScoutRLRuntime:
             blocking.append('scan_stale')
         if snapshot.odom is None:
             blocking.append('odom_missing')
+        elif now - snapshot.odom_received_at > self.config.max_odom_age_sec:
+            blocking.append('odom_stale')
         if snapshot.slam_map is None:
             blocking.append('map_missing')
         elif str(snapshot.slam_map.header.frame_id or '').lstrip('/') != self.config.map_frame.lstrip('/'):

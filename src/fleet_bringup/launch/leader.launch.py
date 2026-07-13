@@ -490,7 +490,7 @@ def generate_launch_description():
                         'cancel_topic': '/fleet/leader_nav_cancel',
                         'require_system_ready': False,
                         'system_ready_topic': '/system/ready',
-                        'require_start_motion': True,
+                        'require_start_motion': False,
                         'start_motion_topic': '/fleet/start_motion',
                     }],
                     env=process_env,
@@ -529,7 +529,7 @@ def generate_launch_description():
                     'localization_ready_topic': '/localization_ready',
                     'require_system_ready': 'false',
                     'system_ready_topic': '/system/ready',
-                    'require_start_motion': 'true',
+                    'require_start_motion': 'false',
                     'start_motion_topic': '/fleet/start_motion',
                 }.items(),
             )

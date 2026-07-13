@@ -47,6 +47,7 @@ class ScoutRLPolicyWorker(Node):
         self.declare_parameter('system_ready_topic', '/system/ready')
         self.declare_parameter('require_start_motion', True)
         self.declare_parameter('start_motion_topic', '/fleet/start_motion')
+        self.declare_parameter('direct_rl_start', True)
         self.declare_parameter('motion_readiness_detail_topic', '/fleet/scout_motion_ready_detail')
         self.declare_parameter('motion_release_stable_sec', 0.0)
         self.declare_parameter('startup_sensor_max_age_sec', 2.0)
@@ -74,7 +75,8 @@ class ScoutRLPolicyWorker(Node):
         self.require_system_ready = bool(get('require_system_ready').value)
         self.system_ready_topic = str(get('system_ready_topic').value)
         requested_start_motion = bool(get('require_start_motion').value)
-        self.require_start_motion = requested_start_motion
+        self.direct_rl_start = bool(get('direct_rl_start').value)
+        self.require_start_motion = bool(requested_start_motion and not self.direct_rl_start)
         self.start_motion_topic = str(get('start_motion_topic').value).strip()
         self.motion_readiness_detail_topic = str(
             get('motion_readiness_detail_topic').value
@@ -110,7 +112,8 @@ class ScoutRLPolicyWorker(Node):
         self.status_recovery_complete = bool(initial_active)
         self.nav_goal_inactive = bool(initial_active)
         self.process_start_mono = time.monotonic()
-        self.start_motion = not self.require_start_motion
+        self.global_start_motion = not requested_start_motion
+        self.start_motion = self._local_motion_release()
         self.video_ready = self.start_motion
         self.motion_authority = 'NONE'
         self.worker_state = RLWorkerState.STANDBY
@@ -124,7 +127,7 @@ class ScoutRLPolicyWorker(Node):
             'role_active': 0 if initial_active else None,
             'active_scout_id': 0 if initial_active else None,
             'lease_valid': 0 if initial_active else None,
-            'start_motion': 0 if self.start_motion else None,
+            'start_motion': 0 if self._local_motion_release() else None,
             'first_nonzero_cmd': None,
         }
         self._last_timeline_log_mono = -1.0e9
@@ -190,6 +193,7 @@ class ScoutRLPolicyWorker(Node):
             f'require_failover_activation={self.require_failover_activation} '
             f'require_system_ready={self.require_system_ready}:{self.system_ready_topic} '
             f'require_start_motion={self.require_start_motion}:{self.start_motion_topic} '
+            f'direct_rl_start={self.direct_rl_start} '
             f'motion_readiness_detail_topic={self.motion_readiness_detail_topic} '
             f'motion_release_stable_sec={self.motion_release_stable_sec:.2f} '
             f'startup_sensor_max_age_sec={self.startup_sensor_max_age_sec:.2f} '
@@ -199,6 +203,9 @@ class ScoutRLPolicyWorker(Node):
 
     def _now(self) -> float:
         return self.get_clock().now().nanoseconds * 1.0e-9
+
+    def _local_motion_release(self) -> bool:
+        return bool(self.direct_rl_start or not self.require_start_motion or self.global_start_motion)
 
     def _process_age_ms(self) -> int:
         return int((time.monotonic() - self.process_start_mono) * 1000.0)
@@ -299,26 +306,28 @@ class ScoutRLPolicyWorker(Node):
         self._evaluate_gate()
 
     def _on_start_motion(self, msg: Bool) -> None:
-        previous = self.start_motion
-        self.start_motion = bool(msg.data)
+        previous = self._local_motion_release()
+        self.global_start_motion = bool(msg.data)
+        self.start_motion = self._local_motion_release()
         self.video_ready = self.start_motion
         if previous and not self.start_motion and self.runtime_active:
             self.runtime_active = False
             self.runtime.deactivate('start_motion_false')
             self._publish_zero()
-        if self.start_motion != previous:
+        if self._local_motion_release() != previous:
             if self.start_motion:
                 self._mark_startup_event('start_motion')
             self.get_logger().warning(
                 'SCOUT_START_MOTION | '
-                f'robot={self.robot_name} ready={self.start_motion} '
+                f'robot={self.robot_name} global_ready={self.global_start_motion} '
+                f'local_motion_release={self._local_motion_release()} '
                 f'topic={self.start_motion_topic}'
             )
-        if self.start_motion and not previous:
+        if self._local_motion_release() and not previous:
             self.startup_released = True
             self.get_logger().warning(
                 'SCOUT_RL_RESUME_REQUEST | '
-                f'robot={self.robot_name} reason=start_motion_true '
+                f'robot={self.robot_name} reason=local_motion_release '
                 'stale_action_dropped=true latest_sensors_retained=true'
             )
         self._evaluate_gate()
@@ -430,7 +439,7 @@ class ScoutRLPolicyWorker(Node):
         if self._warmup_allowed(gate):
             self.runtime.warmup('active_scout_startup')
         state, reason = evaluate_activation_gate(gate)
-        if state == RLWorkerState.ACTIVE and not self.start_motion:
+        if state == RLWorkerState.ACTIVE and not self._local_motion_release():
             state = RLWorkerState.WAIT_MOTION_RELEASE
             reason = 'startup_not_released' if not self.startup_released else 'start_motion_false'
         if state == RLWorkerState.ACTIVE and self.require_system_ready and not self.system_ready:
@@ -456,7 +465,7 @@ class ScoutRLPolicyWorker(Node):
             not should_activate
             and self.runtime_active
             and state in (RLWorkerState.WAIT_SENSOR_READY, RLWorkerState.WAIT_OBSERVATION_READY)
-            and self.start_motion
+            and self._local_motion_release()
             and (self.system_ready or not self.require_system_ready)
         ):
             self.runtime.hold(reason)
@@ -532,7 +541,7 @@ class ScoutRLPolicyWorker(Node):
             blocking_reason = 'motion_authority_unavailable'
         release_state = (
             'RELEASED'
-            if self.start_motion else (
+            if self._local_motion_release() else (
                 'STABLE_CHECK' if minimum_ready else 'WAITING'
             )
         )
@@ -548,6 +557,9 @@ class ScoutRLPolicyWorker(Node):
             'lease_valid': lease_valid,
             'motion_authority_available': motion_authority_available,
             'motion_authority': self.motion_authority,
+            'direct_rl_start': self.direct_rl_start,
+            'global_start_motion': self.global_start_motion,
+            'local_motion_release': self._local_motion_release(),
             'stable_elapsed_ms': int(stable_elapsed_ms),
             'stable_required_ms': int(self.motion_release_stable_sec * 1000.0),
             'blocking_reason': blocking_reason,
@@ -723,7 +735,7 @@ class ScoutRLPolicyWorker(Node):
             return 'role_inactive'
         if self.require_failover_activation and not gate.active_scout_matches:
             return 'lease_expired'
-        if self.require_start_motion and not self.start_motion:
+        if not self._local_motion_release():
             if not self.startup_released:
                 return 'startup_not_released'
             return 'start_motion_false'
@@ -783,7 +795,7 @@ class ScoutRLPolicyWorker(Node):
         hardware_publish_allowed = bool(
             role_active
             and gate.active_scout_matches
-            and self.start_motion
+            and self._local_motion_release()
             and state == RLWorkerState.ACTIVE
         )
         self.get_logger().warning(
@@ -794,7 +806,9 @@ class ScoutRLPolicyWorker(Node):
             f'active_scout_id={self.active_scout_id or "(unset)"} '
             f'epoch={self.role_epoch} '
             f'lease_valid={gate.active_scout_matches} '
-            f'start_motion={self.start_motion} '
+            f'direct_rl_start={self.direct_rl_start} '
+            f'global_start_motion={self.global_start_motion} '
+            f'local_motion_release={self._local_motion_release()} '
             f'system_ready={self.system_ready} '
             f'dashboard_ready={self.video_ready} '
             f'scan_age_ms={float(runtime["scan_age_ms"]):.0f} '
@@ -818,9 +832,23 @@ class ScoutRLPolicyWorker(Node):
             f'blocking_reason={blocking}'
         )
         self.get_logger().warning(
+            'DIRECT_RL_START | '
+            f'enabled={self.direct_rl_start} '
+            f'role_ready={role_active and gate.active_scout_matches} '
+            f'model_ready={self.runtime.ready} '
+            f'scan_ready={float(runtime["scan_age_ms"]) >= 0.0} '
+            f'odom_ready={float(runtime["odom_age_ms"]) >= 0.0} '
+            f'observation_ready={runtime["observation_ready"]} '
+            f'global_start_motion={self.global_start_motion} '
+            f'local_motion_release={self._local_motion_release()} '
+            f'predict_triggered={runtime["predict_attempt_count"]} '
+            f'blocking_reason={blocking}'
+        )
+        self.get_logger().warning(
             'SCOUT_RL_GATE | '
             f'role_active={role_active} '
-            f'start_motion={self.start_motion} '
+            f'global_start_motion={self.global_start_motion} '
+            f'local_motion_release={self._local_motion_release()} '
             f'raw_action_nonzero={raw_nonzero} '
             f'final_command_nonzero={final_nonzero} '
             f'hardware_publish_allowed={hardware_publish_allowed} '
@@ -830,7 +858,8 @@ class ScoutRLPolicyWorker(Node):
             'SCOUT_STARTUP_PIPELINE | '
             f'role={self.desired_role} '
             f'active_scout_id={self.active_scout_id or "(unset)"} '
-            f'start_motion={self.start_motion} '
+            f'global_start_motion={self.global_start_motion} '
+            f'local_motion_release={self._local_motion_release()} '
             f'sensor_pipeline_enabled={runtime["sensor_pipeline_enabled"]} '
             f'motion_pipeline_enabled={runtime["motion_pipeline_enabled"]} '
             f'scan_ready={float(runtime["scan_age_ms"]) >= 0.0} '
@@ -935,7 +964,7 @@ class ScoutRLPolicyWorker(Node):
             )
 
     def _publish_command(self, linear_x: float, angular_z: float) -> None:
-        if not self.start_motion and (linear_x != 0.0 or angular_z != 0.0):
+        if not self._local_motion_release() and (linear_x != 0.0 or angular_z != 0.0):
             self.get_logger().warning(
                 'SCOUT_FIRST_ACTION_DEBUG | '
                 'predict_called=true '

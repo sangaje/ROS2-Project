@@ -1180,7 +1180,7 @@ class LeaderUnifiedDashboard(Node):
             base_detail.update(release_detail)
         self.get_logger().warning(
             'MOTION_RELEASE_DEBUG | '
-            f'state={scout_detail.get("state", phase)} '
+            f'state={phase} '
             f'start_motion={start_motion} '
             f'scan_ready={scout_detail.get("scan_ready")} '
             f'odom_ready={scout_detail.get("odom_ready")} '
@@ -1339,6 +1339,14 @@ class LeaderUnifiedDashboard(Node):
             dashboard_ready=ready,
             base_detail=detail,
         )
+        if (
+            not start_motion
+            and detail.get('blocking_reason')
+            and detail.get('blocking_reason') != 'none'
+        ):
+            reasons = list(detail.get('blocking_reasons', []))
+            reasons.append(str(detail['blocking_reason']))
+            detail['blocking_reasons'] = sorted(set(reasons))
         phase = str(detail.get('phase', 'RUNNING' if start_motion else 'STARTUP_NOT_RELEASED'))
         self._publish_readiness_detail(detail)
         panel_state = detail.get('dashboard_ui', {}).get('panels', {})

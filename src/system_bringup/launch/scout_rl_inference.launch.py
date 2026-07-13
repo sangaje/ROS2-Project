@@ -154,7 +154,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'max_odom_age_sec',
-            default_value='0.8',
+            default_value='2.0',
             description='Maximum receive-age for local odometry before RL holds zero command.',
         ),
         DeclareLaunchArgument(
@@ -215,6 +215,7 @@ def generate_launch_description():
                     value_type=bool,
                 ),
                 'start_motion_topic': start_motion_topic,
+                'direct_rl_start': True,
                 'cmd_vel_topic': cmd_vel_topic,
                 'odom_topic': odom_topic,
                 'max_odom_age_sec': ParameterValue(

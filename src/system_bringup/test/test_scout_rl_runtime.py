@@ -318,7 +318,7 @@ def test_runtime_warmup_updates_observation_without_motion_activation():
     assert 'if not self._sensor_pipeline_enabled:' in runtime
     assert 'publish=self._active' in runtime
     assert 'self._warm_observation(snapshot.scan)' in runtime
-    assert 'if state == RLWorkerState.ACTIVE and not self.start_motion' in worker
+    assert 'if state == RLWorkerState.ACTIVE and not self._local_motion_release()' in worker
     assert 'self.runtime.warmup(' in worker
     assert 'SCOUT_STARTUP_PIPELINE |' in worker
     assert 'SCOUT_OBSERVATION_PIPELINE |' in worker
@@ -348,11 +348,11 @@ def test_scout_rl_worker_can_use_local_motion_release_without_leader_gate():
 
     assert "require_start_motion" in source
     assert "start_motion_topic" in source
-    assert "self.require_start_motion = requested_start_motion" in source
-    assert "self.start_motion = not self.require_start_motion" in source
-    assert "self.create_subscription(Bool, self.start_motion_topic" in source
+    assert "self.declare_parameter('direct_rl_start', True)" in source
+    assert "self.require_start_motion = bool(requested_start_motion and not self.direct_rl_start)" in source
+    assert "def _local_motion_release" in source
     assert "def _on_start_motion" in source
-    assert "if not self.start_motion" in source
+    assert "if not self._local_motion_release()" in source
     assert "self._publish_zero()" in source
     assert "require_video_ready" in source
     assert "video_ready_topic" in source
