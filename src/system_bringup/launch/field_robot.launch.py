@@ -26,12 +26,12 @@ def generate_launch_description():
     domain_id = LaunchConfiguration('domain_id')
     main_domain_id = LaunchConfiguration('main_domain_id')
     initial_role = LaunchConfiguration('initial_role')
-    enable_exploration = LaunchConfiguration('enable_exploration')
+    field_enable_exploration = LaunchConfiguration('field_enable_exploration')
     enable_follow = LaunchConfiguration('enable_follow')
     enable_rl = LaunchConfiguration('enable_rl')
     enable_observation_tx = LaunchConfiguration('enable_observation_tx')
-    enable_cartographer = LaunchConfiguration('enable_cartographer')
-    enable_amcl = LaunchConfiguration('enable_amcl')
+    field_enable_cartographer = LaunchConfiguration('field_enable_cartographer')
+    field_enable_amcl = LaunchConfiguration('field_enable_amcl')
     map_authority_eligible = LaunchConfiguration('map_authority_eligible')
     camera_sender_device = LaunchConfiguration('camera_sender_device')
     flask_server_url = LaunchConfiguration('flask_server_url')
@@ -65,7 +65,7 @@ def generate_launch_description():
             'active_scout_robot_name': name if not is_follower else 'scout22',
             'follower_robot_name': name if is_follower else 'follower21',
             'enable_exploration': _bool_text(
-                enable_exploration.perform(context),
+                field_enable_exploration.perform(context),
                 default_exploration,
             ),
             'start_rl_worker': _bool_text(enable_rl.perform(context), True),
@@ -74,10 +74,10 @@ def generate_launch_description():
                 True,
             ),
             'start_cartographer': _bool_text(
-                enable_cartographer.perform(context),
+                field_enable_cartographer.perform(context),
                 default_cartographer,
             ),
-            'enable_amcl': _bool_text(enable_amcl.perform(context), default_amcl),
+            'enable_amcl': _bool_text(field_enable_amcl.perform(context), default_amcl),
             # Bayesian risk is centralized on the leader; this only controls
             # Cartographer/map production on a field robot.
             'start_risk_map': 'false',
@@ -115,12 +115,30 @@ def generate_launch_description():
             default_value='ACTIVE_SCOUT',
             choices=['ACTIVE_SCOUT', 'FOLLOWER'],
         ),
-        DeclareLaunchArgument('enable_exploration', default_value=''),
+        DeclareLaunchArgument(
+            'field_enable_exploration',
+            default_value='',
+            description=(
+                'Field robot wrapper override. Empty chooses from initial_role.'
+            ),
+        ),
         DeclareLaunchArgument('enable_follow', default_value=''),
         DeclareLaunchArgument('enable_rl', default_value='true'),
         DeclareLaunchArgument('enable_observation_tx', default_value='true'),
-        DeclareLaunchArgument('enable_cartographer', default_value=''),
-        DeclareLaunchArgument('enable_amcl', default_value=''),
+        DeclareLaunchArgument(
+            'field_enable_cartographer',
+            default_value='',
+            description=(
+                'Field robot wrapper override. Empty chooses from initial_role.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'field_enable_amcl',
+            default_value='',
+            description=(
+                'Field robot wrapper override. Empty chooses from initial_role.'
+            ),
+        ),
         DeclareLaunchArgument('map_authority_eligible', default_value=''),
         DeclareLaunchArgument('camera_sender_device', default_value='/dev/video1'),
         DeclareLaunchArgument('flask_server_url', default_value='http://orin-jetson:5005/detect'),
