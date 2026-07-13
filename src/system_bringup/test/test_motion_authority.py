@@ -66,6 +66,20 @@ def test_leader_shadow_hard_stops_on_best_effort_target_detection():
     assert "self._publish_twist(0.0, 0.0)" in source
 
 
+def test_leader_shadow_blocks_nav2_goal_publish_during_target_hold():
+    source = (Path(__file__).parents[1] / 'system_bringup' / 'leader_shadow_follow.py').read_text(
+        encoding='utf-8'
+    )
+    publish_nav = source.split('def _publish_nav2_goal', 1)[1].split(
+        'def _on_nav_goal_response',
+        1,
+    )[0]
+
+    assert 'target_reason = self._target_hold_reason()' in publish_nav
+    assert 'self._hold_for_omx_target(target_reason)' in publish_nav
+    assert "self.declare_parameter('target_memory_hold_sec', 3.0)" in source
+
+
 def test_leader_shadow_backend_is_explicit_and_debug_logs_motion_chain():
     source = (Path(__file__).parents[1] / 'system_bringup' / 'leader_shadow_follow.py').read_text(
         encoding='utf-8'

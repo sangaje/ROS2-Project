@@ -97,7 +97,7 @@ class LeaderShadowFollow(Node):
         self.declare_parameter('target_detected_topic', '/omx/target_detected')
         self.declare_parameter('target_detected_stop_hold_sec', 3.0)
         self.declare_parameter('target_detected_cancel_period_sec', 0.25)
-        self.declare_parameter('target_memory_hold_sec', 5.0)
+        self.declare_parameter('target_memory_hold_sec', 3.0)
         self.declare_parameter('target_reacquire_publish_period_sec', 0.5)
         self.declare_parameter('target_processed_topic', '/omx/target_processed')
         self.declare_parameter('target_lost_topic', '/omx/target_lost')
@@ -596,8 +596,7 @@ class LeaderShadowFollow(Node):
         if (
             self.last_target_point is not None
             and self.target_memory_hold > 0.0
-            and now - max(self.last_target_point_wall, self.target_last_seen_wall)
-            <= self.target_memory_hold
+            and now - self.target_last_seen_wall <= self.target_memory_hold
         ):
             return 'target_reacquire_memory'
         return None
@@ -768,6 +767,10 @@ class LeaderShadowFollow(Node):
         catchup: bool,
         distance_to_scout: Optional[float] = None,
     ) -> None:
+        target_reason = self._target_hold_reason()
+        if target_reason is not None:
+            self._hold_for_omx_target(target_reason)
+            return
         self._stop_direct_cmd('nav2_goal_mode')
         self._publish_cancel(False)
         self._set_controller_speed_limit(True, catchup=catchup)

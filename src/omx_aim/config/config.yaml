@@ -93,8 +93,8 @@ ibvs:
   kp_pitch: 0.03
   sign_vs_x: -1             # 카메라 마운팅에 따른 부호
   sign_vs_y: -1
-  deadband_x:  0.03        # 화면 폭의 3%
-  deadband_y:  0.03        # x축과 동일 (정사각형 데드밴드)
+  deadband_x:  0.015       # 화면 폭의 1.5%; 너무 크면 PD가 멈춘다
+  deadband_y:  0.015       # x축과 동일 (정사각형 데드밴드)
   # 조준 기준점을 화면 정중앙보다 아래/오른쪽으로 둔다.
   # 0.20은 720p 기준 약 72px 아래, 0.08은 1280p 폭 기준 약 51px 오른쪽.
   aim_target_offset_y_norm: 0.20
@@ -128,8 +128,8 @@ yolo:
 # ===========================================================
 fire:
   # 격발 직전 확인 (CONFIRMING 상태)
-  hold_time_sec: 0.5            # deadband 안 유지 시간
-  confirm_deadband_scale: 1.0   # IBVS deadband 의 N배 (1.0 = 같음, 더 좁게 하려면 0.5)
+  hold_time_sec: 0.35           # deadband 안 유지 시간
+  confirm_deadband_scale: 1.8   # 확인 중 잔진동 허용 폭
   aim_settle_sec: 0.7
 
   # 격발 펄스 동안 조준 유지 시간 (fire_node 의 fire_duration_sec 와 일치 권장)
