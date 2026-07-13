@@ -297,6 +297,8 @@ class ActiveScoutRLRuntime:
         self._model_error: Optional[str] = None
         self._last_error = ''
         self._model_loading = True
+        self._model_load_started_mono = time.monotonic()
+        self._last_model_loading_log_at = 0.0
         self._model_ready_notified = False
         self._model_ready_at_ms: Optional[int] = None
         self._first_scan_at_ms: Optional[int] = None
@@ -608,6 +610,10 @@ class ActiveScoutRLRuntime:
             'motion_pipeline_enabled': self._active,
             'ready': self.ready,
             'model_loading': self._model_loading,
+            'model_loading_elapsed_ms': (
+                (now - self._model_load_started_mono) * 1000.0
+                if self._model_loading else -1.0
+            ),
             'model_error': self._model_error or '',
             'scan_age_ms': (
                 (now - snapshot.scan_received_at) * 1000.0
@@ -797,6 +803,11 @@ class ActiveScoutRLRuntime:
     def _start_model_loader(self, model_loader) -> None:
         """Keep PyTorch/SB3 import and checkpoint deserialization off the ROS executor."""
         def load() -> None:
+            self.node.get_logger().warning(
+                'SCOUT_MODEL_LOAD_START | '
+                f'robot={getattr(self.node, "robot_name", "")} '
+                f'model_path={self.config.checkpoint}'
+            )
             model = self._load_model(model_loader)
             with self._model_lock:
                 self.model = model
@@ -826,7 +837,17 @@ class ActiveScoutRLRuntime:
 
     def _model_state_tick(self) -> None:
         """Apply loader completion on an executor callback, never the loader thread."""
-        if not self._active or self._model_loading:
+        if self._model_loading:
+            now = time.monotonic()
+            if now - self._last_model_loading_log_at >= 5.0:
+                self._last_model_loading_log_at = now
+                self.node.get_logger().warning(
+                    'SCOUT_MODEL_LOAD_PENDING | '
+                    f'elapsed_ms={int((now - self._model_load_started_mono) * 1000.0)} '
+                    f'model_path={self.config.checkpoint}'
+                )
+            return
+        if not self._active:
             return
         if not self.ready:
             self._stop('model_unavailable')
