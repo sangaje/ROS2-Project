@@ -224,6 +224,8 @@ def generate_launch_description():
     unified_dashboard = LaunchConfiguration('unified_dashboard')
     dashboard_host = LaunchConfiguration('dashboard_host')
     dashboard_port = LaunchConfiguration('dashboard_port')
+    require_scout_video_ready = LaunchConfiguration('require_scout_video_ready')
+    require_omx_video_ready = LaunchConfiguration('require_omx_video_ready')
 
     def make_stack(context):
         role_value = role.perform(context).strip().lower()
@@ -1090,6 +1092,12 @@ def generate_launch_description():
                         'system_ready_topic': '/system/ready',
                         'system_readiness_detail_topic': '/system/readiness_detail',
                         'video_ready_max_age_sec': 3.0,
+                        'require_scout_video_ready': launch_bool(
+                            require_scout_video_ready.perform(context)
+                        ),
+                        'require_omx_video_ready': launch_bool(
+                            require_omx_video_ready.perform(context)
+                        ),
                     }],
                     env=process_env,
                     respawn=True,
@@ -2094,6 +2102,28 @@ def generate_launch_description():
             'dashboard_port',
             default_value='8091',
             description='Leader role only: integrated dashboard HTTP port.',
+        ),
+        DeclareLaunchArgument(
+            'require_scout_video_ready',
+            default_value='true',
+            choices=['true', 'false'],
+            description=(
+                'Leader role only: require a fresh scout YOLO stream before '
+                '/fleet/start_motion can go true.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'require_omx_video_ready',
+            default_value='true',
+            choices=['true', 'false'],
+            description=(
+                'Leader role only: require a fresh leader OMX camera stream '
+                'before /fleet/start_motion can go true. There was previously '
+                'no way to turn this off from system.launch.py -- a leader '
+                'run without OMX/arm hardware attached could never satisfy '
+                'this and would block RL motion forever. Set false when '
+                'testing without OMX hardware attached.'
+            ),
         ),
         *dds_launch_environment(domain_id),
         OpaqueFunction(function=make_stack),

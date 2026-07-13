@@ -42,6 +42,33 @@ def test_dashboard_publishes_latched_video_ready_after_all_streams_arrive():
     assert "video_ready_max_age_sec" in source
 
 
+def test_system_launch_exposes_omx_and_scout_video_ready_requirements():
+    # Regression test: leader_unified_dashboard.py has always defaulted
+    # require_omx_video_ready/require_scout_video_ready to True internally,
+    # but system.launch.py never exposed them as launch arguments -- a
+    # leader run without OMX/arm hardware physically attached had no way to
+    # ever satisfy dashboard_backend_ready, and start_motion (therefore RL
+    # motion) would block forever with no way to test around it.
+    text = (
+        Path(__file__).parents[1] / 'launch' / 'system.launch.py'
+    ).read_text(encoding='utf-8')
+
+    assert "DeclareLaunchArgument(\n            'require_scout_video_ready'," in text
+    assert "DeclareLaunchArgument(\n            'require_omx_video_ready'," in text
+    assert "require_scout_video_ready = LaunchConfiguration('require_scout_video_ready')" in text
+    assert "require_omx_video_ready = LaunchConfiguration('require_omx_video_ready')" in text
+    assert (
+        "'require_scout_video_ready': launch_bool(\n"
+        "                            require_scout_video_ready.perform(context)\n"
+        "                        ),"
+    ) in text
+    assert (
+        "'require_omx_video_ready': launch_bool(\n"
+        "                            require_omx_video_ready.perform(context)\n"
+        "                        ),"
+    ) in text
+
+
 def test_dashboard_requires_browser_rendered_panel_manifest():
     source = (
         Path(__file__).parents[1] / 'system_bringup' / 'leader_unified_dashboard.py'
