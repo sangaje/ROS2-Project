@@ -160,3 +160,20 @@ def test_camera_read_exceptions_do_not_kill_omx_loop():
     assert 'OMX_CAMERA_READ_ERROR' in node_source
     assert "vision_reason = f'camera_read_failed:{type(exc).__name__}'" in node_source
     assert "getattr(self.detector, 'reset_camera', None)" in node_source
+
+
+def test_target_tracking_repeatedly_cancels_leader_base_motion():
+    node_source = (
+        Path(__file__).parents[1] / 'omx_aim' / 'yolo_node.py'
+    ).read_text(encoding='utf-8')
+    start = node_source.index('    def maybe_stop_nav_on_detection')
+    end = node_source.index('    def _make_point_stamped', start)
+    function_source = node_source[start:end]
+
+    assert 'State.TRACKING' in function_source
+    assert 'State.CONFIRMING' in function_source
+    assert '_detection_streak < 3' not in function_source
+    assert 'if not self._waffle_nav_busy()' not in function_source
+    assert 'if self._waffle_nav_busy():' in function_source
+    assert 'self.publish_leader_nav_cancel()' in function_source
+    assert 'target tracking -> leader cancel' in function_source

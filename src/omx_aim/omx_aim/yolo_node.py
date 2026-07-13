@@ -1577,7 +1577,7 @@ class OmxYoloNode(Node):
         confidence,
         now: float,
     ) -> bool:
-        """Cancel Nav2 only after state-machine-level target confirmation."""
+        """Keep robot base motion cancelled while OMX tracks a target."""
         if not detected:
             self._detection_nav_stop_active = False
             self._detection_streak = 0
@@ -1588,11 +1588,7 @@ class OmxYoloNode(Node):
         self._detection_streak += 1
         if self.sm.state not in (State.TRACKING, State.CONFIRMING):
             return False
-        if self._detection_streak < 3:
-            return False
         if confidence is not None and confidence < float(self.cfg.yolo.conf_threshold):
-            return False
-        if not self._waffle_nav_busy():
             return False
         should_cancel = (
             not self._detection_nav_stop_active
@@ -1601,12 +1597,13 @@ class OmxYoloNode(Node):
         if not should_cancel:
             return False
 
-        self.publish_nav_cancel()
+        if self._waffle_nav_busy():
+            self.publish_nav_cancel()
         self.publish_leader_nav_cancel()
         self._last_detection_cancel_t = now
         self._detection_nav_stop_active = True
         self.get_logger().warn(
-            "[detection_stop] confirmed target -> Nav2/leader cancel")
+            "[detection_stop] target tracking -> leader cancel")
         return True
 
     def _make_point_stamped(self, coord_map):

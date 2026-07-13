@@ -81,8 +81,9 @@ class LeaderShadowFollow(Node):
         self.declare_parameter('require_video_ready', True)
         self.declare_parameter('video_ready_topic', '/fleet/video_ready')
         self.declare_parameter('target_detected_topic', '/omx/target_detected')
-        self.declare_parameter('target_detected_stop_hold_sec', 1.0)
-        self.declare_parameter('pause_on_raw_target_detection', False)
+        self.declare_parameter('target_detected_stop_hold_sec', 3.0)
+        self.declare_parameter('target_detected_cancel_period_sec', 0.25)
+        self.declare_parameter('pause_on_raw_target_detection', True)
         self.declare_parameter('omx_state_topic', '/omx/state')
         self.declare_parameter('pause_on_omx_aiming', True)
         self.declare_parameter('scout_pose_timeout_sec', 2.5)
@@ -146,6 +147,9 @@ class LeaderShadowFollow(Node):
         self.target_detected_topic = str(get('target_detected_topic').value)
         self.target_stop_hold = max(
             0.1, float(get('target_detected_stop_hold_sec').value)
+        )
+        self.target_cancel_period = max(
+            0.05, float(get('target_detected_cancel_period_sec').value)
         )
         self.pause_on_raw_target_detection = bool(
             get('pause_on_raw_target_detection').value
@@ -240,11 +244,17 @@ class LeaderShadowFollow(Node):
                 self._on_video_ready,
                 latched_qos,
             )
+        detected_qos = QoSProfile(
+            depth=5,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+        )
         self.create_subscription(
             Bool,
             self.target_detected_topic,
             self._on_target_detected,
-            10,
+            detected_qos,
         )
         self.create_subscription(String, self.omx_state_topic, self._on_omx_state, 10)
         if self.scan_enabled:
@@ -262,6 +272,7 @@ class LeaderShadowFollow(Node):
         self.video_ready = not self.require_video_ready
         self.target_detected = False
         self.target_detected_wall = -1.0e9
+        self.last_target_cancel_wall = -1.0e9
         self.omx_state = ''
         self.leader_pose: Optional[PoseStamped] = None
         self.original_scout_pose: Optional[PoseStamped] = None
@@ -373,6 +384,8 @@ class LeaderShadowFollow(Node):
         self.target_detected = bool(msg.data)
         if self.target_detected:
             self.target_detected_wall = self._now()
+            if self.pause_on_raw_target_detection:
+                self._force_leader_stop_for_target('target_detected_signal')
 
     def _on_omx_state(self, msg: String) -> None:
         self.omx_state = str(msg.data).strip().upper()
@@ -425,9 +438,7 @@ class LeaderShadowFollow(Node):
             self.pause_on_raw_target_detection
             and self._now() - self.target_detected_wall <= self.target_stop_hold
         ):
-            self._cancel_shadow_goal('target_detected')
-            self._stop_direct_cmd('target_detected')
-            self._publish_twist(0.0, 0.0)
+            self._force_leader_stop_for_target('target_detected_hold')
             self.shadow_active = False
             self.mode = LeaderMode.IDLE
             self._set_controller_speed_limit(False)
@@ -546,6 +557,20 @@ class LeaderShadowFollow(Node):
             self.mode = LeaderMode.WAIT_NEW_SCOUT
         else:
             self.mode = LeaderMode.IDLE
+
+    def _force_leader_stop_for_target(self, reason: str) -> None:
+        """Hard stop the leader while OMX owns target tracking."""
+        now = self._now()
+        if now - self.last_target_cancel_wall >= self.target_cancel_period:
+            self._pulse_cancel()
+            self.last_target_cancel_wall = now
+            self.shadow_goal_active = False
+            self.last_goal = None
+            self.get_logger().warning(
+                f'[LEADER_SHADOW] TARGET_HARD_STOP_CANCEL | reason={reason}'
+            )
+        self._stop_direct_cmd(reason)
+        self._publish_twist(0.0, 0.0)
 
     def _active_scout_pose(self) -> Tuple[Optional[PoseStamped], float]:
         if self.active_scout_id == self.follower_robot_name:

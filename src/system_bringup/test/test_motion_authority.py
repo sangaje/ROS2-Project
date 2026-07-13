@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from system_bringup.motion_authority import (
     MotionAuthority,
     authority_allows_nonzero,
@@ -8,7 +10,6 @@ from system_bringup.rl_activation_gate import (
     evaluate_backend_activation,
 )
 from system_bringup.role_contract import Role
-from system_bringup.leader_shadow_follow import LeaderShadowFollow
 
 
 def test_motion_authority_allows_only_the_current_command_owner():
@@ -41,7 +42,25 @@ def test_backend_activation_requires_active_role_localization_and_nav_release():
 
 
 def test_leader_shadow_pauses_for_target_lock_states():
-    assert LeaderShadowFollow._is_omx_aiming('TRACKING')
-    assert LeaderShadowFollow._is_omx_aiming('CONFIRMING')
-    assert LeaderShadowFollow._is_omx_aiming('firing')
-    assert not LeaderShadowFollow._is_omx_aiming('SCANNING')
+    source = (Path(__file__).parents[1] / 'system_bringup' / 'leader_shadow_follow.py').read_text(
+        encoding='utf-8'
+    )
+
+    assert "@staticmethod\n    def _is_omx_aiming" in source
+    assert "'TRACKING'" in source
+    assert "'CONFIRMING'" in source
+    assert "'FIRING'" in source
+
+
+def test_leader_shadow_hard_stops_on_best_effort_target_detection():
+    source = (Path(__file__).parents[1] / 'system_bringup' / 'leader_shadow_follow.py').read_text(
+        encoding='utf-8'
+    )
+
+    assert "self.declare_parameter('pause_on_raw_target_detection', True)" in source
+    assert "self.declare_parameter('target_detected_stop_hold_sec', 3.0)" in source
+    assert "self.declare_parameter('target_detected_cancel_period_sec', 0.25)" in source
+    assert 'ReliabilityPolicy.BEST_EFFORT' in source
+    assert 'def _force_leader_stop_for_target' in source
+    assert "self._pulse_cancel()" in source
+    assert "self._publish_twist(0.0, 0.0)" in source

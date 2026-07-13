@@ -255,7 +255,7 @@ class LeaderUnifiedDashboard(Node):
         )
         self.create_subscription(String, '/omx/state', lambda msg: self._set_omx('state', msg.data, '/omx/state', 'std_msgs/msg/String'), 10)
         self.create_subscription(String, '/omx/status', lambda msg: self._set_omx('status', msg.data, '/omx/status', 'std_msgs/msg/String'), 10)
-        self.create_subscription(Bool, '/omx/target_detected', lambda msg: self._set_omx('target_detected', bool(msg.data), '/omx/target_detected', 'std_msgs/msg/Bool'), 10)
+        self.create_subscription(Bool, '/omx/target_detected', lambda msg: self._set_omx('target_detected', bool(msg.data), '/omx/target_detected', 'std_msgs/msg/Bool'), latest_best_effort_qos)
         self.create_subscription(Bool, '/omx/camera_ready', self._on_omx_camera_ready, 10)
         self.create_subscription(String, '/omx/observation_status', self._on_omx_observation_status, latest_best_effort_qos)
         self.create_subscription(Float32, '/omx/aim_progress', lambda msg: self._set_omx('aim_progress', float(msg.data), '/omx/aim_progress', 'std_msgs/msg/Float32'), 10)

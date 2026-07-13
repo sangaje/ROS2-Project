@@ -25,3 +25,12 @@ def test_dashboard_publishes_latched_video_ready_after_all_streams_arrive():
     assert "inference_frames" in source
     assert "'/omx/observation_status'" in source
     assert "'/omx/camera_ready'" in source
+
+
+def test_dashboard_subscribes_to_omx_target_detected_with_best_effort_qos():
+    source = (
+        Path(__file__).parents[1] / 'system_bringup' / 'leader_unified_dashboard.py'
+    ).read_text(encoding='utf-8')
+
+    assert "self.create_subscription(Bool, '/omx/target_detected'" in source
+    assert "'std_msgs/msg/Bool'), latest_best_effort_qos)" in source
