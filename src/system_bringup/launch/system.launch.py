@@ -214,6 +214,11 @@ def generate_launch_description():
                 f"fleet_role must be one of {sorted(FLEET_LAUNCH_FILES)}, "
                 f'got {fleet_role_value!r}'
             )
+        if role_value == 'leader' and fleet_role_value != 'leader':
+            raise ValueError(
+                'role:=leader must use fleet_role:=leader; a member/follower '
+                'stack publishes a different robot pose topic.'
+            )
 
         main_domain_value = main_domain_id.perform(context).strip()
         main_domain = domain
@@ -296,7 +301,11 @@ def generate_launch_description():
         if fleet_role_value in ('follower', 'member'):
             fleet_launch_args['main_domain_id'] = str(main_domain)
             fleet_launch_args['forward_map_to_main'] = (
-                'true' if scout_owns_slam else 'false'
+                # The leader-owned risk bridge is the single authoritative
+                # 22->20 map/risk path.  Keeping this member bridge pose and
+                # status-only avoids two domain_bridge processes publishing
+                # the same map/risk samples into domain 20.
+                'false'
             )
         if fleet_role_value in ('leader', 'member'):
             nav2_value = start_nav2.perform(context)

@@ -245,6 +245,7 @@ class ActiveScoutRLRuntime:
         self._last_command_at = 0.0
         self._activated_at = 0.0
         self._last_error_at = 0.0
+        self._last_tf_stamp_fallback_at = 0.0
         self._last_heartbeat_at = 0.0
         self._last_stop_reason = 'not_activated'
         self._model_error: Optional[str] = None
@@ -369,6 +370,27 @@ class ActiveScoutRLRuntime:
 
     def sensor_ready(self) -> bool:
         return self._fresh(self._sensor_snapshot(), time.monotonic())
+
+    def readiness_summary(self) -> str:
+        """Expose the precise distributed-input gate state in worker logs."""
+        snapshot = self._sensor_snapshot()
+        now = time.monotonic()
+        if snapshot.scan is None:
+            scan_summary = 'scan=no'
+        else:
+            scan_summary = f'scan=yes age={now - snapshot.scan_received_at:.2f}s'
+        if snapshot.slam_map is None:
+            map_summary = 'map=no'
+        else:
+            frame = str(snapshot.slam_map.header.frame_id or '').lstrip('/')
+            map_summary = (
+                f'map=yes age={now - snapshot.map_received_at:.2f}s '
+                f'frame={frame or "(empty)"}'
+            )
+        return (
+            f'{scan_summary} {map_summary} tf={self.tf_ready()} '
+            f'expected_map={self.config.map_frame}'
+        )
 
     def tf_ready(self) -> bool:
         snapshot = self._sensor_snapshot()
@@ -502,12 +524,33 @@ class ActiveScoutRLRuntime:
         )
 
     def _lookup_pose(self, target_frame: str, source_frame: str, stamp: Time) -> tuple[np.ndarray, float]:
-        transform = self.tf_buffer.lookup_transform(
-            target_frame,
-            source_frame,
-            stamp,
-            timeout=Duration(seconds=self.config.max_tf_age_sec),
-        )
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                target_frame,
+                source_frame,
+                stamp,
+                timeout=Duration(seconds=self.config.max_tf_age_sec),
+            )
+        except TransformException:
+            # The scout and inference Jetson have independent clocks.  A
+            # fresh DDS scan can therefore have a stamp outside the local TF
+            # cache even though the latest transform is healthy.
+            if stamp.nanoseconds == 0:
+                raise
+            transform = self.tf_buffer.lookup_transform(
+                target_frame,
+                source_frame,
+                Time(),
+                timeout=Duration(seconds=self.config.max_tf_age_sec),
+            )
+            now = time.monotonic()
+            if now - self._last_tf_stamp_fallback_at >= 5.0:
+                self._last_tf_stamp_fallback_at = now
+                self.node.get_logger().warning(
+                    'SCOUT_RL_TF_LATEST_FALLBACK | '
+                    f'target={target_frame} source={source_frame} '
+                    'reason=scan_timestamp_not_available_in_local_tf_cache'
+                )
         translation = transform.transform.translation
         return (
             np.array([float(translation.x), float(translation.y)], dtype=np.float32),

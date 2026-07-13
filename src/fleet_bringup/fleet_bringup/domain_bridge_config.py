@@ -268,6 +268,7 @@ def write_member_bridge_configs(
     member_domain: int,
     *,
     forward_map_to_main: bool = False,
+    forward_risk_to_main: bool = False,
     output_directory: Optional[Path] = None,
 ) -> Tuple[Path, Path]:
     """Create the two directional domain_bridge configurations for a plain
@@ -338,8 +339,9 @@ def write_member_bridge_configs(
             'std_msgs/msg/String',
             profile=qos(durability='transient_local', depth=1),
         ),
-        **risk_topics(),
     }
+    if forward_risk_to_main:
+        member_topics.update(risk_topics())
     if forward_map_to_main:
         member_topics['/map'] = topic(
             'nav_msgs/msg/OccupancyGrid',

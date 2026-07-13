@@ -91,7 +91,7 @@ def test_follower_scan_topic_uses_its_domain_id(tmp_path):
     )
 
 
-def test_member_bridge_forwards_core_risk_topics_to_main(tmp_path):
+def test_member_bridge_keeps_risk_topics_off_the_default_pose_status_path(tmp_path):
     main_path, member_path = write_member_bridge_configs(
         24,
         26,
@@ -112,17 +112,27 @@ def test_member_bridge_forwards_core_risk_topics_to_main(tmp_path):
         'geometry_msgs/msg/PoseArray'
     )
     assert (member['from_domain'], member['to_domain']) == (26, 24)
+    assert '/risk/risk_map' not in member['topics']
+    assert '/risk/person_probability_map' not in member['topics']
+    assert '/risk/evidence_markers' not in member['topics']
+    assert '/map' not in member['topics']
+
+
+def test_member_bridge_can_explicitly_forward_risk_topics_to_main(tmp_path):
+    _, member_path = write_member_bridge_configs(
+        24,
+        26,
+        forward_risk_to_main=True,
+        output_directory=tmp_path,
+    )
+    member = yaml.safe_load(member_path.read_text())
+
     assert member['topics']['/risk/risk_map']['type'] == (
         'nav_msgs/msg/OccupancyGrid'
     )
     assert member['topics']['/risk/risk_map']['qos']['durability'] == (
         'transient_local'
     )
-    assert member['topics']['/risk/person_probability_map']['qos']['depth'] == 1
-    assert member['topics']['/risk/evidence_markers']['type'] == (
-        'visualization_msgs/msg/MarkerArray'
-    )
-    assert '/map' not in member['topics']
 
 
 def test_member_bridge_can_forward_owned_map_to_main(tmp_path):

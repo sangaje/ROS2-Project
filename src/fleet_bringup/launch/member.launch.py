@@ -45,6 +45,7 @@ def generate_launch_description():
     start_nav2 = LaunchConfiguration('start_nav2')
     hardware_param_file = LaunchConfiguration('hardware_param_file')
     forward_map_to_main = LaunchConfiguration('forward_map_to_main')
+    forward_risk_to_main = LaunchConfiguration('forward_risk_to_main')
     initial_x = LaunchConfiguration('member_initial_x')
     initial_y = LaunchConfiguration('member_initial_y')
     initial_yaw = LaunchConfiguration('member_initial_yaw')
@@ -80,6 +81,7 @@ def generate_launch_description():
                 main_domain,
                 member_domain,
                 forward_map_to_main=launch_bool(forward_map_to_main.perform(context)),
+                forward_risk_to_main=launch_bool(forward_risk_to_main.perform(context)),
             )
             bridges = [
                 Node(
@@ -128,6 +130,13 @@ def generate_launch_description():
                 'output_topic': '/member_pose',
                 'publish_rate_hz': 10.0,
                 'log_every_n': 100,
+                # Do not export a Cartographer correction as a physical jump
+                # while the scout's wheel odometry says it is stationary.
+                'freeze_when_stationary': True,
+                'stationary_target_frame': 'odom',
+                'stationary_linear_threshold_m': 0.003,
+                'stationary_angular_threshold_rad': 0.008,
+                'stationary_freeze_warmup_sec': 8.0,
             }],
             env=process_env,
             respawn=True,
@@ -356,6 +365,16 @@ def generate_launch_description():
             description=(
                 'Bridge this robot-owned /map back to the leader domain as '
                 '/map_bridge. Enable only when this member/scout owns SLAM.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'forward_risk_to_main',
+            default_value='false',
+            choices=['true', 'false'],
+            description=(
+                'Bridge risk topics directly from this member to the leader. '
+                'Leave false when the leader runs its dedicated risk->leader '
+                'bridge, which is the normal three-robot topology.'
             ),
         ),
         DeclareLaunchArgument('member_initial_x', default_value='0.0'),

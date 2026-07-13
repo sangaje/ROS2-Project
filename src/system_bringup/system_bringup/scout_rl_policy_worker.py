@@ -382,7 +382,8 @@ class ScoutRLPolicyWorker(Node):
             )
         elif state == RLWorkerState.WAIT_SENSOR_READY:
             self.get_logger().warning(
-                f'SCOUT_WAIT_SENSOR_READY | robot={self.robot_name} reason={reason}'
+                f'SCOUT_WAIT_SENSOR_READY | robot={self.robot_name} reason={reason} '
+                f'inputs={self.runtime.readiness_summary()}'
             )
         elif state == RLWorkerState.ACTIVE:
             self.get_logger().warning(
