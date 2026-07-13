@@ -114,7 +114,7 @@ def generate_launch_description():
         DeclareLaunchArgument('detection_reuse_max_distance_m', default_value='0.50'),
         DeclareLaunchArgument('external_detection_max_count', default_value='64'),
         DeclareLaunchArgument('update_rate_hz', default_value='2.0'),
-        DeclareLaunchArgument('risk_publish_rate_hz', default_value='5.0'),
+        DeclareLaunchArgument('risk_publish_rate_hz', default_value='1.0'),
         DeclareLaunchArgument('diagnostic_publish_rate_hz', default_value='1.0'),
 
         DeclareLaunchArgument('opencv_camera_device', default_value='/dev/video0'),

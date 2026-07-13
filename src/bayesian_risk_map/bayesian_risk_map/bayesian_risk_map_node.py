@@ -570,6 +570,9 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.last_region_debug_wall_sec = 0.0
         self.last_diagnostic_publish_ros_ns = 0
         self.last_risk_publish_ros_ns = 0
+        self.risk_publish_seq = 0
+        self.last_risk_publish_wall_sec = None
+        self.last_detection_pipeline: Dict[str, int] = {}
         self._published_layer_signatures: Dict[str, Tuple] = {}
 
         self.latest_detections: List[Detection2D] = []
@@ -1847,11 +1850,16 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
 
     def on_external_detections(self, msg: String):
         self.external_detection_rx_count += 1
+        pipeline = self._new_detection_pipeline()
+        pipeline['observation_rx'] = int(self.external_detection_rx_count)
         try:
             payload = json.loads(msg.data)
         except Exception as e:
+            pipeline['json_parse_success'] = 0
+            self._log_detection_pipeline(pipeline)
             self.get_logger().warn(f'external detection JSON parse failed: {e}', throttle_duration_sec=2.0)
             return
+        pipeline['json_parse_success'] = 1
 
         image_w = int(payload.get('image_width') or payload.get('width') or 0)
         image_h = int(payload.get('image_height') or payload.get('height') or 0)
@@ -1860,16 +1868,24 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             image_w = int(meta.get('width') or 0)
             image_h = int(meta.get('height') or 0)
         if image_w <= 0 or image_h <= 0:
+            pipeline['rejected_schema'] += 1
+            self._log_detection_pipeline(pipeline)
             self.get_logger().warn('external detection ignored: missing image_width/image_height', throttle_duration_sec=2.0)
             return
 
         raw_dets = payload.get('detections', [])
         if not isinstance(raw_dets, list):
+            pipeline['rejected_schema'] += 1
+            self._log_detection_pipeline(pipeline)
             self.get_logger().warn('external detection ignored: detections is not a list', throttle_duration_sec=2.0)
             return
+        pipeline['raw_detection_count'] = len(raw_dets)
         robot_id = str(payload.get('robot_id', payload.get('robot', 'unknown'))).strip() or 'unknown'
         if not self.observation_source_allowed(payload, robot_id):
+            pipeline['rejected_source'] = len(raw_dets)
+            self._log_detection_pipeline(pipeline)
             return
+        pipeline['active_source_valid_count'] = len(raw_dets)
         boot_id = str(payload.get('boot_id', '')).strip()
         try:
             observation_seq = int(payload.get('sequence', payload.get('observation_id', -1)))
@@ -1883,6 +1899,8 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         previous_seq = self.external_observation_seq_by_robot.get(robot_id, -1)
         if observation_seq >= 0 and observation_seq == previous_seq:
             self.external_observation_duplicate_dropped += 1
+            pipeline['rejected_stale'] = len(raw_dets)
+            self._log_detection_pipeline(pipeline)
             self.get_logger().warn(
                 'OBSERVATION_DUPLICATE_DROPPED | '
                 f'robot_id={robot_id} boot_id={boot_id or "unknown"} '
@@ -1892,6 +1910,8 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             return
         if observation_seq >= 0 and observation_seq < previous_seq:
             self.external_observation_out_of_order_dropped += 1
+            pipeline['rejected_stale'] = len(raw_dets)
+            self._log_detection_pipeline(pipeline)
             self.get_logger().warn(
                 'OBSERVATION_OUT_OF_ORDER_DROPPED | '
                 f'robot_id={robot_id} boot_id={boot_id or "unknown"} '
@@ -1910,34 +1930,84 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         detections: List[Detection2D] = []
         for item in raw_dets:
             if not isinstance(item, dict):
+                pipeline['rejected_schema'] += 1
                 continue
-            conf = float(item.get('conf', item.get('confidence', 0.0)))
-            if conf < self.conf_threshold:
+            try:
+                conf = float(item.get('conf', item.get('confidence', 0.0)))
+            except (TypeError, ValueError):
+                pipeline['rejected_schema'] += 1
                 continue
             label = normalize_label(item.get('label', item.get('name', '')))
             cls = item.get('class_id', item.get('class', item.get('cls', None)))
-            is_target = (
+            class_ok = (
                 self.target_class < 0
-                or label in self.target_labels
                 or cls == self.target_class
                 or str(cls) == str(self.target_class)
             )
+            label_ok = label in self.target_labels
+            if class_ok:
+                pipeline['class_match_count'] += 1
+            if label_ok:
+                pipeline['label_match_count'] += 1
+            is_target = class_ok or label_ok
             if not is_target:
+                pipeline['rejected_class'] += 1
+                if label:
+                    pipeline['rejected_label'] += 1
                 continue
+            if conf < self.conf_threshold:
+                pipeline['rejected_confidence'] += 1
+                continue
+            pipeline['confidence_pass_count'] += 1
 
             bbox_raw = item.get('bbox', item.get('xyxy', None))
             if bbox_raw is None and all(k in item for k in ('x1', 'y1', 'x2', 'y2')):
                 bbox_raw = [item['x1'], item['y1'], item['x2'], item['y2']]
             if not isinstance(bbox_raw, (list, tuple)) or len(bbox_raw) != 4:
+                pipeline['rejected_schema'] += 1
                 continue
-            bbox = tuple(float(v) for v in bbox_raw)
+            try:
+                bbox = tuple(float(v) for v in bbox_raw)
+            except (TypeError, ValueError):
+                pipeline['rejected_schema'] += 1
+                continue
+            if (
+                len(bbox) != 4
+                or not all(math.isfinite(v) for v in bbox)
+                or bbox[2] <= bbox[0]
+                or bbox[3] <= bbox[1]
+            ):
+                pipeline['rejected_schema'] += 1
+                continue
+            pipeline['schema_valid_count'] += 1
             bearing = item.get('bearing_rad', None)
             range_hat = item.get('range_hat_m', item.get('range_m', None))
+            try:
+                bearing_value = (
+                    float(bearing) if bearing is not None
+                    else self.bbox_center_to_bearing(bbox, image_w)
+                )
+                range_value = (
+                    float(range_hat) if range_hat is not None
+                    else self.bbox_height_to_range(bbox, image_h)
+                )
+            except (TypeError, ValueError):
+                pipeline['rejected_range'] += 1
+                continue
+            if (
+                not math.isfinite(bearing_value)
+                or not math.isfinite(range_value)
+                or range_value < self.min_range_m
+                or range_value > self.max_range_m
+            ):
+                pipeline['rejected_range'] += 1
+                continue
+            pipeline['range_valid_count'] += 1
             detections.append(Detection2D(
                 bbox=bbox,
                 conf=conf,
-                bearing_rad=float(bearing) if bearing is not None else self.bbox_center_to_bearing(bbox, image_w),
-                range_hat_m=float(range_hat) if range_hat is not None else self.bbox_height_to_range(bbox, image_h),
+                bearing_rad=bearing_value,
+                range_hat_m=range_value,
             ))
 
         capture_ros_sec = self.payload_float(payload, 'capture_ros_sec', 0.0)
@@ -1965,6 +2035,8 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         capture_pose = self.parse_payload_capture_pose(payload)
         if capture_pose is None:
             self.external_observation_missing_pose_dropped += 1
+            pipeline['rejected_pose'] = len(detections)
+            self._log_detection_pipeline(pipeline)
             self.get_logger().warn(
                 'OBSERVATION_MISSING_POSE_DROPPED | '
                 f'robot_id={robot_id} boot_id={boot_id or "unknown"} '
@@ -1972,6 +2044,8 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                 throttle_duration_sec=2.0,
             )
             return
+        pipeline['pose_match_count'] = len(detections)
+        pipeline['evidence_created_count'] = len(detections)
         for detection in detections:
             self.log_risk_projection_debug(
                 bbox=detection.bbox,
@@ -2002,6 +2076,62 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                 self.external_observation_seq_by_robot[robot_id] = observation_seq
         self.last_image_shape = f'{image_w}x{image_h} flask_json'
         self.last_image_encoding = 'external_json'
+        self._log_detection_pipeline(pipeline)
+
+    @staticmethod
+    def _new_detection_pipeline() -> Dict[str, int]:
+        return {
+            'observation_rx': 0,
+            'json_parse_success': 0,
+            'raw_detection_count': 0,
+            'schema_valid_count': 0,
+            'active_source_valid_count': 0,
+            'class_match_count': 0,
+            'label_match_count': 0,
+            'confidence_pass_count': 0,
+            'pose_match_count': 0,
+            'range_valid_count': 0,
+            'evidence_created_count': 0,
+            'rejected_schema': 0,
+            'rejected_source': 0,
+            'rejected_class': 0,
+            'rejected_label': 0,
+            'rejected_confidence': 0,
+            'rejected_pose': 0,
+            'rejected_stale': 0,
+            'rejected_range': 0,
+        }
+
+    def _log_detection_pipeline(self, pipeline: Dict[str, int]) -> None:
+        self.last_detection_pipeline = dict(pipeline)
+        self.get_logger().warning(
+            'RISK_DETECTION_PIPELINE | '
+            + ' | '.join(
+                f'{key}={int(pipeline.get(key, 0))}'
+                for key in (
+                    'observation_rx',
+                    'json_parse_success',
+                    'raw_detection_count',
+                    'schema_valid_count',
+                    'active_source_valid_count',
+                    'class_match_count',
+                    'label_match_count',
+                    'confidence_pass_count',
+                    'pose_match_count',
+                    'range_valid_count',
+                    'evidence_created_count',
+                    'rejected_schema',
+                    'rejected_source',
+                    'rejected_class',
+                    'rejected_label',
+                    'rejected_confidence',
+                    'rejected_pose',
+                    'rejected_stale',
+                    'rejected_range',
+                )
+            ),
+            throttle_duration_sec=1.0,
+        )
 
     def parse_payload_capture_pose(self, payload):
         pose = payload.get('capture_pose')
@@ -3630,7 +3760,30 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         msg.data = np.ascontiguousarray(data, dtype=np.int8).ravel().tolist()
         return msg
 
-    def _publish_array_layer(self, key: str, publisher, arr, stamp) -> bool:
+    def _risk_publish_stats(self, data: np.ndarray) -> Dict[str, float]:
+        flat = np.asarray(data, dtype=np.int16).ravel()
+        valid = flat >= 0
+        positive = flat > 0
+        positive_values = flat[positive]
+        return {
+            'data_length': int(flat.size),
+            'unknown_count': int(np.count_nonzero(flat < 0)),
+            'zero_count': int(np.count_nonzero(valid & (flat == 0))),
+            'positive_count': int(np.count_nonzero(positive)),
+            'min_value': int(np.min(flat)) if flat.size else 0,
+            'max_value': int(np.max(flat)) if flat.size else 0,
+            'mean_positive': (
+                float(np.mean(positive_values)) if positive_values.size else 0.0
+            ),
+        }
+
+    def _safe_graph_count(self, fn_name: str, topic: str) -> int:
+        try:
+            return int(getattr(self, fn_name)(topic))
+        except Exception:  # noqa: BLE001
+            return -1
+
+    def _publish_array_layer(self, key: str, publisher, arr, stamp, *, force: bool = False) -> bool:
         if publisher is None:
             return False
         if arr is None:
@@ -3639,10 +3792,49 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             arr = np.zeros_like(self.occ_grid, dtype=np.float32)
         data = np.rint(np.clip(arr, 0.0, 1.0) * 100.0).astype(np.int8, copy=False)
         signature = self._layer_signature(data)
-        if self._published_layer_signatures.get(key) == signature:
+        if not force and self._published_layer_signatures.get(key) == signature:
             return False
         publisher.publish(self._make_occgrid_from_int8(data, stamp))
         self._published_layer_signatures[key] = signature
+        if key == 'risk':
+            self.risk_publish_seq = int(getattr(self, 'risk_publish_seq', 0)) + 1
+            now_wall = time.time()
+            previous_wall = getattr(self, 'last_risk_publish_wall_sec', None)
+            self.last_risk_publish_wall_sec = now_wall
+            publish_rate = (
+                1.0 / max(1e-6, now_wall - previous_wall)
+                if previous_wall is not None else 0.0
+            )
+            stats = self._risk_publish_stats(data)
+            info = self.latest_map_msg.info
+            grid_state = (
+                'positive_grid'
+                if stats['positive_count'] > 0 else 'empty_grid'
+            )
+            try:
+                self.get_logger().warning(
+                    'RISK_MAP_PUBLISH_DEBUG | '
+                    'topic=/risk/risk_map '
+                    f'seq={self.risk_publish_seq} '
+                    f'state={grid_state} '
+                    f'frame_id={self.map_frame} '
+                    f'width={int(info.width)} '
+                    f'height={int(info.height)} '
+                    f'resolution={float(info.resolution):.6f} '
+                    f'data_length={int(stats["data_length"])} '
+                    f'unknown_count={int(stats["unknown_count"])} '
+                    f'zero_count={int(stats["zero_count"])} '
+                    f'positive_count={int(stats["positive_count"])} '
+                    f'min_value={int(stats["min_value"])} '
+                    f'max_value={int(stats["max_value"])} '
+                    f'mean_positive={float(stats["mean_positive"]):.3f} '
+                    f'publisher_count={self._safe_graph_count("count_publishers", "/risk/risk_map")} '
+                    f'subscriber_count={self._safe_graph_count("count_subscribers", "/risk/risk_map")} '
+                    f'publish_rate_hz={publish_rate:.2f}',
+                    throttle_duration_sec=1.0,
+                )
+            except Exception:  # noqa: BLE001
+                pass
         return True
 
     def _publish_region_id_layer(self, key: str, publisher, stamp) -> bool:
@@ -3701,7 +3893,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             if self.risk_publish_rate_hz > 0.0 else 0
         )
         if risk_period_ns <= 0 or now_ros_ns - self.last_risk_publish_ros_ns >= risk_period_ns:
-            self._publish_array_layer('risk', self.pub_risk, self.risk_map, stamp)
+            self._publish_array_layer('risk', self.pub_risk, self.risk_map, stamp, force=True)
             self._publish_array_layer(
                 'bearing_consensus',
                 self.pub_bearing_consensus,

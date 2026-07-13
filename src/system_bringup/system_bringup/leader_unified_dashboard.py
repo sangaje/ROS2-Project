@@ -84,6 +84,23 @@ def _metadata_match(a: Optional[Dict[str, Any]], b: Optional[Dict[str, Any]]) ->
     return True
 
 
+def _grid_stats(msg: OccupancyGrid) -> Dict[str, Any]:
+    data = list(msg.data)
+    valid = [int(value) for value in data if int(value) >= 0]
+    positives = [value for value in valid if value > 0]
+    return {
+        'data_length': len(data),
+        'unknown_count': sum(1 for value in data if int(value) < 0),
+        'zero_count': sum(1 for value in valid if value == 0),
+        'positive_count': len(positives),
+        'min_value': min(data) if data else 0,
+        'max_value': max(data) if data else 0,
+        'mean_positive': (
+            sum(positives) / float(len(positives)) if positives else 0.0
+        ),
+    }
+
+
 class CachedMjpegStream:
     """One upstream MJPEG reader, many dashboard browser clients.
 
@@ -623,8 +640,10 @@ class LeaderUnifiedDashboard(Node):
             'png_seq': -1,
             'png': None,
             'metadata': None,
+            'stats': None,
             'render_pending_seq': -1,
             'render_in_progress': False,
+            'render_error': None,
         }
 
     @staticmethod
@@ -800,15 +819,21 @@ class LeaderUnifiedDashboard(Node):
             return response_class(f'{kind} not available\n', status=404, mimetype='text/plain')
         with self._lock:
             seq = int(self._grids[kind]['png_seq'])
+            stats = dict(self._grids[kind].get('stats') or {})
         etag = f'"{kind}-{seq}"'
         if request_obj.headers.get('If-None-Match') == etag:
             response = response_class(status=304)
             response.headers['ETag'] = etag
             response.headers['Cache-Control'] = 'no-cache'
+            response.headers['X-Grid-Seq'] = str(seq)
             return response
         response = response_class(png, mimetype='image/png')
         response.headers['Cache-Control'] = 'no-cache'
         response.headers['ETag'] = etag
+        response.headers['X-Grid-Seq'] = str(seq)
+        response.headers['X-Grid-Positive-Count'] = str(int(stats.get('positive_count', 0) or 0))
+        response.headers['X-Grid-Max-Value'] = str(int(stats.get('max_value', 0) or 0))
+        response.headers['X-Grid-Bytes'] = str(len(png))
         return response
 
     def _run_flask(self) -> None:
@@ -836,11 +861,46 @@ class LeaderUnifiedDashboard(Node):
             state['seq'] += 1
             state['received_wall_sec'] = now
             state['metadata'] = _grid_signature(msg)
+            state['stats'] = _grid_stats(msg)
             state['render_pending_seq'] = int(state['seq'])
+            state['render_error'] = None
+            state['png'] = None
+            state['png_seq'] = -1
             topic = self.map_topic if kind == 'map' else self.risk_topic
             self._touch_topic(topic, now, 'nav_msgs/msg/OccupancyGrid')
         with self._grid_render_condition:
             self._grid_render_condition.notify_all()
+        if kind == 'risk':
+            stats = _grid_stats(msg)
+            source_stamp = _stamp_to_float(msg.header.stamp)
+            source_age_ms = (
+                max(0.0, (time.time() - source_stamp) * 1000.0)
+                if source_stamp > 0.0 else -1.0
+            )
+            try:
+                resolved = self.resolve_topic_name(self.risk_topic)
+            except Exception:  # noqa: BLE001
+                resolved = self.risk_topic
+            self.get_logger().warning(
+                'DASHBOARD_RISK_SUBSCRIBER | '
+                f'configured_topic={self.risk_topic} '
+                f'resolved_topic={resolved} '
+                f'publisher_count={self.count_publishers(self.risk_topic)} '
+                f'subscription_count={self.count_subscribers(self.risk_topic)} '
+                'qos_compatible=true '
+                f'callback_count={int(self._grids["risk"]["seq"])} '
+                'receive_age_ms=0 '
+                f'source_stamp_age_ms={source_age_ms:.1f} '
+                f'frame_id={msg.header.frame_id} '
+                f'width={int(msg.info.width)} '
+                f'height={int(msg.info.height)} '
+                f'resolution={float(msg.info.resolution):.6f} '
+                f'data_length={int(stats["data_length"])} '
+                f'positive_count={int(stats["positive_count"])} '
+                f'max_value={int(stats["max_value"])} '
+                f'grid_seq={int(self._grids["risk"]["seq"])}',
+                throttle_duration_sec=1.0,
+            )
 
     def _on_pose(self, name: str, msg: PoseStamped, source: str) -> None:
         now = time.time()
@@ -1082,6 +1142,24 @@ class LeaderUnifiedDashboard(Node):
             version = panel.get('version') if isinstance(panel, dict) else None
             if name == 'fleet_state':
                 version_ok = bool(isinstance(panel, dict) and panel.get('robots'))
+            elif name == 'risk_map':
+                backend_seq = panel.get('backend_seq') if isinstance(panel, dict) else None
+                png_seq = panel.get('png_seq') if isinstance(panel, dict) else None
+                png_bytes = panel.get('png_bytes') if isinstance(panel, dict) else None
+                status = str(panel.get('status', 'NO DATA')) if isinstance(panel, dict) else 'NO DATA'
+                grid_received = bool(isinstance(panel, dict) and panel.get('grid_received'))
+                version_ok = (
+                    isinstance(version, (int, float))
+                    and isinstance(backend_seq, (int, float))
+                    and isinstance(png_seq, (int, float))
+                    and int(version) == int(backend_seq)
+                    and int(png_seq) == int(backend_seq)
+                    and int(version) > 0
+                    and isinstance(png_bytes, (int, float))
+                    and int(png_bytes) > 0
+                    and grid_received
+                    and status in ('EMPTY_RISK_MAP', 'ACTIVE_RISK_MAP')
+                )
             else:
                 version_ok = isinstance(version, (int, float)) and float(version) > 0
             ok = bool(loaded and rendered and not placeholder and version_ok)
@@ -1090,6 +1168,14 @@ class LeaderUnifiedDashboard(Node):
                 'rendered': rendered,
                 'placeholder': placeholder,
                 'version': version,
+                'backend_seq': panel.get('backend_seq') if isinstance(panel, dict) else None,
+                'png_seq': panel.get('png_seq') if isinstance(panel, dict) else None,
+                'grid_received': panel.get('grid_received') if isinstance(panel, dict) else None,
+                'png_bytes': panel.get('png_bytes') if isinstance(panel, dict) else None,
+                'positive_count': panel.get('positive_count') if isinstance(panel, dict) else None,
+                'max_value': panel.get('max_value') if isinstance(panel, dict) else None,
+                'status': panel.get('status') if isinstance(panel, dict) else None,
+                'render_error': panel.get('render_error') if isinstance(panel, dict) else None,
                 'ready': ok,
             }
             all_ready = all_ready and ok
@@ -1364,6 +1450,8 @@ class LeaderUnifiedDashboard(Node):
             f'leader_omx_rendered={panel_state.get("leader_omx", {}).get("rendered") if isinstance(panel_state.get("leader_omx"), dict) else None} '
             f'map_rendered={panel_state.get("map", {}).get("rendered") if isinstance(panel_state.get("map"), dict) else None} '
             f'risk_map_rendered={panel_state.get("risk_map", {}).get("rendered") if isinstance(panel_state.get("risk_map"), dict) else None} '
+            f'risk_map_has_positive_evidence={int(panel_state.get("risk_map", {}).get("positive_count") or 0) > 0 if isinstance(panel_state.get("risk_map"), dict) else None} '
+            f'risk_map_status={panel_state.get("risk_map", {}).get("status") if isinstance(panel_state.get("risk_map"), dict) else None} '
             f'fleet_state_rendered={panel_state.get("fleet_state", {}).get("rendered") if isinstance(panel_state.get("fleet_state"), dict) else None} '
             f'browser_heartbeat={bool(ui_detail.get("session_fresh"))} '
             f'leader_localization_ready={infrastructure.get("leader_localization")} '
@@ -1550,6 +1638,31 @@ class LeaderUnifiedDashboard(Node):
         with self._lock:
             map_meta = self._grids['map']['metadata']
             risk_meta = self._grids['risk']['metadata']
+            map_seq = int(self._grids['map']['seq'])
+            risk_seq = int(self._grids['risk']['seq'])
+            metadata_matches = _metadata_match(map_meta, risk_meta)
+        if map_meta and risk_meta:
+            origin_delta_x = float(risk_meta['origin']['x']) - float(map_meta['origin']['x'])
+            origin_delta_y = float(risk_meta['origin']['y']) - float(map_meta['origin']['y'])
+            origin_delta_yaw = float(risk_meta['origin']['yaw']) - float(map_meta['origin']['yaw'])
+            self.get_logger().warning(
+                'RISK_MAP_ALIGNMENT | '
+                f'map_seq={map_seq} '
+                f'risk_seq={risk_seq} '
+                f'map_frame={map_meta["frame_id"]} '
+                f'risk_frame={risk_meta["frame_id"]} '
+                f'map_size={map_meta["width"]}x{map_meta["height"]} '
+                f'risk_size={risk_meta["width"]}x{risk_meta["height"]} '
+                f'map_resolution={float(map_meta["resolution"]):.6f} '
+                f'risk_resolution={float(risk_meta["resolution"]):.6f} '
+                f'origin_delta_x={origin_delta_x:.6f} '
+                f'origin_delta_y={origin_delta_y:.6f} '
+                f'origin_delta_yaw={origin_delta_yaw:.6f} '
+                f'metadata_match={metadata_matches} '
+                f'action={"direct_overlay" if metadata_matches else "wait"}',
+                throttle_duration_sec=2.0,
+            )
+        with self._lock:
             return {
                 'server_time_sec': now,
                 'omx_debug': {
@@ -1569,7 +1682,7 @@ class LeaderUnifiedDashboard(Node):
                 'map': self._grid_summary('map', now, self.map_stale_timeout_sec),
                 'risk': {
                     **self._grid_summary('risk', now, self.risk_stale_timeout_sec),
-                    'metadata_matches_map': _metadata_match(map_meta, risk_meta),
+                    'metadata_matches_map': metadata_matches,
                 },
                 'robots': [
                     self._robot_summary(name, now)
@@ -1628,13 +1741,38 @@ class LeaderUnifiedDashboard(Node):
             age = max(0.0, now - state['received_wall_sec'])
             status = 'STALE' if age > stale_timeout else 'OK'
         msg = state['msg']
+        topic = self.map_topic if kind == 'map' else self.risk_topic
+        stats = state.get('stats') or {}
+        publisher_count = self.count_publishers(topic)
+        if kind == 'risk':
+            if publisher_count <= 0 and msg is None:
+                status = 'NO_TOPIC'
+            elif msg is None:
+                status = 'WAITING_FIRST_GRID'
+            elif age is not None and age > stale_timeout:
+                status = 'STALE_RISK_MAP'
+            elif int(stats.get('positive_count', 0) or 0) > 0:
+                status = 'ACTIVE_RISK_MAP'
+            else:
+                status = 'EMPTY_RISK_MAP'
+        png = state.get('png')
         return {
-            'topic': self.map_topic if kind == 'map' else self.risk_topic,
+            'topic': topic,
             'status': status,
             'age_sec': age,
             'seq': int(state['seq']),
             'metadata': state['metadata'],
             'stamp_sec': _stamp_to_float(msg.header.stamp) if msg is not None else None,
+            'grid_received': msg is not None,
+            'callback_count': int(state['seq']),
+            'publisher_count': publisher_count,
+            'subscriber_count': self.count_subscribers(topic),
+            'png_seq': int(state.get('png_seq', -1)),
+            'png_bytes': len(png) if isinstance(png, (bytes, bytearray)) else 0,
+            'render_pending_seq': int(state.get('render_pending_seq', -1)),
+            'render_in_progress': bool(state.get('render_in_progress', False)),
+            'render_error': state.get('render_error'),
+            **stats,
         }
 
     def _robot_summary(self, name: str, now: float) -> Dict[str, Any]:
@@ -1803,16 +1941,36 @@ class LeaderUnifiedDashboard(Node):
                         state['png'] = png
                         state['png_seq'] = seq
                         state['render_pending_seq'] = -1
+                        state['render_error'] = None
                     state['render_in_progress'] = False
-                self.get_logger().debug(
-                    'DASHBOARD_GRID_PNG_CACHE | '
-                    f'kind={kind} seq={seq} bytes={len(png)} encode_ms={elapsed_ms:.1f}'
+                log_name = (
+                    'DASHBOARD_RISK_RENDER_BACKEND'
+                    if kind == 'risk' else 'DASHBOARD_GRID_PNG_CACHE'
+                )
+                self.get_logger().warning(
+                    f'{log_name} | '
+                    f'kind={kind} '
+                    f'grid_seq={seq} '
+                    f'png_seq={seq} '
+                    'render_pending_seq=-1 '
+                    'render_in_progress=false '
+                    'grid_received_age_ms=0 '
+                    f'render_duration_ms={elapsed_ms:.1f} '
+                    f'png_bytes={len(png)} '
+                    'success=true '
+                    'error=none',
+                    throttle_duration_sec=1.0 if kind == 'risk' else 5.0,
                 )
             except Exception as exc:  # noqa: BLE001
                 with self._lock:
                     self._grids[kind]['render_in_progress'] = False
+                    self._grids[kind]['render_error'] = str(exc)
                 self.get_logger().warning(
-                    f'DASHBOARD_GRID_PNG_CACHE_ERROR | kind={kind} seq={seq} error={exc}',
+                    f'DASHBOARD_RISK_RENDER_BACKEND | kind={kind} '
+                    f'grid_seq={seq} png_seq=-1 render_pending_seq={seq} '
+                    'render_in_progress=false grid_received_age_ms=0 '
+                    'render_duration_ms=0.0 png_bytes=0 success=false '
+                    f'error={exc}',
                     throttle_duration_sec=5.0,
                 )
 

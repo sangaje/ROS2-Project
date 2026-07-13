@@ -733,7 +733,7 @@ def generate_launch_description():
                                 'publish_diagnostic_maps': False,
                                 'debug_show_opencv': False,
                                 'teleop_mode': True,
-                                'risk_publish_rate_hz': 5.0,
+                                'risk_publish_rate_hz': 1.0,
                                 'diagnostic_publish_rate_hz': 1.0,
                                 'region_update_period_sec': 1.5,
                                 'enable_room_probability': False,

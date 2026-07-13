@@ -11,7 +11,11 @@ let mapReady = false;
 let riskReady = false;
 const gridLoad = {
   map: {loading: false, requestedSeq: -1, pendingSeq: -1, latestSeq: -1, lastRequestMs: 0, minIntervalMs: 1000},
-  risk: {loading: false, requestedSeq: -1, pendingSeq: -1, latestSeq: -1, lastRequestMs: 0, minIntervalMs: 1000},
+  risk: {loading: false, requestedSeq: -1, pendingSeq: -1, latestSeq: -1, lastRequestMs: 0, minIntervalMs: 250},
+};
+const gridRender = {
+  map: {drawn: false, error: null},
+  risk: {drawn: false, error: null},
 };
 let streamSources = {};
 const streamReconnectTimers = {};
@@ -481,6 +485,8 @@ function updateNavPaths(s) {
 
 function draw() {
   resizeCanvas();
+  gridRender.map = {drawn: false, error: null};
+  gridRender.risk = {drawn: false, error: null};
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.fillStyle = '#08090a';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -493,12 +499,37 @@ function draw() {
   const meta = latest.map.metadata;
   const vp = mapViewport(meta);
   if (document.getElementById('layerMap').checked && mapReady) {
-    drawGridImage(mapImg, meta, meta, vp);
+    try {
+      drawGridImage(mapImg, meta, meta, vp);
+      gridRender.map.drawn = true;
+    } catch (err) {
+      gridRender.map.error = String(err);
+    }
   }
   if (document.getElementById('layerRisk').checked && riskReady && latest.risk.metadata) {
     ctx.save();
     ctx.globalAlpha = Number(document.getElementById('riskOpacity').value);
-    drawGridImage(riskImg, latest.risk.metadata, meta, vp);
+    try {
+      drawGridImage(riskImg, latest.risk.metadata, meta, vp);
+      gridRender.risk.drawn = true;
+    } catch (err) {
+      gridRender.risk.error = String(err);
+    }
+    ctx.restore();
+  }
+  if (latest.risk && latest.risk.status === 'EMPTY_RISK_MAP') {
+    ctx.save();
+    ctx.fillStyle = 'rgba(8, 9, 10, 0.70)';
+    ctx.fillRect(vp.x + 12, vp.y + 12, 270, 58);
+    ctx.fillStyle = '#d5dde5';
+    ctx.font = '14px ui-monospace, SFMono-Regular, Menlo, monospace';
+    ctx.fillText('No active risk evidence', vp.x + 24, vp.y + 36);
+    ctx.fillStyle = '#98a6b3';
+    ctx.fillText(
+      `Risk max: ${latest.risk.max_value || 0} | Positive cells: ${latest.risk.positive_count || 0}`,
+      vp.x + 24,
+      vp.y + 58,
+    );
     ctx.restore();
   }
   if (document.getElementById('layerNavPaths').checked) {
@@ -581,14 +612,33 @@ function imagePanelReady(id) {
 function gridPanelReady(kind) {
   const seq = kind === 'map' ? mapSeq : riskSeq;
   const ready = kind === 'map' ? mapReady : riskReady;
-  const meta = latest && latest[kind === 'map' ? 'map' : 'risk']
-    ? latest[kind === 'map' ? 'map' : 'risk'].metadata
-    : null;
+  const grid = latest && latest[kind === 'map' ? 'map' : 'risk']
+    ? latest[kind === 'map' ? 'map' : 'risk']
+    : {};
+  const meta = grid.metadata || null;
+  const backendSeq = Number.isFinite(grid.seq) ? grid.seq : 0;
+  const pngSeq = Number.isFinite(grid.png_seq) ? grid.png_seq : -1;
+  const pngBytes = Number.isFinite(grid.png_bytes) ? grid.png_bytes : 0;
+  const gridReceived = Boolean(grid.grid_received);
+  const versionMatches = seq > 0 && seq === backendSeq && pngSeq === backendSeq;
+  const loaded = Boolean(
+    ready && meta && meta.width > 0 && meta.height > 0
+    && (kind === 'map' || (gridReceived && pngBytes > 0 && versionMatches))
+  );
+  const rendered = Boolean(loaded && gridRender[kind].drawn);
   return {
-    loaded: Boolean(ready && meta && meta.width > 0 && meta.height > 0),
-    rendered: Boolean(ready && meta && meta.width > 0 && meta.height > 0),
-    placeholder: !ready,
+    loaded,
+    rendered,
+    placeholder: !loaded,
     version: Math.max(0, seq),
+    backend_seq: backendSeq,
+    png_seq: pngSeq,
+    grid_received: gridReceived,
+    png_bytes: pngBytes,
+    positive_count: grid.positive_count || 0,
+    max_value: grid.max_value || 0,
+    status: grid.status || 'NO DATA',
+    render_error: gridRender[kind].error,
   };
 }
 

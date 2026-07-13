@@ -217,7 +217,7 @@ topics:
         DeclareLaunchArgument('pose_topic', default_value='/member_pose'),
         DeclareLaunchArgument('pose_topic_stale_sec', default_value='2.5'),
         DeclareLaunchArgument('external_detection_topic', default_value='/risk/yolo_detections'),
-        DeclareLaunchArgument('risk_publish_rate_hz', default_value='5.0'),
+        DeclareLaunchArgument('risk_publish_rate_hz', default_value='1.0'),
         DeclareLaunchArgument('diagnostic_publish_rate_hz', default_value='1.0'),
         DeclareLaunchArgument('region_update_period_sec', default_value='1.5'),
         DeclareLaunchArgument('enable_room_probability', default_value='false'),

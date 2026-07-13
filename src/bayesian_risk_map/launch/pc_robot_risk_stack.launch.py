@@ -78,7 +78,7 @@ def generate_launch_description():
         DeclareLaunchArgument('base_frame', default_value='base_footprint'),
         DeclareLaunchArgument('pose_topic', default_value='/leader_pose'),
         DeclareLaunchArgument('external_detection_topic', default_value='/risk/yolo_detections'),
-        DeclareLaunchArgument('risk_publish_rate_hz', default_value='5.0'),
+        DeclareLaunchArgument('risk_publish_rate_hz', default_value='1.0'),
 
         *dds_launch_environment(LaunchConfiguration('central_domain_id')),
 

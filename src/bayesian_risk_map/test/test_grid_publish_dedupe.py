@@ -43,6 +43,17 @@ def test_array_layer_publish_skips_unchanged_payload():
     assert pub.messages[-1].data[0] == 70
 
 
+def test_risk_layer_can_force_heartbeat_publish_for_late_dashboard_subscribers():
+    node = make_node()
+    pub = FakePublisher()
+    arr = np.zeros((4, 4), dtype=np.float32)
+
+    assert node._publish_array_layer('risk', pub, arr, Time(sec=1))
+    assert node._publish_array_layer('risk', pub, arr.copy(), Time(sec=2), force=True)
+    assert len(pub.messages) == 2
+    assert node.risk_publish_seq == 2
+
+
 def test_region_id_publish_skips_unchanged_payload():
     node = make_node()
     pub = FakePublisher()

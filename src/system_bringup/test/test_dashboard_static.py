@@ -125,6 +125,10 @@ def test_dashboard_requires_browser_rendered_panel_manifest():
     assert "rendered:" in js
     assert "naturalWidth > 0" in js
     assert "risk_map" in js
+    assert "backend_seq" in js
+    assert "png_seq" in js
+    assert "grid_received" in js
+    assert "png_bytes" in js
     removed_terms = [
         'scout' + '_raw',
         'scout' + 'RawStream',
@@ -138,6 +142,31 @@ def test_dashboard_requires_browser_rendered_panel_manifest():
     assert "observation_status_received_wall_sec" in source
     assert "'/omx/observation_status'" in source
     assert "'/omx/camera_ready'" in source
+
+
+def test_dashboard_risk_map_rendering_requires_real_grid_and_png_state():
+    source = (
+        Path(__file__).parents[1] / 'system_bringup' / 'leader_unified_dashboard.py'
+    ).read_text(encoding='utf-8')
+    js = (
+        Path(__file__).parents[1] / 'static' / 'dashboard.js'
+    ).read_text(encoding='utf-8')
+
+    assert 'DASHBOARD_RISK_SUBSCRIBER |' in source
+    assert 'DASHBOARD_RISK_RENDER_BACKEND' in source
+    assert 'NO_TOPIC' in source
+    assert 'WAITING_FIRST_GRID' in source
+    assert 'EMPTY_RISK_MAP' in source
+    assert 'ACTIVE_RISK_MAP' in source
+    assert 'STALE_RISK_MAP' in source
+    assert 'RISK_MAP_ALIGNMENT |' in source
+    assert "status in ('EMPTY_RISK_MAP', 'ACTIVE_RISK_MAP')" in source
+    assert 'risk_map_has_positive_evidence=' in source
+    assert 'risk_map_status=' in source
+    assert 'No active risk evidence' in js
+    assert 'Risk max:' in js
+    assert 'Positive cells:' in js
+    assert 'seq === backendSeq && pngSeq === backendSeq' in js
 
 
 def test_dashboard_subscribes_to_omx_target_detected_with_best_effort_qos():
