@@ -145,6 +145,9 @@ class NavGoalManager:
             self._set_authority(MotionAuthority.NONE, 'goal_rejected')
             self._on_failure(source, 'rejected')
             return
+        self._log.warning(
+            f'FIELD_NAV_GOAL_ACCEPTED | source={source} goal_id={goal_id}'
+        )
         self.active_goal_handle = handle
         self.active_goal_source = source
         handle.get_result_async().add_done_callback(

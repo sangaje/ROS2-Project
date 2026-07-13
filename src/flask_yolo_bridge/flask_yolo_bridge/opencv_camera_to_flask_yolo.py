@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import statistics
 import threading
 import time
 from collections import deque
@@ -176,6 +177,9 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         self.missing_pose_drop_count = 0
         self.last_log_wall_sec = 0.0
         self.ok_timestamps = deque(maxlen=120)
+        self.encode_ms_samples = deque(maxlen=120)
+        self.rtt_ms_samples = deque(maxlen=120)
+        self.capture_age_ms_samples = deque(maxlen=120)
         self.active_device = ''
         self.next_open_attempt_mono_sec = 0.0
         self.read_fail_streak = 0
@@ -547,7 +551,10 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             self.log_periodic()
             return
 
+        encode_start = time.monotonic()
         jpeg, w, h = self.encode_jpeg(frame)
+        encode_ms = (time.monotonic() - encode_start) * 1000.0
+        self.encode_ms_samples.append(encode_ms)
         self.sent_count += 1
         files = {'image': ('frame.jpg', jpeg, 'image/jpeg')}
         data = dict(meta or {})
@@ -566,6 +573,7 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             timeout=(self.connect_timeout_sec, self.read_timeout_sec),
         )
         roundtrip_sec = time.monotonic() - request_start
+        self.rtt_ms_samples.append(roundtrip_sec * 1000.0)
         resp.raise_for_status()
         payload = resp.json()
         if not payload.get('ok', True) or payload.get('stale', False):
@@ -579,6 +587,7 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             return
 
         total_frame_age_sec = time.monotonic() - capture_mono_sec if capture_mono_sec > 0.0 else roundtrip_sec
+        self.capture_age_ms_samples.append(total_frame_age_sec * 1000.0)
         if self.max_http_roundtrip_sec > 0.0 and roundtrip_sec > self.max_http_roundtrip_sec:
             self.drop_count += 1
             self.get_logger().warn(
@@ -633,6 +642,7 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             payload['robot_bridge_wall_sec'] = time.time()
             payload['robot_frame_age_ms'] = total_frame_age_sec * 1000.0
             payload['http_roundtrip_ms'] = roundtrip_sec * 1000.0
+            payload['camera_encode_ms'] = encode_ms
             payload['robot_frame_seq'] = int(seq)
 
             msg = String()
@@ -652,12 +662,29 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         if len(self.ok_timestamps) >= 2:
             dt = self.ok_timestamps[-1] - self.ok_timestamps[0]
             output_fps = (len(self.ok_timestamps) - 1) / dt if dt > 1e-6 else 0.0
+        encode = self._sample_summary(self.encode_ms_samples)
+        rtt = self._sample_summary(self.rtt_ms_samples)
+        age = self._sample_summary(self.capture_age_ms_samples)
         self.get_logger().info(
             f'OPENCV_HTTP_YOLO_STATUS | captured={self.rx_count} sent={self.sent_count} '
             f'ok={self.ok_count} fail={self.fail_count} replaced={self.drop_count} '
             f'missing_pose={self.missing_pose_drop_count} '
-            f'output_fps={output_fps:.2f} out={self.output_topic}'
+            f'output_fps={output_fps:.2f} '
+            f'camera_encode_ms_p50={encode[0]:.1f} p95={encode[1]:.1f} max={encode[2]:.1f} '
+            f'network_rtt_ms_p50={rtt[0]:.1f} p95={rtt[1]:.1f} max={rtt[2]:.1f} '
+            f'end_to_end_frame_age_ms_p50={age[0]:.1f} p95={age[1]:.1f} max={age[2]:.1f} '
+            f'out={self.output_topic}'
         )
+
+    @staticmethod
+    def _sample_summary(samples):
+        values = list(samples)
+        if not values:
+            return -1.0, -1.0, -1.0
+        ordered = sorted(float(v) for v in values)
+        p50 = statistics.median(ordered)
+        p95_index = min(len(ordered) - 1, int(round(0.95 * (len(ordered) - 1))))
+        return float(p50), float(ordered[p95_index]), float(max(ordered))
 
     def destroy_node(self):
         self.stop_threads = True

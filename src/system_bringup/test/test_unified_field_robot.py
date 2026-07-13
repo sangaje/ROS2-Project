@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 from builtin_interfaces.msg import Time
 from geometry_msgs.msg import PoseStamped, TwistStamped
@@ -432,3 +433,18 @@ def test_nav2_shadow_goal_starts_even_when_leader_begins_next_to_scout():
     goal = node.goal_pub.messages[0]
     assert -1.3 < goal.pose.position.x < -0.9
     assert node.shadow_goal_active is True
+
+
+def test_follower_startup_hold_has_timeout_and_follow_debug():
+    source = (
+        Path(__file__).parents[1]
+        / 'system_bringup'
+        / 'unified_field_robot.py'
+    ).read_text(encoding='utf-8')
+
+    assert "follow_startup_timeout_sec" in source
+    assert "startup_elapsed < self.follow_startup_timeout" in source
+    assert "FOLLOW_DEBUG |" in source
+    assert "nav_action_ready=" in source
+    assert "goal_sent=" in source
+    assert "odom_motion=" in source
