@@ -69,6 +69,24 @@ def test_system_launch_exposes_omx_and_scout_video_ready_requirements():
     ) in text
 
 
+def test_start_motion_has_falling_edge_grace_instead_of_instant_drop():
+    # Regression test for the observed "works, then doesn't, then works
+    # again" oscillation: start_motion used to be recomputed from scratch
+    # every 1 Hz poll with zero hysteresis, so a single missed check (one
+    # late YOLO frame, one browser heartbeat gap) instantly cut motion
+    # authority and stopped the robot, then it recovered a few polls later.
+    source = (
+        Path(__file__).parents[1] / 'system_bringup' / 'leader_unified_dashboard.py'
+    ).read_text(encoding='utf-8')
+
+    assert 'motion_drop_grace_sec' in source
+    assert '_motion_not_ready_since' in source
+    assert 'raw_motion_ok = bool(ready and system_ready)' in source
+    assert 'if raw_motion_ok:' in source
+    assert 'elif previous_start_motion:' in source
+    assert 'now - self._motion_not_ready_since < self.motion_drop_grace_sec' in source
+
+
 def test_dashboard_requires_browser_rendered_panel_manifest():
     source = (
         Path(__file__).parents[1] / 'system_bringup' / 'leader_unified_dashboard.py'

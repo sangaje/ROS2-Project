@@ -1091,7 +1091,7 @@ def generate_launch_description():
                         'start_motion_detail_topic': '/fleet/start_motion_detail',
                         'system_ready_topic': '/system/ready',
                         'system_readiness_detail_topic': '/system/readiness_detail',
-                        'video_ready_max_age_sec': 3.0,
+                        'video_ready_max_age_sec': 5.0,
                         'require_scout_video_ready': launch_bool(
                             require_scout_video_ready.perform(context)
                         ),

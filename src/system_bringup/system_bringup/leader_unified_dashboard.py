@@ -344,13 +344,23 @@ class LeaderUnifiedDashboard(Node):
             _declare(self, 'video_ready_poll_period_sec', 1.0)
         )
         self.video_ready_max_age_sec = float(
-            _declare(self, 'video_ready_max_age_sec', 3.0)
+            _declare(self, 'video_ready_max_age_sec', 5.0)
         )
         self.dashboard_session_timeout_sec = float(
-            _declare(self, 'dashboard_session_timeout_sec', 3.0)
+            _declare(self, 'dashboard_session_timeout_sec', 6.0)
         )
         self.dashboard_stable_duration_sec = float(
-            _declare(self, 'dashboard_stable_duration_sec', 2.0)
+            _declare(self, 'dashboard_stable_duration_sec', 1.0)
+        )
+        # Once motion has actually been released, a single missed poll (one
+        # late YOLO frame over flaky Wi-Fi, one browser heartbeat gap) must
+        # not immediately yank motion authority and stop the robot -- that
+        # produced exactly the observed "works, then doesn't, then works
+        # again" oscillation. Require readiness to stay down for this long
+        # before actually dropping start_motion; a transient blip that
+        # recovers within the window never interrupts motion at all.
+        self.motion_drop_grace_sec = float(
+            _declare(self, 'motion_drop_grace_sec', 4.0)
         )
         self.fleet_registry_json = str(_declare(self, 'fleet_registry_json', ''))
         self.robot_stale_timeout_sec = float(_declare(self, 'robot_stale_timeout_sec', 3.0))
@@ -437,6 +447,7 @@ class LeaderUnifiedDashboard(Node):
         self._dashboard_manifest: Dict[str, Any] = {}
         self._dashboard_manifest_wall_sec: Optional[float] = None
         self._dashboard_ui_good_since: Optional[float] = None
+        self._motion_not_ready_since: Optional[float] = None
         self._dashboard_ui_ready = False
         self._startup_motion_released = False
         self._events: Dict[str, Dict[str, Any]] = {
@@ -1190,7 +1201,23 @@ class LeaderUnifiedDashboard(Node):
             previous_start_motion = self._start_motion
             self._video_ready = ready
             system_ready = system_ready_snapshot
-            start_motion = bool(ready and system_ready)
+            raw_motion_ok = bool(ready and system_ready)
+            if raw_motion_ok:
+                self._motion_not_ready_since = None
+                start_motion = True
+            elif previous_start_motion:
+                if self._motion_not_ready_since is None:
+                    self._motion_not_ready_since = now
+                if now - self._motion_not_ready_since < self.motion_drop_grace_sec:
+                    # Transient blip while already running -- ride it out
+                    # instead of stopping the robot on a single bad poll.
+                    start_motion = True
+                else:
+                    start_motion = False
+            else:
+                # Never actually released yet: no grace period at startup,
+                # readiness must be genuinely satisfied first.
+                start_motion = False
             if start_motion:
                 self._startup_motion_released = True
             phase = (
