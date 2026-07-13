@@ -448,6 +448,7 @@ class StateMachine:
             'scan_sweep': False,
             'cancel_navigation': False,
             'cancel_reason': '',
+            'auto_armed': False,
         }
 
         # 1. nav_result 처리
@@ -480,6 +481,10 @@ class StateMachine:
             not in (State.TRACKING, State.CONFIRMING, State.FIRING, State.COOLDOWN)
         )
         if detection_preempted_nav:
+            if not self.armed:
+                self.armed = True
+                action['auto_armed'] = True
+                self._log("카메라 탐지: 자동 ARM")
             self.boundary_queue.clear()
             self.current_focus = None
             self.nav_waypoints = []

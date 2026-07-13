@@ -1453,6 +1453,7 @@ class OmxYoloNode(Node):
         payload = {
             'state': self.sm.state.value,
             'armed': bool(self.sm.armed),
+            'auto_armed': bool(action.get('auto_armed', False)),
             'paused': bool(self.paused),
             'detected': bool(detected),
             'confidence': float(confidence or 0.0) if confidence is not None else None,
@@ -1487,6 +1488,7 @@ class OmxYoloNode(Node):
                 f"state={payload['state']} action={payload['action']} "
                 f"detected={payload['detected']} error={payload['error_norm']} "
                 f"moved={payload['track_moved']} armed={payload['armed']} "
+                f"auto_armed={payload['auto_armed']} "
                 f"video_only={payload['control_video_only']}"
             )
 

@@ -79,6 +79,7 @@ def test_omx_aim_debug_topic_exposes_pd_tracking_contract():
     assert 'def publish_aim_debug(' in node_source
     assert "'track_requested': action.get('action') == 'track'" in node_source
     assert "'track_moved': None if track_moved is None else bool(track_moved)" in node_source
+    assert "'auto_armed': bool(action.get('auto_armed', False))" in node_source
     assert "track_moved = self._controller_call(" in node_source
 
 

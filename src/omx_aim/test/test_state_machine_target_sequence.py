@@ -41,6 +41,18 @@ def test_detection_preempts_navigation_before_tracking():
     assert action['cancel_reason'] == 'target_detected_track'
 
 
+def test_detection_auto_arms_and_enters_tracking_when_disarmed():
+    sm = StateMachine(_cfg(armed=False))
+
+    action = sm.update(True, (0.18, 0.12), 10.0, vision_valid=True)
+
+    assert sm.armed is True
+    assert sm.state == State.TRACKING
+    assert action['auto_armed'] is True
+    assert action['action'] == 'track'
+    assert action['error'] == (0.18, 0.12)
+
+
 def test_tracking_holds_after_target_disappears_until_timeout():
     sm = StateMachine(_cfg(armed=True, lost_timeout_sec=3.0))
     sm.state = State.TRACKING
