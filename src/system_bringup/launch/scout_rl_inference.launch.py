@@ -38,6 +38,8 @@ def generate_launch_description():
     start_motion_topic = LaunchConfiguration('start_motion_topic')
     cmd_vel_topic = LaunchConfiguration('cmd_vel_topic')
     use_stamped_cmd_vel = LaunchConfiguration('use_stamped_cmd_vel')
+    odom_topic = LaunchConfiguration('odom_topic')
+    max_odom_age_sec = LaunchConfiguration('max_odom_age_sec')
     enable_velocity_safety_filter = LaunchConfiguration(
         'enable_velocity_safety_filter'
     )
@@ -143,6 +145,16 @@ def generate_launch_description():
             description='Velocity topic owned by this inference process.',
         ),
         DeclareLaunchArgument(
+            'odom_topic',
+            default_value='/odom',
+            description='Scout-local odometry topic used by RL readiness; never bridged cross-domain.',
+        ),
+        DeclareLaunchArgument(
+            'max_odom_age_sec',
+            default_value='0.8',
+            description='Maximum receive-age for local odometry before RL holds zero command.',
+        ),
+        DeclareLaunchArgument(
             'use_stamped_cmd_vel',
             default_value='true',
             choices=['true', 'false'],
@@ -201,6 +213,11 @@ def generate_launch_description():
                 ),
                 'start_motion_topic': start_motion_topic,
                 'cmd_vel_topic': cmd_vel_topic,
+                'odom_topic': odom_topic,
+                'max_odom_age_sec': ParameterValue(
+                    max_odom_age_sec,
+                    value_type=float,
+                ),
                 'use_stamped_cmd_vel': ParameterValue(
                     use_stamped_cmd_vel,
                     value_type=bool,

@@ -2,7 +2,7 @@ from pathlib import Path
 import threading
 
 import numpy as np
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, Odometry
 from sensor_msgs.msg import LaserScan
 
 from system_bringup.rl_policy_contract import active_scout_config
@@ -31,6 +31,14 @@ def _scan(front_distance=3.0):
     message.range_max = 3.5
     message.ranges = [3.0] * 360
     message.ranges[180] = front_distance
+    return message
+
+
+def _odom():
+    message = Odometry()
+    message.header.frame_id = 'odom'
+    message.child_frame_id = 'base_footprint'
+    message.pose.pose.orientation.w = 1.0
     return message
 
 
@@ -234,6 +242,8 @@ def test_first_predict_exception_does_not_deactivate_active_scout():
     runtime._map_snapshot = type('MapSnapshot', (), {'updated_at': __import__('time').monotonic()})()
     runtime._sensor_snapshot = lambda: SensorSnapshot(
         scan=_scan(), scan_received_at=__import__('time').monotonic(), scan_generation=1,
+        odom=_odom(), odom_received_at=__import__('time').monotonic(),
+        odom_generation=1, odom_source_stamp_age_ms=5.0,
         slam_map=object(), map_received_at=__import__('time').monotonic(), map_generation=1,
     )
     runtime._fresh = lambda snapshot, now: True
@@ -468,9 +478,11 @@ def test_hardware_contract_leaves_budget_for_slow_map_and_inference_callbacks():
 
     assert config.map_substeps_per_action == 2
     assert config.max_scan_age_sec == 0.8
+    assert config.max_odom_age_sec == 0.8
     assert config.max_map_age_sec == 5.0
     assert config.max_inference_sec == 2.0
     assert config.command_timeout_sec == 3.0
+    assert config.odom_topic == '/odom'
 
 
 def test_runtime_publishes_the_exact_policy_lidar_debug_topic():
@@ -514,11 +526,16 @@ def test_scout_rl_worker_logs_recoverable_runtime_gate_debug():
     assert 'raw_action_linear=' in source
     assert 'raw_action_nonzero=' in source
     assert 'scan_stale' in source
+    assert 'odom_stale' in source
     assert 'map_stale' in source
     assert 'policy_worker_dead' in source
+    assert 'SCOUT_ODOM_DEBUG |' in source
+    assert 'blocking_inputs=' in source
     assert 'SCOUT_RL_RESUME_REQUEST |' in source
     assert 'self.runtime.hold(reason)' in source
     assert 'def debug_snapshot' in runtime
+    assert 'self.odom_sub = self.node.create_subscription' in runtime
+    assert 'Odometry, self.config.odom_topic' in runtime
     assert 'def hold(self, reason: str)' in runtime
     assert "'observation_ready'" in runtime
     assert "'inference_age_ms'" in runtime

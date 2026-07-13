@@ -567,6 +567,8 @@ def generate_launch_description():
                             'require_system_ready': 'false',
                             'system_ready_topic': '/system/ready',
                             'cmd_vel_topic': '/fleet/active_scout_rl_cmd',
+                            'odom_topic': '/odom',
+                            'max_odom_age_sec': '0.8',
                             'use_stamped_cmd_vel': 'true',
                             'enable_velocity_safety_filter': 'true',
                         }.items(),

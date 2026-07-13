@@ -38,11 +38,13 @@ class ActiveScoutPolicyConfig:
     control_dt_sec: float
     map_substeps_per_action: int
     max_scan_age_sec: float
+    max_odom_age_sec: float
     max_map_age_sec: float
     max_tf_age_sec: float
     max_inference_sec: float
     command_timeout_sec: float
     scan_topic: str
+    odom_topic: str
     map_topic: str
     map_frame: str
     base_frame: str
@@ -217,11 +219,13 @@ def active_scout_config(
         control_dt_sec=float(runtime['control_dt_sec']),
         map_substeps_per_action=int(runtime['map_substeps_per_action']),
         max_scan_age_sec=float(runtime['max_scan_age_sec']),
+        max_odom_age_sec=float(runtime.get('max_odom_age_sec', runtime['max_scan_age_sec'])),
         max_map_age_sec=float(runtime['max_map_age_sec']),
         max_tf_age_sec=float(runtime['max_tf_age_sec']),
         max_inference_sec=float(runtime['max_inference_sec']),
         command_timeout_sec=float(runtime['command_timeout_sec']),
         scan_topic=str(topics['scan']),
+        odom_topic=str(topics.get('odom', '/odom')),
         map_topic=str(topics['map']),
         map_frame=str(topics['map_frame']),
         base_frame=str(topics['base_frame']),

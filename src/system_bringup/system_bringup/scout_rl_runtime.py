@@ -17,7 +17,7 @@ import traceback
 from typing import Callable, Optional
 
 import numpy as np
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, Odometry
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.duration import Duration
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
@@ -45,6 +45,10 @@ class SensorSnapshot:
     scan: Optional[LaserScan]
     scan_received_at: float
     scan_generation: int
+    odom: Optional[Odometry]
+    odom_received_at: float
+    odom_generation: int
+    odom_source_stamp_age_ms: float
     slam_map: Optional[OccupancyGrid]
     map_received_at: float
     map_generation: int
@@ -64,6 +68,7 @@ class MapSnapshot:
 class RuntimeCounters:
     model_load_count: int = 0
     scan_callback_count: int = 0
+    odom_callback_count: int = 0
     map_callback_count: int = 0
     pose_success_count: int = 0
     confidence_update_attempt_count: int = 0
@@ -233,6 +238,10 @@ class ActiveScoutRLRuntime:
         self._scan: Optional[LaserScan] = None
         self._scan_received_at = 0.0
         self._scan_generation = 0
+        self._odom: Optional[Odometry] = None
+        self._odom_received_at = 0.0
+        self._odom_generation = 0
+        self._odom_source_stamp_age_ms = -1.0
         self._map: Optional[OccupancyGrid] = None
         self._map_received_at = 0.0
         self._map_generation = 0
@@ -328,6 +337,16 @@ class ActiveScoutRLRuntime:
             LaserScan, self.config.scan_topic, self._on_scan, qos_profile_sensor_data,
             callback_group=self._sensor_group,
         )
+        odom_qos = QoSProfile(
+            depth=5,
+            history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self.odom_sub = self.node.create_subscription(
+            Odometry, self.config.odom_topic, self._on_odom, odom_qos,
+            callback_group=self._sensor_group,
+        )
         self.policy_scan_pub = self.node.create_publisher(
             LaserScan,
             '/rl_policy_scan_60',
@@ -404,8 +423,16 @@ class ActiveScoutRLRuntime:
                 f'map=yes age={now - snapshot.map_received_at:.2f}s '
                 f'frame={frame or "(empty)"}'
             )
+        if snapshot.odom is None:
+            odom_summary = 'odom=no'
+        else:
+            odom_summary = (
+                f'odom=yes age={now - snapshot.odom_received_at:.2f}s '
+                f'frame={snapshot.odom.header.frame_id or "(empty)"} '
+                f'child={snapshot.odom.child_frame_id or "(empty)"}'
+            )
         return (
-            f'{scan_summary} {map_summary} tf={self.tf_ready()} '
+            f'{scan_summary} {odom_summary} {map_summary} tf={self.tf_ready()} '
             f'expected_map={self.config.map_frame}'
         )
 
@@ -413,6 +440,37 @@ class ActiveScoutRLRuntime:
         snapshot = self._sensor_snapshot()
         now = time.monotonic()
         map_snapshot = self._map_snapshot
+        blocking_inputs = self._blocking_inputs(snapshot, now, map_snapshot)
+        odom_frame = ''
+        odom_child_frame = ''
+        odom_position_finite = False
+        odom_orientation_finite = False
+        odom_linear_velocity = 0.0
+        odom_angular_velocity = 0.0
+        if snapshot.odom is not None:
+            pose = snapshot.odom.pose.pose
+            twist = snapshot.odom.twist.twist
+            odom_frame = str(snapshot.odom.header.frame_id or '')
+            odom_child_frame = str(snapshot.odom.child_frame_id or '')
+            odom_position_finite = all(
+                math.isfinite(float(value))
+                for value in (
+                    pose.position.x,
+                    pose.position.y,
+                    pose.position.z,
+                )
+            )
+            odom_orientation_finite = all(
+                math.isfinite(float(value))
+                for value in (
+                    pose.orientation.x,
+                    pose.orientation.y,
+                    pose.orientation.z,
+                    pose.orientation.w,
+                )
+            )
+            odom_linear_velocity = float(twist.linear.x)
+            odom_angular_velocity = float(twist.angular.z)
         observation_ready = bool(
             self._fresh(snapshot, now)
             and map_snapshot is not None
@@ -429,6 +487,24 @@ class ActiveScoutRLRuntime:
                 (now - snapshot.map_received_at) * 1000.0
                 if snapshot.slam_map is not None else -1.0
             ),
+            'odom_age_ms': (
+                (now - snapshot.odom_received_at) * 1000.0
+                if snapshot.odom is not None else -1.0
+            ),
+            'odom_source_stamp_age_ms': snapshot.odom_source_stamp_age_ms,
+            'odom_ready': (
+                snapshot.odom is not None
+                and now - snapshot.odom_received_at <= self.config.max_odom_age_sec
+            ),
+            'odom_callback_count': self.counters.odom_callback_count,
+            'odom_topic': self.config.odom_topic,
+            'odom_frame_id': odom_frame,
+            'odom_child_frame_id': odom_child_frame,
+            'odom_position_finite': odom_position_finite,
+            'odom_orientation_finite': odom_orientation_finite,
+            'odom_linear_velocity': odom_linear_velocity,
+            'odom_angular_velocity': odom_angular_velocity,
+            'blocking_inputs': ','.join(blocking_inputs) if blocking_inputs else 'none',
             'observation_ready': observation_ready,
             'policy_worker_alive': self._model_loading or self.ready,
             'inference_age_ms': (
@@ -567,12 +643,51 @@ class ActiveScoutRLRuntime:
         # If this topic is absent, the policy process is not receiving /scan.
         self._publish_policy_scan_from_raw(message)
 
+    def _on_odom(self, message: Odometry) -> None:
+        if not self._odom_finite(message):
+            self._warn_throttled('SCOUT_RL_ODOM_DROPPED | reason=non_finite')
+            return
+        with self._lock:
+            self._odom = message
+            self._odom_received_at = time.monotonic()
+            self._odom_generation += 1
+            self._odom_source_stamp_age_ms = self._source_stamp_age_ms(message)
+            self.counters.odom_callback_count += 1
+
     def _on_map(self, message: OccupancyGrid) -> None:
         with self._lock:
             self._map = message
             self._map_received_at = time.monotonic()
             self._map_generation += 1
             self.counters.map_callback_count += 1
+
+    @staticmethod
+    def _odom_finite(message: Odometry) -> bool:
+        pose = message.pose.pose
+        twist = message.twist.twist
+        values = (
+            pose.position.x,
+            pose.position.y,
+            pose.position.z,
+            pose.orientation.x,
+            pose.orientation.y,
+            pose.orientation.z,
+            pose.orientation.w,
+            twist.linear.x,
+            twist.linear.y,
+            twist.angular.z,
+        )
+        return all(math.isfinite(float(value)) for value in values)
+
+    def _source_stamp_age_ms(self, message) -> float:
+        stamp = getattr(getattr(message, 'header', None), 'stamp', None)
+        if stamp is None or (int(stamp.sec) == 0 and int(stamp.nanosec) == 0):
+            return -1.0
+        age = (
+            self.node.get_clock().now().nanoseconds
+            - Time.from_msg(stamp).nanoseconds
+        ) * 1.0e-6
+        return float(age)
 
     def _on_confidence_seed(self, message: OccupancyGrid) -> None:
         if not self._valid_grid(message):
@@ -668,6 +783,10 @@ class ActiveScoutRLRuntime:
                 scan=self._scan,
                 scan_received_at=self._scan_received_at,
                 scan_generation=self._scan_generation,
+                odom=self._odom,
+                odom_received_at=self._odom_received_at,
+                odom_generation=self._odom_generation,
+                odom_source_stamp_age_ms=self._odom_source_stamp_age_ms,
                 slam_map=self._map,
                 map_received_at=self._map_received_at,
                 map_generation=self._map_generation,
@@ -676,10 +795,40 @@ class ActiveScoutRLRuntime:
     def _fresh(self, snapshot: SensorSnapshot, now: float) -> bool:
         return bool(
             snapshot.scan is not None
+            and snapshot.odom is not None
             and snapshot.slam_map is not None
             and now - snapshot.scan_received_at <= self.config.max_scan_age_sec
+            and now - snapshot.odom_received_at <= self.config.max_odom_age_sec
             and now - snapshot.map_received_at <= self.config.max_map_age_sec
         )
+
+    def _blocking_inputs(
+        self,
+        snapshot: SensorSnapshot,
+        now: float,
+        map_snapshot: Optional[MapSnapshot],
+    ) -> list[str]:
+        blocking: list[str] = []
+        if snapshot.scan is None:
+            blocking.append('scan_missing')
+        elif now - snapshot.scan_received_at > self.config.max_scan_age_sec:
+            blocking.append('scan_stale')
+        if snapshot.odom is None:
+            blocking.append('odom_missing')
+        elif now - snapshot.odom_received_at > self.config.max_odom_age_sec:
+            blocking.append('odom_stale')
+        if snapshot.slam_map is None:
+            blocking.append('map_missing')
+        elif now - snapshot.map_received_at > self.config.max_map_age_sec:
+            blocking.append('map_stale')
+        elif str(snapshot.slam_map.header.frame_id or '').lstrip('/') != self.config.map_frame.lstrip('/'):
+            blocking.append('map_frame_mismatch')
+        if not blocking:
+            if map_snapshot is None:
+                blocking.append('observation_map_update_missing')
+            elif now - map_snapshot.updated_at > self.config.max_scan_age_sec:
+                blocking.append('observation_stale')
+        return blocking
 
     def _lookup_pose(
         self,
@@ -874,14 +1023,18 @@ class ActiveScoutRLRuntime:
         snapshot = self._sensor_snapshot()
         map_snapshot = self._map_snapshot
         scan_age = (now - snapshot.scan_received_at) * 1000.0 if snapshot.scan else -1.0
+        odom_age = (now - snapshot.odom_received_at) * 1000.0 if snapshot.odom else -1.0
         map_age = (now - snapshot.map_received_at) * 1000.0 if snapshot.slam_map else -1.0
         obs_ok = bool(map_snapshot is not None and now - map_snapshot.updated_at <= self.config.max_scan_age_sec)
         counters = self.counters
         self.node.get_logger().info(
             'RL_RUNTIME_HEARTBEAT | '
-            f'active={self._active} scan_age_ms={scan_age:.0f} map_age_ms={map_age:.0f} '
+            f'active={self._active} scan_age_ms={scan_age:.0f} '
+            f'odom_age_ms={odom_age:.0f} map_age_ms={map_age:.0f} '
             f'pose_ok={counters.pose_success_count > 0} obs_ok={obs_ok} '
-            f'scan_cb={counters.scan_callback_count} map_cb={counters.map_callback_count} '
+            f'scan_cb={counters.scan_callback_count} '
+            f'odom_cb={counters.odom_callback_count} '
+            f'map_cb={counters.map_callback_count} '
             f'model_load={counters.model_load_count} '
             f'conf_attempts={counters.confidence_update_attempt_count} '
             f'conf_success={counters.confidence_update_success_count} '

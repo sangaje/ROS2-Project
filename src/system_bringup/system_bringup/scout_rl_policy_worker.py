@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
 from typing import Optional
 
 import rclpy
@@ -15,6 +16,7 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPo
 from std_msgs.msg import Bool, String
 
 from .rl_activation_gate import GateInputs, RLWorkerState, evaluate_activation_gate
+from .rl_policy_contract import active_scout_config
 from .role_contract import RoleMessage, parse_epoch, parse_role_message
 from .scout_rl_runtime import ActiveScoutRLRuntime
 
@@ -51,6 +53,8 @@ class ScoutRLPolicyWorker(Node):
         self.declare_parameter('cmd_vel_topic', '/cmd_vel')
         self.declare_parameter('use_stamped_cmd_vel', True)
         self.declare_parameter('enable_velocity_safety_filter', True)
+        self.declare_parameter('odom_topic', '/odom')
+        self.declare_parameter('max_odom_age_sec', 0.8)
 
         get = self.get_parameter
         self.robot_name = str(get('robot_name').value).strip()
@@ -78,6 +82,8 @@ class ScoutRLPolicyWorker(Node):
         self.enable_velocity_safety_filter = bool(
             get('enable_velocity_safety_filter').value
         )
+        self.odom_topic = str(get('odom_topic').value).strip() or '/odom'
+        self.max_odom_age_sec = max(0.05, float(get('max_odom_age_sec').value))
 
         self.desired_role = 'ACTIVE_SCOUT' if initial_active else 'IDLE'
         self.role_epoch = 0
@@ -97,7 +103,15 @@ class ScoutRLPolicyWorker(Node):
         self.runtime_active = False
         self.last_gate_reason = 'startup'
         self.last_debug_wall = -1.0e9
+        self.last_odom_debug_wall = -1.0e9
         self.startup_released = False
+        self._last_role_update_tuple = (
+            self.desired_role,
+            self.role_epoch,
+            self.active_scout_id,
+            self.role_localization_ready,
+            self.role_recovery_complete,
+        )
 
         if self.use_stamped:
             self.cmd_pub = self.create_publisher(TwistStamped, self.cmd_vel_topic, 10)
@@ -123,6 +137,11 @@ class ScoutRLPolicyWorker(Node):
         self.runtime = ActiveScoutRLRuntime(
             self,
             self._publish_command,
+            config=replace(
+                active_scout_config(),
+                odom_topic=self.odom_topic,
+                max_odom_age_sec=self.max_odom_age_sec,
+            ),
             enable_velocity_safety_filter=self.enable_velocity_safety_filter,
         )
         # A short but non-aggressive gate rate leaves executor capacity for
@@ -142,7 +161,8 @@ class ScoutRLPolicyWorker(Node):
             f'require_failover_activation={self.require_failover_activation} '
             f'require_system_ready={self.require_system_ready}:{self.system_ready_topic} '
             f'require_start_motion={self.require_start_motion}:{self.start_motion_topic} '
-            f'requested_start_motion_gate={requested_start_motion}'
+            f'requested_start_motion_gate={requested_start_motion} '
+            f'odom_topic={self.odom_topic} max_odom_age_sec={self.max_odom_age_sec:.2f}'
         )
 
     def _now(self) -> float:
@@ -164,12 +184,27 @@ class ScoutRLPolicyWorker(Node):
             return
         if epoch < self.role_epoch:
             return
+        next_role = update.role.value
+        next_active_scout_id = (
+            update.active_scout_id
+            if update.active_scout_id is not None
+            else self.active_scout_id
+        )
+        next_tuple = (
+            next_role,
+            epoch,
+            next_active_scout_id,
+            update.localization_ready,
+            update.recovery_complete,
+        )
+        if next_tuple == self._last_role_update_tuple:
+            return
         self.role_epoch = epoch
-        self.desired_role = update.role.value
+        self.desired_role = next_role
         self.role_localization_ready = update.localization_ready
         self.role_recovery_complete = update.recovery_complete
-        if update.active_scout_id is not None:
-            self.active_scout_id = update.active_scout_id
+        self.active_scout_id = next_active_scout_id
+        self._last_role_update_tuple = next_tuple
         self.get_logger().info(
             'RL_ROLE_UPDATE | '
             f'robot={self.robot_name} role={self.desired_role} '
@@ -182,15 +217,19 @@ class ScoutRLPolicyWorker(Node):
         self._evaluate_gate()
 
     def _on_active_scout_id(self, msg: String) -> None:
-        self.active_scout_id = str(msg.data).strip()
+        active_scout_id = str(msg.data).strip()
+        if active_scout_id == self.active_scout_id:
+            return
+        self.active_scout_id = active_scout_id
         self._evaluate_gate()
 
     def _on_scout_epoch(self, msg: String) -> None:
         epoch = parse_epoch(str(msg.data).strip())
         if epoch is None:
             return
-        if epoch > self.failover_epoch:
-            self.failover_epoch = epoch
+        if epoch <= self.failover_epoch:
+            return
+        self.failover_epoch = epoch
         self._evaluate_gate()
 
     def _on_localization_ready(self, msg: Bool) -> None:
@@ -378,11 +417,15 @@ class ScoutRLPolicyWorker(Node):
             return 'cmd_vel_authority_lost'
         if state == RLWorkerState.WAIT_SENSOR_READY:
             scan_age = float(runtime.get('scan_age_ms', -1.0))
+            odom_age = float(runtime.get('odom_age_ms', -1.0))
             map_age = float(runtime.get('map_age_ms', -1.0))
             max_scan_ms = self.runtime.config.max_scan_age_sec * 1000.0
+            max_odom_ms = self.runtime.config.max_odom_age_sec * 1000.0
             max_map_ms = self.runtime.config.max_map_age_sec * 1000.0
             if scan_age < 0.0 or scan_age > max_scan_ms:
                 return 'scan_stale'
+            if odom_age < 0.0 or odom_age > max_odom_ms:
+                return 'odom_stale'
             if map_age < 0.0 or map_age > max_map_ms:
                 return 'map_stale'
             if not bool(runtime.get('policy_worker_alive', False)):
@@ -436,8 +479,9 @@ class ScoutRLPolicyWorker(Node):
             f'dashboard_ready={self.video_ready} '
             f'scan_age_ms={float(runtime["scan_age_ms"]):.0f} '
             f'map_age_ms={float(runtime["map_age_ms"]):.0f} '
-            f'odom_age_ms=-1 '
+            f'odom_age_ms={float(runtime["odom_age_ms"]):.0f} '
             f'observation_ready={runtime["observation_ready"]} '
+            f'blocking_inputs={runtime["blocking_inputs"]} '
             f'policy_worker_alive={runtime["policy_worker_alive"]} '
             f'inference_age_ms={float(runtime["inference_age_ms"]):.0f} '
             f'raw_action_linear={float(runtime["raw_cmd_linear"]):.3f} '
@@ -456,6 +500,35 @@ class ScoutRLPolicyWorker(Node):
             f'raw_action_nonzero={raw_nonzero} '
             f'final_command_nonzero={final_nonzero} '
             f'hardware_publish_allowed={hardware_publish_allowed} '
+            f'blocking_reason={blocking}'
+        )
+        self._log_odom_debug(runtime, blocking)
+
+    def _log_odom_debug(self, runtime: dict[str, object], blocking: str) -> None:
+        now = self._now()
+        if now - self.last_odom_debug_wall < 2.0:
+            return
+        self.last_odom_debug_wall = now
+        callback_count = int(runtime.get('odom_callback_count', 0) or 0)
+        publisher_count = self.count_publishers(self.odom_topic)
+        subscription_count = self.count_subscribers(self.odom_topic)
+        qos_compatible = publisher_count > 0 and callback_count > 0
+        self.get_logger().warning(
+            'SCOUT_ODOM_DEBUG | '
+            f'configured_topic={self.odom_topic} '
+            f'resolved_topic={runtime.get("odom_topic", self.odom_topic)} '
+            f'publisher_count={publisher_count} '
+            f'subscription_count={subscription_count} '
+            f'qos_compatible={qos_compatible} '
+            f'frame_id={runtime.get("odom_frame_id", "") or "(empty)"} '
+            f'child_frame_id={runtime.get("odom_child_frame_id", "") or "(empty)"} '
+            f'source_stamp_age_ms={float(runtime.get("odom_source_stamp_age_ms", -1.0)):.0f} '
+            f'receive_age_ms={float(runtime.get("odom_age_ms", -1.0)):.0f} '
+            f'position_finite={bool(runtime.get("odom_position_finite", False))} '
+            f'orientation_finite={bool(runtime.get("odom_orientation_finite", False))} '
+            f'linear_velocity={float(runtime.get("odom_linear_velocity", 0.0)):.3f} '
+            f'angular_velocity={float(runtime.get("odom_angular_velocity", 0.0)):.3f} '
+            f'callback_count={callback_count} '
             f'blocking_reason={blocking}'
         )
 
