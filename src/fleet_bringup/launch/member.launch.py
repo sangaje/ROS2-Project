@@ -148,6 +148,7 @@ def generate_launch_description():
 
         amcl = None
         localization_lifecycle = None
+        fixed_seed_ready = None
         if amcl_enabled:
             # AMCL is the one TF source this stack owns by default (map->odom
             # over a shared, bridged map). It is deliberately the only thing
@@ -212,7 +213,7 @@ def generate_launch_description():
                 name='member_global_localize',
                 output='screen',
                 parameters=[{
-                    'enable_scout_pose_seed': True,
+                    'enable_scout_pose_seed': False,
                     'active_scout_id_topic': '/failover/active_scout_id',
                     'active_scout_robot_name': 'scout22',
                     'follower_robot_name': 'follower21',
@@ -253,6 +254,27 @@ def generate_launch_description():
                 respawn=True,
                 respawn_delay=3.0,
             )
+        elif amcl_enabled:
+            fixed_seed_ready = Node(
+                package='fleet_bringup',
+                executable='amcl_fixed_seed_ready',
+                name='member_amcl_fixed_seed_ready',
+                output='screen',
+                parameters=[{
+                    'map_topic': '/map',
+                    'scan_topic': '/scan',
+                    'odom_topic': '/odom',
+                    'amcl_pose_topic': '/amcl_pose',
+                    'amcl_get_state_service': '/amcl/get_state',
+                    'global_frame': 'map',
+                    'base_frame': 'base_footprint',
+                    'ready_topic': 'localization_ready',
+                    'fixed_seed_initial_pose_applied': True,
+                }],
+                env=process_env,
+                respawn=True,
+                respawn_delay=3.0,
+            )
 
         base = IncludeLaunchDescription(
             PythonLaunchDescriptionSource(base_launch),
@@ -274,7 +296,7 @@ def generate_launch_description():
                 'nav_delay_sec': '8.0',
                 'lifecycle_delay_sec': '12.0',
                 'require_localization_ready': (
-                    'true' if amcl_enabled and auto else 'false'
+                    'true' if amcl_enabled else 'false'
                 ),
                 'localization_ready_topic': '/localization_ready',
             }.items(),
@@ -316,6 +338,16 @@ def generate_launch_description():
             actions.append(
                 TimerAction(period=kickstart_t, actions=[kickstart_node])
             )
+        if fixed_seed_ready is not None:
+            actions.append(TimerAction(
+                period=kickstart_t,
+                actions=[
+                    LogInfo(msg=[
+                        'MEMBER_STAGE | starting fixed-seed AMCL ready watcher',
+                    ]),
+                    fixed_seed_ready,
+                ],
+            ))
         return actions
 
     return LaunchDescription([
@@ -393,13 +425,13 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'auto_localize',
-            default_value='true',
+            default_value='false',
             choices=['true', 'false'],
             description=(
                 'Let AMCL search the whole map via '
                 'reinitialize_global_localization after seeding from '
-                'member_initial_x/y/yaw. Set false to use only the fixed '
-                'seed.'
+                'member_initial_x/y/yaw. Default false uses only the fixed '
+                'seed and amcl_fixed_seed_ready.'
             ),
         ),
         *dds_launch_environment(domain_id),

@@ -97,22 +97,22 @@ controller_server:
     FollowPath:
       plugin: "dwb_core::DWBLocalPlanner"
       debug_trajectory_details: true
-      min_vel_x: 0.0
+      min_vel_x: -0.08
       min_vel_y: 0.0
-      max_vel_x: 0.14
+      max_vel_x: 0.26
       max_vel_y: 0.0
       # Keep rotation below the range where the loaded chassis arcs wide and
       # diverges from the differential-drive model.
-      max_vel_theta: 0.35
+      max_vel_theta: 1.00
       min_speed_xy: 0.0
-      max_speed_xy: 0.14
+      max_speed_xy: 0.26
       min_speed_theta: 0.0
-      acc_lim_x: 0.20
+      acc_lim_x: 1.20
       acc_lim_y: 0.0
-      acc_lim_theta: 0.40
-      decel_lim_x: -0.25
+      acc_lim_theta: 2.20
+      decel_lim_x: -1.20
       decel_lim_y: 0.0
-      decel_lim_theta: -0.50
+      decel_lim_theta: -2.20
       vx_samples: 20
       vy_samples: 1
       vtheta_samples: 40
@@ -172,9 +172,9 @@ behavior_server:
     transform_tolerance: 0.5
     transform_timeout: 0.1
     simulate_ahead_time: 2.0
-    max_rotational_vel: 0.35
+    max_rotational_vel: 1.00
     min_rotational_vel: 0.12
-    rotational_acc_lim: 0.40
+    rotational_acc_lim: 2.20
     enable_stamped_cmd_vel: true
 
 bt_navigator:

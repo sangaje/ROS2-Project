@@ -375,6 +375,8 @@ def test_nav2_shadow_goal_starts_even_when_leader_begins_next_to_scout():
     node.startup_grace = 0.0
     node.require_localization_ready = False
     node.localization_ready = True
+    node.require_video_ready = False
+    node.video_ready = True
     node.pause_on_omx_aiming = False
     node.pause_on_raw_target_detection = False
     node.failover_state = 'NORMAL_OPERATION'

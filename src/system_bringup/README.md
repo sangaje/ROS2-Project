@@ -26,20 +26,12 @@ cd ~/ROS2-Project
 source /opt/ros/jazzy/setup.zsh
 source install/setup.zsh
 export ROS_DOMAIN_ID=22
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-export FASTDDS_BUILTIN_TRANSPORTS=UDPv4
 export TURTLEBOT3_MODEL=burger
 
-ros2 launch system_bringup system.launch.py \
-  role:=scout fleet_role:=member domain_id:=22 main_domain_id:=20 \
-  active_scout_robot_name:=scout22 follower_robot_name:=follower21 \
-  scout_initial_x:=0.0 scout_initial_y:=0.0 scout_initial_yaw:=0.0 \
-  start_cartographer:=true enable_amcl:=false start_nav2:=false \
-  auto_localize:=false enable_scout_failover:=true enable_exploration:=true \
-  rl_backend:=external_worker start_rl_worker:=true \
-  enable_localization_spin_on_takeover:=false \
-  start_risk_map:=true start_camera_sender:=true start_camera:=false \
-  enable_yolo:=false detection_source:=flask_topic
+ros2 launch system_bringup field_robot.launch.py \
+  robot_name:=scout22 \
+  domain_id:=22 \
+  initial_role:=ACTIVE_SCOUT
 ```
 
 Domain 21, standby follower `follower21`:
@@ -49,19 +41,12 @@ cd ~/ROS2-Project
 source /opt/ros/jazzy/setup.zsh
 source install/setup.zsh
 export ROS_DOMAIN_ID=21
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-export FASTDDS_BUILTIN_TRANSPORTS=UDPv4
 export TURTLEBOT3_MODEL=burger
 
-ros2 launch system_bringup system.launch.py \
-  role:=scout fleet_role:=follower domain_id:=21 main_domain_id:=20 \
-  active_scout_robot_name:=scout22 follower_robot_name:=follower21 \
-  follower_initial_x:=0.0 follower_initial_y:=-0.10 follower_initial_yaw:=0.0 \
-  start_cartographer:=false enable_amcl:=true auto_localize:=false start_nav2:=true \
-  enable_scout_failover:=true enable_exploration:=true \
-  rl_backend:=external_worker start_rl_worker:=true \
-  enable_localization_spin_on_takeover:=false \
-  start_risk_map:=true start_camera_sender:=true
+ros2 launch system_bringup field_robot.launch.py \
+  robot_name:=follower21 \
+  domain_id:=21 \
+  initial_role:=FOLLOWER
 ```
 
 Domain 20, leader:
@@ -71,19 +56,20 @@ cd ~/ROS2-Project
 source /opt/ros/jazzy/setup.zsh
 source install/setup.zsh
 export ROS_DOMAIN_ID=20
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-export FASTDDS_BUILTIN_TRANSPORTS=UDPv4
 export TURTLEBOT3_MODEL=waffle
 
 ros2 launch system_bringup system.launch.py \
-  role:=leader fleet_role:=leader domain_id:=20 \
-  risk_domain_id:=22 member_domain_id:=22 follower_domain_id:=21 \
-  active_scout_robot_name:=scout22 follower_robot_name:=follower21 \
-  leader_initial_x:=0.0 leader_initial_y:=0.10 leader_initial_yaw:=0.0 \
-  enable_cartographer:=false leader_auto_localize:=false \
-  enable_scout_failover:=true start_omx_aim:=true \
-  start_yolo_server:=true debug_stream:=true
+  role:=leader \
+  domain_id:=20 \
+  risk_domain_id:=22
 ```
+
+기본 초기 pose는 공유 `map` 기준으로 `scout22=(0.00,0.00,0.0)`,
+`leader20=(0.00,+0.10,0.0)`, `follower21=(0.00,-0.10,0.0)`이다.
+세 로봇 모두 `yaw=0.0`, 즉 `+x` 방향을 바라본다. Leader/Follower는
+`auto_localize:=false` fixed-seed AMCL을 기본으로 사용하고,
+`amcl_fixed_seed_ready`가 map/scan/odom/amcl/TF/lifecycle 상태를 확인한
+뒤 `/localization_ready=true`를 latch한다.
 
 PC 디버깅 실행 (fleet/risk RViz):
 

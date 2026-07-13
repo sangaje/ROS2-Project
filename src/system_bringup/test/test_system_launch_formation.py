@@ -23,6 +23,20 @@ def test_system_launch_passes_initial_pose_to_fleet_launches():
     assert "fleet_launch_args['follower_initial_y']" in text
 
 
+def test_system_launch_uses_fixed_seed_localization_and_faster_nav2_leader_defaults():
+    text = SYSTEM_LAUNCH.read_text(encoding='utf-8')
+
+    assert "'auto_localize', default_value='false'" in text
+    assert "'leader_auto_localize', default_value='false'" in text
+    assert "'leader_shadow_max_linear_vel',\n            default_value='0.26'" in text
+    assert "'leader_shadow_catchup_max_linear_vel',\n            default_value='0.26'" in text
+    assert "'leader_shadow_max_angular_vel',\n            default_value='1.00'" in text
+    assert "'leader_shadow_goal_update_period_sec',\n            default_value='1.0'" in text
+    assert "'leader_shadow_goal_min_change_m',\n            default_value='0.35'" in text
+    assert "'follow_goal_update_distance_m': 0.30" in text
+    assert "'follow_startup_leader_motion_m': 0.30" in text
+
+
 def test_scout_member_pose_is_stabilized_when_cartographer_corrects_while_stopped():
     text = (
         Path(__file__).parents[2]

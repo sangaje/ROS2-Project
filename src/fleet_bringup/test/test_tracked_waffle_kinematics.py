@@ -40,14 +40,14 @@ def test_tracked_adapter_defaults_to_separate_nav_and_hardware_topics():
     assert adapter['angular_gain'] == pytest.approx(1.286)
     assert adapter['left_wheel_command_scale'] == pytest.approx(0.5)
     assert adapter['right_wheel_command_scale'] == pytest.approx(0.5)
-    assert adapter['linear_command_scale'] == pytest.approx(0.5)
-    assert adapter['angular_command_scale'] == pytest.approx(0.5)
-    assert adapter['max_linear_velocity'] == pytest.approx(0.14)
-    assert adapter['max_angular_velocity'] == pytest.approx(0.35)
-    assert adapter['max_linear_acceleration'] == pytest.approx(0.20)
-    assert adapter['max_linear_deceleration'] == pytest.approx(0.25)
-    assert adapter['max_angular_acceleration'] == pytest.approx(0.40)
-    assert adapter['max_angular_deceleration'] == pytest.approx(0.50)
+    assert adapter['linear_command_scale'] == pytest.approx(1.0)
+    assert adapter['angular_command_scale'] == pytest.approx(1.0)
+    assert adapter['max_linear_velocity'] == pytest.approx(0.26)
+    assert adapter['max_angular_velocity'] == pytest.approx(1.00)
+    assert adapter['max_linear_acceleration'] == pytest.approx(1.20)
+    assert adapter['max_linear_deceleration'] == pytest.approx(1.20)
+    assert adapter['max_angular_acceleration'] == pytest.approx(2.20)
+    assert adapter['max_angular_deceleration'] == pytest.approx(2.20)
 
 
 def test_straight_calibration_uses_measured_over_odom_ratio():

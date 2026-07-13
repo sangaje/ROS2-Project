@@ -83,7 +83,9 @@ class UnifiedFieldRobot(Node):
         self.declare_parameter('odom_topic', '/odom')
         self.declare_parameter('follow_distance_m', 0.70)
         self.declare_parameter('follow_goal_period_sec', 1.0)
-        self.declare_parameter('follow_goal_update_distance_m', 0.25)
+        self.declare_parameter('follow_goal_update_distance_m', 0.30)
+        self.declare_parameter('follow_startup_leader_motion_m', 0.30)
+        self.declare_parameter('follow_startup_close_distance_m', 0.35)
         self.declare_parameter('recovery_arrival_tolerance_m', 0.40)
         self.declare_parameter('self_pose_timeout_sec', 2.0)
         self.declare_parameter('movement_start_distance_m', 0.03)
@@ -135,6 +137,12 @@ class UnifiedFieldRobot(Node):
         self.follow_distance = max(0.1, float(get('follow_distance_m').value))
         self.follow_goal_period = max(0.2, float(get('follow_goal_period_sec').value))
         self.follow_update_distance = max(0.05, float(get('follow_goal_update_distance_m').value))
+        self.follow_startup_leader_motion = max(
+            0.0, float(get('follow_startup_leader_motion_m').value)
+        )
+        self.follow_startup_close_distance = max(
+            0.0, float(get('follow_startup_close_distance_m').value)
+        )
         self.arrival_tolerance = max(0.05, float(get('recovery_arrival_tolerance_m').value))
         self.self_pose_timeout = max(0.1, float(get('self_pose_timeout_sec').value))
         self.movement_start_distance = max(
@@ -208,6 +216,10 @@ class UnifiedFieldRobot(Node):
         self.localization_ready = False
         self.last_follow_goal_xy: Optional[tuple[float, float]] = None
         self.last_follow_goal_wall = -1.0e9
+        self.pending_follow_goal_xy: Optional[tuple[float, float]] = None
+        self.pending_follow_goal_wall = -1.0e9
+        self.first_follow_leader_xy: Optional[tuple[float, float]] = None
+        self.follow_startup_released = False
         self.recovery_target: Optional[PoseStamped] = None
         self.last_amcl_wall: Optional[float] = None
         self.xy_cov = float('inf')
@@ -414,7 +426,16 @@ class UnifiedFieldRobot(Node):
         self._publish_status()
 
     def _tick_follow(self) -> None:
-        if not self.enable_follow or self.leader_pose is None:
+        if not self.enable_follow:
+            return
+        if self.leader_pose is None:
+            self._log_follow_gate('leader_pose_missing')
+            return
+        if self.self_pose is None or self.self_pose_wall is None:
+            self._log_follow_gate('self_pose_missing')
+            return
+        if self._now() - self.self_pose_wall > self.self_pose_timeout:
+            self._log_follow_gate('self_pose_missing')
             return
         if self.require_localization_ready and not self.localization_ready:
             # Without this, FOLLOWER starts sending Nav2 goals the instant
@@ -423,10 +444,43 @@ class UnifiedFieldRobot(Node):
             # hasn't finished/published /localization_ready yet). Nav2
             # then acts on a bad pose estimate, and the reported position
             # "teleports" once AMCL catches up or re-converges elsewhere.
+            self._log_follow_gate('localization_not_ready')
+            return
+        if not self.nav_client.server_is_ready():
+            self._log_follow_gate('nav_server_unavailable')
+            return
+        if self.nav.has_pending_goal or not self.nav.is_idle:
+            self._log_follow_gate('command_authority_conflict')
             return
         now = self._now()
         if now - self.last_follow_goal_wall < self.follow_goal_period:
             return
+        if not self.follow_startup_released:
+            leader_xy = (
+                self.leader_pose.pose.position.x,
+                self.leader_pose.pose.position.y,
+            )
+            self_xy = (
+                self.self_pose.pose.position.x,
+                self.self_pose.pose.position.y,
+            )
+            if self.first_follow_leader_xy is None:
+                self.first_follow_leader_xy = leader_xy
+            leader_moved = math.hypot(
+                leader_xy[0] - self.first_follow_leader_xy[0],
+                leader_xy[1] - self.first_follow_leader_xy[1],
+            )
+            leader_distance = math.hypot(
+                leader_xy[0] - self_xy[0],
+                leader_xy[1] - self_xy[1],
+            )
+            if (
+                leader_distance <= self.follow_startup_close_distance
+                and leader_moved < self.follow_startup_leader_motion
+            ):
+                self._log_follow_gate('startup_formation_hold')
+                return
+            self.follow_startup_released = True
         yaw = yaw_from_quaternion(self.leader_pose.pose.orientation)
         goal = self._copy_pose(self.leader_pose)
         goal.pose.position.x -= self.follow_distance * math.cos(yaw)
@@ -436,8 +490,17 @@ class UnifiedFieldRobot(Node):
             if math.hypot(xy[0] - self.last_follow_goal_xy[0], xy[1] - self.last_follow_goal_xy[1]) < self.follow_update_distance:
                 return
         self._queue_nav_goal(goal, source='FOLLOW')
-        self.last_follow_goal_xy = xy
-        self.last_follow_goal_wall = now
+        self.pending_follow_goal_xy = xy
+        self.pending_follow_goal_wall = now
+
+    def _log_follow_gate(self, reason: str) -> None:
+        self.get_logger().warning(
+            'FOLLOW_NAV_BLOCKED | '
+            f'reason={reason} role={self.role.value} '
+            f'localization_ready={self.localization_ready} '
+            f'pending={self.nav.has_pending_goal} active={self.nav.active_goal_count}',
+            throttle_duration_sec=3.0,
+        )
 
     def _tick_recovery(self) -> None:
         if self.recovery_target is None:
@@ -543,6 +606,9 @@ class UnifiedFieldRobot(Node):
         old = self.role
         if role != Role.FOLLOWER:
             self.last_follow_goal_xy = None
+            self.pending_follow_goal_xy = None
+            self.first_follow_leader_xy = None
+            self.follow_startup_released = False
         if old != role:
             self._set_authority(MotionAuthority.NONE, f'release_{old.value}')
             self._invalidate_nav_goal(
@@ -588,6 +654,10 @@ class UnifiedFieldRobot(Node):
         self.nav_start_odom_xy = self.last_odom_xy
         self.movement_started = False
         self.movement_sample_count = 0
+        if source == 'FOLLOW' and self.pending_follow_goal_xy is not None:
+            self.last_follow_goal_xy = self.pending_follow_goal_xy
+            self.last_follow_goal_wall = self.pending_follow_goal_wall
+            self.pending_follow_goal_xy = None
 
     def _on_nav_result(self, source: str, status, error: str) -> None:
         if source != 'RECOVERY' or self.role != Role.RECOVERY_NAVIGATING:

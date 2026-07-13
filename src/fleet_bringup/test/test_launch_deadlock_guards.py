@@ -43,3 +43,24 @@ def test_leader_does_not_seed_from_scout_pose_by_default():
     assert "'enable_scout_pose_seed': False" in text
     assert "'allow_blind_global_reinit': False" in text
     assert "'freeze_when_stationary': False" in text
+
+
+def test_fixed_seed_defaults_do_not_global_localize_or_copy_other_robot_pose():
+    leader = (LAUNCH_DIR / 'leader.launch.py').read_text(encoding='utf-8')
+    follower = (LAUNCH_DIR / 'follower.launch.py').read_text(encoding='utf-8')
+    member = (LAUNCH_DIR / 'member.launch.py').read_text(encoding='utf-8')
+
+    assert "DeclareLaunchArgument('leader_initial_y', default_value='0.10')" in leader
+    assert "'auto_localize',\n            default_value='false'" in leader
+    assert "executable='amcl_fixed_seed_ready'" in leader
+
+    assert "DeclareLaunchArgument('follower_initial_x', default_value='0.0')" in follower
+    assert "DeclareLaunchArgument('follower_initial_y', default_value='-0.10')" in follower
+    assert "'start_legacy_follower',\n            default_value='false'" in follower
+    assert "'auto_localize',\n            default_value='false'" in follower
+    assert "'enable_scout_pose_seed': False" in follower
+    assert "executable='amcl_fixed_seed_ready'" in follower
+
+    assert "'auto_localize',\n            default_value='false'" in member
+    assert "'enable_scout_pose_seed': False" in member
+    assert "executable='amcl_fixed_seed_ready'" in member

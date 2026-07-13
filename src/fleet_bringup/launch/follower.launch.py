@@ -200,10 +200,11 @@ def generate_launch_description():
 
         amcl_enabled = launch_bool(enable_amcl.perform(context))
         auto = launch_bool(auto_localize.perform(context))
-        require_ready_for_follow = bool(amcl_enabled and auto and not simulation)
+        require_ready_for_follow = bool(amcl_enabled and not simulation)
 
         amcl = None
         localization_lifecycle = None
+        fixed_seed_ready = None
         if amcl_enabled:
             # AMCL is the one TF source this stack owns by default (map->
             # odom over a shared, bridged map). Set enable_amcl:=false only
@@ -311,7 +312,7 @@ def generate_launch_description():
                 output='screen',
                 parameters=[{
                     'use_sim_time': simulation,
-                    'enable_scout_pose_seed': True,
+                    'enable_scout_pose_seed': False,
                     'active_scout_id_topic': '/failover/active_scout_id',
                     'active_scout_robot_name': 'scout22',
                     'follower_robot_name': 'follower21',
@@ -347,6 +348,27 @@ def generate_launch_description():
                     'localization_check_timeout_sec': 9.0,
                     'max_spin_retries': 0,
                     'force_spin_after_sec': 14.0,
+                }],
+                env=process_env,
+                respawn=True,
+                respawn_delay=3.0,
+            )
+        elif amcl_enabled and not simulation:
+            fixed_seed_ready = Node(
+                package='fleet_bringup',
+                executable='amcl_fixed_seed_ready',
+                name='follower_amcl_fixed_seed_ready',
+                output='screen',
+                parameters=[{
+                    'map_topic': '/map',
+                    'scan_topic': '/scan',
+                    'odom_topic': '/odom',
+                    'amcl_pose_topic': '/amcl_pose',
+                    'amcl_get_state_service': '/amcl/get_state',
+                    'global_frame': 'map',
+                    'base_frame': 'base_footprint',
+                    'ready_topic': 'localization_ready',
+                    'fixed_seed_initial_pose_applied': True,
                 }],
                 env=process_env,
                 respawn=True,
@@ -437,6 +459,16 @@ def generate_launch_description():
             actions.append(
                 TimerAction(period=kickstart_t, actions=[kickstart_node])
             )
+        if fixed_seed_ready is not None:
+            actions.append(TimerAction(
+                period=kickstart_t,
+                actions=[
+                    LogInfo(msg=[
+                        'FOLLOWER_STAGE | starting fixed-seed AMCL ready watcher',
+                    ]),
+                    fixed_seed_ready,
+                ],
+            ))
         return actions
 
     return LaunchDescription([
@@ -492,15 +524,15 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'start_legacy_follower',
-            default_value='true',
+            default_value='false',
             choices=['true', 'false'],
             description=(
                 'Start fleet_follower. Set false when system_bringup '
                 'unified_field_robot owns FOLLOWER mode.'
             ),
         ),
-        DeclareLaunchArgument('follower_initial_x', default_value='-0.70'),
-        DeclareLaunchArgument('follower_initial_y', default_value='0.0'),
+        DeclareLaunchArgument('follower_initial_x', default_value='0.0'),
+        DeclareLaunchArgument('follower_initial_y', default_value='-0.10'),
         DeclareLaunchArgument('follower_initial_yaw', default_value='0.0'),
         DeclareLaunchArgument(
             'enable_amcl',
@@ -515,13 +547,13 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'auto_localize',
-            default_value='true',
+            default_value='false',
             choices=['true', 'false'],
             description=(
                 'Let AMCL search the whole map via '
                 'reinitialize_global_localization after seeding from '
-                'follower_initial_x/y/yaw. Set false to use only the fixed '
-                'seed.'
+                'follower_initial_x/y/yaw. Default false uses only the fixed '
+                'seed and amcl_fixed_seed_ready.'
             ),
         ),
         *dds_launch_environment(domain_id),

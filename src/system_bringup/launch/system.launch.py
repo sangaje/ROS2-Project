@@ -487,6 +487,10 @@ def generate_launch_description():
                         'require_localization_ready': not scout_owns_slam,
                         'localization_ready_topic': '/localization_ready',
                         'follow_distance_m': 0.70,
+                        'follow_goal_period_sec': 1.0,
+                        'follow_goal_update_distance_m': 0.30,
+                        'follow_startup_leader_motion_m': 0.30,
+                        'follow_startup_close_distance_m': 0.35,
                         'recovery_arrival_tolerance_m': float(
                             scout_takeover_arrival_tolerance_m.perform(context)
                         ),
@@ -544,7 +548,6 @@ def generate_launch_description():
         if role_value == 'leader':
             leader_localization_ready_gate = (
                 not launch_bool(enable_cartographer.perform(context))
-                and launch_bool(leader_auto_localize.perform(context))
             )
             risk_domain_value = risk_domain_id.perform(context).strip()
             if (
@@ -1245,7 +1248,7 @@ def generate_launch_description():
             ),
         ),
         DeclareLaunchArgument(
-            'auto_localize', default_value='true',
+            'auto_localize', default_value='false',
             choices=['true', 'false'],
             description=(
                 'Passed through to follower/member AMCL global '
@@ -1254,12 +1257,11 @@ def generate_launch_description():
             ),
         ),
         DeclareLaunchArgument(
-            'leader_auto_localize', default_value='true',
+            'leader_auto_localize', default_value='false',
             choices=['true', 'false'],
             description=(
-                'Leader fleet_role only: enable AMCL scout-pose seed plus '
-                'verified in-place spin. Default true forces the leader to '
-                'turn in place once before Nav2/fleet goals are allowed.'
+                'Leader fleet_role only: enable verified in-place spin after '
+                'fixed AMCL seed. Default false uses fixed-seed readiness.'
             ),
         ),
         DeclareLaunchArgument(
@@ -1583,27 +1585,27 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'leader_shadow_max_linear_vel',
-            default_value='0.14',
+            default_value='0.26',
             description='Best-effort DWB linear velocity cap while shadow following.',
         ),
         DeclareLaunchArgument(
             'leader_shadow_catchup_max_linear_vel',
-            default_value='0.14',
+            default_value='0.26',
             description='Best-effort DWB linear velocity cap when the leader is far behind the active scout.',
         ),
         DeclareLaunchArgument(
             'leader_shadow_max_angular_vel',
-            default_value='0.35',
+            default_value='1.00',
             description='Best-effort DWB angular velocity cap while shadow following.',
         ),
         DeclareLaunchArgument(
             'leader_shadow_goal_update_period_sec',
-            default_value='2.0',
+            default_value='1.0',
             description='Minimum time between leader shadow Nav2 goal updates.',
         ),
         DeclareLaunchArgument(
             'leader_shadow_goal_min_change_m',
-            default_value='0.60',
+            default_value='0.35',
             description='Minimum shadow target displacement before sending another leader goal.',
         ),
         DeclareLaunchArgument(
@@ -1621,12 +1623,12 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'leader_shadow_cmd_max_linear_vel',
-            default_value='0.14',
+            default_value='0.26',
             description='Hard cap for direct shadow-follow linear.x before tracked adapter.',
         ),
         DeclareLaunchArgument(
             'leader_shadow_cmd_max_angular_vel',
-            default_value='0.35',
+            default_value='1.00',
             description='Hard cap for compensated direct /cmd_vel angular.z.',
         ),
         DeclareLaunchArgument(

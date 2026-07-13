@@ -93,18 +93,18 @@ class LeaderShadowFollow(Node):
         self.declare_parameter('leader_shadow_stop_distance_m', 0.8)
         self.declare_parameter('leader_shadow_resume_distance_m', 1.3)
         self.declare_parameter('leader_shadow_far_distance_m', 2.4)
-        self.declare_parameter('leader_shadow_max_linear_vel', 0.14)
-        self.declare_parameter('leader_shadow_catchup_max_linear_vel', 0.14)
-        self.declare_parameter('leader_shadow_max_angular_vel', 0.35)
-        self.declare_parameter('leader_restore_max_linear_vel', 0.14)
-        self.declare_parameter('leader_restore_max_angular_vel', 0.35)
-        self.declare_parameter('leader_shadow_goal_update_period_sec', 2.0)
-        self.declare_parameter('leader_shadow_goal_min_change_m', 0.60)
+        self.declare_parameter('leader_shadow_max_linear_vel', 0.26)
+        self.declare_parameter('leader_shadow_catchup_max_linear_vel', 0.26)
+        self.declare_parameter('leader_shadow_max_angular_vel', 1.00)
+        self.declare_parameter('leader_restore_max_linear_vel', 0.26)
+        self.declare_parameter('leader_restore_max_angular_vel', 1.00)
+        self.declare_parameter('leader_shadow_goal_update_period_sec', 1.0)
+        self.declare_parameter('leader_shadow_goal_min_change_m', 0.35)
         self.declare_parameter('leader_shadow_cmd_goal_tolerance_m', 0.16)
         self.declare_parameter('leader_shadow_cmd_linear_scale', 1.0)
         self.declare_parameter('leader_shadow_cmd_angular_scale', 1.0)
-        self.declare_parameter('leader_shadow_cmd_max_linear_vel', 0.14)
-        self.declare_parameter('leader_shadow_cmd_max_angular_vel', 0.35)
+        self.declare_parameter('leader_shadow_cmd_max_linear_vel', 0.26)
+        self.declare_parameter('leader_shadow_cmd_max_angular_vel', 1.00)
         self.declare_parameter('leader_shadow_linear_kp', 0.70)
         self.declare_parameter('leader_shadow_angular_kp', 1.40)
         self.declare_parameter('leader_shadow_heading_slowdown_rad', 0.75)
@@ -421,7 +421,6 @@ class LeaderShadowFollow(Node):
         if self.require_video_ready and not self.video_ready:
             self._cancel_shadow_goal('waiting_video_ready')
             self._stop_direct_cmd('waiting_video_ready')
-            self._publish_twist(0.0, 0.0)
             self.mode = LeaderMode.IDLE
             self._set_controller_speed_limit(False)
             self._publish_state('waiting_video_ready')
@@ -429,7 +428,6 @@ class LeaderShadowFollow(Node):
         if self.pause_on_omx_aiming and self._is_omx_aiming(self.omx_state):
             self._cancel_shadow_goal('omx_aiming')
             self._stop_direct_cmd('omx_aiming')
-            self._publish_twist(0.0, 0.0)
             self.mode = LeaderMode.IDLE
             self._set_controller_speed_limit(False)
             self._publish_state('omx_aiming_hold')
@@ -570,7 +568,8 @@ class LeaderShadowFollow(Node):
                 f'[LEADER_SHADOW] TARGET_HARD_STOP_CANCEL | reason={reason}'
             )
         self._stop_direct_cmd(reason)
-        self._publish_twist(0.0, 0.0)
+        if self.direct_shadow_cmd_vel:
+            self._publish_twist(0.0, 0.0)
 
     def _active_scout_pose(self) -> Tuple[Optional[PoseStamped], float]:
         if self.active_scout_id == self.follower_robot_name:

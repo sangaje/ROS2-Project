@@ -205,6 +205,7 @@ def generate_launch_description():
         localization_lifecycle = None
         map_relay = None
         kickstart_node = None
+        fixed_seed_ready = None
         if cartographer_owned:
             cartographer_launch = os.path.join(
                 get_package_share_directory('turtlebot3_cartographer'),
@@ -354,6 +355,27 @@ def generate_launch_description():
                     respawn=True,
                     respawn_delay=3.0,
                 )
+            else:
+                fixed_seed_ready = Node(
+                    package='fleet_bringup',
+                    executable='amcl_fixed_seed_ready',
+                    name='leader_amcl_fixed_seed_ready',
+                    output='screen',
+                    parameters=[{
+                        'map_topic': '/map',
+                        'scan_topic': amcl_scan_topic_value,
+                        'odom_topic': '/odom',
+                        'amcl_pose_topic': '/amcl_pose',
+                        'amcl_get_state_service': '/amcl/get_state',
+                        'global_frame': 'map',
+                        'base_frame': 'base_footprint',
+                        'ready_topic': 'localization_ready',
+                        'fixed_seed_initial_pose_applied': True,
+                    }],
+                    env=process_env,
+                    respawn=True,
+                    respawn_delay=3.0,
+                )
 
         leader_pose = Node(
             package='fleet_bringup',
@@ -497,7 +519,7 @@ def generate_launch_description():
                     'lifecycle_delay_sec': lifecycle_delay_sec,
                     'goal_delay_sec': goal_delay_sec,
                     'require_localization_ready': (
-                        'true' if auto_localize_enabled else 'false'
+                        'true' if not cartographer_owned else 'false'
                     ),
                     'localization_ready_topic': '/localization_ready',
                 }.items(),
@@ -516,7 +538,7 @@ def generate_launch_description():
                 # External-map AMCL must physically spin first. Holding the
                 # coordinator prevents it from publishing leader/member goals
                 # while global_localize_kickstart owns /cmd_vel.
-                'require_localization_ready': auto_localize_enabled,
+                'require_localization_ready': not cartographer_owned,
             }],
             env=process_env,
             respawn=True,
@@ -690,6 +712,19 @@ def generate_launch_description():
                             ],
                         )
                     )
+                if fixed_seed_ready is not None:
+                    actions.append(
+                        TimerAction(
+                            period=4.0,
+                            actions=[
+                                LogInfo(msg=[
+                                    'LEADER_STAGE | starting fixed-seed AMCL ',
+                                    'ready watcher',
+                                ]),
+                                fixed_seed_ready,
+                            ],
+                        )
+                    )
         return actions
 
     return LaunchDescription([
@@ -745,13 +780,14 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'auto_localize',
-            default_value='true',
+            default_value='false',
             choices=['true', 'false'],
             description=(
                 'Only used when enable_cartographer:=false. Start AMCL from '
-                'leader_initial_x/y/yaw or RViz 2D Pose Estimate, then refine '
-                'via verified in-place spin. Scout pose seeding is disabled '
-                'by default because scout pose != leader pose.'
+                'leader_initial_x/y/yaw. Default false uses fixed-seed '
+                'readiness without global localization or in-place spin. '
+                'When true, refine via verified in-place spin. Scout pose '
+                'seeding is disabled because scout pose != leader pose.'
             ),
         ),
         DeclareLaunchArgument(
@@ -807,7 +843,7 @@ def generate_launch_description():
             description='Leader-domain follower SLAM map input selected after takeover.',
         ),
         DeclareLaunchArgument('leader_initial_x', default_value='0.0'),
-        DeclareLaunchArgument('leader_initial_y', default_value='0.0'),
+        DeclareLaunchArgument('leader_initial_y', default_value='0.10'),
         DeclareLaunchArgument('leader_initial_yaw', default_value='0.0'),
         *dds_launch_environment(domain_id),
         OpaqueFunction(function=make_stack),

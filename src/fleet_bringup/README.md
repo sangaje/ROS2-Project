@@ -60,16 +60,21 @@ start_robot_bringup:=false
 
 ## 초기 위치 자동 탐색 (`auto_localize`)
 
-`follower.launch.py`와 `member.launch.py`는 기본적으로 `auto_localize:=true`다.
-매번 `follower_initial_x/y/yaw`(또는 `member_initial_x/y/yaw`)로 고정된
-위치를 AMCL에 강제로 심는 대신, localization 스택이 뜨면
-`global_localize_kickstart` 노드가 `/reinitialize_global_localization`을
-호출해 맵 전체에 파티클을 고르게 뿌리고, 실물 로봇을 짧게(기본 8초) 제자리
-회전시켜 스캔 매칭이 여러 시점을 확보하도록 돕는다.
+`follower.launch.py`, `member.launch.py`, `leader.launch.py`는 실물 기본값이
+`auto_localize:=false`다. AMCL의 `set_initial_pose=true`가
+`*_initial_x/y/yaw`를 정확히 한 번 적용하고, `amcl_fixed_seed_ready`가
+공유 `/map`, 자기 `/scan`, 자기 `/odom`, `/amcl_pose`, AMCL lifecycle ACTIVE,
+`map->base_footprint` TF를 확인한 뒤 `/localization_ready=true`를 latch한다.
 
-고정 시드가 이미 정확히 맞는 상황이거나, 대칭적인 공간이라 자동 탐색이
-불안정하면 `auto_localize:=false`로 끄고 기존처럼 `follower_initial_x/y/yaw`
-(`member_initial_x/y/yaw`)를 실측값으로 넣는다.
+따라서 정상 기동 중에는 다른 로봇 pose를 복사하지 않고,
+`/reinitialize_global_localization`, 반복 `/initialpose`, 자동 제자리 회전을
+사용하지 않는다. 맵 위 실제 배치를 모르는 디버깅 상황에서만
+`auto_localize:=true`를 명시적으로 켜면 `global_localize_kickstart`가 동작한다.
+이때도 scout pose seed는 기본으로 꺼져 있다.
+
+현재 3-로봇 기본 배치는 공유 `map` 기준으로 `scout22=(0.00,0.00,0.0)`,
+`leader20=(0.00,+0.10,0.0)`, `follower21=(0.00,-0.10,0.0)`이며 모두 `+x`를
+바라본다.
 
 ## AMCL을 끄는 옵션 (`enable_amcl`)
 

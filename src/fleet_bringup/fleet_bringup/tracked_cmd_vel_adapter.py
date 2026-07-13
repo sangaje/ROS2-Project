@@ -115,11 +115,11 @@ class TrackedCmdVelAdapter(Node):
         )
         self.linear_command_scale = _validate_scale(
             'linear_command_scale',
-            _safe_declare(self, 'linear_command_scale', 0.5),
+            _safe_declare(self, 'linear_command_scale', 1.0),
         )
         self.angular_command_scale = _validate_scale(
             'angular_command_scale',
-            _safe_declare(self, 'angular_command_scale', 0.5),
+            _safe_declare(self, 'angular_command_scale', 1.0),
         )
         self.effective_wheel_radius = _validate_positive(
             'effective_wheel_radius',
@@ -131,27 +131,27 @@ class TrackedCmdVelAdapter(Node):
         )
         self.max_linear_velocity = _validate_nonnegative(
             'max_linear_velocity',
-            _safe_declare(self, 'max_linear_velocity', 0.14),
+            _safe_declare(self, 'max_linear_velocity', 0.26),
         )
         self.max_angular_velocity = _validate_nonnegative(
             'max_angular_velocity',
-            _safe_declare(self, 'max_angular_velocity', 0.35),
+            _safe_declare(self, 'max_angular_velocity', 1.0),
         )
         self.max_linear_acceleration = _validate_nonnegative(
             'max_linear_acceleration',
-            _safe_declare(self, 'max_linear_acceleration', 0.20),
+            _safe_declare(self, 'max_linear_acceleration', 1.20),
         )
         self.max_linear_deceleration = _validate_nonnegative(
             'max_linear_deceleration',
-            _safe_declare(self, 'max_linear_deceleration', 0.25),
+            _safe_declare(self, 'max_linear_deceleration', 1.20),
         )
         self.max_angular_acceleration = _validate_nonnegative(
             'max_angular_acceleration',
-            _safe_declare(self, 'max_angular_acceleration', 0.40),
+            _safe_declare(self, 'max_angular_acceleration', 2.20),
         )
         self.max_angular_deceleration = _validate_nonnegative(
             'max_angular_deceleration',
-            _safe_declare(self, 'max_angular_deceleration', 0.50),
+            _safe_declare(self, 'max_angular_deceleration', 2.20),
         )
         self.command_timeout_sec = max(
             0.05, float(_safe_declare(self, 'command_timeout_sec', 0.5))
