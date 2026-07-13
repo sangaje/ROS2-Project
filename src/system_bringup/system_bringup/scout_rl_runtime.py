@@ -607,6 +607,8 @@ class ActiveScoutRLRuntime:
             'sensor_pipeline_enabled': self._sensor_pipeline_enabled,
             'motion_pipeline_enabled': self._active,
             'ready': self.ready,
+            'model_loading': self._model_loading,
+            'model_error': self._model_error or '',
             'scan_age_ms': (
                 (now - snapshot.scan_received_at) * 1000.0
                 if snapshot.scan is not None else -1.0
