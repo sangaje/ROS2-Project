@@ -10,8 +10,8 @@ let riskSeq = -1;
 let mapReady = false;
 let riskReady = false;
 const gridLoad = {
-  map: {loading: false, requestedSeq: -1, pendingSeq: -1, latestSeq: -1},
-  risk: {loading: false, requestedSeq: -1, pendingSeq: -1, latestSeq: -1},
+  map: {loading: false, requestedSeq: -1, pendingSeq: -1, latestSeq: -1, lastRequestMs: 0, minIntervalMs: 1000},
+  risk: {loading: false, requestedSeq: -1, pendingSeq: -1, latestSeq: -1, lastRequestMs: 0, minIntervalMs: 1000},
 };
 let streamSources = {};
 const framePollTimers = {};
@@ -140,8 +140,18 @@ function queueGridLoad(kind, seq, status) {
     state.pendingSeq = Math.max(state.pendingSeq, seq);
     return;
   }
+  const nowMs = Date.now();
+  if (nowMs - state.lastRequestMs < state.minIntervalMs) {
+    state.pendingSeq = Math.max(state.pendingSeq, seq);
+    window.setTimeout(
+      () => queueGridLoad(kind, state.pendingSeq, 'OK'),
+      Math.max(50, state.minIntervalMs - (nowMs - state.lastRequestMs)),
+    );
+    return;
+  }
   state.loading = true;
   state.requestedSeq = seq;
+  state.lastRequestMs = nowMs;
   const image = kind === 'map' ? mapImg : riskImg;
   image.src = `/api/${kind}.png?v=${seq}&t=${Date.now()}`;
 }

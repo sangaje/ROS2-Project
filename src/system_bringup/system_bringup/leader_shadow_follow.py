@@ -17,7 +17,7 @@ from typing import Optional, Tuple
 
 import rclpy
 from geometry_msgs.msg import PoseStamped, Twist, TwistStamped
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
 from rcl_interfaces.srv import SetParameters
 from rclpy.node import Node
@@ -67,6 +67,9 @@ class LeaderShadowFollow(Node):
         self.declare_parameter('cmd_vel_topic', '/cmd_vel')
         self.declare_parameter('use_stamped_cmd_vel', True)
         self.declare_parameter('direct_shadow_cmd_vel', False)
+        self.declare_parameter('leader_follow_backend', 'nav2')
+        self.declare_parameter('leader_path_topic', '/plan')
+        self.declare_parameter('odom_topic', '/odom')
         self.declare_parameter(
             'controller_set_parameters_service',
             '/controller_server/set_parameters',
@@ -134,6 +137,15 @@ class LeaderShadowFollow(Node):
         self.cmd_vel_topic = str(get('cmd_vel_topic').value)
         self.use_stamped_cmd_vel = bool(get('use_stamped_cmd_vel').value)
         self.direct_shadow_cmd_vel = bool(get('direct_shadow_cmd_vel').value)
+        self.follow_backend = str(get('leader_follow_backend').value).strip().lower()
+        if self.follow_backend not in ('nav2', 'direct'):
+            self.get_logger().warning(
+                f'LEADER_FOLLOW_BACKEND_INVALID | backend={self.follow_backend!r}; using nav2'
+            )
+            self.follow_backend = 'nav2'
+        self.direct_shadow_cmd_vel = self.follow_backend == 'direct'
+        self.leader_path_topic = str(get('leader_path_topic').value)
+        self.odom_topic = str(get('odom_topic').value)
         self.controller_set_parameters_service = str(
             get('controller_set_parameters_service').value
         )
@@ -231,6 +243,10 @@ class LeaderShadowFollow(Node):
         self.create_subscription(PoseStamped, self.leader_pose_topic, self._on_leader_pose, 10)
         self.create_subscription(PoseStamped, self.active_pose_topic, self._on_original_scout_pose, 20)
         self.create_subscription(PoseStamped, self.follower_pose_topic, self._on_follower_scout_pose, 20)
+        self.create_subscription(Path, self.leader_path_topic, self._on_path, 10)
+        self.create_subscription(Odometry, self.odom_topic, self._on_odom, 10)
+        self.create_subscription(TwistStamped, self.cmd_vel_topic, self._on_cmd_vel_stamped, 10)
+        self.create_subscription(Twist, self.cmd_vel_topic, self._on_cmd_vel, 10)
         self.create_subscription(OccupancyGrid, self.map_topic, self._on_map, map_qos)
         self.create_subscription(String, self.failover_state_topic, self._on_failover_state, latched_qos)
         self.create_subscription(String, self.active_scout_id_topic, self._on_active_scout_id, latched_qos)
@@ -294,6 +310,11 @@ class LeaderShadowFollow(Node):
         self.map_msg: Optional[OccupancyGrid] = None
         self.last_scan_wall = -1.0e9
         self.last_scan_stamp = -1.0
+        self.last_path_wall = -1.0e9
+        self.last_cmd_vel_wall = -1.0e9
+        self.last_nonzero_cmd_wall = -1.0e9
+        self.last_odom_wall = -1.0e9
+        self.odom_motion = False
 
         self.heading: Optional[float] = None
         self.previous_scout_sample: Optional[Tuple[float, Point2]] = None
@@ -321,7 +342,7 @@ class LeaderShadowFollow(Node):
             f'enabled={self.enabled} scout={self.original_scout_id}:{self.active_pose_topic} '
             f'follower_scout={self.follower_robot_name}:{self.follower_pose_topic} '
             f'distance={self.follow_distance:.2f}m fov={self.scan_fov_deg:.1f}deg '
-            f'direct_cmd={self.direct_shadow_cmd_vel}:{self.cmd_vel_topic} '
+            f'backend={self.follow_backend} direct_cmd={self.direct_shadow_cmd_vel}:{self.cmd_vel_topic} '
             f'cmd_scale=lin{self.cmd_linear_scale:.2f}/ang{self.cmd_angular_scale:.2f} '
             f'cmd_cap=lin{self.cmd_max_linear_vel:.2f}/ang{self.cmd_max_angular_vel:.2f} '
             f'controller_service={self.controller_set_parameters_service} '
@@ -350,6 +371,29 @@ class LeaderShadowFollow(Node):
 
     def _on_map(self, msg: OccupancyGrid) -> None:
         self.map_msg = msg
+
+    def _on_path(self, msg: Path) -> None:
+        if msg.poses:
+            self.last_path_wall = self._now()
+
+    def _on_cmd_vel_stamped(self, msg: TwistStamped) -> None:
+        self._record_cmd_vel(msg.twist)
+
+    def _on_cmd_vel(self, msg: Twist) -> None:
+        self._record_cmd_vel(msg)
+
+    def _record_cmd_vel(self, twist: Twist) -> None:
+        now = self._now()
+        self.last_cmd_vel_wall = now
+        if abs(float(twist.linear.x)) > 1.0e-3 or abs(float(twist.angular.z)) > 1.0e-3:
+            self.last_nonzero_cmd_wall = now
+
+    def _on_odom(self, msg: Odometry) -> None:
+        self.last_odom_wall = self._now()
+        self.odom_motion = bool(
+            abs(float(msg.twist.twist.linear.x)) > 0.01
+            or abs(float(msg.twist.twist.angular.z)) > 0.03
+        )
 
     def _on_failover_state(self, msg: String) -> None:
         previous = self.failover_state
@@ -431,9 +475,11 @@ class LeaderShadowFollow(Node):
             self._set_controller_speed_limit(False)
             self.mode = LeaderMode.IDLE
             self._publish_state('disabled')
+            self._log_follow_debug('disabled')
             return
         if self._now() - self.start_wall < self.startup_grace:
             self._publish_state('startup_grace')
+            self._log_follow_debug('startup_grace')
             return
         if self.require_localization_ready and not self.localization_ready:
             self._cancel_shadow_goal('waiting_localization_ready')
@@ -441,6 +487,7 @@ class LeaderShadowFollow(Node):
             self.mode = LeaderMode.IDLE
             self._set_controller_speed_limit(False)
             self._publish_state('waiting_localization_ready')
+            self._log_follow_debug('waiting_localization_ready')
             return
         if getattr(self, 'require_system_ready', False) and not getattr(
             self, 'system_ready', True
@@ -450,6 +497,7 @@ class LeaderShadowFollow(Node):
             self.mode = LeaderMode.IDLE
             self._set_controller_speed_limit(False)
             self._publish_state('waiting_system_ready')
+            self._log_follow_debug('waiting_system_ready')
             return
         if self.require_video_ready and not self.video_ready:
             self._cancel_shadow_goal('waiting_video_ready')
@@ -457,6 +505,7 @@ class LeaderShadowFollow(Node):
             self.mode = LeaderMode.IDLE
             self._set_controller_speed_limit(False)
             self._publish_state('waiting_video_ready')
+            self._log_follow_debug('waiting_video_ready')
             return
         if self.pause_on_omx_aiming and self._is_omx_aiming(self.omx_state):
             self._cancel_shadow_goal('omx_aiming')
@@ -464,6 +513,7 @@ class LeaderShadowFollow(Node):
             self.mode = LeaderMode.IDLE
             self._set_controller_speed_limit(False)
             self._publish_state('omx_aiming_hold')
+            self._log_follow_debug('omx_aiming_hold')
             return
         if (
             self.pause_on_raw_target_detection
@@ -474,10 +524,12 @@ class LeaderShadowFollow(Node):
             self.mode = LeaderMode.IDLE
             self._set_controller_speed_limit(False)
             self._publish_state('target_detected_hold')
+            self._log_follow_debug('target_detected_hold')
             return
         if not self._failover_allows_shadow():
             self._stop_shadow_for_failover()
             self._publish_state('failover_owns_leader_goal')
+            self._log_follow_debug('failover_owns_leader_goal')
             return
 
         scout_pose, scout_wall = self._active_scout_pose()
@@ -487,6 +539,7 @@ class LeaderShadowFollow(Node):
             self.mode = LeaderMode.IDLE
             self._set_controller_speed_limit(False)
             self._publish_state('waiting_pose')
+            self._log_follow_debug('waiting_pose')
             return
         scout_age = self._now() - scout_wall
         if scout_age > self.scout_pose_timeout:
@@ -495,6 +548,7 @@ class LeaderShadowFollow(Node):
             self.mode = LeaderMode.SCOUT_SUSPECTED_DEAD
             self._set_controller_speed_limit(False)
             self._publish_state(f'scout_pose_stale_{scout_age:.2f}s')
+            self._log_follow_debug('scout_pose_stale')
             return
 
         self.mode = (
@@ -508,6 +562,7 @@ class LeaderShadowFollow(Node):
             self._cancel_shadow_goal('no_feasible_shadow_target')
             self._stop_direct_cmd('no_feasible_shadow_target')
             self._publish_state('no_feasible_shadow_target')
+            self._log_follow_debug('no_feasible_shadow_target')
             return
         distance_to_shadow_goal = self._distance_pose(self.leader_pose, goal)
         self.shadow_active = distance_to_shadow_goal > self.cmd_goal_tolerance
@@ -521,6 +576,7 @@ class LeaderShadowFollow(Node):
                 goal=goal,
                 distance_to_scout=distance_to_scout,
             )
+            self._log_follow_debug('at_shadow_target', goal=goal, distance_to_scout=distance_to_scout)
             return
         catchup = distance_to_scout >= self.far_distance
         if self.direct_shadow_cmd_vel:
@@ -533,6 +589,7 @@ class LeaderShadowFollow(Node):
             self.last_goal = goal
             self.last_goal_wall = self._now()
             self._publish_state('direct_cmd', goal=goal, distance_to_scout=distance_to_scout)
+            self._log_follow_debug('direct_cmd', goal=goal, distance_to_scout=distance_to_scout)
             return
 
         self._stop_direct_cmd('nav2_shadow_goal_mode')
@@ -540,6 +597,7 @@ class LeaderShadowFollow(Node):
         self._set_controller_speed_limit(True, catchup=catchup)
         if not self._should_publish_goal(goal):
             self._publish_state('goal_rate_limited')
+            self._log_follow_debug('goal_rate_limited', goal=goal, distance_to_scout=distance_to_scout)
             return
 
         self.goal_pub.publish(goal)
@@ -548,6 +606,7 @@ class LeaderShadowFollow(Node):
         self.shadow_goal_active = True
         self.last_goal_wall = self._now()
         self._publish_state('goal_sent', goal=goal, distance_to_scout=distance_to_scout)
+        self._log_follow_debug('goal_sent', goal=goal, distance_to_scout=distance_to_scout)
         self.get_logger().warning(
             '[LEADER_SHADOW] GOAL_SENT | '
             f'active_scout={self.active_scout_id} '
@@ -901,6 +960,49 @@ class LeaderShadowFollow(Node):
         msg = String()
         msg.data = json.dumps(data, sort_keys=True)
         self.state_pub.publish(msg)
+
+    def _age_ms(self, wall: float) -> float:
+        if wall < 0.0:
+            return -1.0
+        return max(0.0, (self._now() - wall) * 1000.0)
+
+    def _log_follow_debug(
+        self,
+        reason: str,
+        *,
+        goal: Optional[PoseStamped] = None,
+        distance_to_scout: Optional[float] = None,
+    ) -> None:
+        scout_pose, scout_wall = self._active_scout_pose()
+        goal_required = goal is not None and reason not in (
+            'at_shadow_target',
+            'waiting_pose',
+            'waiting_system_ready',
+            'waiting_video_ready',
+            'waiting_localization_ready',
+        )
+        self.get_logger().warning(
+            'LEADER_FOLLOW_DEBUG | '
+            f'backend={getattr(self, "follow_backend", "nav2")} '
+            f'scout_pose_rx={scout_pose is not None} '
+            f'scout_pose_age_ms={self._age_ms(scout_wall):.0f} '
+            f'leader_pose_rx={self.leader_pose is not None} '
+            f'system_ready={getattr(self, "system_ready", True)} '
+            f'dashboard_ready={getattr(self, "video_ready", True)} '
+            f'localization_ready={self.localization_ready} '
+            f'nav_server_mode={getattr(self, "follow_backend", "nav2") == "nav2"} '
+            f'goal_required={goal_required} '
+            f'goal_sent={reason == "goal_sent"} '
+            f'path_received={getattr(self, "last_path_wall", -1.0e9) >= 0.0} '
+            f'path_age_ms={self._age_ms(getattr(self, "last_path_wall", -1.0e9)):.0f} '
+            f'cmd_vel_age_ms={self._age_ms(getattr(self, "last_cmd_vel_wall", -1.0e9)):.0f} '
+            f'nonzero_cmd_age_ms={self._age_ms(getattr(self, "last_nonzero_cmd_wall", -1.0e9)):.0f} '
+            f'odom_age_ms={self._age_ms(getattr(self, "last_odom_wall", -1.0e9)):.0f} '
+            f'odom_motion={getattr(self, "odom_motion", False)} '
+            f'distance_to_scout={distance_to_scout if distance_to_scout is not None else float("nan"):.3f} '
+            f'blocking_reason={reason}',
+            throttle_duration_sec=1.0,
+        )
 
     def _publish_scan_state(self, state: str, *, age: Optional[float] = None) -> None:
         data = {

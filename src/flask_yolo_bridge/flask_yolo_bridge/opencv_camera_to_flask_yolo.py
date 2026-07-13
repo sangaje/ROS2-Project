@@ -59,6 +59,12 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         ).strip()
         self.output_topic = self.declare_parameter('output_topic', '/risk/yolo_detections').value
         self.max_rate_hz = float(self.declare_parameter('max_rate_hz', 5.0).value)
+        self.active_max_rate_hz = float(
+            self.declare_parameter('active_max_rate_hz', self.max_rate_hz).value
+        )
+        self.standby_max_rate_hz = float(
+            self.declare_parameter('standby_max_rate_hz', min(1.0, self.max_rate_hz)).value
+        )
         self.http_worker_count = int(self.declare_parameter('http_worker_count', 1).value)
         self.jpeg_quality = int(self.declare_parameter('jpeg_quality', 60).value)
         self.timeout_sec = float(self.declare_parameter('timeout_sec', 1.0).value)
@@ -115,6 +121,16 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
                 self.declare_parameter(
                     'active_roles',
                     'ACTIVE_SCOUT,SCOUT,FOLLOWER,RECOVERING',
+                ).value
+            ).split(',')
+            if item.strip()
+        }
+        self.publish_roles = {
+            item.strip().upper()
+            for item in str(
+                self.declare_parameter(
+                    'publish_roles',
+                    'ACTIVE_SCOUT,SCOUT,RECOVERING',
                 ).value
             ).split(',')
             if item.strip()
@@ -214,6 +230,7 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             f'capture_request={self.width}x{self.height} send={self.send_width}x{self.send_height} '
             f'camera_fps={self.camera_fps:.1f} fourcc={self.fourcc or "default"} '
             f'server={self.server_url} out={self.output_topic} rate={self.max_rate_hz:.2f}Hz '
+            f'active_rate={self.active_max_rate_hz:.2f}Hz standby_rate={self.standby_max_rate_hz:.2f}Hz '
             f'http_workers={max(1, self.http_worker_count)} '
             f'jpeg_quality={self.jpeg_quality} timeout={self.timeout_sec:.2f}s '
             f'connect_timeout={self.connect_timeout_sec:.2f}s read_timeout={self.read_timeout_sec:.2f}s '
@@ -223,6 +240,7 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             f'pose_topic={self.pose_topic} require_capture_pose={self.require_capture_pose} '
             f'robot_id={self.robot_name or "unknown"} boot_id={self.boot_id} '
             f'camera_active={self.camera_active} active_roles={sorted(self.active_roles)} '
+            f'publish_roles={sorted(self.publish_roles)} '
             f'latest_frame_only=true ros_image_publish=false'
         )
 
@@ -510,13 +528,14 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         return bytes(buf), frame.shape[1], frame.shape[0]
 
     def http_worker_loop(self):
-        period = 1.0 / self.max_rate_hz if self.max_rate_hz > 0.0 else 0.0
         next_allowed = 0.0
         while not self.stop_threads:
             if not self.camera_active:
                 time.sleep(0.1)
                 next_allowed = 0.0
                 continue
+            rate = self._current_upload_rate_hz()
+            period = 1.0 / rate if rate > 0.0 else 0.0
             frame, capture_sec, capture_mono_sec, seq, meta = self.wait_latest_frame(next_allowed)
             if frame is None:
                 continue
@@ -645,13 +664,23 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             payload['camera_encode_ms'] = encode_ms
             payload['robot_frame_seq'] = int(seq)
 
-            msg = String()
-            msg.data = json.dumps(payload, separators=(',', ':'))
-            self.pub.publish(msg)
+            if self._current_role_allows_publish():
+                msg = String()
+                msg.data = json.dumps(payload, separators=(',', ':'))
+                self.pub.publish(msg)
 
         self.ok_count += 1
         self.ok_timestamps.append(time.monotonic())
         self.log_periodic()
+
+    def _current_upload_rate_hz(self) -> float:
+        role = str(self.current_role or '').strip().upper()
+        if role in self.publish_roles:
+            return max(0.1, float(self.active_max_rate_hz))
+        return max(0.1, float(self.standby_max_rate_hz))
+
+    def _current_role_allows_publish(self) -> bool:
+        return str(self.current_role or '').strip().upper() in self.publish_roles
 
     def log_periodic(self):
         now = time.time()
@@ -669,6 +698,8 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             f'OPENCV_HTTP_YOLO_STATUS | captured={self.rx_count} sent={self.sent_count} '
             f'ok={self.ok_count} fail={self.fail_count} replaced={self.drop_count} '
             f'missing_pose={self.missing_pose_drop_count} '
+            f'role={self.current_role} upload_rate={self._current_upload_rate_hz():.2f} '
+            f'publish_enabled={self._current_role_allows_publish()} '
             f'output_fps={output_fps:.2f} '
             f'camera_encode_ms_p50={encode[0]:.1f} p95={encode[1]:.1f} max={encode[2]:.1f} '
             f'network_rtt_ms_p50={rtt[0]:.1f} p95={rtt[1]:.1f} max={rtt[2]:.1f} '

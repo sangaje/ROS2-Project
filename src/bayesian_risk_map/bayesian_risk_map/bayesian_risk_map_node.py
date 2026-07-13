@@ -162,6 +162,20 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                 str(item).strip() for item in (observation_topics_raw or [])
                 if str(item).strip()
             ]
+        self.require_active_observation_source = self.declare_bool_parameter(
+            'require_active_observation_source',
+            True,
+        )
+        self.active_scout_id = str(
+            self.declare_parameter('active_scout_id', 'scout22').value
+        ).strip()
+        self.scout_epoch = int(self.declare_parameter('scout_epoch', 0).value)
+        self.active_scout_id_topic = str(
+            self.declare_parameter('active_scout_id_topic', '/failover/active_scout_id').value
+        ).strip()
+        self.scout_epoch_topic = str(
+            self.declare_parameter('scout_epoch_topic', '/failover/scout_epoch').value
+        ).strip()
         # Target model contract: model/target_v3 class 0 is the target.
         # Keep external_person_only declared for backwards-compatible old launch files,
         # but select detections exclusively by the explicit target class below.
@@ -675,6 +689,18 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         # IO
         self.map_sub = self.create_subscription(OccupancyGrid, self.map_topic, self.on_map, self.qos_map_sub)
         self.pose_sub = None
+        self.active_scout_sub = self.create_subscription(
+            String,
+            self.active_scout_id_topic,
+            self.on_active_scout_id,
+            self.qos_latest_reliable,
+        ) if self.active_scout_id_topic else None
+        self.scout_epoch_sub = self.create_subscription(
+            String,
+            self.scout_epoch_topic,
+            self.on_scout_epoch,
+            self.qos_latest_reliable,
+        ) if self.scout_epoch_topic else None
         if self.pose_source in ('topic', 'pose_topic', 'pose'):
             self.pose_sub = self.create_subscription(
                 PoseStamped,
@@ -1715,6 +1741,60 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             self.publish_debug_frame(overlay, header)
             self.debug_output_image(overlay)
 
+    def on_active_scout_id(self, msg: String):
+        scout_id = str(msg.data).strip()
+        if scout_id and scout_id != self.active_scout_id:
+            self.active_scout_id = scout_id
+            self.get_logger().warn(
+                f'RISK_ACTIVE_SOURCE_CHANGED | active_scout_id={self.active_scout_id} '
+                f'epoch={self.scout_epoch}'
+            )
+
+    def on_scout_epoch(self, msg: String):
+        try:
+            epoch = int(str(msg.data).strip())
+        except (TypeError, ValueError):
+            return
+        if epoch < self.scout_epoch:
+            return
+        if epoch != self.scout_epoch:
+            self.scout_epoch = epoch
+            self.get_logger().warn(
+                f'RISK_ACTIVE_EPOCH_CHANGED | active_scout_id={self.active_scout_id} '
+                f'epoch={self.scout_epoch}'
+            )
+
+    def observation_source_allowed(self, payload: dict, robot_id: str) -> bool:
+        if not self.require_active_observation_source:
+            return True
+        role = str(payload.get('role', '')).strip().upper()
+        if role and role not in ('ACTIVE_SCOUT', 'SCOUT', 'RECOVERING'):
+            self.get_logger().warn(
+                'OBSERVATION_INACTIVE_ROLE_DROPPED | '
+                f'robot_id={robot_id} role={role} active={self.active_scout_id}',
+                throttle_duration_sec=2.0,
+            )
+            return False
+        if robot_id != self.active_scout_id:
+            self.get_logger().warn(
+                'OBSERVATION_INACTIVE_SOURCE_DROPPED | '
+                f'robot_id={robot_id} active={self.active_scout_id}',
+                throttle_duration_sec=2.0,
+            )
+            return False
+        try:
+            epoch = int(payload.get('role_epoch', payload.get('epoch', 0)) or 0)
+        except (TypeError, ValueError):
+            epoch = -1
+        if epoch != self.scout_epoch:
+            self.get_logger().warn(
+                'OBSERVATION_STALE_EPOCH_DROPPED | '
+                f'robot_id={robot_id} epoch={epoch} active_epoch={self.scout_epoch}',
+                throttle_duration_sec=2.0,
+            )
+            return False
+        return True
+
     def on_external_detections(self, msg: String):
         self.external_detection_rx_count += 1
         try:
@@ -1738,6 +1818,8 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             self.get_logger().warn('external detection ignored: detections is not a list', throttle_duration_sec=2.0)
             return
         robot_id = str(payload.get('robot_id', payload.get('robot', 'unknown'))).strip() or 'unknown'
+        if not self.observation_source_allowed(payload, robot_id):
+            return
         boot_id = str(payload.get('boot_id', '')).strip()
         try:
             observation_seq = int(payload.get('sequence', payload.get('observation_id', -1)))

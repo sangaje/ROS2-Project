@@ -64,3 +64,20 @@ def test_leader_shadow_hard_stops_on_best_effort_target_detection():
     assert 'def _force_leader_stop_for_target' in source
     assert "self._pulse_cancel()" in source
     assert "if self.direct_shadow_cmd_vel:\n            self._publish_twist(0.0, 0.0)" in source
+
+
+def test_leader_shadow_backend_is_explicit_and_debug_logs_motion_chain():
+    source = (Path(__file__).parents[1] / 'system_bringup' / 'leader_shadow_follow.py').read_text(
+        encoding='utf-8'
+    )
+    launch = (Path(__file__).parents[1] / 'launch' / 'system.launch.py').read_text(
+        encoding='utf-8'
+    )
+
+    assert "self.declare_parameter('leader_follow_backend', 'nav2')" in source
+    assert "self.follow_backend not in ('nav2', 'direct')" in source
+    assert "LEADER_FOLLOW_DEBUG |" in source
+    assert "path_age_ms" in source
+    assert "nonzero_cmd_age_ms" in source
+    assert "odom_motion" in source
+    assert "DeclareLaunchArgument(\n            'leader_follow_backend'" in launch

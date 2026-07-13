@@ -19,6 +19,8 @@ def generate_launch_description():
         DeclareLaunchArgument('server_url', default_value='http://10.10.14.58:5005/detect'),
         DeclareLaunchArgument('output_topic', default_value='/risk/yolo_detections'),
         DeclareLaunchArgument('max_rate_hz', default_value='0.0'),
+        DeclareLaunchArgument('active_max_rate_hz', default_value='5.0'),
+        DeclareLaunchArgument('standby_max_rate_hz', default_value='1.0'),
         DeclareLaunchArgument('http_worker_count', default_value='2'),
         DeclareLaunchArgument('jpeg_quality', default_value='85'),
         DeclareLaunchArgument('timeout_sec', default_value='0.8'),
@@ -41,6 +43,7 @@ def generate_launch_description():
         DeclareLaunchArgument('camera_calibration_id', default_value=''),
         DeclareLaunchArgument('initial_role_active', default_value='true'),
         DeclareLaunchArgument('active_roles', default_value='ACTIVE_SCOUT,SCOUT,FOLLOWER,RECOVERING'),
+        DeclareLaunchArgument('publish_roles', default_value='ACTIVE_SCOUT,SCOUT,RECOVERING'),
         Node(
             package='flask_yolo_bridge',
             executable='opencv_camera_to_flask_yolo',
@@ -60,6 +63,8 @@ def generate_launch_description():
                 'server_url': LaunchConfiguration('server_url'),
                 'output_topic': LaunchConfiguration('output_topic'),
                 'max_rate_hz': LaunchConfiguration('max_rate_hz'),
+                'active_max_rate_hz': LaunchConfiguration('active_max_rate_hz'),
+                'standby_max_rate_hz': LaunchConfiguration('standby_max_rate_hz'),
                 'http_worker_count': LaunchConfiguration('http_worker_count'),
                 'jpeg_quality': LaunchConfiguration('jpeg_quality'),
                 'timeout_sec': LaunchConfiguration('timeout_sec'),
@@ -82,6 +87,7 @@ def generate_launch_description():
                 'camera_calibration_id': LaunchConfiguration('camera_calibration_id'),
                 'initial_role_active': LaunchConfiguration('initial_role_active'),
                 'active_roles': LaunchConfiguration('active_roles'),
+                'publish_roles': LaunchConfiguration('publish_roles'),
             }],
         ),
     ])

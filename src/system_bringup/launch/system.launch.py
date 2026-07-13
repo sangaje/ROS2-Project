@@ -134,6 +134,7 @@ def generate_launch_description():
     scout_pose_topic = LaunchConfiguration('scout_pose_topic')
     scout_pose_timeout_sec = LaunchConfiguration('scout_pose_timeout_sec')
     enable_leader_shadow_follow = LaunchConfiguration('enable_leader_shadow_follow')
+    leader_follow_backend = LaunchConfiguration('leader_follow_backend')
     leader_shadow_direct_cmd_vel = LaunchConfiguration('leader_shadow_direct_cmd_vel')
     leader_shadow_follow_distance_m = LaunchConfiguration('leader_shadow_follow_distance_m')
     leader_shadow_stop_distance_m = LaunchConfiguration('leader_shadow_stop_distance_m')
@@ -681,6 +682,10 @@ def generate_launch_description():
                                     f'/field/{active_scout_robot_name.perform(context)}/risk_observation',
                                     f'/field/{follower_robot_name.perform(context)}/risk_observation',
                                 ],
+                                'require_active_observation_source': True,
+                                'active_scout_id': active_scout_robot_name.perform(context),
+                                'active_scout_id_topic': '/failover/active_scout_id',
+                                'scout_epoch_topic': '/failover/scout_epoch',
                                 'enable_yolo': False,
                                 'publish_overlay': False,
                                 'publish_debug_image': False,
@@ -895,6 +900,13 @@ def generate_launch_description():
                     }.items(),
                 ))
             if launch_bool(enable_leader_shadow_follow.perform(context)):
+                follow_backend_value = leader_follow_backend.perform(context).strip().lower()
+                if not follow_backend_value:
+                    follow_backend_value = (
+                        'direct'
+                        if launch_bool(leader_shadow_direct_cmd_vel.perform(context))
+                        else 'nav2'
+                    )
                 actions.append(TimerAction(
                     period=3.0,
                     actions=[Node(
@@ -911,9 +923,10 @@ def generate_launch_description():
                             'leader_cancel_topic': '/fleet/leader_nav_cancel',
                             'cmd_vel_topic': leader_cmd_vel_topic,
                             'use_stamped_cmd_vel': True,
-                            'direct_shadow_cmd_vel': launch_bool(
-                                leader_shadow_direct_cmd_vel.perform(context)
-                            ),
+                            'leader_follow_backend': follow_backend_value,
+                            'leader_path_topic': '/plan',
+                            'odom_topic': '/odom',
+                            'direct_shadow_cmd_vel': follow_backend_value == 'direct',
                             'map_topic': '/map',
                             'failover_state_topic': '/failover/state',
                             'active_scout_id_topic': '/failover/active_scout_id',
@@ -1206,12 +1219,14 @@ def generate_launch_description():
                     'output_topic': field_observation_topic,
                     'width': '1920',
                     'height': '1080',
-                    'send_width': '960',
-                    'send_height': '540',
+                    'send_width': '640',
+                    'send_height': '360',
                     'camera_fps': '15.0',
-                    'max_rate_hz': '12.0',
+                    'max_rate_hz': '7.0',
+                    'active_max_rate_hz': '7.0',
+                    'standby_max_rate_hz': '1.0',
                     'http_worker_count': '1',
-                    'jpeg_quality': '65',
+                    'jpeg_quality': '60',
                     'timeout_sec': '1.0',
                     'connect_timeout_sec': '0.3',
                     'read_timeout_sec': '1.8',
@@ -1236,6 +1251,7 @@ def generate_launch_description():
                         else 'false'
                     ),
                     'active_roles': 'ACTIVE_SCOUT,SCOUT,FOLLOWER,RECOVERING',
+                    'publish_roles': 'ACTIVE_SCOUT,SCOUT,RECOVERING',
                 }.items(),
             ))
 
@@ -1640,6 +1656,15 @@ def generate_launch_description():
             default_value='true',
             choices=['true', 'false'],
             description='Leader role only: move behind the active scout during normal operation.',
+        ),
+        DeclareLaunchArgument(
+            'leader_follow_backend',
+            default_value='nav2',
+            choices=['nav2', 'direct'],
+            description=(
+                'Leader shadow follow backend. nav2 publishes NavigateToPose '
+                'goals only; direct publishes cmd_vel only.'
+            ),
         ),
         DeclareLaunchArgument(
             'leader_shadow_direct_cmd_vel',
