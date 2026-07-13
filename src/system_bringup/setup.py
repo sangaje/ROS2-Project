@@ -40,6 +40,7 @@ setup(
     license='Apache-2.0',
     entry_points={
         'console_scripts': [
+            'active_field_source_mux = system_bringup.active_field_source_mux:main',
             'leader_unified_dashboard = system_bringup.leader_unified_dashboard:main',
             'leader_shadow_follow = system_bringup.leader_shadow_follow:main',
             'scout_failover_coordinator = system_bringup.scout_failover_coordinator:main',

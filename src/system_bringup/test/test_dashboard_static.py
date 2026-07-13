@@ -24,6 +24,24 @@ def test_dashboard_publishes_latched_video_ready_after_all_streams_arrive():
     assert "yolo_frames" in source
     assert "inference_frames" in source
     assert "video_ready_max_age_sec" in source
+
+
+def test_dashboard_requires_browser_rendered_panel_manifest():
+    source = (
+        Path(__file__).parents[1] / 'system_bringup' / 'leader_unified_dashboard.py'
+    ).read_text(encoding='utf-8')
+    js = (
+        Path(__file__).parents[1] / 'static' / 'dashboard.js'
+    ).read_text(encoding='utf-8')
+
+    assert "/api/dashboard_readiness" in source
+    assert "dashboard_ui_ready_topic" in source
+    assert "dashboard_readiness_detail_topic" in source
+    assert "_dashboard_ui_panels_ready" in source
+    assert "backend_ready and ui_ready" in source
+    assert "publishDashboardReadiness" in js
+    assert "naturalWidth > 0" in js
+    assert "risk_map" in js
     assert "raw_frame_age_sec" in source
     assert "yolo_frame_age_sec" in source
     assert "inference_frame_age_sec" in source

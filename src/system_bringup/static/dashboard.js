@@ -2,6 +2,7 @@ const stateUrl = '/api/status';
 const yoloStatusUrl = '/api/yolo_status';
 const mapImg = new Image();
 const riskImg = new Image();
+const dashboardSessionId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 let latest = null;
 let latestYolo = null;
 let mapSeq = -1;
@@ -14,6 +15,11 @@ const gridLoad = {
 };
 let streamSources = {};
 const framePollTimers = {};
+const frameVersions = {
+  omxStream: 0,
+  scoutRawStream: 0,
+  scoutYoloStream: 0,
+};
 const canvas = document.getElementById('mapCanvas');
 const ctx = canvas.getContext('2d');
 const roleColors = {leader: '#58a6ff', follower: '#63d297'};
@@ -99,7 +105,12 @@ function reconnectStream(id) {
   // Poll only after the previous JPEG has completed.  A fixed interval can
   // repeatedly cancel a slower first request and recreate the F5-dependent
   // black panels that this dashboard is meant to avoid.
-  image.addEventListener('load', () => scheduleFramePoll(id, 220));
+  image.addEventListener('load', () => {
+    if (image.naturalWidth > 0 && image.naturalHeight > 0) {
+      frameVersions[id] = (frameVersions[id] || 0) + 1;
+    }
+    scheduleFramePoll(id, 220);
+  });
   image.addEventListener('error', () => reconnectStream(id));
 });
 
@@ -522,6 +533,62 @@ function updateTop(s) {
     : '';
 }
 
+function imagePanelReady(id) {
+  const img = document.getElementById(id);
+  return {
+    loaded: Boolean(img && img.complete && img.naturalWidth > 0 && img.naturalHeight > 0),
+    placeholder: false,
+    version: frameVersions[id] || 0,
+    naturalWidth: img ? img.naturalWidth : 0,
+    naturalHeight: img ? img.naturalHeight : 0,
+  };
+}
+
+function gridPanelReady(kind) {
+  const seq = kind === 'map' ? mapSeq : riskSeq;
+  const ready = kind === 'map' ? mapReady : riskReady;
+  const meta = latest && latest[kind === 'map' ? 'map' : 'risk']
+    ? latest[kind === 'map' ? 'map' : 'risk'].metadata
+    : null;
+  return {
+    loaded: Boolean(ready && meta && meta.width > 0 && meta.height > 0),
+    placeholder: !ready,
+    version: Math.max(0, seq),
+  };
+}
+
+async function publishDashboardReadiness() {
+  if (!latest) return;
+  const manifest = {
+    session_id: dashboardSessionId,
+    stamp: Date.now() / 1000.0,
+    panels: {
+      scout_raw: imagePanelReady('scoutRawStream'),
+      scout_yolo: imagePanelReady('scoutYoloStream'),
+      omx_camera: imagePanelReady('omxStream'),
+      map: gridPanelReady('map'),
+      risk_map: gridPanelReady('risk'),
+      fleet_state: {
+        loaded: Array.isArray(latest.robots) && latest.robots.length > 0,
+        placeholder: false,
+        version: Array.isArray(latest.robots) ? latest.robots.length : 0,
+        robots: Array.isArray(latest.robots) ? latest.robots.map(r => r.name) : [],
+      },
+    },
+  };
+  try {
+    await fetch('/api/dashboard_readiness', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(manifest),
+      cache: 'no-store',
+      keepalive: true,
+    });
+  } catch (err) {
+    console.warn('dashboard readiness publish failed', err);
+  }
+}
+
 async function refresh() {
   try {
     const [stateResp, yoloResp] = await Promise.all([
@@ -541,6 +608,7 @@ async function refresh() {
     updateMapMeta(s);
     updateNavPaths(s);
     draw();
+    publishDashboardReadiness();
   } catch (err) {
     console.warn('dashboard refresh failed', err);
   }

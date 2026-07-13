@@ -26,6 +26,9 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPo
 from std_msgs.msg import Bool, String
 from tf2_ros import Buffer, ExtrapolationException, LookupException, TransformListener
 
+from .fleet_registry import build_legacy_registry, normalize_registry
+from .role_contract import parse_epoch
+
 
 class ReadinessStage(str, Enum):
     BOOTING = 'BOOTING'
@@ -52,6 +55,13 @@ class SystemReadinessMonitor(Node):
         self.declare_parameter('field_robot_status_topic', '/fleet/field_robot_status')
         self.declare_parameter('leader_localization_ready_topic', '/localization_ready')
         self.declare_parameter('video_ready_topic', '/fleet/video_ready')
+        self.declare_parameter('fleet_registry_json', '')
+        self.declare_parameter('active_scout_robot_name', 'scout22')
+        self.declare_parameter('risk_domain_id', '')
+        self.declare_parameter('follower_robot_name', 'follower21')
+        self.declare_parameter('follower_domain_id', '')
+        self.declare_parameter('active_scout_id_topic', '/failover/active_scout_id')
+        self.declare_parameter('scout_epoch_topic', '/failover/scout_epoch')
         self.declare_parameter('require_scout', True)
         self.declare_parameter('require_follower', True)
         self.declare_parameter('leader_bt_state_service', '/bt_navigator/get_state')
@@ -75,6 +85,24 @@ class SystemReadinessMonitor(Node):
         self.field_status_topic = str(get('field_robot_status_topic').value)
         self.leader_localization_topic = str(get('leader_localization_ready_topic').value)
         self.video_ready_topic = str(get('video_ready_topic').value)
+        registry = normalize_registry(str(get('fleet_registry_json').value))
+        if not registry:
+            registry = build_legacy_registry(
+                active_scout_robot_name=str(get('active_scout_robot_name').value),
+                risk_domain_id=str(get('risk_domain_id').value),
+                follower_robot_name=str(get('follower_robot_name').value),
+                follower_domain_id=str(get('follower_domain_id').value),
+            )
+        self.field_registry = registry
+        self.field_robot_names = [robot.robot_name for robot in registry]
+        self.active_scout_id = next(
+            (robot.robot_name for robot in registry if robot.initial_role == 'ACTIVE_SCOUT'),
+            str(get('active_scout_robot_name').value),
+        )
+        self.active_epoch = 0
+        self.active_lease_id = f'epoch-{self.active_epoch}-{self.active_scout_id}'
+        self.active_scout_id_topic = str(get('active_scout_id_topic').value)
+        self.scout_epoch_topic = str(get('scout_epoch_topic').value)
         self.require_scout = bool(get('require_scout').value)
         self.require_follower = bool(get('require_follower').value)
         self.leader_bt_state_service = str(get('leader_bt_state_service').value)
@@ -114,6 +142,8 @@ class SystemReadinessMonitor(Node):
         self.create_subscription(String, self.field_status_topic, self._on_field_status, volatile_qos)
         self.create_subscription(Bool, self.leader_localization_topic, self._on_leader_localization, latched_qos)
         self.create_subscription(Bool, self.video_ready_topic, self._on_video_ready, latched_qos)
+        self.create_subscription(String, self.active_scout_id_topic, self._on_active_scout_id, latched_qos)
+        self.create_subscription(String, self.scout_epoch_topic, self._on_scout_epoch, latched_qos)
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -166,6 +196,19 @@ class SystemReadinessMonitor(Node):
 
     def _on_video_ready(self, msg: Bool) -> None:
         self.video_ready = bool(msg.data)
+
+    def _on_active_scout_id(self, msg: String) -> None:
+        robot = str(msg.data).strip()
+        if robot:
+            self.active_scout_id = robot
+            self.active_lease_id = f'epoch-{self.active_epoch}-{self.active_scout_id}'
+
+    def _on_scout_epoch(self, msg: String) -> None:
+        epoch = parse_epoch(str(msg.data).strip())
+        if epoch is None or epoch < self.active_epoch:
+            return
+        self.active_epoch = epoch
+        self.active_lease_id = f'epoch-{self.active_epoch}-{self.active_scout_id}'
 
     def _on_field_status(self, msg: String) -> None:
         try:
@@ -246,22 +289,44 @@ class SystemReadinessMonitor(Node):
             self._fresh(self.follower_pose_wall) if self.require_follower else True
         )
         map_tf = map_ok and leader_pose_ok and self._tf_ok()
-        scout_localization = (
-            scout_pose_ok and self._field_robot_ready('scout22')
-            if self.require_scout else True
-        )
+        active_status_ready = self._field_robot_ready(self.active_scout_id)
+        scout_localization = scout_pose_ok and active_status_ready if self.require_scout else True
+        follower_candidates = [
+            name for name in self.field_robot_names if name != self.active_scout_id
+        ] or ['follower21']
+        follower_status_ready = any(self._field_robot_ready(name) for name in follower_candidates)
         follower_localization = (
-            follower_pose_ok and self._field_robot_ready('follower21')
-            if self.require_follower else True
+            follower_pose_ok and follower_status_ready if self.require_follower else True
         )
         leader_nav2 = self._leader_nav2_ready()
         follower_nav2 = (
-            self._field_robot_nav_ready('follower21')
+            any(self._field_robot_nav_ready(name) for name in follower_candidates)
             if self.require_follower else True
         )
         domain_bridges = scout_pose_ok and follower_pose_ok
         dashboard = self.video_ready
+        field_details = {}
+        for robot in self.field_robot_names:
+            status = self.field_status_by_robot.get(robot, {})
+            field_details[robot] = {
+                'domain': next((spec.domain_id for spec in self.field_registry if spec.robot_name == robot), None),
+                'role': status.get('role'),
+                'localization': self._field_robot_ready(robot),
+                'nav2': self._field_robot_nav_ready(robot),
+                'camera': bool(status.get('camera_ready', status.get('camera_prewarm_ready', False))),
+                'role_ack': bool(status),
+            }
         detail = {
+            'active_scout_id': self.active_scout_id,
+            'active_epoch': self.active_epoch,
+            'active_lease_id': self.active_lease_id,
+            'field_robots': field_details,
+            'active_map_source': self.active_scout_id,
+            'active_risk_source': self.active_scout_id,
+            'dashboard_backend_ready': dashboard,
+            'dashboard_ui_ready': dashboard,
+            'all_panels_rendered': dashboard,
+            'motion_hold': False,
             'scout_sensor': scout_pose_ok,
             'scout_localization': scout_localization,
             'leader_localization': self.leader_localization_ready,

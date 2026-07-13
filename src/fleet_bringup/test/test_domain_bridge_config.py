@@ -1,7 +1,9 @@
 import yaml
 
 from fleet_bringup.domain_bridge_config import (
+    validate_no_duplicate_bridge_routes,
     write_leader_to_pc_bridge_config,
+    write_field_robot_candidate_bridge_configs,
     write_fleet_bridge_configs,
     write_member_bridge_configs,
     write_risk_to_leader_bridge_config,
@@ -250,3 +252,47 @@ def test_leader_to_pc_bridge_is_visualization_only(tmp_path):
     assert '/tf' not in config['topics']
     assert '/tf_static' not in config['topics']
     assert '/cmd_vel' not in config['topics']
+
+
+def test_candidate_field_bridge_uses_identity_namespaces(tmp_path):
+    paths = write_field_robot_candidate_bridge_configs(
+        20,
+        [
+            {'robot_name': 'scout22', 'domain_id': 22, 'initial_role': 'ACTIVE_SCOUT'},
+            {'robot_name': 'follower21', 'domain_id': 21, 'initial_role': 'FOLLOWER'},
+        ],
+        output_directory=tmp_path,
+    )
+    configs = [yaml.safe_load(path.read_text()) for path in paths]
+    from_configs = [c for c in configs if c['to_domain'] == 20]
+
+    assert any(
+        c['topics']['/member_pose']['remap'] == '/field/scout22/pose'
+        for c in from_configs
+        if c['from_domain'] == 22
+    )
+    assert any(
+        c['topics']['/burger_pose']['remap'] == '/field/follower21/pose'
+        for c in from_configs
+        if c['from_domain'] == 21
+    )
+    assert any(
+        c['topics']['/map']['remap'] == '/field/scout22/map'
+        for c in from_configs
+        if c['from_domain'] == 22
+    )
+
+
+def test_duplicate_bridge_routes_are_rejected():
+    duplicate = {
+        'name': 'dup',
+        'from_domain': 22,
+        'to_domain': 20,
+        'topics': {'/map': {'type': 'nav_msgs/msg/OccupancyGrid'}},
+    }
+    try:
+        validate_no_duplicate_bridge_routes([duplicate, duplicate])
+    except ValueError as exc:
+        assert 'duplicate domain_bridge route' in str(exc)
+    else:
+        raise AssertionError('duplicate route was not rejected')

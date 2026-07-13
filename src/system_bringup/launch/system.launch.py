@@ -42,6 +42,11 @@ from system_bringup.launch_defaults import (
     DEFAULT_FOLLOWER,
     DEFAULT_ROLE_TOPIC_TEMPLATE,
 )
+from system_bringup.fleet_registry import (
+    build_legacy_registry,
+    load_registry_file,
+    registry_to_json,
+)
 
 
 FLEET_LAUNCH_FILES = {
@@ -107,6 +112,7 @@ def generate_launch_description():
     )
     member_domain_id = LaunchConfiguration('member_domain_id')
     follower_domain_id = LaunchConfiguration('follower_domain_id')
+    fleet_registry_file = LaunchConfiguration('fleet_registry_file')
     enable_scout_failover = LaunchConfiguration('enable_scout_failover')
     leader_robot_name = LaunchConfiguration('leader_robot_name')
     active_scout_robot_name = LaunchConfiguration('active_scout_robot_name')
@@ -228,6 +234,18 @@ def generate_launch_description():
         fleet_role_value = fleet_role.perform(context).strip().lower()
         if not fleet_role_value:
             fleet_role_value = DEFAULT_FLEET_ROLE[role_value]
+
+        registry_file_value = fleet_registry_file.perform(context).strip()
+        if registry_file_value:
+            field_registry = load_registry_file(registry_file_value)
+        else:
+            field_registry = build_legacy_registry(
+                active_scout_robot_name=active_scout_robot_name.perform(context),
+                risk_domain_id=risk_domain_id.perform(context),
+                follower_robot_name=follower_robot_name.perform(context),
+                follower_domain_id=follower_domain_id.perform(context),
+            )
+        field_registry_json = registry_to_json(field_registry)
         if fleet_role_value not in FLEET_LAUNCH_FILES:
             raise ValueError(
                 f"fleet_role must be one of {sorted(FLEET_LAUNCH_FILES)}, "
@@ -554,6 +572,25 @@ def generate_launch_description():
             leader_localization_ready_gate = (
                 not launch_bool(enable_cartographer.perform(context))
             )
+            if field_registry:
+                actions.append(Node(
+                    package='system_bringup',
+                    executable='active_field_source_mux',
+                    name='active_field_source_mux',
+                    output='screen',
+                    parameters=[{
+                        'fleet_registry_json': field_registry_json,
+                        'active_scout_robot_name': active_scout_robot_name.perform(context),
+                        'risk_domain_id': risk_domain_id.perform(context),
+                        'follower_robot_name': follower_robot_name.perform(context),
+                        'follower_domain_id': follower_domain_id.perform(context),
+                        'active_scout_id_topic': '/failover/active_scout_id',
+                        'scout_epoch_topic': '/failover/scout_epoch',
+                    }],
+                    env=process_env,
+                    respawn=True,
+                    respawn_delay=3.0,
+                ))
             risk_domain_value = risk_domain_id.perform(context).strip()
             if (
                 launch_bool(enable_risk_to_leader_bridge.perform(context))
@@ -980,6 +1017,7 @@ def generate_launch_description():
                         'second_follower_pose_topic': '/member_pose',
                         'second_follower_name': 'scout22',
                         'second_follower_role': 'scout',
+                        'fleet_registry_json': field_registry_json,
                         'fleet_poses_topic': '/fleet/robot_poses',
                         'fleet_status_topic': '/fleet/coordination_status',
                         'collision_warning_topic': '/fleet/collision_warning',
@@ -1008,6 +1046,9 @@ def generate_launch_description():
                         'scout_pose_topic': scout_pose_topic.perform(context),
                         'follower_pose_topic': '/burger_pose',
                         'field_robot_status_topic': '/fleet/field_robot_status',
+                        'fleet_registry_json': field_registry_json,
+                        'active_scout_id_topic': '/failover/active_scout_id',
+                        'scout_epoch_topic': '/failover/scout_epoch',
                         'leader_localization_ready_topic': '/localization_ready',
                         'video_ready_topic': video_ready_topic.perform(context),
                         'require_scout': True,
@@ -1484,6 +1525,15 @@ def generate_launch_description():
             'follower_domain_id',
             default_value='',
             description='Leader debug marker label for a follower domain.',
+        ),
+        DeclareLaunchArgument(
+            'fleet_registry_file',
+            default_value='',
+            description=(
+                'Optional YAML registry for all non-leader Field Robots. '
+                'When empty, risk_domain_id/follower_domain_id are converted '
+                'to a backward-compatible registry.'
+            ),
         ),
         DeclareLaunchArgument(
             'enable_scout_failover',

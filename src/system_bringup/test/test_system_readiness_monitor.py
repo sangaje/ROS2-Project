@@ -59,5 +59,7 @@ def test_system_readiness_monitor_waits_for_nav2_dashboard_and_bridge_inputs():
     assert "ActionClient(self, NavigateToPose" in source
     assert "create_client(GetState" in source
     assert "self.create_subscription(Bool, self.video_ready_topic" in source
-    assert "_field_robot_nav_ready('follower21')" in source
+    assert "fleet_registry_json" in source
+    assert "follower_candidates" in source
+    assert "any(self._field_robot_nav_ready(name)" in source
     assert "self.tf_buffer.lookup_transform" in source

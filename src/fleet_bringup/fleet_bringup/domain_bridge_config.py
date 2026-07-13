@@ -1,6 +1,6 @@
 import tempfile
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 import yaml
 
@@ -83,6 +83,9 @@ def system_readiness_topics() -> Dict[str, Dict]:
         '/system/ready': topic('std_msgs/msg/Bool', profile=latched),
         '/system/readiness': topic('std_msgs/msg/String', profile=latched),
         '/system/readiness_detail': topic('std_msgs/msg/String', profile=latched),
+        '/fleet/dashboard_backend_ready': topic('std_msgs/msg/Bool', profile=latched),
+        '/fleet/dashboard_ui_ready': topic('std_msgs/msg/Bool', profile=latched),
+        '/fleet/dashboard_readiness_detail': topic('std_msgs/msg/String', profile=latched),
     }
 
 
@@ -97,6 +100,7 @@ def _write_runtime_config(
     config: Dict,
     output_directory: Optional[Path] = None,
 ) -> Path:
+    validate_no_duplicate_bridge_routes([config])
     output = _runtime_output_directory(output_directory)
     with tempfile.NamedTemporaryFile(
         mode='w',
@@ -108,6 +112,65 @@ def _write_runtime_config(
     ) as handle:
         yaml.safe_dump(config, handle, sort_keys=False)
         return Path(handle.name)
+
+
+def validate_no_duplicate_bridge_routes(configs: Iterable[Dict]) -> None:
+    """Reject duplicate bridge routes before domain_bridge processes start."""
+    seen: dict[tuple[int, int, str, str], str] = {}
+    for config in configs:
+        try:
+            from_domain = int(config['from_domain'])
+            to_domain = int(config['to_domain'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        name = str(config.get('name', '<unnamed>'))
+        topics = config.get('topics', {})
+        if not isinstance(topics, dict):
+            continue
+        for source_topic, spec in topics.items():
+            if not isinstance(spec, dict):
+                continue
+            destination = str(spec.get('remap', source_topic))
+            key = (from_domain, to_domain, str(source_topic), destination)
+            if key in seen:
+                raise ValueError(
+                    'duplicate domain_bridge route: '
+                    f'{source_topic}->{destination} {from_domain}->{to_domain} '
+                    f'in {seen[key]} and {name}'
+                )
+            seen[key] = name
+
+
+def field_robot_identity_topics(robot_name: str, *, pose_source: str) -> Dict[str, Dict]:
+    """Robot-domain outputs remapped into stable leader-domain identity topics."""
+    robot = str(robot_name).strip()
+    if not robot:
+        raise ValueError('robot_name is required for identity bridge topics')
+    return {
+        pose_source: topic(
+            'geometry_msgs/msg/PoseStamped',
+            remap=f'/field/{robot}/pose',
+        ),
+        '/map': topic(
+            'nav_msgs/msg/OccupancyGrid',
+            remap=f'/field/{robot}/map',
+            profile=map_qos(depth=5),
+        ),
+        '/scout/signal': topic(
+            'std_msgs/msg/String',
+            remap=f'/field/{robot}/heartbeat',
+            profile=qos(reliability='best_effort', durability='volatile', depth=5),
+        ),
+        '/fleet/field_robot_status': topic(
+            'std_msgs/msg/String',
+            remap=f'/field/{robot}/status',
+            profile=qos(durability='transient_local', depth=1),
+        ),
+        f'/field/{robot}/risk_observation': topic(
+            'std_msgs/msg/String',
+            profile=qos(reliability='best_effort', durability='volatile', depth=5),
+        ),
+    }
 
 
 def write_fleet_bridge_configs(
@@ -492,6 +555,79 @@ def write_risk_to_leader_bridge_config(
         },
         output_directory,
     )
+
+
+def write_field_robot_candidate_bridge_configs(
+    main_domain: int,
+    field_robots: Iterable[Dict],
+    *,
+    output_directory: Optional[Path] = None,
+) -> Tuple[Path, ...]:
+    """Create identity-namespaced bridges for every candidate field robot.
+
+    This is the scalable bridge shape used by the leader when a registry is
+    provided.  Legacy writers still exist elsewhere for compatibility, but
+    these configs keep every candidate under /field/<robot_name>/... so role
+    changes do not rename topics.
+    """
+    paths: list[Path] = []
+    configs: list[Dict] = []
+    main_topics = {
+        **system_readiness_topics(),
+        '/fleet/video_ready': topic(
+            'std_msgs/msg/Bool',
+            profile=qos(durability='transient_local', depth=1),
+        ),
+        '/fleet/field_robot_role_cmd': topic(
+            'std_msgs/msg/String',
+            profile=qos(durability='transient_local', depth=1),
+        ),
+        '/fleet/scout_role': topic(
+            'std_msgs/msg/String',
+            profile=qos(durability='transient_local', depth=1),
+        ),
+        '/failover/active_scout_id': topic(
+            'std_msgs/msg/String',
+            profile=qos(durability='transient_local', depth=1),
+        ),
+        '/failover/scout_epoch': topic(
+            'std_msgs/msg/String',
+            profile=qos(durability='transient_local', depth=1),
+        ),
+        '/leader_pose': topic('geometry_msgs/msg/PoseStamped'),
+        '/fleet/robot_poses': topic('geometry_msgs/msg/PoseArray', profile=qos(depth=5)),
+        '/initialpose': topic('geometry_msgs/msg/PoseWithCovarianceStamped', profile=qos(depth=1)),
+    }
+    for item in field_robots:
+        robot = str(item.get('robot_name', '')).strip()
+        if not robot:
+            continue
+        domain = int(item['domain_id'])
+        pose_source = str(item.get('pose_source', '')).strip()
+        if not pose_source:
+            initial_role = str(item.get('initial_role', '')).strip().upper()
+            pose_source = '/burger_pose' if initial_role == 'FOLLOWER' else '/member_pose'
+        to_robot = {
+            'name': f'main_{main_domain}_to_field_{robot}_{domain}',
+            'from_domain': int(main_domain),
+            'to_domain': domain,
+            'topics': main_topics,
+        }
+        from_robot = {
+            'name': f'field_{robot}_{domain}_to_main_{main_domain}',
+            'from_domain': domain,
+            'to_domain': int(main_domain),
+            'topics': field_robot_identity_topics(robot, pose_source=pose_source),
+        }
+        configs.extend([to_robot, from_robot])
+    validate_no_duplicate_bridge_routes(configs)
+    for config in configs:
+        paths.append(_write_runtime_config(
+            f'{config["name"]}_',
+            config,
+            output_directory,
+        ))
+    return tuple(paths)
 
 
 def write_leader_to_pc_bridge_config(

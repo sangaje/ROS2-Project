@@ -77,6 +77,7 @@ def generate_launch_description():
                 field_enable_cartographer.perform(context),
                 default_cartographer,
             ),
+            'enable_cartographer': 'false',
             'enable_amcl': _bool_text(field_enable_amcl.perform(context), default_amcl),
             # Bayesian risk is centralized on the leader; this only controls
             # Cartographer/map production on a field robot.

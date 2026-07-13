@@ -136,6 +136,22 @@ class LeaderUnifiedDashboard(Node):
         self.video_ready_max_age_sec = float(
             _declare(self, 'video_ready_max_age_sec', 3.0)
         )
+        self.dashboard_ui_ready_topic = str(
+            _declare(self, 'dashboard_ui_ready_topic', '/fleet/dashboard_ui_ready')
+        )
+        self.dashboard_backend_ready_topic = str(
+            _declare(self, 'dashboard_backend_ready_topic', '/fleet/dashboard_backend_ready')
+        )
+        self.dashboard_readiness_detail_topic = str(
+            _declare(self, 'dashboard_readiness_detail_topic', '/fleet/dashboard_readiness_detail')
+        )
+        self.dashboard_session_timeout_sec = float(
+            _declare(self, 'dashboard_session_timeout_sec', 3.0)
+        )
+        self.dashboard_stable_duration_sec = float(
+            _declare(self, 'dashboard_stable_duration_sec', 2.0)
+        )
+        self.fleet_registry_json = str(_declare(self, 'fleet_registry_json', ''))
         self.robot_stale_timeout_sec = float(_declare(self, 'robot_stale_timeout_sec', 3.0))
         self.map_stale_timeout_sec = float(_declare(self, 'map_stale_timeout_sec', 30.0))
         self.risk_stale_timeout_sec = float(_declare(self, 'risk_stale_timeout_sec', 10.0))
@@ -198,6 +214,10 @@ class LeaderUnifiedDashboard(Node):
             'omx_frame_ready': False,
             'published_count': 0,
         }
+        self._dashboard_manifest: Dict[str, Any] = {}
+        self._dashboard_manifest_wall_sec: Optional[float] = None
+        self._dashboard_ui_good_since: Optional[float] = None
+        self._dashboard_ui_ready = False
         self._events: Dict[str, Dict[str, Any]] = {
             'fire': self._empty_event('/omx/fire', 'std_msgs/msg/Empty'),
             'target_processed': self._empty_event(
@@ -289,6 +309,15 @@ class LeaderUnifiedDashboard(Node):
         self.video_ready_pub = self.create_publisher(
             Bool, self.video_ready_topic, video_ready_qos
         )
+        self.dashboard_ui_ready_pub = self.create_publisher(
+            Bool, self.dashboard_ui_ready_topic, video_ready_qos
+        )
+        self.dashboard_backend_ready_pub = self.create_publisher(
+            Bool, self.dashboard_backend_ready_topic, video_ready_qos
+        )
+        self.dashboard_readiness_detail_pub = self.create_publisher(
+            String, self.dashboard_readiness_detail_topic, video_ready_qos
+        )
         self.create_timer(
             max(0.2, self.video_ready_poll_period_sec),
             self._evaluate_video_ready,
@@ -351,7 +380,7 @@ class LeaderUnifiedDashboard(Node):
 
     def _build_app(self):
         try:
-            from flask import Flask, Response, jsonify, render_template, stream_with_context
+            from flask import Flask, Response, jsonify, render_template, request, stream_with_context
         except ImportError as exc:
             raise RuntimeError('Flask is required for leader_unified_dashboard') from exc
 
@@ -375,6 +404,14 @@ class LeaderUnifiedDashboard(Node):
         @app.get('/api/state')
         def status():
             response = jsonify(self.snapshot())
+            response.headers['Cache-Control'] = 'no-store'
+            return response
+
+        @app.post('/api/dashboard_readiness')
+        def dashboard_readiness():
+            payload = request.get_json(silent=True) or {}
+            self._on_dashboard_manifest(payload)
+            response = jsonify({'ok': True, 'ui_ready': self._dashboard_ui_ready})
             response.headers['Cache-Control'] = 'no-store'
             return response
 
@@ -681,6 +718,84 @@ class LeaderUnifiedDashboard(Node):
                 'reason': reason,
             }
 
+    def _publish_dashboard_readiness(
+        self,
+        *,
+        backend_ready: bool,
+        ui_ready: bool,
+        detail: Dict[str, Any],
+    ) -> None:
+        self.dashboard_backend_ready_pub.publish(Bool(data=bool(backend_ready)))
+        self.dashboard_ui_ready_pub.publish(Bool(data=bool(ui_ready)))
+        self.dashboard_readiness_detail_pub.publish(String(
+            data=json.dumps(detail, sort_keys=True)
+        ))
+
+    def _on_dashboard_manifest(self, payload: Dict[str, Any]) -> None:
+        if not isinstance(payload, dict):
+            return
+        panels = payload.get('panels')
+        if not isinstance(panels, dict):
+            return
+        with self._lock:
+            self._dashboard_manifest = payload
+            self._dashboard_manifest_wall_sec = time.time()
+
+    def _dashboard_ui_panels_ready(self, now: float) -> tuple[bool, Dict[str, Any]]:
+        required = ['map', 'risk_map', 'fleet_state']
+        if self.require_scout_video_ready:
+            required.extend(['scout_raw', 'scout_yolo'])
+        if self.require_omx_video_ready:
+            required.append('omx_camera')
+        with self._lock:
+            manifest = dict(self._dashboard_manifest)
+            manifest_wall = self._dashboard_manifest_wall_sec
+        panels = manifest.get('panels') if isinstance(manifest, dict) else {}
+        if not isinstance(panels, dict):
+            panels = {}
+        session_fresh = (
+            isinstance(manifest_wall, (int, float))
+            and now - float(manifest_wall) <= self.dashboard_session_timeout_sec
+        )
+        panel_details: Dict[str, Any] = {}
+        all_ready = session_fresh
+        for name in required:
+            panel = panels.get(name, {})
+            loaded = bool(isinstance(panel, dict) and panel.get('loaded'))
+            placeholder = bool(isinstance(panel, dict) and panel.get('placeholder'))
+            version = panel.get('version') if isinstance(panel, dict) else None
+            if name == 'fleet_state':
+                version_ok = bool(isinstance(panel, dict) and panel.get('robots'))
+            else:
+                version_ok = isinstance(version, (int, float)) and float(version) > 0
+            ok = bool(loaded and not placeholder and version_ok)
+            panel_details[name] = {
+                'loaded': loaded,
+                'placeholder': placeholder,
+                'version': version,
+                'ready': ok,
+            }
+            all_ready = all_ready and ok
+        if all_ready:
+            if self._dashboard_ui_good_since is None:
+                self._dashboard_ui_good_since = now
+            stable = now - self._dashboard_ui_good_since >= self.dashboard_stable_duration_sec
+        else:
+            self._dashboard_ui_good_since = None
+            stable = False
+        detail = {
+            'session_id': manifest.get('session_id'),
+            'session_fresh': session_fresh,
+            'required_panels': required,
+            'panels': panel_details,
+            'stable_sec': (
+                0.0 if self._dashboard_ui_good_since is None
+                else now - self._dashboard_ui_good_since
+            ),
+            'stable_required_sec': self.dashboard_stable_duration_sec,
+        }
+        return bool(all_ready and stable), detail
+
     def _evaluate_video_ready(self) -> None:
         yolo = self.yolo_status()
         data = yolo.get('data') if isinstance(yolo, dict) else None
@@ -729,9 +844,14 @@ class LeaderUnifiedDashboard(Node):
             if self.require_scout_video_ready else True
         )
         omx_ready = omx_frame_ready if self.require_omx_video_ready else True
-        ready = bool(scout_ready and omx_ready)
+        backend_ready = bool(scout_ready and omx_ready)
+        ui_ready, ui_detail = self._dashboard_ui_panels_ready(now)
+        ready = bool(backend_ready and ui_ready)
         detail = {
             'ready': ready,
+            'backend_ready': backend_ready,
+            'dashboard_ui_ready': ui_ready,
+            'dashboard_ui': ui_detail,
             'topic': self.video_ready_topic,
             'scout_required': self.require_scout_video_ready,
             'omx_required': self.require_omx_video_ready,
@@ -753,6 +873,12 @@ class LeaderUnifiedDashboard(Node):
             published_count = int(self._video_ready_detail.get('published_count', 0))
             detail['published_count'] = published_count
             self._video_ready_detail = detail
+            self._dashboard_ui_ready = ui_ready
+        self._publish_dashboard_readiness(
+            backend_ready=backend_ready,
+            ui_ready=ui_ready,
+            detail=detail,
+        )
         if ready != previous:
             self._publish_video_ready(ready, 'all_video_ready' if ready else 'video_not_ready')
             self.get_logger().warning(
@@ -760,7 +886,7 @@ class LeaderUnifiedDashboard(Node):
                 f'ready={ready} scout_raw={scout_raw_ready} '
                 f'scout_yolo={scout_yolo_ready} '
                 f'scout_inference={scout_inference_ready} '
-                f'omx_frame={omx_frame_ready}'
+                f'omx_frame={omx_frame_ready} ui={ui_ready}'
             )
 
     def _on_nav_path(self, name: str, msg: NavPath) -> None:
