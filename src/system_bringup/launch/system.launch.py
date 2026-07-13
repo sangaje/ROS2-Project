@@ -512,9 +512,7 @@ def generate_launch_description():
             self_pose_topic = (
                 '/burger_pose' if fleet_role_value == 'follower' else '/member_pose'
             )
-            actions.append(TimerAction(
-                period=2.5,
-                actions=[Node(
+            actions.append(Node(
                     package='system_bringup',
                     executable='unified_field_robot',
                     name='unified_field_robot',
@@ -538,7 +536,7 @@ def generate_launch_description():
                         'localization_ready_topic': '/localization_ready',
                         'require_system_ready': False,
                         'system_ready_topic': '/system/ready',
-                        'require_start_motion': True,
+                        'require_start_motion': fleet_role_value == 'follower',
                         'start_motion_topic': '/fleet/start_motion',
                         'follow_distance_m': 0.50,
                         'follow_stop_distance_m': 0.35,
@@ -566,7 +564,6 @@ def generate_launch_description():
                     env=process_env,
                     respawn=True,
                     respawn_delay=3.0,
-                )],
             ))
             if (
                 local_exploration
@@ -578,9 +575,7 @@ def generate_launch_description():
                     'launch',
                     'scout_rl_inference.launch.py',
                 )
-                actions.append(TimerAction(
-                    period=1.0,
-                    actions=[IncludeLaunchDescription(
+                actions.append(IncludeLaunchDescription(
                         PythonLaunchDescriptionSource(scout_rl_launch),
                         launch_arguments={
                             'domain_id': str(domain),
@@ -588,16 +583,18 @@ def generate_launch_description():
                             'role_topic': DEFAULT_ROLE_TOPIC_TEMPLATE.format(
                                 robot_name=local_robot_name
                             ),
-                            # The unified role publisher is authoritative;
-                            # worker activation never comes from launch args.
-                            'initial_role_active': 'false',
+                            'initial_role_active': (
+                                'true' if fleet_role_value == 'member' else 'false'
+                            ),
                             'require_failover_activation': 'true',
                             'require_localization_ready': (
                                 'false' if scout_owns_slam else 'true'
                             ),
                             'require_video_ready': require_video_ready.perform(context),
                             'video_ready_topic': '/fleet/start_motion',
-                            'require_start_motion': 'true',
+                            'require_start_motion': (
+                                'false' if fleet_role_value == 'member' else 'true'
+                            ),
                             'start_motion_topic': '/fleet/start_motion',
                             'require_system_ready': 'false',
                             'system_ready_topic': '/system/ready',
@@ -607,7 +604,6 @@ def generate_launch_description():
                             'use_stamped_cmd_vel': 'true',
                             'enable_velocity_safety_filter': 'true',
                         }.items(),
-                    )],
                 ))
 
         if role_value == 'leader':

@@ -342,14 +342,14 @@ def test_standalone_policy_worker_is_registered_as_the_separate_process():
     assert 'scout_rl_policy_worker = system_bringup.scout_rl_policy_worker:main' in setup
 
 
-def test_scout_rl_worker_requires_leader_start_motion_gate():
+def test_scout_rl_worker_can_use_local_motion_release_without_leader_gate():
     worker = Path(__file__).parents[1] / 'system_bringup' / 'scout_rl_policy_worker.py'
     source = worker.read_text(encoding='utf-8')
 
     assert "require_start_motion" in source
     assert "start_motion_topic" in source
-    assert "self.require_start_motion = True" in source
-    assert "self.start_motion = False" in source
+    assert "self.require_start_motion = requested_start_motion" in source
+    assert "self.start_motion = not self.require_start_motion" in source
     assert "self.create_subscription(Bool, self.start_motion_topic" in source
     assert "def _on_start_motion" in source
     assert "if not self.start_motion" in source
@@ -514,15 +514,16 @@ def test_fast_observation_tick_never_recomputes_the_heavy_confidence_grid():
     )()
     runtime._merge_confidence_seed_locked = lambda: None
 
-    # Before any confidence tick has ever produced stats, the fast tick must
-    # not fabricate a snapshot out of nothing.
+    # Before any confidence tick has ever produced stats, the fast tick still
+    # commits a policy-shaped first snapshot using safe default stats. It must
+    # not wait for the heavy confidence-grid update.
     runtime._latest_stats = None
     runtime._fast_observation_tick()
-    assert runtime._map_snapshot is None
+    assert runtime._map_snapshot is not None
     assert update_calls == []
 
-    # Once a confidence tick has produced stats, the fast tick commits a
-    # fresh snapshot on its own cadence without ever calling .update() itself.
+    # Once a confidence tick has produced stats, the fast tick continues to
+    # commit on its own cadence without ever calling .update() itself.
     runtime._latest_stats = object()
     runtime._fast_observation_tick()
     assert runtime._map_snapshot is not None

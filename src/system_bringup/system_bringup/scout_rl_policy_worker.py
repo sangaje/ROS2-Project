@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import replace
 from typing import Optional
 
@@ -47,7 +48,7 @@ class ScoutRLPolicyWorker(Node):
         self.declare_parameter('require_start_motion', True)
         self.declare_parameter('start_motion_topic', '/fleet/start_motion')
         self.declare_parameter('motion_readiness_detail_topic', '/fleet/scout_motion_ready_detail')
-        self.declare_parameter('motion_release_stable_sec', 1.0)
+        self.declare_parameter('motion_release_stable_sec', 0.15)
         self.declare_parameter('startup_sensor_max_age_sec', 0.5)
         # Backward-compatible names accepted by old launch files. They no
         # longer control the final motion barrier.
@@ -73,7 +74,7 @@ class ScoutRLPolicyWorker(Node):
         self.require_system_ready = bool(get('require_system_ready').value)
         self.system_ready_topic = str(get('system_ready_topic').value)
         requested_start_motion = bool(get('require_start_motion').value)
-        self.require_start_motion = True
+        self.require_start_motion = requested_start_motion
         self.start_motion_topic = str(get('start_motion_topic').value).strip()
         self.motion_readiness_detail_topic = str(
             get('motion_readiness_detail_topic').value
@@ -108,7 +109,8 @@ class ScoutRLPolicyWorker(Node):
         self.role_recovery_complete: Optional[bool] = True if initial_active else None
         self.status_recovery_complete = bool(initial_active)
         self.nav_goal_inactive = bool(initial_active)
-        self.start_motion = False
+        self.process_start_mono = time.monotonic()
+        self.start_motion = not self.require_start_motion
         self.video_ready = self.start_motion
         self.motion_authority = 'NONE'
         self.worker_state = RLWorkerState.STANDBY
@@ -118,6 +120,16 @@ class ScoutRLPolicyWorker(Node):
         self.last_odom_debug_wall = -1.0e9
         self.startup_released = False
         self._motion_ready_since: Optional[float] = None
+        self._startup_events_ms: dict[str, Optional[int]] = {
+            'role_active': 0 if initial_active else None,
+            'active_scout_id': 0 if initial_active else None,
+            'lease_valid': 0 if initial_active else None,
+            'start_motion': 0 if self.start_motion else None,
+            'first_nonzero_cmd': None,
+        }
+        self._last_timeline_log_mono = -1.0e9
+        self._startup_timeout_logged = False
+        self._startup_bottleneck_logged = False
         self._last_role_update_tuple = (
             self.desired_role,
             self.role_epoch,
@@ -144,7 +156,8 @@ class ScoutRLPolicyWorker(Node):
         self.create_subscription(Bool, self.localization_ready_topic, self._on_localization_ready, latched_qos)
         if self.require_system_ready:
             self.create_subscription(Bool, self.system_ready_topic, self._on_system_ready, latched_qos)
-        self.create_subscription(Bool, self.start_motion_topic, self._on_start_motion, latched_qos)
+        if self.require_start_motion:
+            self.create_subscription(Bool, self.start_motion_topic, self._on_start_motion, latched_qos)
         self.create_subscription(String, self.field_robot_status_topic, self._on_field_status, 10)
         self.motion_readiness_pub = self.create_publisher(
             String, self.motion_readiness_detail_topic, latched_qos
@@ -187,6 +200,13 @@ class ScoutRLPolicyWorker(Node):
     def _now(self) -> float:
         return self.get_clock().now().nanoseconds * 1.0e-9
 
+    def _process_age_ms(self) -> int:
+        return int((time.monotonic() - self.process_start_mono) * 1000.0)
+
+    def _mark_startup_event(self, name: str) -> None:
+        if self._startup_events_ms.get(name) is None:
+            self._startup_events_ms[name] = self._process_age_ms()
+
     def _on_role(self, msg: String) -> None:
         update = parse_role_update(msg.data, self.robot_name)
         if update is None:
@@ -224,6 +244,11 @@ class ScoutRLPolicyWorker(Node):
         self.role_recovery_complete = update.recovery_complete
         self.active_scout_id = next_active_scout_id
         self._last_role_update_tuple = next_tuple
+        if self.desired_role == 'ACTIVE_SCOUT':
+            self._mark_startup_event('role_active')
+        if self.active_scout_id == self.robot_name:
+            self._mark_startup_event('active_scout_id')
+            self._mark_startup_event('lease_valid')
         self.get_logger().info(
             'RL_ROLE_UPDATE | '
             f'robot={self.robot_name} role={self.desired_role} '
@@ -240,6 +265,9 @@ class ScoutRLPolicyWorker(Node):
         if active_scout_id == self.active_scout_id:
             return
         self.active_scout_id = active_scout_id
+        if self.active_scout_id == self.robot_name:
+            self._mark_startup_event('active_scout_id')
+            self._mark_startup_event('lease_valid')
         self._evaluate_gate()
 
     def _on_scout_epoch(self, msg: String) -> None:
@@ -279,6 +307,8 @@ class ScoutRLPolicyWorker(Node):
             self.runtime.deactivate('start_motion_false')
             self._publish_zero()
         if self.start_motion != previous:
+            if self.start_motion:
+                self._mark_startup_event('start_motion')
             self.get_logger().warning(
                 'SCOUT_START_MOTION | '
                 f'robot={self.robot_name} ready={self.start_motion} '
@@ -539,6 +569,7 @@ class ScoutRLPolicyWorker(Node):
         self.motion_readiness_pub.publish(
             String(data=json.dumps(payload, sort_keys=True))
         )
+        self._update_startup_timeline(runtime, blocking_reason)
         ready_count = sum(1 for ok in conditions.values() if ok)
         self.get_logger().warning(
             'MOTION_RELEASE_PROGRESS | '
@@ -546,6 +577,125 @@ class ScoutRLPolicyWorker(Node):
             f'stable_elapsed_ms={int(stable_elapsed_ms)} '
             f'blocking_reason={blocking_reason}',
             throttle_duration_sec=1.0,
+        )
+
+    def _update_startup_timeline(
+        self,
+        runtime: dict[str, object],
+        blocking_reason: str,
+    ) -> None:
+        for runtime_key, event_key in (
+            ('model_ready_at_ms', 'model_ready'),
+            ('first_scan_at_ms', 'first_scan'),
+            ('first_odom_at_ms', 'first_odom'),
+            ('first_map_at_ms', 'first_map'),
+            ('tf_ready_at_ms', 'tf_ready'),
+            ('first_observation_at_ms', 'first_observation'),
+            ('first_predict_at_ms', 'first_predict'),
+            ('first_nonzero_action_at_ms', 'first_nonzero_action'),
+            ('first_nonzero_cmd_at_ms', 'first_nonzero_cmd'),
+        ):
+            value = runtime.get(runtime_key)
+            if isinstance(value, int) and self._startup_events_ms.get(event_key) is None:
+                self._startup_events_ms[event_key] = value
+        now_mono = time.monotonic()
+        if now_mono - self._last_timeline_log_mono < 1.0:
+            return
+        self._last_timeline_log_mono = now_mono
+        events = self._startup_events_ms
+        self.get_logger().warning(
+            'SCOUT_STARTUP_TIMELINE | '
+            f'process_age_ms={self._process_age_ms()} '
+            f'role_active_at_ms={events.get("role_active")} '
+            f'active_scout_id_at_ms={events.get("active_scout_id")} '
+            f'lease_valid_at_ms={events.get("lease_valid")} '
+            f'model_ready_at_ms={events.get("model_ready")} '
+            f'first_scan_at_ms={events.get("first_scan")} '
+            f'first_odom_at_ms={events.get("first_odom")} '
+            f'first_map_at_ms={events.get("first_map")} '
+            f'tf_ready_at_ms={events.get("tf_ready")} '
+            f'first_observation_at_ms={events.get("first_observation")} '
+            f'start_motion_at_ms={events.get("start_motion")} '
+            f'first_predict_at_ms={events.get("first_predict")} '
+            f'first_nonzero_action_at_ms={events.get("first_nonzero_action")} '
+            f'first_nonzero_cmd_at_ms={events.get("first_nonzero_cmd")} '
+            f'current_blocking_reason={blocking_reason}'
+        )
+        self._log_startup_timeout_if_needed(runtime, blocking_reason)
+        self._log_startup_bottleneck_if_ready(blocking_reason)
+
+    def _log_startup_timeout_if_needed(
+        self,
+        runtime: dict[str, object],
+        blocking_reason: str,
+    ) -> None:
+        if self._startup_timeout_logged or self._process_age_ms() < 5000:
+            return
+        if self._startup_events_ms.get('first_predict') is not None:
+            return
+        self._startup_timeout_logged = True
+        missing = [
+            key for key in (
+                'role_active',
+                'active_scout_id',
+                'lease_valid',
+                'model_ready',
+                'first_scan',
+                'first_odom',
+                'first_map',
+                'tf_ready',
+                'first_observation',
+                'start_motion',
+            )
+            if self._startup_events_ms.get(key) is None
+        ]
+        self.get_logger().error(
+            'SCOUT_STARTUP_TIMEOUT | '
+            f'elapsed_sec={self._process_age_ms() / 1000.0:.1f} '
+            f'missing_conditions={missing} '
+            f'last_scan_age_ms={float(runtime.get("scan_age_ms", -1.0)):.0f} '
+            f'last_odom_age_ms={float(runtime.get("odom_age_ms", -1.0)):.0f} '
+            f'last_map_age_ms={float(runtime.get("map_age_ms", -1.0)):.0f} '
+            f'tf_ready={runtime.get("tf_ready")} '
+            f'observation_ready={runtime.get("observation_ready")} '
+            f'blocking_reason={blocking_reason}'
+        )
+
+    def _log_startup_bottleneck_if_ready(self, blocking_reason: str) -> None:
+        if self._startup_bottleneck_logged:
+            return
+        if self._startup_events_ms.get('first_predict') is None:
+            return
+        ordered = [
+            ('role_active', 'role initialization'),
+            ('active_scout_id', 'active scout id'),
+            ('lease_valid', 'lease validation'),
+            ('model_ready', 'model load'),
+            ('first_scan', 'scan receive'),
+            ('first_odom', 'odom receive'),
+            ('first_map', 'map receive'),
+            ('tf_ready', 'TF lookup'),
+            ('first_observation', 'observation snapshot'),
+            ('start_motion', 'motion release'),
+            ('first_predict', 'policy inference'),
+            ('first_nonzero_cmd', 'command publish'),
+        ]
+        last_ms = 0
+        worst_stage = 'startup'
+        worst_delay = 0
+        for key, label in ordered:
+            value = self._startup_events_ms.get(key)
+            if value is None:
+                continue
+            delay = max(0, int(value) - int(last_ms))
+            if delay > worst_delay:
+                worst_delay = delay
+                worst_stage = label
+            last_ms = int(value)
+        self._startup_bottleneck_logged = True
+        self.get_logger().warning(
+            'SCOUT_STARTUP_BOTTLENECK | '
+            f'stage={worst_stage} delay_ms={worst_delay} cause={blocking_reason}'
         )
         self.get_logger().warning(
             'SCOUT_OBSERVATION_MINIMAL_DEBUG | '
@@ -786,6 +936,16 @@ class ScoutRLPolicyWorker(Node):
 
     def _publish_command(self, linear_x: float, angular_z: float) -> None:
         if not self.start_motion and (linear_x != 0.0 or angular_z != 0.0):
+            self.get_logger().warning(
+                'SCOUT_FIRST_ACTION_DEBUG | '
+                'predict_called=true '
+                f'raw_linear={float(linear_x):.3f} raw_angular={float(angular_z):.3f} '
+                'safety_linear=unknown safety_angular=unknown '
+                'authority_allowed=false '
+                'hardware_linear=0.000 hardware_angular=0.000 '
+                'blocking_stage=hardware_gate_zeroed',
+                throttle_duration_sec=1.0,
+            )
             self._publish_zero()
             return
         if not self.runtime_active and (linear_x != 0.0 or angular_z != 0.0):
@@ -801,6 +961,8 @@ class ScoutRLPolicyWorker(Node):
             msg.linear.x = float(linear_x)
             msg.angular.z = float(angular_z)
         self.cmd_pub.publish(msg)
+        if abs(float(linear_x)) > 1.0e-4 or abs(float(angular_z)) > 1.0e-4:
+            self._mark_startup_event('first_nonzero_cmd')
 
     def _publish_zero(self) -> None:
         if self.use_stamped:

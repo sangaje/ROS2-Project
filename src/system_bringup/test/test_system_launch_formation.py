@@ -59,14 +59,14 @@ def test_system_launch_uses_external_worker_without_in_process_runtime():
     assert "default_value='external_worker'" in text
     assert "'start_rl_worker'" in text
     assert "'scout_rl_inference.launch.py'" in text
-    assert "'initial_role_active': 'false'" in text
+    assert "'true' if fleet_role_value == 'member' else 'false'" in text
     assert "'rl_backend': rl_backend_value" in text
     assert "'require_video_ready': require_video_ready.perform(context)" in text
     assert "'video_ready_topic': '/fleet/start_motion'" in text
     assert "'require_system_ready': 'false'" in text
 
 
-def test_system_launch_gates_motion_on_leader_start_motion():
+def test_system_launch_uses_local_scout_release_and_follower_start_motion_gate():
     text = SYSTEM_LAUNCH.read_text(encoding='utf-8')
 
     assert "'require_video_ready'" in text
@@ -74,7 +74,8 @@ def test_system_launch_gates_motion_on_leader_start_motion():
     assert "'video_ready_topic'" in text
     assert "default_value='/fleet/video_ready'" in text
     assert "'require_start_motion': require_video_ready.perform(context)" in text
-    assert "'require_start_motion': True" in text
+    assert "'require_start_motion': fleet_role_value == 'follower'" in text
+    assert "'false' if fleet_role_value == 'member' else 'true'" in text
     assert "'start_motion_topic': '/fleet/start_motion'" in text
 
 

@@ -239,6 +239,9 @@ class ActiveScoutRLRuntime:
     ) -> None:
         self.node = node
         self.config = config or active_scout_config()
+        self._process_start_mono = float(
+            getattr(node, 'process_start_mono', time.monotonic())
+        )
         self.publish_command = publish_command
         self.on_stop = on_stop
         self.on_ready = on_ready
@@ -289,11 +292,22 @@ class ActiveScoutRLRuntime:
         self._last_heartbeat_at = 0.0
         self._last_policy_tick_log_at = -1.0e9
         self._last_inference_log_at = -1.0e9
+        self._policy_wakeup_pending = False
         self._last_stop_reason = 'not_activated'
         self._model_error: Optional[str] = None
         self._last_error = ''
         self._model_loading = True
         self._model_ready_notified = False
+        self._model_ready_at_ms: Optional[int] = None
+        self._first_scan_at_ms: Optional[int] = None
+        self._first_odom_at_ms: Optional[int] = None
+        self._first_map_at_ms: Optional[int] = None
+        self._first_tf_ready_at_ms: Optional[int] = None
+        self._first_observation_at_ms: Optional[int] = None
+        self._first_predict_at_ms: Optional[int] = None
+        self._first_nonzero_action_at_ms: Optional[int] = None
+        self._first_nonzero_cmd_at_ms: Optional[int] = None
+        self._first_action_debug_logged = False
         self.model = None
         self.counters = RuntimeCounters()
         self._sensor_group = ReentrantCallbackGroup()
@@ -425,6 +439,55 @@ class ActiveScoutRLRuntime:
             callback_group=self._sensor_group,
         )
         self._start_model_loader(model_loader)
+
+    def _event_ms(self) -> int:
+        start = float(getattr(self, '_process_start_mono', time.monotonic()))
+        return int((time.monotonic() - start) * 1000.0)
+
+    @staticmethod
+    def _default_map_stats(slam_map: OccupancyGrid) -> MapUpdateStats:
+        known = sum(1 for cell in slam_map.data if cell >= 0)
+        total = max(1, int(slam_map.info.width) * int(slam_map.info.height))
+        coverage = float(known) / float(total)
+        return MapUpdateStats(
+            known_cells=known,
+            new_known_cells=0,
+            coverage_ratio=coverage,
+            coverage_delta=0.0,
+            frontier_count=0,
+            frontier_distance=3.5,
+            frontier_angle=0.0,
+            robot_visit_count=0,
+            mean_confidence=0.0,
+            stale_known_cells=0,
+            stale_ratio=0.0,
+            low_confidence_cells=0,
+            low_confidence_ratio=0.0,
+            stale_refresh_cells=0,
+            confidence_gain=0.0,
+            target_priority=0.0,
+            target_type='none',
+            target_switched=False,
+            target_lock_age=0,
+            target_reachable=False,
+            path_distance=0.0,
+            path_angle=0.0,
+            path_progress=0.0,
+            alternative_path_count=0,
+            alternative_path_angles=(),
+            priority_score=0.0,
+            priority_gain=0.0,
+            priority_cleared_cells=0,
+            priority_clear_gain=0.0,
+            priority_invalidated_cells=0,
+            priority_invalidated_gain=0.0,
+            priority_rechecked_cells=0,
+            priority_rechecked_gain=0.0,
+            wall_support_score=0.0,
+            open_space_score=0.0,
+            nearest_obstacle_distance=3.5,
+            obstacle_proximity_score=0.0,
+        )
 
     @property
     def ready(self) -> bool:
@@ -604,6 +667,15 @@ class ActiveScoutRLRuntime:
             'zero_hold_active': bool(self._active and not nonzero_command),
             'last_stop_reason': self._last_stop_reason,
             'last_error': self._last_error.splitlines()[-1] if self._last_error else '',
+            'model_ready_at_ms': self._model_ready_at_ms,
+            'first_scan_at_ms': self._first_scan_at_ms,
+            'first_odom_at_ms': self._first_odom_at_ms,
+            'first_map_at_ms': self._first_map_at_ms,
+            'tf_ready_at_ms': self._first_tf_ready_at_ms,
+            'first_observation_at_ms': self._first_observation_at_ms,
+            'first_predict_at_ms': self._first_predict_at_ms,
+            'first_nonzero_action_at_ms': self._first_nonzero_action_at_ms,
+            'first_nonzero_cmd_at_ms': self._first_nonzero_cmd_at_ms,
         }
 
     def tf_ready(self) -> bool:
@@ -631,6 +703,8 @@ class ActiveScoutRLRuntime:
             )
         except TransformException:
             return False
+        if self._first_tf_ready_at_ms is None:
+            self._first_tf_ready_at_ms = self._event_ms()
         return True
 
     def activate(self) -> None:
@@ -642,6 +716,7 @@ class ActiveScoutRLRuntime:
         self._last_stop_reason = ''
         if self.ready:
             self.node.get_logger().warning('SCOUT_RL_ACTIVE | deterministic=true map_substeps=2')
+            self.request_immediate_policy_tick()
             return
         if self._model_loading:
             self.node.get_logger().warning(
@@ -653,6 +728,23 @@ class ActiveScoutRLRuntime:
             self._stop('model_unavailable')
             self.node.get_logger().error(f'SCOUT_RL_UNAVAILABLE | {self._model_error}')
             return
+
+    def request_immediate_policy_tick(self) -> None:
+        if self._policy_wakeup_pending:
+            return
+        self._policy_wakeup_pending = True
+
+        def wake() -> None:
+            try:
+                self._policy_tick()
+            finally:
+                self._policy_wakeup_pending = False
+
+        threading.Thread(
+            target=wake,
+            name='scout_rl_policy_immediate_tick',
+            daemon=True,
+        ).start()
 
     def warmup(self, reason: str = 'startup_warmup') -> None:
         if self._sensor_pipeline_enabled:
@@ -704,6 +796,8 @@ class ActiveScoutRLRuntime:
             with self._model_lock:
                 self.model = model
                 self._model_loading = False
+                if model is not None and self._model_ready_at_ms is None:
+                    self._model_ready_at_ms = self._event_ms()
 
         threading.Thread(
             target=load,
@@ -724,6 +818,7 @@ class ActiveScoutRLRuntime:
         self.node.get_logger().warning(
             'SCOUT_RL_ACTIVE | deterministic=true map_substeps=2 model=ready'
         )
+        self.request_immediate_policy_tick()
         if self.on_ready is not None:
             self.on_ready()
 
@@ -740,6 +835,8 @@ class ActiveScoutRLRuntime:
             self._scan_received_at = time.monotonic()
             self._scan_generation += 1
             self.counters.scan_callback_count += 1
+            if self._first_scan_at_ms is None:
+                self._first_scan_at_ms = self._event_ms()
         # This is intentionally independent of map/TF/inference readiness.
         # If this topic is absent, the policy process is not receiving /scan.
         self._publish_policy_scan_from_raw(message)
@@ -754,6 +851,8 @@ class ActiveScoutRLRuntime:
             self._odom_generation += 1
             self._odom_source_stamp_age_ms = self._source_stamp_age_ms(message)
             self.counters.odom_callback_count += 1
+            if self._first_odom_at_ms is None:
+                self._first_odom_at_ms = self._event_ms()
 
     def _on_map(self, message: OccupancyGrid) -> None:
         with self._lock:
@@ -761,6 +860,8 @@ class ActiveScoutRLRuntime:
             self._map_received_at = time.monotonic()
             self._map_generation += 1
             self.counters.map_callback_count += 1
+            if self._first_map_at_ms is None:
+                self._first_map_at_ms = self._event_ms()
 
     @staticmethod
     def _odom_finite(message: Odometry) -> bool:
@@ -1027,13 +1128,7 @@ class ActiveScoutRLRuntime:
                 lock_wait_ms = (time.monotonic() - lock_start) * 1000.0
                 stats = self._latest_stats
                 if stats is None:
-                    self.counters.map_tick_failure_count += 1
-                    self._hold('waiting_for_first_confidence_update')
-                    self._log_map_tick_timing(
-                        scheduled_period_ms, actual_interval_ms, tf_ms, lock_wait_ms,
-                        (time.monotonic() - tick_start) * 1000.0,
-                    )
-                    return
+                    stats = self._default_map_stats(snapshot.slam_map)
                 self._map_snapshot = MapSnapshot(
                     stats=stats,
                     robot_xy=robot_xy,
@@ -1043,6 +1138,8 @@ class ActiveScoutRLRuntime:
                     updated_at=now,
                 )
                 self.counters.snapshot_update_count += 1
+                if getattr(self, '_first_observation_at_ms', None) is None:
+                    self._first_observation_at_ms = self._event_ms()
             if not self._active:
                 self._warm_observation(snapshot.scan)
             self._log_heartbeat()
@@ -1205,6 +1302,8 @@ class ActiveScoutRLRuntime:
             started = time.monotonic()
             self.counters.predict_attempt_count += 1
             action, _ = self.model.predict(observation, deterministic=True)
+            if getattr(self, '_first_predict_at_ms', None) is None:
+                self._first_predict_at_ms = self._event_ms()
             elapsed = time.monotonic() - started
             self._log_inference(
                 attempt=self.counters.predict_attempt_count,
@@ -1225,6 +1324,11 @@ class ActiveScoutRLRuntime:
                 self._hold('inference_timeout')
                 return
             self._last_policy_action = np.asarray(action, dtype=np.float32).reshape(-1).copy()
+            if (
+                getattr(self, '_first_nonzero_action_at_ms', None) is None
+                and np.linalg.norm(self._last_policy_action) > 1.0e-4
+            ):
+                self._first_nonzero_action_at_ms = self._event_ms()
             command = (
                 self.safety.filter(self._last_policy_action, snapshot.scan)
                 if self.enable_velocity_safety_filter
@@ -1263,6 +1367,23 @@ class ActiveScoutRLRuntime:
             self._last_nonzero_command_at = now
         self.counters.predict_success_count += 1
         self.publish_command(float(command[0]), float(command[1]))
+        if (
+            not getattr(self, '_first_action_debug_logged', False)
+            and hasattr(self, 'node')
+        ):
+            self._first_action_debug_logged = True
+            self.node.get_logger().warning(
+                'SCOUT_FIRST_ACTION_DEBUG | '
+                'predict_called=true '
+                f'raw_linear={float(self._last_policy_action[0]):.3f} '
+                f'raw_angular={float(self._last_policy_action[1]):.3f} '
+                f'safety_linear={float(command[0]):.3f} '
+                f'safety_angular={float(command[1]):.3f} '
+                'authority_allowed=true '
+                f'hardware_linear={float(command[0]):.3f} '
+                f'hardware_angular={float(command[1]):.3f} '
+                'blocking_stage=none'
+            )
         self._log_heartbeat()
         self._log_policy_tick(
             model_ready=model_ready, sensor_ready=sensor_fresh,
