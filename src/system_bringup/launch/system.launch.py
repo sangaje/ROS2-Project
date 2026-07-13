@@ -111,6 +111,8 @@ def generate_launch_description():
     leader_robot_name = LaunchConfiguration('leader_robot_name')
     active_scout_robot_name = LaunchConfiguration('active_scout_robot_name')
     follower_robot_name = LaunchConfiguration('follower_robot_name')
+    require_video_ready = LaunchConfiguration('require_video_ready')
+    video_ready_topic = LaunchConfiguration('video_ready_topic')
     leader_initial_x = LaunchConfiguration('leader_initial_x')
     leader_initial_y = LaunchConfiguration('leader_initial_y')
     leader_initial_yaw = LaunchConfiguration('leader_initial_yaw')
@@ -514,6 +516,8 @@ def generate_launch_description():
                             'require_localization_ready': (
                                 'false' if scout_owns_slam else 'true'
                             ),
+                            'require_video_ready': require_video_ready.perform(context),
+                            'video_ready_topic': video_ready_topic.perform(context),
                             'cmd_vel_topic': DEFAULT_CMD_VEL_TOPIC,
                             'use_stamped_cmd_vel': 'true',
                             'enable_velocity_safety_filter': 'true',
@@ -798,6 +802,8 @@ def generate_launch_description():
                             omx_camera_reconnect_period_sec.perform(context)
                         ),
                         'omx_camera_required': omx_camera_required.perform(context),
+                        'require_video_ready': require_video_ready.perform(context),
+                        'video_ready_topic': video_ready_topic.perform(context),
                         'start_patrol_planner': (
                             start_patrol_planner.perform(context)
                         ),
@@ -845,6 +851,10 @@ def generate_launch_description():
                             'follower_robot_name': follower_robot_name.perform(context),
                             'require_localization_ready': leader_localization_ready_gate,
                             'localization_ready_topic': '/localization_ready',
+                            'require_video_ready': launch_bool(
+                                require_video_ready.perform(context)
+                            ),
+                            'video_ready_topic': video_ready_topic.perform(context),
                             'scout_pose_timeout_sec': float(
                                 scout_pose_timeout_sec.perform(context)
                             ),
@@ -943,6 +953,7 @@ def generate_launch_description():
                         'follower_nav_path_topic': '/burger_plan',
                         'member_nav_path_topic': '/member_plan',
                         'omx_waypoint_route_topic': '/omx/waypoint_route',
+                        'video_ready_topic': video_ready_topic.perform(context),
                     }],
                     env=process_env,
                     respawn=True,
@@ -1410,6 +1421,21 @@ def generate_launch_description():
         DeclareLaunchArgument('leader_robot_name', default_value='leader'),
         DeclareLaunchArgument('active_scout_robot_name', default_value=DEFAULT_ACTIVE_SCOUT),
         DeclareLaunchArgument('follower_robot_name', default_value=DEFAULT_FOLLOWER),
+        DeclareLaunchArgument(
+            'require_video_ready',
+            default_value='true',
+            choices=['true', 'false'],
+            description=(
+                'Hold Scout RL, leader shadow motion, and OMX Waffle Nav2 '
+                'until the unified dashboard has received the required '
+                'video streams.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'video_ready_topic',
+            default_value='/fleet/video_ready',
+            description='Latched dashboard video readiness topic shared across robot domains.',
+        ),
         DeclareLaunchArgument(
             'leader_initial_x',
             default_value='0.0',

@@ -78,6 +78,8 @@ class LeaderShadowFollow(Node):
         self.declare_parameter('follower_robot_name', 'follower21')
         self.declare_parameter('require_localization_ready', True)
         self.declare_parameter('localization_ready_topic', '/localization_ready')
+        self.declare_parameter('require_video_ready', True)
+        self.declare_parameter('video_ready_topic', '/fleet/video_ready')
         self.declare_parameter('target_detected_topic', '/omx/target_detected')
         self.declare_parameter('target_detected_stop_hold_sec', 1.0)
         self.declare_parameter('pause_on_raw_target_detection', False)
@@ -139,6 +141,8 @@ class LeaderShadowFollow(Node):
         self.follower_robot_name = str(get('follower_robot_name').value)
         self.require_localization_ready = bool(get('require_localization_ready').value)
         self.localization_ready_topic = str(get('localization_ready_topic').value)
+        self.require_video_ready = bool(get('require_video_ready').value)
+        self.video_ready_topic = str(get('video_ready_topic').value)
         self.target_detected_topic = str(get('target_detected_topic').value)
         self.target_stop_hold = max(
             0.1, float(get('target_detected_stop_hold_sec').value)
@@ -229,6 +233,13 @@ class LeaderShadowFollow(Node):
                 self._on_localization_ready,
                 latched_qos,
             )
+        if self.require_video_ready:
+            self.create_subscription(
+                Bool,
+                self.video_ready_topic,
+                self._on_video_ready,
+                latched_qos,
+            )
         self.create_subscription(
             Bool,
             self.target_detected_topic,
@@ -248,6 +259,7 @@ class LeaderShadowFollow(Node):
         self.active_scout_id = self.original_scout_id
         self.failover_state = 'NORMAL_OPERATION'
         self.localization_ready = not self.require_localization_ready
+        self.video_ready = not self.require_video_ready
         self.target_detected = False
         self.target_detected_wall = -1.0e9
         self.omx_state = ''
@@ -290,7 +302,8 @@ class LeaderShadowFollow(Node):
             f'cmd_scale=lin{self.cmd_linear_scale:.2f}/ang{self.cmd_angular_scale:.2f} '
             f'cmd_cap=lin{self.cmd_max_linear_vel:.2f}/ang{self.cmd_max_angular_vel:.2f} '
             f'controller_service={self.controller_set_parameters_service} '
-            f'localization_gate={self.require_localization_ready}:{self.localization_ready_topic}'
+            f'localization_gate={self.require_localization_ready}:{self.localization_ready_topic} '
+            f'video_gate={self.require_video_ready}:{self.video_ready_topic}'
         )
 
     def _now(self) -> float:
@@ -345,6 +358,17 @@ class LeaderShadowFollow(Node):
                 f'[LEADER_SHADOW] LOCALIZATION_READY | topic={self.localization_ready_topic}'
             )
 
+    def _on_video_ready(self, msg: Bool) -> None:
+        previous = self.video_ready
+        self.video_ready = bool(msg.data)
+        if previous and not self.video_ready:
+            self._cancel_shadow_goal('video_not_ready')
+            self._stop_direct_cmd('video_not_ready')
+        if self.video_ready != previous:
+            self.get_logger().warning(
+                f'[LEADER_SHADOW] VIDEO_READY | ready={self.video_ready} topic={self.video_ready_topic}'
+            )
+
     def _on_target_detected(self, msg: Bool) -> None:
         self.target_detected = bool(msg.data)
         if self.target_detected:
@@ -380,6 +404,14 @@ class LeaderShadowFollow(Node):
             self.mode = LeaderMode.IDLE
             self._set_controller_speed_limit(False)
             self._publish_state('waiting_localization_ready')
+            return
+        if self.require_video_ready and not self.video_ready:
+            self._cancel_shadow_goal('waiting_video_ready')
+            self._stop_direct_cmd('waiting_video_ready')
+            self._publish_twist(0.0, 0.0)
+            self.mode = LeaderMode.IDLE
+            self._set_controller_speed_limit(False)
+            self._publish_state('waiting_video_ready')
             return
         if self.pause_on_omx_aiming and self._is_omx_aiming(self.omx_state):
             self._cancel_shadow_goal('omx_aiming')

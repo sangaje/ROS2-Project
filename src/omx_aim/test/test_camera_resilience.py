@@ -103,6 +103,8 @@ def test_jetson_launch_prioritizes_risk_patrol_without_localization_gate():
     ).read_text(encoding='utf-8')
 
     assert "'require_localization_ready': False" in launch_source
+    assert "'require_video_ready': _is_true(require_video_ready)" in launch_source
+    assert "'video_ready_topic': video_ready_topic" in launch_source
     assert "'patrol_min_risk', default_value='8'" in launch_source
     assert "'patrol_publish_period_sec', default_value='3.0'" in launch_source
     assert "'patrol_view_standoff_distance_m', default_value='1.2'" in launch_source

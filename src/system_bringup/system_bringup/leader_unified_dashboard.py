@@ -127,6 +127,12 @@ class LeaderUnifiedDashboard(Node):
             _declare(self, 'yolo_overlay_stream_path', '/stream/yolo.mjpg')
         )
         self.yolo_status_path = str(_declare(self, 'yolo_status_path', '/api/status'))
+        self.video_ready_topic = str(_declare(self, 'video_ready_topic', '/fleet/video_ready'))
+        self.require_scout_video_ready = bool(_declare(self, 'require_scout_video_ready', True))
+        self.require_omx_video_ready = bool(_declare(self, 'require_omx_video_ready', True))
+        self.video_ready_poll_period_sec = float(
+            _declare(self, 'video_ready_poll_period_sec', 1.0)
+        )
         self.robot_stale_timeout_sec = float(_declare(self, 'robot_stale_timeout_sec', 3.0))
         self.map_stale_timeout_sec = float(_declare(self, 'map_stale_timeout_sec', 30.0))
         self.risk_stale_timeout_sec = float(_declare(self, 'risk_stale_timeout_sec', 10.0))
@@ -177,6 +183,17 @@ class LeaderUnifiedDashboard(Node):
             'aim_error_norm': None,
             'leader_cmd_vel': None,
             'leader_cmd_vel_nav': None,
+            'camera_ready': None,
+            'observation_status': None,
+        }
+        self._video_ready = False
+        self._video_ready_detail: Dict[str, Any] = {
+            'ready': False,
+            'scout_raw_ready': False,
+            'scout_yolo_ready': False,
+            'scout_inference_ready': False,
+            'omx_frame_ready': False,
+            'published_count': 0,
         }
         self._events: Dict[str, Dict[str, Any]] = {
             'fire': self._empty_event('/omx/fire', 'std_msgs/msg/Empty'),
@@ -239,6 +256,8 @@ class LeaderUnifiedDashboard(Node):
         self.create_subscription(String, '/omx/state', lambda msg: self._set_omx('state', msg.data, '/omx/state', 'std_msgs/msg/String'), 10)
         self.create_subscription(String, '/omx/status', lambda msg: self._set_omx('status', msg.data, '/omx/status', 'std_msgs/msg/String'), 10)
         self.create_subscription(Bool, '/omx/target_detected', lambda msg: self._set_omx('target_detected', bool(msg.data), '/omx/target_detected', 'std_msgs/msg/Bool'), 10)
+        self.create_subscription(Bool, '/omx/camera_ready', self._on_omx_camera_ready, 10)
+        self.create_subscription(String, '/omx/observation_status', self._on_omx_observation_status, latest_best_effort_qos)
         self.create_subscription(Float32, '/omx/aim_progress', lambda msg: self._set_omx('aim_progress', float(msg.data), '/omx/aim_progress', 'std_msgs/msg/Float32'), 10)
         self.create_subscription(Int32, '/omx/queue_size', lambda msg: self._set_omx('queue_size', int(msg.data), '/omx/queue_size', 'std_msgs/msg/Int32'), 10)
         self.create_subscription(String, '/waffle/status', lambda msg: self._set_omx('waffle_status', msg.data, '/waffle/status', 'std_msgs/msg/String'), 10)
@@ -257,6 +276,21 @@ class LeaderUnifiedDashboard(Node):
         self.create_subscription(PointStamped, '/omx/target_blocked', lambda msg: self._on_point_event('target_blocked', msg), 10)
         self.create_subscription(PointStamped, '/omx/target_not_found', lambda msg: self._on_point_event('target_not_found', msg), 10)
         self.create_subscription(PoseStamped, '/omx/nav_goal', self._on_nav_goal, 10)
+
+        video_ready_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.video_ready_pub = self.create_publisher(
+            Bool, self.video_ready_topic, video_ready_qos
+        )
+        self.create_timer(
+            max(0.2, self.video_ready_poll_period_sec),
+            self._evaluate_video_ready,
+        )
+        self._publish_video_ready(False, 'startup')
 
         self._app = self._build_app()
         self._server_thread = threading.Thread(target=self._run_flask, daemon=True)
@@ -609,6 +643,97 @@ class LeaderUnifiedDashboard(Node):
                 'type': 'std_msgs/msg/Bool',
             }
 
+    def _on_omx_camera_ready(self, msg: Bool) -> None:
+        self._set_omx(
+            'camera_ready',
+            bool(msg.data),
+            '/omx/camera_ready',
+            'std_msgs/msg/Bool',
+        )
+
+    def _on_omx_observation_status(self, msg: String) -> None:
+        try:
+            payload = json.loads(msg.data)
+        except (json.JSONDecodeError, TypeError):
+            payload = {'raw': msg.data}
+        self._set_omx(
+            'observation_status',
+            payload,
+            '/omx/observation_status',
+            'std_msgs/msg/String',
+        )
+
+    def _publish_video_ready(self, ready: bool, reason: str) -> None:
+        msg = Bool()
+        msg.data = bool(ready)
+        self.video_ready_pub.publish(msg)
+        with self._lock:
+            self._video_ready_detail['published_count'] = int(
+                self._video_ready_detail.get('published_count', 0)
+            ) + 1
+            self._topic_state[self.video_ready_topic] = {
+                'value': bool(ready),
+                'received_wall_sec': time.time(),
+                'type': 'std_msgs/msg/Bool',
+                'reason': reason,
+            }
+
+    def _evaluate_video_ready(self) -> None:
+        yolo = self.yolo_status()
+        data = yolo.get('data') if isinstance(yolo, dict) else None
+        if not isinstance(data, dict):
+            data = {}
+        scout_raw_ready = int(data.get('raw_frames', 0) or 0) > 0
+        scout_yolo_ready = int(data.get('yolo_frames', 0) or 0) > 0
+        scout_inference_ready = int(data.get('inference_frames', 0) or 0) > 0
+        with self._lock:
+            observation = self._omx_state.get('observation_status')
+            camera_ready = bool(self._omx_state.get('camera_ready'))
+        omx_frame_ready = False
+        if isinstance(observation, dict):
+            omx_frame_ready = bool(
+                observation.get('camera_ready')
+                and observation.get('frame_valid')
+                and observation.get('inference_ran')
+            )
+        elif not self.require_omx_video_ready:
+            omx_frame_ready = True
+        if self.require_omx_video_ready and not omx_frame_ready:
+            omx_frame_ready = camera_ready and bool(observation)
+        scout_ready = (
+            scout_raw_ready and scout_yolo_ready and scout_inference_ready
+            if self.require_scout_video_ready else True
+        )
+        omx_ready = omx_frame_ready if self.require_omx_video_ready else True
+        ready = bool(scout_ready and omx_ready)
+        detail = {
+            'ready': ready,
+            'topic': self.video_ready_topic,
+            'scout_required': self.require_scout_video_ready,
+            'omx_required': self.require_omx_video_ready,
+            'scout_raw_ready': scout_raw_ready,
+            'scout_yolo_ready': scout_yolo_ready,
+            'scout_inference_ready': scout_inference_ready,
+            'omx_frame_ready': omx_frame_ready,
+            'yolo_status': yolo.get('status'),
+            'yolo_error': yolo.get('error'),
+        }
+        with self._lock:
+            previous = self._video_ready
+            self._video_ready = ready
+            published_count = int(self._video_ready_detail.get('published_count', 0))
+            detail['published_count'] = published_count
+            self._video_ready_detail = detail
+        if ready != previous:
+            self._publish_video_ready(ready, 'all_video_ready' if ready else 'video_not_ready')
+            self.get_logger().warning(
+                'FLEET_VIDEO_READY | '
+                f'ready={ready} scout_raw={scout_raw_ready} '
+                f'scout_yolo={scout_yolo_ready} '
+                f'scout_inference={scout_inference_ready} '
+                f'omx_frame={omx_frame_ready}'
+            )
+
     def _on_nav_path(self, name: str, msg: NavPath) -> None:
         now = time.time()
         with self._lock:
@@ -785,6 +910,7 @@ class LeaderUnifiedDashboard(Node):
                 'fleet': {
                     'coordination_status': self._topic_value(self.fleet_status_topic, now),
                     'collision_warning': self._topic_value(self.collision_warning_topic, now),
+                    'video_ready': dict(self._video_ready_detail),
                 },
                 'nav2_paths': [
                     self._nav_path_summary(name, now)

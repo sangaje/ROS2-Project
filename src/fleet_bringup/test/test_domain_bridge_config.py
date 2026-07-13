@@ -26,6 +26,10 @@ def test_real_bridge_directions_and_control_qos(tmp_path):
     assert main['topics']['/fleet/collision_warning']['qos']['durability'] == (
         'transient_local'
     )
+    assert main['topics']['/fleet/video_ready']['type'] == 'std_msgs/msg/Bool'
+    assert main['topics']['/fleet/video_ready']['qos']['durability'] == (
+        'transient_local'
+    )
     assert main['topics']['/fleet/robot_poses']['type'] == (
         'geometry_msgs/msg/PoseArray'
     )
@@ -116,6 +120,9 @@ def test_member_bridge_keeps_risk_topics_off_the_default_pose_status_path(tmp_pa
     assert main['topics']['/omx/observation_status']['type'] == 'std_msgs/msg/String'
     assert main['topics']['/omx/camera_ready']['type'] == 'std_msgs/msg/Bool'
     assert main['topics']['/fleet/coordination_status']['qos']['durability'] == (
+        'transient_local'
+    )
+    assert main['topics']['/fleet/video_ready']['qos']['durability'] == (
         'transient_local'
     )
     assert main['topics']['/fleet/robot_poses']['type'] == (

@@ -43,6 +43,19 @@ def test_system_launch_uses_external_worker_without_in_process_runtime():
     assert "'scout_rl_inference.launch.py'" in text
     assert "'initial_role_active': 'false'" in text
     assert "'rl_backend': rl_backend_value" in text
+    assert "'require_video_ready': require_video_ready.perform(context)" in text
+    assert "'video_ready_topic': video_ready_topic.perform(context)" in text
+
+
+def test_system_launch_gates_motion_on_dashboard_video_ready():
+    text = SYSTEM_LAUNCH.read_text(encoding='utf-8')
+
+    assert "'require_video_ready'" in text
+    assert "default_value='true'" in text
+    assert "'video_ready_topic'" in text
+    assert "default_value='/fleet/video_ready'" in text
+    assert "'require_video_ready': launch_bool(" in text
+    assert "'video_ready_topic': video_ready_topic.perform(context)" in text
 
 
 def test_leader_can_own_risk_map_from_scout_sources():

@@ -30,6 +30,8 @@ def generate_launch_description():
     field_robot_status_topic = LaunchConfiguration('field_robot_status_topic')
     require_failover_activation = LaunchConfiguration('require_failover_activation')
     require_localization_ready = LaunchConfiguration('require_localization_ready')
+    require_video_ready = LaunchConfiguration('require_video_ready')
+    video_ready_topic = LaunchConfiguration('video_ready_topic')
     cmd_vel_topic = LaunchConfiguration('cmd_vel_topic')
     use_stamped_cmd_vel = LaunchConfiguration('use_stamped_cmd_vel')
     enable_velocity_safety_filter = LaunchConfiguration(
@@ -99,6 +101,17 @@ def generate_launch_description():
             description='Require active scout id, epoch, localization and motion-release gates.',
         ),
         DeclareLaunchArgument(
+            'require_video_ready',
+            default_value='true',
+            choices=['true', 'false'],
+            description='Hold RL movement until the unified dashboard has received every required video stream.',
+        ),
+        DeclareLaunchArgument(
+            'video_ready_topic',
+            default_value='/fleet/video_ready',
+            description='Latched dashboard video readiness topic.',
+        ),
+        DeclareLaunchArgument(
             'cmd_vel_topic',
             default_value=DEFAULT_CMD_VEL_TOPIC,
             description='Velocity topic owned by this inference process.',
@@ -146,6 +159,11 @@ def generate_launch_description():
                     require_localization_ready,
                     value_type=bool,
                 ),
+                'require_video_ready': ParameterValue(
+                    require_video_ready,
+                    value_type=bool,
+                ),
+                'video_ready_topic': video_ready_topic,
                 'cmd_vel_topic': cmd_vel_topic,
                 'use_stamped_cmd_vel': ParameterValue(
                     use_stamped_cmd_vel,

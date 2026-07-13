@@ -187,6 +187,10 @@ def write_fleet_bridge_configs(
             'std_msgs/msg/Bool',
             profile=qos(durability='transient_local', depth=1),
         ),
+        '/fleet/video_ready': topic(
+            'std_msgs/msg/Bool',
+            profile=qos(durability='transient_local', depth=1),
+        ),
         '/fleet/hazard_pose': topic(
             'geometry_msgs/msg/PoseStamped',
             profile=qos(depth=5),
@@ -337,6 +341,10 @@ def write_member_bridge_configs(
             profile=qos(depth=5),
         ),
         '/fleet/collision_warning': topic(
+            'std_msgs/msg/Bool',
+            profile=qos(durability='transient_local', depth=1),
+        ),
+        '/fleet/video_ready': topic(
             'std_msgs/msg/Bool',
             profile=qos(durability='transient_local', depth=1),
         ),
@@ -537,6 +545,10 @@ def write_leader_to_pc_bridge_config(
             profile=qos(depth=5),
         ),
         '/fleet/collision_warning': topic(
+            'std_msgs/msg/Bool',
+            profile=qos(durability='transient_local', depth=1),
+        ),
+        '/fleet/video_ready': topic(
             'std_msgs/msg/Bool',
             profile=qos(durability='transient_local', depth=1),
         ),

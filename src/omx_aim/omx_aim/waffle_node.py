@@ -135,6 +135,8 @@ class WaffleNavNode(Node):
         self.declare_parameter('require_amcl_ready', False)
         self.declare_parameter('require_localization_ready', False)
         self.declare_parameter('localization_ready_topic', '/localization_ready')
+        self.declare_parameter('require_video_ready', True)
+        self.declare_parameter('video_ready_topic', '/fleet/video_ready')
         self.declare_parameter('amcl_pose_topic', '/amcl_pose')
         self.declare_parameter('max_amcl_pose_age_sec', 3.0)
         self.declare_parameter('max_xy_covariance', 2.00)
@@ -149,6 +151,11 @@ class WaffleNavNode(Node):
             self.get_parameter('require_localization_ready').value)
         self.localization_ready_topic = str(
             self.get_parameter('localization_ready_topic').value)
+        self.require_video_ready = bool(
+            self.get_parameter('require_video_ready').value)
+        self.video_ready_topic = str(
+            self.get_parameter('video_ready_topic').value)
+        self._video_ready_flag = not self.require_video_ready
         self.amcl_pose_topic = str(
             self.get_parameter('amcl_pose_topic').value)
         self.max_amcl_pose_age_sec = float(
@@ -202,6 +209,19 @@ class WaffleNavNode(Node):
                 self.on_localization_ready,
                 latched_qos,
             )
+        if self.require_video_ready:
+            latched_qos = QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                history=HistoryPolicy.KEEP_LAST,
+            )
+            self.create_subscription(
+                Bool,
+                self.video_ready_topic,
+                self.on_video_ready,
+                latched_qos,
+            )
 
         # Publishers
         self.pub_result = self.create_publisher(
@@ -233,6 +253,9 @@ class WaffleNavNode(Node):
         self.get_logger().info(
             f"Localization spin gate: require={self.require_localization_ready} "
             f"topic={self.localization_ready_topic}")
+        self.get_logger().info(
+            f"Dashboard video gate: require={self.require_video_ready} "
+            f"topic={self.video_ready_topic}")
         self.get_logger().info("입력:")
         self.get_logger().info("  /omx/nav_goal    PoseStamped")
         self.get_logger().info("  /omx/nav_cancel  Empty")
@@ -304,6 +327,15 @@ class WaffleNavNode(Node):
                 f"localization_ready 수신: {self.localization_ready_topic}=true")
             self._try_send_pending_goal()
 
+    def on_video_ready(self, msg: Bool):
+        previous = self._video_ready_flag
+        self._video_ready_flag = bool(msg.data)
+        if self._video_ready_flag != previous:
+            self.get_logger().warn(
+                f"dashboard video_ready 수신: {self.video_ready_topic}={self._video_ready_flag}")
+        if self._video_ready_flag and not previous:
+            self._try_send_pending_goal()
+
     def on_nav_goal_meta(self, msg: String):
         try:
             data = json.loads(msg.data)
@@ -325,6 +357,9 @@ class WaffleNavNode(Node):
         age = time.time() - self._last_amcl_pose_wall
         return age <= self.max_amcl_pose_age_sec
 
+    def _video_ready(self) -> bool:
+        return self.dry_run or (not self.require_video_ready or self._video_ready_flag)
+
     def _queue_nav_goal(self, msg: PoseStamped, reason: str):
         self._pending_goal = msg
         self._pending_goal_received_wall = time.time()
@@ -342,6 +377,7 @@ class WaffleNavNode(Node):
         self.get_logger().warn(
             'WAFFLE_NAV_HOLD | '
             f'reason={reason} goal_id={self._current_goal_id} '
+            f'video_ready={self._video_ready_flag}/{self.require_video_ready} '
             f'localization_flag={self._localization_ready_flag} '
             f'localization={spin_text} AMCL={self._amcl_cov_text}',
             throttle_duration_sec=2.0,
@@ -367,6 +403,14 @@ class WaffleNavNode(Node):
             self._publish_result("rejected")
             return
 
+        if not self._video_ready():
+            self.transition(WaffleState.WAITING_SERVER)
+            self.get_logger().warn(
+                f"pending nav_goal 대기: dashboard video_ready 준비 전 "
+                f"({self.video_ready_topic}=false)",
+                throttle_duration_sec=5.0,
+            )
+            return
         if not self.action_client.server_is_ready():
             self.transition(WaffleState.WAITING_SERVER)
             self.get_logger().warn(
@@ -444,6 +488,7 @@ class WaffleNavNode(Node):
             'goal_epoch': self._goal_epoch,
             'action_server_ready': bool(self.dry_run or self.action_client.server_is_ready()),
             'localization_ready': bool(self._localization_ready()),
+            'video_ready': bool(self._video_ready()),
             'amcl_ready': bool(self._amcl_ready),
             'goal_pending': self._pending_goal is not None,
             'goal_accepted': bool(self._goal_accepted),
@@ -497,6 +542,9 @@ class WaffleNavNode(Node):
             self._dry_run_navigate()
             return
 
+        if not self._video_ready():
+            self._queue_nav_goal(msg, "dashboard video_ready 준비 전")
+            return
         if not self.action_client.server_is_ready():
             self._queue_nav_goal(
                 msg, f"Nav2 액션 서버 '{self.action_name}' 준비 전")

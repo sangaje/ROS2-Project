@@ -75,6 +75,8 @@ def launch_setup(context, *args, **kwargs):
         'omx_camera_reconnect_period_sec'
     ).perform(context)
     omx_camera_required = LaunchConfiguration('omx_camera_required').perform(context)
+    require_video_ready = LaunchConfiguration('require_video_ready').perform(context)
+    video_ready_topic = LaunchConfiguration('video_ready_topic').perform(context)
     yolo_server_device = LaunchConfiguration('yolo_server_device').perform(context)
     patrol_delay = float(
         LaunchConfiguration('patrol_planner_delay_sec').perform(context)
@@ -145,6 +147,8 @@ def launch_setup(context, *args, **kwargs):
                 'require_amcl_ready': False,
                 'require_localization_ready': False,
                 'localization_ready_topic': '/localization_ready',
+                'require_video_ready': _is_true(require_video_ready),
+                'video_ready_topic': video_ready_topic,
                 'max_pending_goal_age_sec': 300.0,
                 'goal_ack_timeout_sec': 5.0,
                 'cancel_timeout_sec': 3.0,
@@ -296,6 +300,14 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'omx_camera_required', default_value='false', choices=['true', 'false'],
             description='Diagnostic policy only; false keeps Nav2 running without a camera.',
+        ),
+        DeclareLaunchArgument(
+            'require_video_ready', default_value='true', choices=['true', 'false'],
+            description='Hold Waffle Nav2 movement until dashboard video streams are visible.',
+        ),
+        DeclareLaunchArgument(
+            'video_ready_topic', default_value='/fleet/video_ready',
+            description='Latched dashboard video readiness topic.',
         ),
         DeclareLaunchArgument(
             'patrol_planner_delay_sec', default_value='6.0',
