@@ -105,6 +105,7 @@ def main() -> int:
     ctrl = OmxController(cfg, dry_run=args.dry_run)
     center_yaw_rad = math.radians(args.center_yaw_deg)
     dt = 1.0 / max(1.0, args.rate_hz)
+    connected = False
 
     print(
         "OMX_SCAN_SWEEP_TEST | "
@@ -114,6 +115,7 @@ def main() -> int:
 
     try:
         ctrl.connect()
+        connected = True
         ctrl.go_home()
         if args.home_only:
             print("OMX_SCAN_SWEEP_TEST | home command sent")
@@ -142,29 +144,39 @@ def main() -> int:
         print("OMX_SCAN_SWEEP_TEST | interrupted")
         return 130
     except Exception as exc:  # noqa: BLE001
+        extra = ""
+        message = str(exc)
+        if "Missing motor IDs" in message and "- 11 " in message:
+            extra = (
+                "\nOMX_SCAN_SWEEP_DIAGNOSIS | missing id=11 "
+                "means shoulder_pan is not visible on the Dynamixel bus; "
+                "pan scan, horizontal aiming, and sweep cannot move until "
+                "that motor/cable/power/ID is fixed."
+            )
         print(
             "OMX_SCAN_SWEEP_TEST_ERROR | "
-            f"{type(exc).__name__}: {exc}\n"
+            f"{type(exc).__name__}: {exc}{extra}\n"
             "If this fails but video still works in the launch, the ROS node will "
             "fall back to video_only mode and the arm will not move.",
             file=sys.stderr,
         )
         return 1
     finally:
-        try:
-            bus = getattr(ctrl, "bus", None)
-            if args.leave_torque_on and bus is not None and getattr(
-                bus, "is_connected", False
-            ):
-                bus.disconnect(disable_torque=False)
-            else:
-                ctrl.disconnect()
-        except Exception as exc:  # noqa: BLE001
-            print(
-                "OMX_SCAN_SWEEP_TEST_DISCONNECT_ERROR | "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
+        if connected:
+            try:
+                bus = getattr(ctrl, "bus", None)
+                if args.leave_torque_on and bus is not None and getattr(
+                    bus, "is_connected", False
+                ):
+                    bus.disconnect(disable_torque=False)
+                else:
+                    ctrl.disconnect()
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    "OMX_SCAN_SWEEP_TEST_DISCONNECT_ERROR | "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
 
 
 if __name__ == "__main__":
