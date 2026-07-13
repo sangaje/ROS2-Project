@@ -1643,8 +1643,12 @@ class OmxYoloNode(Node):
                 throttle_duration_sec=2.0,
             )
             try:
-                self.detector.release()
-                self.detector._set_camera_health(False, 'read_exception')
+                reset_camera = getattr(self.detector, 'reset_camera', None)
+                if callable(reset_camera):
+                    reset_camera()
+                else:
+                    self.detector.release()
+                    self.detector._set_camera_health(False, 'read_exception')
             except Exception:
                 pass
         frame_valid = frame is not None

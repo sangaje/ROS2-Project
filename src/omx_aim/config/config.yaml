@@ -84,6 +84,11 @@ ibvs:
   camera_backend: "v4l2"
   camera_reconnect_period_sec: 1.0
   camera_required: false
+  camera_width: 1280
+  camera_height: 720
+  camera_fps: 15.0
+  camera_fourcc: "MJPG"
+  camera_buffer_size: 1
   kp_yaw:   0.05            # 비례 게인 (rad / normalized error)
   kp_pitch: 0.03
   sign_vs_x: -1             # 카메라 마운팅에 따른 부호

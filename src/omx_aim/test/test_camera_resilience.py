@@ -10,11 +10,13 @@ def test_omx_camera_uses_v4l2_preflight_and_reconnect_contract():
     assert 'OMX_CAMERA_PREFLIGHT' in source
     assert 'OMX_CAMERA_UNAVAILABLE' in source
     assert 'OMX_CAMERA_BUSY' in source
-    assert 'self._pending_first_frame = frame' in source
     assert 'self._reopen_period_sec' in source
     assert 'def _camera_source_candidates' in source
     assert 'active={source}' in source
     assert "('AUTO', cv2.CAP_ANY)" in source
+    assert 'def _capture_loop(self)' in source
+    assert 'cv2.CAP_PROP_FOURCC' in source
+    assert 'self._latest_frame.copy()' in source
 
 
 def test_scan_sweep_is_centered_on_forward_heading():
@@ -82,5 +84,4 @@ def test_camera_read_exceptions_do_not_kill_omx_loop():
 
     assert 'OMX_CAMERA_READ_ERROR' in node_source
     assert "vision_reason = f'camera_read_failed:{type(exc).__name__}'" in node_source
-    assert 'self.detector.release()' in node_source
-    assert "self.detector._set_camera_health(False, 'read_exception')" in node_source
+    assert "getattr(self.detector, 'reset_camera', None)" in node_source

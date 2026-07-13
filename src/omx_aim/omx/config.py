@@ -64,6 +64,11 @@ class IbvsConfig:
     camera_backend: str = 'v4l2'
     camera_reconnect_period_sec: float = 1.0
     camera_required: bool = False
+    camera_width: int = 1280
+    camera_height: int = 720
+    camera_fps: float = 15.0
+    camera_fourcc: str = 'MJPG'
+    camera_buffer_size: int = 1
     # ----- 움직이는 표적 추적 (Phase B) -----
     # 미분 게인. 0 이면 순수 P (기존 동작 유지).
     # 권장 시작값: kp * 0.1 ~ 0.3 (예: kp=0.02 -> kd=0.002~0.006)

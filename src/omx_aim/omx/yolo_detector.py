@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
 import time
 
 import cv2
@@ -139,10 +140,17 @@ class YoloDetector:
         self.camera_failure_reason = 'startup'
         self.frame_width = 0
         self.frame_height = 0
-        self._pending_first_frame = None
+        self._cap_lock = threading.RLock()
+        self._frame_lock = threading.Lock()
+        self._latest_frame = None
+        self._latest_frame_seq = 0
+        self._consumed_frame_seq = 0
+        self._capture_stop = False
+        self._capture_thread = None
         self._active_camera_source = None
         self._active_camera_backend = None
         self._open_camera(initial=True)
+        self._start_capture_thread()
 
         requested_device = str(os.environ.get(
             "OMX_YOLO_DEVICE",
@@ -203,6 +211,69 @@ class YoloDetector:
             return [('V4L2', cv2.CAP_V4L2), ('AUTO', cv2.CAP_ANY)]
         return [('AUTO', cv2.CAP_ANY)]
 
+    def _configure_capture(self, cap) -> None:
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, int(getattr(self.cfg.ibvs, 'camera_buffer_size', 1)))
+        except Exception:
+            pass
+        fourcc = str(getattr(self.cfg.ibvs, 'camera_fourcc', 'MJPG') or '').strip()
+        if fourcc:
+            fourcc = fourcc[:4].ljust(4)
+            try:
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
+            except Exception:
+                pass
+        width = int(getattr(self.cfg.ibvs, 'camera_width', 0) or 0)
+        height = int(getattr(self.cfg.ibvs, 'camera_height', 0) or 0)
+        fps = float(getattr(self.cfg.ibvs, 'camera_fps', 0.0) or 0.0)
+        if width > 0:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(width))
+        if height > 0:
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(height))
+        if fps > 0.0:
+            cap.set(cv2.CAP_PROP_FPS, fps)
+
+    def _store_frame(self, frame) -> None:
+        self.frame_height, self.frame_width = frame.shape[:2]
+        with self._frame_lock:
+            self._latest_frame = frame
+            self._latest_frame_seq += 1
+
+    def _start_capture_thread(self) -> None:
+        if self._capture_thread is not None:
+            return
+        self._capture_thread = threading.Thread(
+            target=self._capture_loop,
+            name='omx_camera_capture',
+            daemon=True,
+        )
+        self._capture_thread.start()
+
+    def _capture_loop(self) -> None:
+        while not self._capture_stop:
+            with self._cap_lock:
+                cap = self.cap
+                if cap is None or not cap.isOpened():
+                    cap = None
+                if cap is not None:
+                    ok, frame = cap.read()
+                else:
+                    ok, frame = False, None
+
+            if ok and frame is not None:
+                self._consecutive_read_failures = 0
+                self._store_frame(frame)
+                self._set_camera_health(True, 'ready')
+                time.sleep(0.001)
+                continue
+
+            self._consecutive_read_failures += 1
+            if self._consecutive_read_failures >= 3:
+                self._set_camera_health(False, 'read_failed')
+                self._open_camera()
+            else:
+                time.sleep(0.02)
+
     def _device_preflight(self) -> tuple[bool, str]:
         if not isinstance(self.camera_source, str) or not self.camera_source.startswith('/'):
             return True, 'index'
@@ -254,8 +325,10 @@ class YoloDetector:
                 f'attempt={self._reconnect_attempt} device={self._camera_label()}'
             )
 
-        if self.cap is not None:
-            self.cap.release()
+        with self._cap_lock:
+            if self.cap is not None:
+                self.cap.release()
+                self.cap = None
 
         preflight_ok, preflight_reason = self._device_preflight()
         if not preflight_ok:
@@ -273,15 +346,15 @@ class YoloDetector:
             for backend_name, backend in self._camera_backend_candidates():
                 cap = cv2.VideoCapture(source, backend)
                 if cap.isOpened():
-                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    self._configure_capture(cap)
                     ok, frame = cap.read()
                     if ok and frame is not None:
-                        self.cap = cap
+                        with self._cap_lock:
+                            self.cap = cap
                         self._active_camera_source = source
                         self._active_camera_backend = backend_name
                         self._consecutive_read_failures = 0
-                        self.frame_height, self.frame_width = frame.shape[:2]
-                        self._pending_first_frame = frame
+                        self._store_frame(frame)
                         self._set_camera_health(True, 'ready')
                         self._reconnect_attempt = 0
                         self._log(
@@ -311,27 +384,19 @@ class YoloDetector:
 
     def read_frame(self):
         """카메라 1 프레임 읽기. 실패 시 None."""
-        if self.cap is None or not self.cap.isOpened():
+        with self._cap_lock:
+            cap_ready = self.cap is not None and self.cap.isOpened()
+        if not cap_ready:
             self._open_camera()
             return None
 
-        pending = getattr(self, '_pending_first_frame', None)
-        if pending is not None:
-            self._pending_first_frame = None
-            return pending
-
-        ok, frame = self.cap.read()
-        if ok and frame is not None:
-            self._consecutive_read_failures = 0
-            self.frame_height, self.frame_width = frame.shape[:2]
-            self._set_camera_health(True, 'ready')
-            return frame
-
-        self._consecutive_read_failures += 1
-        if self._consecutive_read_failures >= 5:
-            self._set_camera_health(False, 'read_failed')
-            self._open_camera()
-        return None
+        with self._frame_lock:
+            if self._latest_frame is None:
+                return None
+            if self._latest_frame_seq == self._consumed_frame_seq:
+                return None
+            self._consumed_frame_seq = self._latest_frame_seq
+            return self._latest_frame.copy()
 
     def detect(self, frame):
         """프레임에서 target_class 최고 conf 객체 검출.
@@ -375,5 +440,21 @@ class YoloDetector:
 
     def release(self):
         """카메라 자원 해제."""
-        if self.cap:
-            self.cap.release()
+        self._capture_stop = True
+        if (
+            self._capture_thread is not None
+            and self._capture_thread is not threading.current_thread()
+        ):
+            self._capture_thread.join(timeout=1.0)
+        with self._cap_lock:
+            if self.cap:
+                self.cap.release()
+                self.cap = None
+
+    def reset_camera(self) -> None:
+        """Drop the current handle but keep the capture thread alive."""
+        with self._cap_lock:
+            if self.cap:
+                self.cap.release()
+                self.cap = None
+        self._set_camera_health(False, 'reset')
