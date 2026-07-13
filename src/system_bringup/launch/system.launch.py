@@ -1317,13 +1317,18 @@ def generate_launch_description():
                     'require_capture_pose': 'true',
                     'camera_hfov_deg': leader_scan_fov_deg.perform(context),
                     'initial_role_active': (
+                        # FOLLOWER must not start with camera/upload/publish
+                        # capability -- it has no scout authority until an
+                        # actual takeover. Only "no role gating at all" or
+                        # genuinely being the member/ACTIVE_SCOUT stack
+                        # starts active.
                         'true'
-                        if (not role_gating_on or fleet_role_value in ('member', 'follower'))
+                        if (not role_gating_on or fleet_role_value == 'member')
                         else 'false'
                     ),
                     'active_roles': 'ACTIVE_SCOUT,SCOUT,RECOVERING',
                     'standby_roles': 'FOLLOWER,IDLE,TAKEOVER_PENDING',
-                    'publish_roles': 'ACTIVE_SCOUT,SCOUT,FOLLOWER,RECOVERING',
+                    'publish_roles': 'ACTIVE_SCOUT,SCOUT,RECOVERING',
                 }.items(),
             ))
 

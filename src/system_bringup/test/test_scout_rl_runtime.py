@@ -265,6 +265,8 @@ def test_first_predict_exception_does_not_deactivate_active_scout():
     commands = []
     runtime.publish_command = lambda linear, angular: commands.append((linear, angular))
     runtime._log_heartbeat = lambda: None
+    runtime._log_policy_tick = lambda **kwargs: None
+    runtime._log_inference = lambda **kwargs: None
 
     runtime._policy_tick()
     runtime._policy_tick()
@@ -416,7 +418,7 @@ def test_worker_gate_manual_active_scout_skips_failover_localization_gate():
     ))
 
     assert state == RLWorkerState.ACTIVE
-    assert reason == 'activation_gate_passed'
+    assert reason == 'all_runtime_inputs_ready'
 
 
 def test_worker_gate_manual_mode_still_requires_active_scout_role():
@@ -446,7 +448,85 @@ def test_worker_gate_accepts_only_fully_ready_failover_owner():
     state, reason = evaluate_activation_gate(_gate())
 
     assert state == RLWorkerState.ACTIVE
-    assert reason == 'activation_gate_passed'
+    assert reason == 'all_runtime_inputs_ready'
+
+
+def test_worker_gate_waits_for_observation_ready_even_when_raw_sensors_are_fresh():
+    # Regression test for the exact contradiction reported on real hardware:
+    # role/lease/motion/model/sensor/tf all pass, but the internal MapSnapshot
+    # the RL policy predicts from is still stale. The gate must not report
+    # ACTIVE in that case.
+    state, reason = evaluate_activation_gate(_gate(observation_ready=False))
+
+    assert state == RLWorkerState.WAIT_OBSERVATION_READY
+    assert reason == 'observation_stale'
+
+
+def test_gate_inputs_default_observation_ready_true_for_existing_callers():
+    # Callers built before observation_ready existed (e.g. this test file's
+    # own _gate() helper) must keep their prior ACTIVE-when-otherwise-ready
+    # behavior without having to be updated for the new field.
+    gate = _gate()
+    assert gate.observation_ready is True
+
+
+def test_fast_observation_tick_never_recomputes_the_heavy_confidence_grid():
+    # The fast tick must only ever reuse whatever _confidence_tick last
+    # produced; it must never itself call exploration_map.update() (the
+    # CPU-heavy call that used to be fused into a single 10 Hz callback and
+    # caused the reported snapshot-age stalls).
+    deque = __import__('collections').deque
+    runtime = ActiveScoutRLRuntime.__new__(ActiveScoutRLRuntime)
+    runtime.config = active_scout_config()
+    runtime._sensor_pipeline_enabled = True
+    runtime._active = False
+    runtime.counters = RuntimeCounters()
+    runtime._last_fast_tick_mono = 0.0
+    runtime._last_map_tick_timing_log_at = 0.0
+    runtime._fast_interval_ms_samples = deque(maxlen=100)
+    runtime._fast_tf_ms_samples = deque(maxlen=100)
+    runtime._fast_lock_ms_samples = deque(maxlen=100)
+    runtime._fast_total_ms_samples = deque(maxlen=100)
+    runtime._confidence_update_ms_samples = deque(maxlen=100)
+    runtime._map_state_lock = threading.Lock()
+    runtime._map_snapshot = None
+    slam_map = OccupancyGrid()
+    slam_map.header.frame_id = runtime.config.map_frame
+    scan = _scan()
+    scan.header.frame_id = runtime.config.scan_frame
+    now = __import__('time').monotonic()
+    runtime._sensor_snapshot = lambda: SensorSnapshot(
+        scan=scan, scan_received_at=now, scan_generation=1,
+        odom=_odom(), odom_received_at=now, odom_generation=1,
+        odom_source_stamp_age_ms=5.0,
+        slam_map=slam_map, map_received_at=now, map_generation=1,
+    )
+    runtime._fresh = lambda snapshot, now: True
+    runtime._lookup_pose = lambda *args, **kwargs: (np.zeros(2, dtype=np.float32), 0.0)
+    runtime._warn_throttled = lambda message: None
+    runtime._hold = lambda reason: None
+    runtime._log_heartbeat = lambda: None
+    runtime._warm_observation = lambda scan: None
+
+    update_calls = []
+    runtime.exploration_map = type(
+        'Grid', (), {'update': staticmethod(lambda *a, **k: update_calls.append(1) or object())}
+    )()
+    runtime._merge_confidence_seed_locked = lambda: None
+
+    # Before any confidence tick has ever produced stats, the fast tick must
+    # not fabricate a snapshot out of nothing.
+    runtime._latest_stats = None
+    runtime._fast_observation_tick()
+    assert runtime._map_snapshot is None
+    assert update_calls == []
+
+    # Once a confidence tick has produced stats, the fast tick commits a
+    # fresh snapshot on its own cadence without ever calling .update() itself.
+    runtime._latest_stats = object()
+    runtime._fast_observation_tick()
+    assert runtime._map_snapshot is not None
+    assert update_calls == []
 
 
 def test_worker_role_parser_supports_json_and_simple_strings():
@@ -476,7 +556,7 @@ def test_worker_cartographer_mode_does_not_require_amcl_ready_signal():
     ))
 
     assert state == RLWorkerState.ACTIVE
-    assert reason == 'activation_gate_passed'
+    assert reason == 'all_runtime_inputs_ready'
 
 
 def test_runtime_map_subscription_accepts_cartographer_volatile_maps():
@@ -506,6 +586,20 @@ def test_hardware_contract_leaves_budget_for_slow_map_and_inference_callbacks():
     assert config.max_inference_sec == 2.0
     assert config.command_timeout_sec == 3.0
     assert config.odom_topic == '/odom'
+
+
+def test_observation_snapshot_and_confidence_periods_are_bounded_and_derived():
+    config = active_scout_config()
+    fast_tick_period_sec = config.control_dt_sec / config.map_substeps_per_action
+
+    # Deliberately not tied to max_scan_age_sec: this is the freshness bound
+    # for the derived MapSnapshot, not for raw scan/odom/map messages.
+    assert config.max_observation_snapshot_age_sec >= 0.6
+    assert config.max_observation_snapshot_age_sec <= fast_tick_period_sec * 10.0
+    assert config.confidence_update_period_sec >= 0.5
+    # The heavy confidence/publish pipeline must run at a bounded, slower
+    # cadence than the fast observation tick, not on every fast tick.
+    assert config.confidence_update_period_sec > fast_tick_period_sec
 
 
 def test_runtime_publishes_the_exact_policy_lidar_debug_topic():

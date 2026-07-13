@@ -71,12 +71,22 @@ class RuntimeCounters:
     odom_callback_count: int = 0
     map_callback_count: int = 0
     map_tick_count: int = 0
+    map_tick_failure_count: int = 0
     pose_success_count: int = 0
     confidence_update_attempt_count: int = 0
     confidence_update_success_count: int = 0
     predict_attempt_count: int = 0
     predict_success_count: int = 0
     predict_failure_count: int = 0
+
+
+def _percentile_summary(samples) -> tuple[float, float, float]:
+    values = sorted(float(v) for v in samples)
+    if not values:
+        return -1.0, -1.0, -1.0
+    p50 = values[len(values) // 2]
+    p95_index = min(len(values) - 1, int(round(0.95 * (len(values) - 1))))
+    return float(p50), float(values[p95_index]), float(values[-1])
 
 
 def _stamp_time(message) -> Time:
@@ -250,6 +260,20 @@ class ActiveScoutRLRuntime:
         self._pending_confidence_seed: Optional[OccupancyGrid] = None
         self._confidence_seed_applied = False
         self._map_snapshot: Optional[MapSnapshot] = None
+        # Full confidence/exploration grid stats, refreshed by the slower
+        # _confidence_tick. The fast _fast_observation_tick reuses whatever
+        # is here (even if a cycle or two stale) so a heavy grid update
+        # never blocks the fast snapshot commit that observation_ready()
+        # depends on.
+        self._latest_stats: Optional[MapUpdateStats] = None
+        self._last_fast_tick_mono = 0.0
+        self._last_nonzero_command_at = 0.0
+        self._last_map_tick_timing_log_at = 0.0
+        self._fast_interval_ms_samples: deque[float] = deque(maxlen=100)
+        self._fast_tf_ms_samples: deque[float] = deque(maxlen=100)
+        self._fast_lock_ms_samples: deque[float] = deque(maxlen=100)
+        self._fast_total_ms_samples: deque[float] = deque(maxlen=100)
+        self._confidence_update_ms_samples: deque[float] = deque(maxlen=100)
         self._history_vector: deque[np.ndarray] = deque(maxlen=self.config.history_len)
         self._history_map: deque[np.ndarray] = deque(maxlen=self.config.history_len)
         self._previous_action = np.zeros(2, dtype=np.float32)
@@ -262,6 +286,8 @@ class ActiveScoutRLRuntime:
         self._last_error_at = 0.0
         self._last_tf_stamp_fallback_at = 0.0
         self._last_heartbeat_at = 0.0
+        self._last_policy_tick_log_at = -1.0e9
+        self._last_inference_log_at = -1.0e9
         self._last_stop_reason = 'not_activated'
         self._model_error: Optional[str] = None
         self._last_error = ''
@@ -271,6 +297,7 @@ class ActiveScoutRLRuntime:
         self.counters = RuntimeCounters()
         self._sensor_group = ReentrantCallbackGroup()
         self._map_group = MutuallyExclusiveCallbackGroup()
+        self._confidence_group = MutuallyExclusiveCallbackGroup()
         self._policy_group = MutuallyExclusiveCallbackGroup()
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self.node, spin_thread=False)
@@ -373,8 +400,13 @@ class ActiveScoutRLRuntime:
         )
         self.map_timer = self.node.create_timer(
             self.config.control_dt_sec / self.config.map_substeps_per_action,
-            self._map_tick,
+            self._fast_observation_tick,
             callback_group=self._map_group,
+        )
+        self.confidence_timer = self.node.create_timer(
+            self.config.confidence_update_period_sec,
+            self._confidence_tick,
+            callback_group=self._confidence_group,
         )
         self.policy_timer = self.node.create_timer(
             self.config.control_dt_sec,
@@ -407,7 +439,35 @@ class ActiveScoutRLRuntime:
         return self._last_stop_reason
 
     def sensor_ready(self) -> bool:
+        """Raw scan/odom/SLAM-map message freshness only."""
         return self._fresh(self._sensor_snapshot(), time.monotonic())
+
+    def observation_ready(self) -> bool:
+        """Freshness of the internal MapSnapshot the policy predicts from.
+
+        Distinct from ``sensor_ready()``: raw topics can all be fresh while
+        the derived snapshot (built by ``_fast_observation_tick``) has still
+        fallen behind, e.g. the tick was starved for an executor thread.
+        """
+        snapshot = self._map_snapshot
+        if snapshot is None:
+            return False
+        return (
+            time.monotonic() - snapshot.updated_at
+            <= self.config.max_observation_snapshot_age_sec
+        )
+
+    def inference_ready(self) -> tuple[bool, str]:
+        """Everything ``_policy_tick`` needs before ``model.predict()`` may run."""
+        if not self.ready:
+            return False, 'model_not_ready'
+        if not self.sensor_ready():
+            return False, 'sensor_not_ready'
+        if not self.tf_ready():
+            return False, 'tf_not_ready'
+        if not self.observation_ready():
+            return False, 'observation_stale'
+        return True, 'ready'
 
     def readiness_summary(self) -> str:
         """Expose the precise distributed-input gate state in worker logs."""
@@ -473,10 +533,10 @@ class ActiveScoutRLRuntime:
             )
             odom_linear_velocity = float(twist.linear.x)
             odom_angular_velocity = float(twist.angular.z)
-        observation_ready = bool(
-            self._fresh(snapshot, now)
-            and map_snapshot is not None
-            and now - map_snapshot.updated_at <= self.config.max_scan_age_sec
+        observation_ready = self.observation_ready()
+        nonzero_command = bool(
+            abs(float(self._last_command[0])) > 1.0e-4
+            or abs(float(self._last_command[1])) > 1.0e-4
         )
         return {
             'active': self._active,
@@ -531,6 +591,13 @@ class ActiveScoutRLRuntime:
             'final_cmd_linear': float(self._last_command[0]),
             'final_cmd_angular': float(self._last_command[1]),
             'cmd_vel_published': self._last_command_at > 0.0,
+            'cmd_vel_message_published': self._last_command_at > 0.0,
+            'cmd_vel_nonzero_published': nonzero_command,
+            'last_nonzero_cmd_age_ms': (
+                (now - self._last_nonzero_command_at) * 1000.0
+                if self._last_nonzero_command_at > 0.0 else -1.0
+            ),
+            'zero_hold_active': bool(self._active and not nonzero_command),
             'last_stop_reason': self._last_stop_reason,
             'last_error': self._last_error.splitlines()[-1] if self._last_error else '',
         }
@@ -904,30 +971,119 @@ class ActiveScoutRLRuntime:
             _yaw_from_quaternion(transform.transform.rotation),
         )
 
-    def _map_tick(self) -> None:
+    def _fast_observation_tick(self) -> None:
+        """Commit a fresh MapSnapshot every cycle with no CPU-heavy grid work.
+
+        This is the loop ``observation_ready()``/``max_observation_snapshot_
+        age_sec`` depend on. It reuses whatever confidence/exploration
+        ``MapUpdateStats`` the slower ``_confidence_tick`` last produced, so a
+        slow heavy update never blocks this commit and the reported snapshot
+        age stays bounded even while the full grid update is still running.
+        """
+        tick_start = time.monotonic()
         if not self._sensor_pipeline_enabled:
             return
         self.counters.map_tick_count += 1
+        scheduled_period_ms = (
+            self.config.control_dt_sec / self.config.map_substeps_per_action
+        ) * 1000.0
+        actual_interval_ms = (
+            (tick_start - self._last_fast_tick_mono) * 1000.0
+            if self._last_fast_tick_mono > 0.0 else scheduled_period_ms
+        )
+        self._last_fast_tick_mono = tick_start
         snapshot = self._sensor_snapshot()
         now = time.monotonic()
         if not self._fresh(snapshot, now):
+            self.counters.map_tick_failure_count += 1
             self._hold('waiting_for_sensor_or_map')
+            self._log_map_tick_timing(
+                scheduled_period_ms, actual_interval_ms, 0.0, 0.0,
+                (time.monotonic() - tick_start) * 1000.0,
+            )
             return
         assert snapshot.scan is not None and snapshot.slam_map is not None
         map_frame = str(snapshot.slam_map.header.frame_id or '').lstrip('/')
         if map_frame != self.config.map_frame.lstrip('/'):
+            self.counters.map_tick_failure_count += 1
             self._hold('waiting_for_expected_map_frame')
+            self._log_map_tick_timing(
+                scheduled_period_ms, actual_interval_ms, 0.0, 0.0,
+                (time.monotonic() - tick_start) * 1000.0,
+            )
+            return
+        try:
+            stamp = _stamp_time(snapshot.scan)
+            tf_start = time.monotonic()
+            robot_xy, robot_yaw = self._lookup_pose(self.config.map_frame, self.config.base_frame, stamp)
+            tf_ms = (time.monotonic() - tf_start) * 1000.0
+            self.counters.pose_success_count += 1
+            lock_start = time.monotonic()
+            with self._map_state_lock:
+                lock_wait_ms = (time.monotonic() - lock_start) * 1000.0
+                stats = self._latest_stats
+                if stats is None:
+                    self.counters.map_tick_failure_count += 1
+                    self._hold('waiting_for_first_confidence_update')
+                    self._log_map_tick_timing(
+                        scheduled_period_ms, actual_interval_ms, tf_ms, lock_wait_ms,
+                        (time.monotonic() - tick_start) * 1000.0,
+                    )
+                    return
+                self._map_snapshot = MapSnapshot(
+                    stats=stats,
+                    robot_xy=robot_xy,
+                    robot_yaw=robot_yaw,
+                    scan_generation=snapshot.scan_generation,
+                    map_generation=snapshot.map_generation,
+                    updated_at=now,
+                )
+            if not self._active:
+                self._warm_observation(snapshot.scan)
+            self._log_heartbeat()
+            self._log_map_tick_timing(
+                scheduled_period_ms, actual_interval_ms, tf_ms, lock_wait_ms,
+                (time.monotonic() - tick_start) * 1000.0,
+            )
+        except TransformException as exc:
+            self.counters.map_tick_failure_count += 1
+            self._last_error = f'TransformException: {exc}'
+            self._warn_throttled(f'SCOUT_RL_WAIT_TF | {exc}')
+            self._hold('waiting_for_tf')
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.counters.map_tick_failure_count += 1
+            self._last_error = traceback.format_exc()
+            self._warn_throttled(f'SCOUT_RL_WAIT_MAP_UPDATE | {exc}\n{self._last_error}')
+            self._hold('waiting_for_map_update')
+            return
+
+    def _confidence_tick(self) -> None:
+        """Heavy confidence/exploration grid maintenance + bounded external
+        publish, on its own slower timer so it never delays the fast
+        observation snapshot the RL policy reads every cycle.
+        """
+        if not self._sensor_pipeline_enabled:
+            return
+        snapshot = self._sensor_snapshot()
+        now = time.monotonic()
+        if not self._fresh(snapshot, now):
+            return
+        assert snapshot.scan is not None and snapshot.slam_map is not None
+        map_frame = str(snapshot.slam_map.header.frame_id or '').lstrip('/')
+        if map_frame != self.config.map_frame.lstrip('/'):
             return
         scan_frame = str(snapshot.scan.header.frame_id or self.config.scan_frame).lstrip('/')
         try:
             stamp = _stamp_time(snapshot.scan)
             robot_xy, robot_yaw = self._lookup_pose(self.config.map_frame, self.config.base_frame, stamp)
             sensor_xy, sensor_yaw = self._lookup_pose(self.config.map_frame, scan_frame, stamp)
-            self.counters.pose_success_count += 1
             self.counters.confidence_update_attempt_count += 1
-            # The exploration map is mutable, but the sensor lock is never held
-            # while this CPU-heavy update runs.  Policy reads take the same lock
-            # only while cropping an observation, then release it before predict.
+            # The exploration map is mutable, but this CPU-heavy update never
+            # blocks _fast_observation_tick's own snapshot commit for longer
+            # than the tail of whatever update is already in flight -- the
+            # two ticks run on separate callback groups/timers.
+            update_start = time.monotonic()
             with self._map_state_lock:
                 stats = self.exploration_map.update(
                     snapshot.scan,
@@ -939,28 +1095,55 @@ class ActiveScoutRLRuntime:
                     sensor_yaw=sensor_yaw,
                 )
                 self._merge_confidence_seed_locked()
-                self._map_snapshot = MapSnapshot(
-                    stats=stats,
-                    robot_xy=robot_xy,
-                    robot_yaw=robot_yaw,
-                    scan_generation=snapshot.scan_generation,
-                    map_generation=snapshot.map_generation,
-                    updated_at=now,
-                )
+                self._latest_stats = stats
+            self._confidence_update_ms_samples.append((time.monotonic() - update_start) * 1000.0)
             self.counters.confidence_update_success_count += 1
-            if not self._active:
-                self._warm_observation(snapshot.scan)
-            self._log_heartbeat()
         except TransformException as exc:
             self._last_error = f'TransformException: {exc}'
             self._warn_throttled(f'SCOUT_RL_WAIT_TF | {exc}')
-            self._hold('waiting_for_tf')
-            return
         except Exception as exc:  # noqa: BLE001
             self._last_error = traceback.format_exc()
             self._warn_throttled(f'SCOUT_RL_WAIT_MAP_UPDATE | {exc}\n{self._last_error}')
-            self._hold('waiting_for_map_update')
+
+    def _log_map_tick_timing(
+        self,
+        scheduled_period_ms: float,
+        actual_interval_ms: float,
+        tf_lookup_ms: float,
+        lock_wait_ms: float,
+        total_ms: float,
+    ) -> None:
+        self._fast_interval_ms_samples.append(actual_interval_ms)
+        self._fast_tf_ms_samples.append(tf_lookup_ms)
+        self._fast_lock_ms_samples.append(lock_wait_ms)
+        self._fast_total_ms_samples.append(total_ms)
+        now = time.monotonic()
+        if now - self._last_map_tick_timing_log_at < 1.0:
             return
+        self._last_map_tick_timing_log_at = now
+        interval = _percentile_summary(self._fast_interval_ms_samples)
+        tf = _percentile_summary(self._fast_tf_ms_samples)
+        lock = _percentile_summary(self._fast_lock_ms_samples)
+        total = _percentile_summary(self._fast_total_ms_samples)
+        confidence = _percentile_summary(self._confidence_update_ms_samples)
+        snapshot_age_ms = (
+            (now - self._map_snapshot.updated_at) * 1000.0
+            if self._map_snapshot is not None else -1.0
+        )
+        self.node.get_logger().info(
+            'SCOUT_MAP_TICK_TIMING | '
+            f'scheduled_period_ms={scheduled_period_ms:.1f} '
+            f'actual_interval_ms_p50={interval[0]:.1f} p95={interval[1]:.1f} max={interval[2]:.1f} '
+            f'tf_lookup_ms_p50={tf[0]:.1f} p95={tf[1]:.1f} max={tf[2]:.1f} '
+            f'lock_wait_ms_p50={lock[0]:.1f} p95={lock[1]:.1f} max={lock[2]:.1f} '
+            f'total_ms_p50={total[0]:.1f} p95={total[1]:.1f} max={total[2]:.1f} '
+            f'confidence_update_ms_p50={confidence[0]:.1f} p95={confidence[1]:.1f} max={confidence[2]:.1f} '
+            f'map_tick_count={self.counters.map_tick_count} '
+            f'success_count={self.counters.map_tick_count - self.counters.map_tick_failure_count} '
+            f'failure_count={self.counters.map_tick_failure_count} '
+            f'confidence_tick_count={self.counters.confidence_update_attempt_count} '
+            f'snapshot_age_ms={snapshot_age_ms:.1f}'
+        )
 
     def _warm_observation(self, scan: LaserScan) -> None:
         map_snapshot = self._map_snapshot
@@ -981,14 +1164,31 @@ class ActiveScoutRLRuntime:
         snapshot = self._sensor_snapshot()
         map_snapshot = self._map_snapshot
         now = time.monotonic()
-        if (
-            not self._fresh(snapshot, now)
-            or map_snapshot is None
-            or now - map_snapshot.updated_at > self.config.max_scan_age_sec
-        ):
+        model_ready = self.ready
+        sensor_fresh = self._fresh(snapshot, now)
+        snapshot_exists = map_snapshot is not None
+        snapshot_age_ms = (now - map_snapshot.updated_at) * 1000.0 if snapshot_exists else -1.0
+        snapshot_fresh = self.observation_ready()
+        blocking_reason = 'none'
+        if not model_ready:
+            blocking_reason = 'model_not_ready'
+        elif not sensor_fresh:
+            blocking_reason = 'sensor_stale'
+        elif not snapshot_exists:
+            blocking_reason = 'observation_snapshot_missing'
+        elif not snapshot_fresh:
+            blocking_reason = 'observation_stale'
+        if blocking_reason != 'none':
+            self._log_policy_tick(
+                model_ready=model_ready, sensor_ready=sensor_fresh,
+                snapshot_exists=snapshot_exists, snapshot_age_ms=snapshot_age_ms,
+                snapshot_fresh=snapshot_fresh, predict_called=False,
+                predict_duration_ms=-1.0, command_generated=False,
+                blocking_reason=blocking_reason,
+            )
             self._hold('waiting_for_coherent_observation')
             return
-        assert snapshot.scan is not None
+        assert snapshot.scan is not None and map_snapshot is not None
         try:
             # Never retain the map lock over model.predict(): scan/map callbacks
             # must remain able to replace their latest snapshots while inference
@@ -1001,9 +1201,22 @@ class ActiveScoutRLRuntime:
             self.counters.predict_attempt_count += 1
             action, _ = self.model.predict(observation, deterministic=True)
             elapsed = time.monotonic() - started
+            self._log_inference(
+                attempt=self.counters.predict_attempt_count,
+                observation_age_ms=snapshot_age_ms,
+                duration_ms=elapsed * 1000.0,
+                action=action, success=True, error='',
+            )
             if elapsed > self.config.max_inference_sec:
                 self.counters.predict_failure_count += 1
                 self._warn_throttled(f'SCOUT_RL_INFERENCE_TIMEOUT | sec={elapsed:.3f}')
+                self._log_policy_tick(
+                    model_ready=model_ready, sensor_ready=sensor_fresh,
+                    snapshot_exists=snapshot_exists, snapshot_age_ms=snapshot_age_ms,
+                    snapshot_fresh=snapshot_fresh, predict_called=True,
+                    predict_duration_ms=elapsed * 1000.0, command_generated=False,
+                    blocking_reason='inference_timeout',
+                )
                 self._hold('inference_timeout')
                 return
             self._last_policy_action = np.asarray(action, dtype=np.float32).reshape(-1).copy()
@@ -1020,6 +1233,18 @@ class ActiveScoutRLRuntime:
             self.counters.predict_failure_count += 1
             self._last_error = traceback.format_exc()
             self._warn_throttled(f'SCOUT_RL_INFERENCE_FAILED | {exc}\n{self._last_error}')
+            self._log_inference(
+                attempt=self.counters.predict_attempt_count,
+                observation_age_ms=snapshot_age_ms, duration_ms=-1.0,
+                action=None, success=False, error=str(exc),
+            )
+            self._log_policy_tick(
+                model_ready=model_ready, sensor_ready=sensor_fresh,
+                snapshot_exists=snapshot_exists, snapshot_age_ms=snapshot_age_ms,
+                snapshot_fresh=snapshot_fresh, predict_called=True,
+                predict_duration_ms=-1.0, command_generated=False,
+                blocking_reason='inference_error',
+            )
             # A bad frame or a transient CPU error must not turn ACTIVE_SCOUT
             # into a permanent inactive latch.  The next coherent snapshot gets
             # another deterministic attempt.
@@ -1029,9 +1254,84 @@ class ActiveScoutRLRuntime:
         self._last_command = command.copy()
         self._last_command_at = now
         self._last_inference_at = now
+        if np.linalg.norm(command) > 1.0e-4:
+            self._last_nonzero_command_at = now
         self.counters.predict_success_count += 1
         self.publish_command(float(command[0]), float(command[1]))
         self._log_heartbeat()
+        self._log_policy_tick(
+            model_ready=model_ready, sensor_ready=sensor_fresh,
+            snapshot_exists=snapshot_exists, snapshot_age_ms=snapshot_age_ms,
+            snapshot_fresh=snapshot_fresh, predict_called=True,
+            predict_duration_ms=elapsed * 1000.0, command_generated=True,
+            blocking_reason='none',
+        )
+
+    def _log_policy_tick(
+        self,
+        *,
+        model_ready: bool,
+        sensor_ready: bool,
+        snapshot_exists: bool,
+        snapshot_age_ms: float,
+        snapshot_fresh: bool,
+        predict_called: bool,
+        predict_duration_ms: float,
+        command_generated: bool,
+        blocking_reason: str,
+    ) -> None:
+        now = time.monotonic()
+        if now - self._last_policy_tick_log_at < 1.0:
+            return
+        self._last_policy_tick_log_at = now
+        self.node.get_logger().info(
+            'SCOUT_POLICY_TICK | '
+            f'tick_count={self.counters.predict_attempt_count + self.counters.predict_failure_count} '
+            f'role_active={self._active} '
+            f'model_ready={model_ready} '
+            f'sensor_ready={sensor_ready} '
+            f'tf_ready={self.tf_ready()} '
+            f'snapshot_exists={snapshot_exists} '
+            f'snapshot_age_ms={snapshot_age_ms:.0f} '
+            f'snapshot_fresh={snapshot_fresh} '
+            f'history_ready={len(self._history_vector) > 0} '
+            f'predict_called={predict_called} '
+            f'predict_duration_ms={predict_duration_ms:.1f} '
+            f'command_generated={command_generated} '
+            f'blocking_reason={blocking_reason}'
+        )
+
+    def _log_inference(
+        self,
+        *,
+        attempt: int,
+        observation_age_ms: float,
+        duration_ms: float,
+        action,
+        success: bool,
+        error: str,
+    ) -> None:
+        now = time.monotonic()
+        if success and now - self._last_inference_log_at < 1.0:
+            return
+        self._last_inference_log_at = now
+        if action is not None:
+            values = np.asarray(action, dtype=np.float32).reshape(-1)
+            action_linear = float(values[0]) if values.size > 0 else 0.0
+            action_angular = float(values[1]) if values.size > 1 else 0.0
+        else:
+            action_linear = 0.0
+            action_angular = 0.0
+        self.node.get_logger().info(
+            'SCOUT_RL_INFERENCE | '
+            f'attempt={attempt} '
+            f'observation_age_ms={observation_age_ms:.0f} '
+            f'duration_ms={duration_ms:.1f} '
+            f'action_linear={action_linear:.3f} '
+            f'action_angular={action_angular:.3f} '
+            f'success={success} '
+            f'error={error}'
+        )
 
     def _command_watchdog(self) -> None:
         if not self._active:

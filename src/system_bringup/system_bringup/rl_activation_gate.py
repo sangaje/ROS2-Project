@@ -15,6 +15,7 @@ class RLWorkerState(str, Enum):
     WAIT_LOCALIZATION = 'WAIT_LOCALIZATION'
     WAIT_MOTION_RELEASE = 'WAIT_MOTION_RELEASE'
     WAIT_SENSOR_READY = 'WAIT_SENSOR_READY'
+    WAIT_OBSERVATION_READY = 'WAIT_OBSERVATION_READY'
     ACTIVE = 'ACTIVE'
     FAILED = 'FAILED'
 
@@ -36,6 +37,13 @@ class GateInputs:
     tf_ready: bool
     require_failover_activation: bool
     require_localization_ready: bool
+    # Raw scan/odom/SLAM-map freshness (``sensor_ready``) is not sufficient
+    # for ACTIVE: the internal MapSnapshot the policy actually reads for
+    # inference can still be stale (e.g. the confidence-grid tick fell
+    # behind) even while every raw topic is fresh. Defaults to True so
+    # existing callers that construct GateInputs without this field keep
+    # their previous behavior.
+    observation_ready: bool = True
 
 
 @dataclass(frozen=True)
@@ -108,7 +116,9 @@ def evaluate_activation(gate: GateInputs) -> ActivationDecision:
         return ActivationDecision(RLWorkerState.WAIT_MOTION_RELEASE, 'motion_authority_busy')
     if not gate.model_ready or not gate.sensor_ready or not gate.tf_ready:
         return ActivationDecision(RLWorkerState.WAIT_SENSOR_READY, 'runtime_inputs_not_ready')
-    return ActivationDecision(RLWorkerState.ACTIVE, 'activation_gate_passed')
+    if not gate.observation_ready:
+        return ActivationDecision(RLWorkerState.WAIT_OBSERVATION_READY, 'observation_stale')
+    return ActivationDecision(RLWorkerState.ACTIVE, 'all_runtime_inputs_ready')
 
 
 def evaluate_activation_gate(gate: GateInputs) -> tuple[RLWorkerState, str]:

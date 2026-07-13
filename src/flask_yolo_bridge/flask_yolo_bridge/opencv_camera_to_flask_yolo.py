@@ -145,6 +145,14 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             ).split(',')
             if item.strip()
         }
+        # Informational only: these role names never grant camera/upload/
+        # publish capability by themselves. They used to be OR'd into the
+        # activation check below (a bug -- FOLLOWER sat in both this set and
+        # publish_roles, so a follower's camera stayed open and kept
+        # uploading to the same YOLO server as the real active scout). Kept
+        # as a declared parameter only so existing launch files that still
+        # pass it don't error, and so role logs can label a role as a known
+        # standby state.
         self.standby_roles = {
             item.strip().upper()
             for item in str(
@@ -160,16 +168,29 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             for item in str(
                 self.declare_parameter(
                     'publish_roles',
-                    'ACTIVE_SCOUT,SCOUT,FOLLOWER,RECOVERING',
+                    'ACTIVE_SCOUT,SCOUT,RECOVERING',
                 ).value
             ).split(',')
             if item.strip()
         }
-        self.camera_active = bool(
+        initial_active = bool(
             self.declare_bool_parameter('initial_role_active', True)
         )
+        # Three independently-named gates. They happen to share one source
+        # condition today (role membership in active_roles/publish_roles),
+        # but are tracked/logged separately so a FOLLOWER (or any role
+        # outside active_roles) never opens the camera, never uploads a
+        # frame, and never publishes a risk observation -- not even at a
+        # throttled "standby" rate.
+        self.camera_process_enabled = initial_active
+        self.camera_upload_enabled = initial_active
+        self.risk_observation_publish_enabled = (
+            initial_active and self.initial_role in self.publish_roles
+        )
         if not self.enable_role_gating:
-            self.camera_active = True
+            self.camera_process_enabled = True
+            self.camera_upload_enabled = True
+            self.risk_observation_publish_enabled = True
         if self.enable_role_gating and not self.role_topic:
             if self.robot_name:
                 self.role_topic = f'/{self.robot_name}/role'
@@ -179,7 +200,13 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
                     'robot_name/role_topic missing'
                 )
                 self.enable_role_gating = False
-                self.camera_active = True
+                self.camera_process_enabled = True
+                self.camera_upload_enabled = True
+                self.risk_observation_publish_enabled = True
+        # Back-compat alias: capture_loop/http_worker_loop/wait_latest_frame
+        # read camera_process_enabled/camera_upload_enabled directly; this
+        # name is kept only for the startup log line below.
+        self.camera_active = self.camera_process_enabled
 
         self.pub = self.create_publisher(
             String,
@@ -249,7 +276,7 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
 
         self.cv2 = cv2
         self.cap = None
-        if self.camera_active:
+        if self.camera_process_enabled:
             self.open_camera(log_success=False)
 
         self.capture_thread = threading.Thread(
@@ -287,7 +314,10 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             f'role_gating={self.enable_role_gating} role_topic={self.role_topic or "none"} '
             f'pose_topic={self.pose_topic} require_capture_pose={self.require_capture_pose} '
             f'robot_id={self.robot_name or "unknown"} boot_id={self.boot_id} '
-            f'camera_active={self.camera_active} active_roles={sorted(self.active_roles)} '
+            f'camera_process_enabled={self.camera_process_enabled} '
+            f'camera_upload_enabled={self.camera_upload_enabled} '
+            f'risk_observation_publish_enabled={self.risk_observation_publish_enabled} '
+            f'active_roles={sorted(self.active_roles)} '
             f'standby_roles={sorted(self.standby_roles)} '
             f'publish_roles={sorted(self.publish_roles)} '
             f'latest_frame_only=true ros_image_publish=false'
@@ -303,15 +333,26 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         else:
             self.current_role = raw.strip().upper()
         role_name = role.strip().upper()
-        is_active = (
-            role_name in self.active_roles
-            or role_name in self.standby_roles
-            or role_name in self.publish_roles
+        # Only active_roles (ACTIVE_SCOUT/SCOUT/RECOVERING by default) may
+        # open the camera, upload to the YOLO server, or publish a risk
+        # observation. FOLLOWER/IDLE/TAKEOVER_PENDING/RECOVERY_NAVIGATING
+        # get none of the three, even at a throttled rate -- a follower has
+        # no scout authority until it actually takes over.
+        camera_process_enabled = role_name in self.active_roles
+        camera_upload_enabled = camera_process_enabled
+        risk_observation_publish_enabled = role_name in self.publish_roles
+        changed = (
+            camera_process_enabled != self.camera_process_enabled
+            or camera_upload_enabled != self.camera_upload_enabled
+            or risk_observation_publish_enabled != self.risk_observation_publish_enabled
         )
-        if is_active == self.camera_active:
+        if not changed:
             return
-        self.camera_active = is_active
-        if not is_active:
+        self.camera_process_enabled = camera_process_enabled
+        self.camera_upload_enabled = camera_upload_enabled
+        self.risk_observation_publish_enabled = risk_observation_publish_enabled
+        self.camera_active = camera_process_enabled
+        if not camera_process_enabled:
             self.close_camera()
             with self.frame_condition:
                 self.latest_frame = None
@@ -322,7 +363,11 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             with self.frame_condition:
                 self.frame_condition.notify_all()
         self.get_logger().warning(
-            f'OPENCV_CAMERA_ROLE_GATE | role={role} active={self.camera_active} '
+            'OPENCV_CAMERA_ROLE_GATE | '
+            f'role={role} '
+            f'camera_process_enabled={self.camera_process_enabled} '
+            f'camera_upload_enabled={self.camera_upload_enabled} '
+            f'risk_observation_publish_enabled={self.risk_observation_publish_enabled} '
             f'robot={self.robot_name or "unknown"}'
         )
 
@@ -464,7 +509,7 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
 
     def capture_loop(self):
         while not self.stop_threads:
-            if not self.camera_active:
+            if not self.camera_process_enabled:
                 if self.is_camera_open():
                     self.close_camera()
                 time.sleep(0.1)
@@ -541,7 +586,7 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
     def wait_latest_frame(self, next_allowed: float):
         with self.frame_condition:
             while not self.stop_threads:
-                if not self.camera_active:
+                if not self.camera_upload_enabled:
                     self.frame_condition.wait(timeout=0.1)
                     continue
                 now = time.monotonic()
@@ -664,7 +709,7 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
     def http_worker_loop(self):
         next_allowed = 0.0
         while not self.stop_threads:
-            if not self.camera_active:
+            if not self.camera_upload_enabled:
                 time.sleep(0.1)
                 next_allowed = 0.0
                 continue
@@ -869,7 +914,7 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         return True
 
     def _current_role_allows_publish(self) -> bool:
-        return str(self.current_role or '').strip().upper() in self.publish_roles
+        return bool(self.risk_observation_publish_enabled)
 
     def log_periodic(self):
         now = time.time()

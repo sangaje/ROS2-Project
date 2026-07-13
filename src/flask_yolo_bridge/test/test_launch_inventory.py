@@ -45,6 +45,9 @@ def test_camera_sender_has_role_based_rates_and_publish_gate():
     assert 'standby_roles' in node
     assert 'def _current_upload_rate_hz' in node
     assert 'def _current_role_allows_publish' in node
+    assert 'camera_process_enabled' in node
+    assert 'camera_upload_enabled' in node
+    assert 'risk_observation_publish_enabled' in node
     assert "DeclareLaunchArgument('width', default_value='640')" in launch
     assert "DeclareLaunchArgument('height', default_value='480')" in launch
     assert "DeclareLaunchArgument('send_width', default_value='640')" in launch

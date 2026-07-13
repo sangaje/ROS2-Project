@@ -43,6 +43,12 @@ class ActiveScoutPolicyConfig:
     max_tf_age_sec: float
     max_inference_sec: float
     command_timeout_sec: float
+    # Derived, not part of the frozen training contract: how stale the
+    # internal MapSnapshot the RL observation is built from may be before
+    # activation must wait, and how often the heavy confidence-grid/publish
+    # pipeline is allowed to run. See active_scout_config() for the formula.
+    max_observation_snapshot_age_sec: float
+    confidence_update_period_sec: float
     scan_topic: str
     odom_topic: str
     map_topic: str
@@ -224,6 +230,18 @@ def active_scout_config(
         max_tf_age_sec=float(runtime['max_tf_age_sec']),
         max_inference_sec=float(runtime['max_inference_sec']),
         command_timeout_sec=float(runtime['command_timeout_sec']),
+        # Fast observation tick runs at control_dt_sec / map_substeps_per_action
+        # (10 Hz at the frozen v132 values). Allow a handful of missed ticks
+        # before treating the snapshot as stale, floored at 0.6s per the
+        # startup-gate design target, without tying this to max_scan_age_sec.
+        max_observation_snapshot_age_sec=max(
+            0.6,
+            (float(runtime['control_dt_sec']) / int(runtime['map_substeps_per_action'])) * 6.0,
+        ),
+        # Heavy confidence-grid update + external map publish is bounded to
+        # ~2 Hz so it never blocks the fast observation tick from committing
+        # a fresh snapshot every cycle.
+        confidence_update_period_sec=max(0.5, float(runtime['control_dt_sec']) * 2.5),
         scan_topic=str(topics['scan']),
         odom_topic=str(topics.get('odom', '/odom')),
         map_topic=str(topics['map']),

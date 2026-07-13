@@ -354,6 +354,10 @@ class ScoutRLPolicyWorker(Node):
             tf_ready=self.runtime.tf_ready(),
             require_failover_activation=self.require_failover_activation,
             require_localization_ready=self.require_localization_ready,
+            # Raw scan/odom/map freshness (sensor_ready) is not the same as
+            # the derived MapSnapshot the RL policy actually predicts from
+            # being fresh -- see ActiveScoutRLRuntime.observation_ready().
+            observation_ready=self.runtime.observation_ready(),
         )
 
     def _warmup_allowed(self, gate: GateInputs) -> bool:
@@ -402,7 +406,7 @@ class ScoutRLPolicyWorker(Node):
         elif (
             not should_activate
             and self.runtime_active
-            and state == RLWorkerState.WAIT_SENSOR_READY
+            and state in (RLWorkerState.WAIT_SENSOR_READY, RLWorkerState.WAIT_OBSERVATION_READY)
             and self.start_motion
             and (self.system_ready or not self.require_system_ready)
         ):
@@ -451,6 +455,8 @@ class ScoutRLPolicyWorker(Node):
             if not bool(runtime.get('policy_worker_alive', False)):
                 return 'policy_worker_dead'
             return 'observation_not_ready'
+        if state == RLWorkerState.WAIT_OBSERVATION_READY:
+            return 'observation_stale'
         if str(runtime.get('last_stop_reason', '')) == 'inference_timeout':
             return 'inference_timeout'
         if not bool(runtime.get('safety_allowed', True)):
@@ -510,6 +516,10 @@ class ScoutRLPolicyWorker(Node):
             f'final_cmd_linear={float(runtime["final_cmd_linear"]):.3f} '
             f'final_cmd_angular={float(runtime["final_cmd_angular"]):.3f} '
             f'cmd_vel_published={runtime["cmd_vel_published"]} '
+            f'cmd_vel_message_published={runtime["cmd_vel_message_published"]} '
+            f'cmd_vel_nonzero_published={runtime["cmd_vel_nonzero_published"]} '
+            f'last_nonzero_cmd_age_ms={float(runtime["last_nonzero_cmd_age_ms"]):.0f} '
+            f'zero_hold_active={runtime["zero_hold_active"]} '
             f'gate_state={state.value} gate_reason={reason} '
             f'blocking_reason={blocking}'
         )
@@ -609,6 +619,11 @@ class ScoutRLPolicyWorker(Node):
                 f'system_ready={self.system_ready}/{self.require_system_ready} '
                 f'start_motion={self.start_motion}/{self.require_start_motion}'
             )
+        elif state == RLWorkerState.WAIT_OBSERVATION_READY:
+            self.get_logger().warning(
+                f'SCOUT_WAIT_OBSERVATION_READY | robot={self.robot_name} reason={reason} '
+                'raw_sensor_and_tf_ready=true internal_map_snapshot_stale=true'
+            )
         elif state == RLWorkerState.ACTIVE:
             self.get_logger().warning(
                 'RL_ACTIVATION_GATE | '
@@ -666,7 +681,14 @@ class ScoutRLPolicyWorker(Node):
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = ScoutRLPolicyWorker()
-    executor = MultiThreadedExecutor(num_threads=2)
+    # 5 largely-independent callback groups now share this executor: the
+    # node's own default group (role/failover/status subs + gate timer),
+    # the sensor group (scan/odom/map/confidence_seed + watchdog/model_state),
+    # the fast observation tick, the heavy confidence tick, and the policy
+    # tick. Two threads let a slow heavy-tick invocation starve the fast
+    # tick/policy tick of executor time, which is the exact failure mode
+    # this split is meant to eliminate -- give each group real headroom.
+    executor = MultiThreadedExecutor(num_threads=6)
     executor.add_node(node)
     try:
         executor.spin()

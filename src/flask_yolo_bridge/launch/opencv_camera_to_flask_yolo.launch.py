@@ -47,7 +47,7 @@ def generate_launch_description():
         DeclareLaunchArgument('initial_role_active', default_value='true'),
         DeclareLaunchArgument('active_roles', default_value='ACTIVE_SCOUT,SCOUT,RECOVERING'),
         DeclareLaunchArgument('standby_roles', default_value='FOLLOWER,IDLE,TAKEOVER_PENDING'),
-        DeclareLaunchArgument('publish_roles', default_value='ACTIVE_SCOUT,SCOUT,FOLLOWER,RECOVERING'),
+        DeclareLaunchArgument('publish_roles', default_value='ACTIVE_SCOUT,SCOUT,RECOVERING'),
         Node(
             package='flask_yolo_bridge',
             executable='opencv_camera_to_flask_yolo',
