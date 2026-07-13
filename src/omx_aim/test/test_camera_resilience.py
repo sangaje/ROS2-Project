@@ -1,4 +1,7 @@
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 
 def test_omx_camera_uses_v4l2_preflight_and_reconnect_contract():
@@ -53,10 +56,41 @@ def test_aim_reference_can_be_lowered_below_image_center():
         encoding='utf-8'
     )
 
-    assert 'aim_target_offset_y_norm: 0.14' in config_source
+    assert 'aim_target_offset_y_norm: 0.20' in config_source
+    assert 'aim_target_offset_x_norm: 0.08' in config_source
     assert 'def aim_reference_pixel' in detector_source
     assert "getattr(self.cfg.ibvs, 'aim_target_offset_y_norm'" in detector_source
+    assert "getattr(self.cfg.ibvs, 'aim_target_offset_x_norm'" in detector_source
     assert 'self.detector.aim_reference_pixel(w, h)' in node_source
+
+
+def test_aim_reference_offsets_shift_both_axes_and_stay_in_bounds():
+    from omx.yolo_detector import YoloDetector
+
+    detector = YoloDetector.__new__(YoloDetector)
+    detector.cfg = SimpleNamespace(
+        ibvs=SimpleNamespace(
+            aim_target_offset_x_norm=0.08,
+            aim_target_offset_y_norm=0.20,
+        )
+    )
+
+    cx, cy = detector.aim_reference_pixel(1280, 720)
+
+    assert cx == pytest.approx(640.0 + 0.08 * 640.0)
+    assert cy == pytest.approx(360.0 + 0.20 * 360.0)
+
+    # Extreme offsets must clamp inside the frame instead of going negative
+    # or past the far edge.
+    detector.cfg = SimpleNamespace(
+        ibvs=SimpleNamespace(
+            aim_target_offset_x_norm=-5.0,
+            aim_target_offset_y_norm=5.0,
+        )
+    )
+    cx, cy = detector.aim_reference_pixel(1280, 720)
+    assert cx == 0.0
+    assert cy == 719.0
 
 
 def test_runtime_motor_fallback_is_visible_in_status_and_observation():

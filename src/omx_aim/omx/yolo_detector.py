@@ -180,10 +180,14 @@ class YoloDetector:
         """Return the visual-servo reference pixel used for error_norm."""
         cx = float(width) / 2.0
         cy = float(height) / 2.0
+        offset_x = float(getattr(self.cfg.ibvs, 'aim_target_offset_x_norm', 0.0))
         offset_y = float(getattr(self.cfg.ibvs, 'aim_target_offset_y_norm', 0.0))
-        # Offset is normalized by image half-height so it shares the same
-        # units as error_norm.y. Positive means lower on the screen.
+        # Offsets are normalized by image half-width/half-height so they
+        # share the same units as error_norm.x/y. Positive x means further
+        # right, positive y means lower on the screen.
+        cx += offset_x * (float(width) / 2.0)
         cy += offset_y * (float(height) / 2.0)
+        cx = max(0.0, min(float(width) - 1.0, cx))
         cy = max(0.0, min(float(height) - 1.0, cy))
         return cx, cy
 

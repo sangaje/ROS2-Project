@@ -64,6 +64,10 @@ class IbvsConfig:
     # image center, in normalized half-height units. 0.14 is about 50 px on
     # a 720p frame.
     aim_target_offset_y_norm: float = 0.14
+    # Positive values move the visual-servo reference point rightward from
+    # the image center, in normalized half-width units (same convention as
+    # aim_target_offset_y_norm, just for x).
+    aim_target_offset_x_norm: float = 0.0
     camera_device: str = ''
     camera_backend: str = 'v4l2'
     camera_reconnect_period_sec: float = 1.0
