@@ -21,6 +21,18 @@ def test_external_detection_delay_fields_are_tracked():
     assert 'capture_source=' in source
 
 
+def test_new_scout_positive_batch_is_projected_once_even_after_delay():
+    source = (
+        PKG_ROOT
+        / 'bayesian_risk_map'
+        / 'bayesian_risk_map_node.py'
+    ).read_text(encoding='utf-8')
+
+    assert 'process_new_positive_batch' in source
+    assert 'has_new_detection_batch and has_latest_detections' in source
+    assert 'can_reuse_detection or process_new_positive_batch' in source
+
+
 def test_central_risk_bridge_defaults_to_scout_pose():
     source = (
         PKG_ROOT

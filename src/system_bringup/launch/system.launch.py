@@ -634,6 +634,8 @@ def generate_launch_description():
                                 'source_min_value': 0.01,
                                 'positive_memory_alpha': 0.95,
                                 'person_bayes_candidate_power': 0.35,
+                                'detection_timeout_sec': 6.0,
+                                'detection_reuse_max_distance_m': 2.5,
                                 'leader_observation_max_age_sec': 4.0,
                                 'leader_camera_yaw_max_age_sec': 4.0,
                                 'leader_visible_risk_decay_per_sec': 3.5,

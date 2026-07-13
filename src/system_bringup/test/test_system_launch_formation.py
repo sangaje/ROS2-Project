@@ -56,6 +56,9 @@ def test_leader_can_own_risk_map_from_scout_sources():
     assert "'detection_source': 'flask_topic'" in text
     assert "'target_class': '-1'" in text
     assert "'positive_projection_mode': 'range_cone'" in text
+    assert "'detection_timeout_sec': 6.0" in text
+    assert "'detection_reuse_max_distance_m': 2.5" in text
+    assert "'enable_visibility_tracking': True" in text
     assert "'leader_visible_risk_decay_per_sec': 3.5" in text
 
 

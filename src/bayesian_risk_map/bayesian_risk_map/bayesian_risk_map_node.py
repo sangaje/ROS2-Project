@@ -3129,12 +3129,18 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             if math.hypot(dx, dy) > max(0.0, self.detection_reuse_max_distance_m):
                 can_reuse_detection = False
 
+        has_latest_detections = bool(latest_detections)
+        process_new_positive_batch = (
+            has_new_detection_batch and has_latest_detections
+        )
         new_detections = list(fake_detections)
-        if has_new_detection_batch and can_reuse_detection:
+        if has_new_detection_batch and (
+            can_reuse_detection or process_new_positive_batch
+        ):
             new_detections.extend(latest_detections)
         currently_detecting_person = bool(fake_detections) or (
             can_reuse_detection and bool(latest_detections)
-        )
+        ) or process_new_positive_batch
         bayes_positive_candidate = None
 
         if new_detections:
