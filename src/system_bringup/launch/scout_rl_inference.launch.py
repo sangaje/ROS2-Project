@@ -106,13 +106,13 @@ def generate_launch_description():
             'require_video_ready',
             default_value='true',
             choices=['true', 'false'],
-            description='Hold RL movement until the unified dashboard has received every required video stream.',
+            description='Hold RL movement until the leader-owned start_motion latch is true.',
         ),
         DeclareLaunchArgument(
             'require_system_ready',
-            default_value='true',
+            default_value='false',
             choices=['true', 'false'],
-            description='Hold RL movement until the leader-domain /system/ready latch is true.',
+            description='Legacy internal gate; default false because /fleet/start_motion owns motion release.',
         ),
         DeclareLaunchArgument(
             'system_ready_topic',
@@ -121,8 +121,8 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'video_ready_topic',
-            default_value='/fleet/video_ready',
-            description='Latched dashboard video readiness topic.',
+            default_value='/fleet/start_motion',
+            description='Latched leader-owned final motion permission topic.',
         ),
         DeclareLaunchArgument(
             'cmd_vel_topic',

@@ -19,6 +19,11 @@ def test_dashboard_publishes_latched_video_ready_after_all_streams_arrive():
 
     assert "video_ready_topic" in source
     assert "self.video_ready_pub" in source
+    assert "start_motion_topic" in source
+    assert "self.start_motion_pub" in source
+    assert "readiness_detail_topic" in source
+    assert "self.readiness_detail_pub" in source
+    assert "self._publish_start_motion(False" in source
     assert "DurabilityPolicy.TRANSIENT_LOCAL" in source
     assert "raw_frames" in source
     assert "yolo_frames" in source
@@ -35,11 +40,15 @@ def test_dashboard_requires_browser_rendered_panel_manifest():
     ).read_text(encoding='utf-8')
 
     assert "/api/dashboard_readiness" in source
-    assert "dashboard_ui_ready_topic" in source
-    assert "dashboard_readiness_detail_topic" in source
+    assert "dashboard_ui_ready_topic" not in source
+    assert "dashboard_readiness_detail_topic" not in source
+    assert "readiness_detail_topic" in source
     assert "_dashboard_ui_panels_ready" in source
+    assert "rendered" in source
     assert "backend_ready and ui_ready" in source
+    assert "ready and system_ready" in source
     assert "publishDashboardReadiness" in js
+    assert "rendered:" in js
     assert "naturalWidth > 0" in js
     assert "risk_map" in js
     assert "raw_frame_age_sec" in source

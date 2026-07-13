@@ -547,6 +547,7 @@ function imagePanelReady(id) {
   const img = document.getElementById(id);
   return {
     loaded: Boolean(img && img.complete && img.naturalWidth > 0 && img.naturalHeight > 0),
+    rendered: Boolean(img && img.complete && img.naturalWidth > 0 && img.naturalHeight > 0),
     placeholder: false,
     version: frameVersions[id] || 0,
     naturalWidth: img ? img.naturalWidth : 0,
@@ -562,6 +563,7 @@ function gridPanelReady(kind) {
     : null;
   return {
     loaded: Boolean(ready && meta && meta.width > 0 && meta.height > 0),
+    rendered: Boolean(ready && meta && meta.width > 0 && meta.height > 0),
     placeholder: !ready,
     version: Math.max(0, seq),
   };
@@ -580,6 +582,7 @@ async function publishDashboardReadiness() {
       risk_map: gridPanelReady('risk'),
       fleet_state: {
         loaded: Array.isArray(latest.robots) && latest.robots.length > 0,
+        rendered: Array.isArray(latest.robots) && latest.robots.length > 0,
         placeholder: false,
         version: Array.isArray(latest.robots) ? latest.robots.length : 0,
         robots: Array.isArray(latest.robots) ? latest.robots.map(r => r.name) : [],

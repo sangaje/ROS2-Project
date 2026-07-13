@@ -72,7 +72,9 @@ class UnifiedFieldRobot(Node):
         self.declare_parameter('localization_ready_topic', '/localization_ready')
         self.declare_parameter('require_localization_ready', True)
         self.declare_parameter('system_ready_topic', '/system/ready')
-        self.declare_parameter('require_system_ready', True)
+        self.declare_parameter('require_system_ready', False)
+        self.declare_parameter('start_motion_topic', '/fleet/start_motion')
+        self.declare_parameter('require_start_motion', True)
         self.declare_parameter('role_command_topic', '/fleet/field_robot_role_cmd')
         self.declare_parameter('fleet_role_topic', '/fleet/scout_role')
         self.declare_parameter('status_topic', '/fleet/field_robot_status')
@@ -80,6 +82,7 @@ class UnifiedFieldRobot(Node):
         self.declare_parameter('active_scout_heartbeat_topic', '/scout/signal')
         self.declare_parameter('navigate_action', '/navigate_to_pose')
         self.declare_parameter('cmd_vel_topic', '/cmd_vel')
+        self.declare_parameter('external_rl_cmd_topic', '/fleet/active_scout_rl_cmd')
         self.declare_parameter('use_stamped_cmd_vel', True)
         self.declare_parameter('amcl_pose_topic', '/amcl_pose')
         self.declare_parameter('odom_topic', '/odom')
@@ -129,6 +132,8 @@ class UnifiedFieldRobot(Node):
         self.require_localization_ready = bool(get('require_localization_ready').value)
         self.system_ready_topic = str(get('system_ready_topic').value)
         self.require_system_ready = bool(get('require_system_ready').value)
+        self.start_motion_topic = str(get('start_motion_topic').value)
+        self.require_start_motion = bool(get('require_start_motion').value)
         self.role_command_topic = str(get('role_command_topic').value)
         self.fleet_role_topic = str(get('fleet_role_topic').value)
         self.status_topic = str(get('status_topic').value)
@@ -136,6 +141,7 @@ class UnifiedFieldRobot(Node):
         self.heartbeat_topic = str(get('active_scout_heartbeat_topic').value)
         self.navigate_action = str(get('navigate_action').value)
         self.cmd_vel_topic = str(get('cmd_vel_topic').value)
+        self.external_rl_cmd_topic = str(get('external_rl_cmd_topic').value)
         self.use_stamped = bool(get('use_stamped_cmd_vel').value)
         self.amcl_pose_topic = str(get('amcl_pose_topic').value)
         self.odom_topic = str(get('odom_topic').value)
@@ -201,6 +207,13 @@ class UnifiedFieldRobot(Node):
             self.cmd_pub = self.create_publisher(TwistStamped, self.cmd_vel_topic, 10)
         else:
             self.cmd_pub = self.create_publisher(Twist, self.cmd_vel_topic, 10)
+        if self.scout_rl_enabled and self.rl_backend == 'external_worker':
+            self.create_subscription(
+                TwistStamped,
+                self.external_rl_cmd_topic,
+                self._on_external_rl_cmd,
+                10,
+            )
 
         self.nav_client = ActionClient(self, NavigateToPose, self.navigate_action)
         self.create_subscription(String, self.role_command_topic, self._on_role_command, latched_qos)
@@ -216,6 +229,10 @@ class UnifiedFieldRobot(Node):
             self.create_subscription(
                 Bool, self.system_ready_topic, self._on_system_ready, latched_qos
             )
+        if self.require_start_motion:
+            self.create_subscription(
+                Bool, self.start_motion_topic, self._on_start_motion, latched_qos
+            )
 
         self.epoch = 0
         self.nav_retry_not_before = -1.0e9
@@ -228,6 +245,7 @@ class UnifiedFieldRobot(Node):
         self.self_pose_wall: Optional[float] = None
         self.localization_ready = False
         self.system_ready = not self.require_system_ready
+        self.start_motion = not self.require_start_motion
         self.last_follow_goal_xy: Optional[tuple[float, float]] = None
         self.last_follow_goal_wall = -1.0e9
         self.pending_follow_goal_xy: Optional[tuple[float, float]] = None
@@ -284,7 +302,8 @@ class UnifiedFieldRobot(Node):
             f'robot={self.robot_name} role={self.role.value} '
             f'nav={self.navigate_action} cmd_vel={self.cmd_vel_topic} '
             f'rl_backend={self.rl_backend} '
-            f'system_gate={self.require_system_ready}:{self.system_ready_topic}'
+            f'system_gate={self.require_system_ready}:{self.system_ready_topic} '
+            f'start_motion_gate={self.require_start_motion}:{self.start_motion_topic}'
         )
         if self.in_process_rl_enabled:
             self.get_logger().warning(
@@ -345,6 +364,26 @@ class UnifiedFieldRobot(Node):
                 f'topic={self.system_ready_topic}'
             )
 
+    def _on_start_motion(self, msg: Bool) -> None:
+        previous = self.start_motion
+        self.start_motion = bool(msg.data)
+        if previous and not self.start_motion:
+            self._deactivate_rl('start_motion_false')
+            self._invalidate_nav_goal('start_motion_false', clear_pending=True)
+            self._set_authority(MotionAuthority.NONE, 'start_motion_false')
+            self._reset_follow_goal_memory()
+            self._publish_command(0.0, 0.0)
+        elif self.start_motion and not previous:
+            self._reset_follow_goal_memory()
+            if self.role == Role.ACTIVE_SCOUT:
+                self._activate_rl()
+        if self.start_motion != previous:
+            self.get_logger().warning(
+                'FIELD_START_MOTION | '
+                f'robot={self.robot_name} ready={self.start_motion} '
+                f'topic={self.start_motion_topic}'
+            )
+
     def _on_amcl(self, msg: PoseWithCovarianceStamped) -> None:
         cov = msg.pose.covariance
         self.xy_cov = max(abs(float(cov[0])), abs(float(cov[7])))
@@ -379,6 +418,12 @@ class UnifiedFieldRobot(Node):
                     self.movement_started = True
             else:
                 self.movement_sample_count = 0
+
+    def _on_external_rl_cmd(self, msg: TwistStamped) -> None:
+        self._publish_rl_command(
+            float(msg.twist.linear.x),
+            float(msg.twist.angular.z),
+        )
 
     def _on_fleet_role(self, msg: String) -> None:
         update = parse_role_message(msg.data, self.robot_name)
@@ -459,6 +504,9 @@ class UnifiedFieldRobot(Node):
 
     def _tick_follow(self) -> None:
         if not self.enable_follow:
+            return
+        if not self._start_motion_allowed():
+            self._log_follow_gate('start_motion_false')
             return
         if getattr(self, 'require_system_ready', False) and not getattr(
             self, 'system_ready', True
@@ -641,6 +689,8 @@ class UnifiedFieldRobot(Node):
         )
 
     def _tick_recovery(self) -> None:
+        if not self._start_motion_allowed():
+            return
         if getattr(self, 'require_system_ready', False) and not getattr(
             self, 'system_ready', True
         ):
@@ -699,6 +749,9 @@ class UnifiedFieldRobot(Node):
         self._enter_role(Role.LOCALIZATION_SPIN, reason='amcl_covariance')
 
     def _tick_spin(self) -> None:
+        if not self._start_motion_allowed():
+            self._publish_twist(0.0)
+            return
         if not self._non_rl_motion_quiesced():
             return
         if not self.spin_command_started:
@@ -776,6 +829,8 @@ class UnifiedFieldRobot(Node):
         self._publish_status()
 
     def _queue_nav_goal(self, pose: PoseStamped, source: str) -> None:
+        if not self._start_motion_allowed():
+            return
         self.nav.request_goal(pose, source)
 
     def _dispatch_pending_nav_goal(self) -> None:
@@ -786,6 +841,8 @@ class UnifiedFieldRobot(Node):
         )
 
     def _nav_source_allowed(self, source: str) -> bool:
+        if not self._start_motion_allowed():
+            return False
         if getattr(self, 'require_system_ready', False) and not getattr(
             self, 'system_ready', True
         ):
@@ -912,6 +969,9 @@ class UnifiedFieldRobot(Node):
         self._enter_role(Role.LOCALIZATION_CHECK, reason='recovery_arrival_verified')
 
     def _activate_rl(self) -> None:
+        if not self._start_motion_allowed():
+            self._deactivate_rl('start_motion_false')
+            return
         allowed, reason = evaluate_backend_activation(BackendGateInputs(
             role=self.role,
             scout_enabled=self.scout_rl_enabled,
@@ -1041,6 +1101,7 @@ class UnifiedFieldRobot(Node):
             'movement_started': self.movement_started,
             'localization_ready': self.localization_ready,
             'system_ready': getattr(self, 'system_ready', True),
+            'start_motion': getattr(self, 'start_motion', True),
             'nav_server_ready': self.nav_client.server_is_ready(),
             'recovery_arrived': self.recovery_arrived,
             'recovery_complete': recovery_complete,
@@ -1076,6 +1137,7 @@ class UnifiedFieldRobot(Node):
             'recovery_complete': recovery_complete,
             'active_scout_ready': active_scout_ready,
             'motion_authority': self.motion_authority.value,
+            'start_motion': getattr(self, 'start_motion', True),
         }, sort_keys=True)
         self.role_pub.publish(role_msg)
 
@@ -1087,6 +1149,7 @@ class UnifiedFieldRobot(Node):
         """
         if (
             self.role != Role.ACTIVE_SCOUT
+            or not self._start_motion_allowed()
             or not authority_allows_nonzero(
                 self.motion_authority, MotionAuthority.ACTIVE_SCOUT_RL
             )
@@ -1100,6 +1163,11 @@ class UnifiedFieldRobot(Node):
         self._publish_command(0.0, angular_z)
 
     def _publish_command(self, linear_x: float, angular_z: float) -> None:
+        if not self._start_motion_allowed() and (
+            abs(float(linear_x)) > 1.0e-9 or abs(float(angular_z)) > 1.0e-9
+        ):
+            linear_x = 0.0
+            angular_z = 0.0
         if self.use_stamped:
             msg = TwistStamped()
             msg.header.stamp = self.get_clock().now().to_msg()
@@ -1112,6 +1180,19 @@ class UnifiedFieldRobot(Node):
             msg.linear.x = float(linear_x)
             msg.angular.z = angular_z
             self.cmd_pub.publish(msg)
+
+    def _start_motion_allowed(self) -> bool:
+        return bool(
+            not getattr(self, 'require_start_motion', False)
+            or getattr(self, 'start_motion', True)
+        )
+
+    def _reset_follow_goal_memory(self) -> None:
+        self.last_follow_goal_xy = None
+        self.pending_follow_goal_xy = None
+        self.first_follow_leader_xy = None
+        self.first_follow_wall = None
+        self.follow_startup_released = False
 
     def _copy_pose(self, pose: PoseStamped) -> PoseStamped:
         msg = PoseStamped()

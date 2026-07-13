@@ -81,7 +81,7 @@ class LeaderShadowFollow(Node):
         self.declare_parameter('follower_robot_name', 'follower21')
         self.declare_parameter('require_localization_ready', True)
         self.declare_parameter('localization_ready_topic', '/localization_ready')
-        self.declare_parameter('require_system_ready', True)
+        self.declare_parameter('require_system_ready', False)
         self.declare_parameter('system_ready_topic', '/system/ready')
         self.declare_parameter('require_video_ready', True)
         self.declare_parameter('video_ready_topic', '/fleet/video_ready')
@@ -232,10 +232,12 @@ class LeaderShadowFollow(Node):
 
         self.goal_pub = self.create_publisher(PoseStamped, self.leader_goal_topic, 10)
         self.cancel_pub = self.create_publisher(Bool, self.leader_cancel_topic, latched_qos)
-        if self.use_stamped_cmd_vel:
-            self.cmd_pub = self.create_publisher(TwistStamped, self.cmd_vel_topic, 10)
-        else:
-            self.cmd_pub = self.create_publisher(Twist, self.cmd_vel_topic, 10)
+        self.cmd_pub = None
+        if self.direct_shadow_cmd_vel:
+            if self.use_stamped_cmd_vel:
+                self.cmd_pub = self.create_publisher(TwistStamped, self.cmd_vel_topic, 10)
+            else:
+                self.cmd_pub = self.create_publisher(Twist, self.cmd_vel_topic, 10)
         self.state_pub = self.create_publisher(String, '/leader_shadow/state', latched_qos)
         self.goal_debug_pub = self.create_publisher(PoseStamped, '/leader_shadow/goal', 10)
         self.scan_state_pub = self.create_publisher(String, '/leader_scan/state', latched_qos)
@@ -826,6 +828,8 @@ class LeaderShadowFollow(Node):
         self.direct_cmd_active = True
 
     def _publish_twist(self, linear_x: float, angular_z: float) -> None:
+        if self.cmd_pub is None:
+            return
         if self.use_stamped_cmd_vel:
             msg = TwistStamped()
             msg.header.stamp = self.get_clock().now().to_msg()

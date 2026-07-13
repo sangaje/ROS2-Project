@@ -38,7 +38,7 @@ def test_waffle_diagnostics_exposes_waiting_localization_state():
     node.dry_run = False
     node.action_client = type('ActionClient', (), {'server_is_ready': lambda self: True})()
     node._localization_ready = lambda: False
-    node._video_ready = lambda: False
+    node._start_motion_ready = lambda: False
     node._amcl_ready = True
     node._pending_goal = object()
     node._goal_accepted = False
@@ -51,18 +51,19 @@ def test_waffle_diagnostics_exposes_waiting_localization_state():
     assert payload['goal_id'] == 42
     assert payload['goal_pending'] is True
     assert payload['localization_ready'] is False
-    assert payload['video_ready'] is False
+    assert payload['start_motion'] is False
 
 
-def test_waffle_nav_waits_for_dashboard_video_ready_before_sending_goals():
+def test_waffle_nav_rejects_goals_before_start_motion():
     source = Path(__file__).parents[1] / 'omx_aim' / 'waffle_node.py'
     text = source.read_text(encoding='utf-8')
 
-    assert "require_video_ready" in text
-    assert "video_ready_topic" in text
-    assert "def on_video_ready" in text
-    assert "def _video_ready" in text
-    assert "dashboard video_ready 준비 전" in text
+    assert "require_start_motion" in text
+    assert "start_motion_topic" in text
+    assert "def on_start_motion" in text
+    assert "def _start_motion_ready" in text
+    assert "WAFFLE_NAV_GOAL_REJECTED_START_MOTION_FALSE" in text
+    assert "start_motion_false" in text
 
 
 def test_yolo_retry_suppresses_all_busy_waffle_states_in_source():

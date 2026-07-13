@@ -58,18 +58,20 @@ def test_system_launch_uses_external_worker_without_in_process_runtime():
     assert "'initial_role_active': 'false'" in text
     assert "'rl_backend': rl_backend_value" in text
     assert "'require_video_ready': require_video_ready.perform(context)" in text
-    assert "'video_ready_topic': video_ready_topic.perform(context)" in text
+    assert "'video_ready_topic': '/fleet/start_motion'" in text
+    assert "'require_system_ready': 'false'" in text
 
 
-def test_system_launch_gates_motion_on_dashboard_video_ready():
+def test_system_launch_gates_motion_on_leader_start_motion():
     text = SYSTEM_LAUNCH.read_text(encoding='utf-8')
 
     assert "'require_video_ready'" in text
     assert "default_value='true'" in text
     assert "'video_ready_topic'" in text
     assert "default_value='/fleet/video_ready'" in text
-    assert "'require_video_ready': launch_bool(" in text
-    assert "'video_ready_topic': video_ready_topic.perform(context)" in text
+    assert "'require_start_motion': require_video_ready.perform(context)" in text
+    assert "'require_start_motion': True" in text
+    assert "'start_motion_topic': '/fleet/start_motion'" in text
 
 
 def test_system_launch_starts_global_readiness_monitor_and_motion_gates():
@@ -79,9 +81,10 @@ def test_system_launch_starts_global_readiness_monitor_and_motion_gates():
     assert "'ready_topic': '/system/ready'" in text
     assert "'readiness_topic': '/system/readiness'" in text
     assert "'detail_topic': '/system/readiness_detail'" in text
-    assert "'require_system_ready': True" in text
+    assert "'require_system_ready': False" in text
     assert "'system_ready_topic': '/system/ready'" in text
-    assert "'require_system_ready': 'true'" in text
+    assert "'require_system_ready': 'false'" in text
+    assert "'readiness_detail_topic': '/fleet/readiness_detail'" in text
 
 
 def test_leader_can_own_risk_map_from_scout_sources():

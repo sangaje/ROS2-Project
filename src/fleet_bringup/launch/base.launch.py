@@ -63,6 +63,8 @@ def generate_launch_description():
     localization_ready_topic = LaunchConfiguration('localization_ready_topic')
     require_system_ready = LaunchConfiguration('require_system_ready')
     system_ready_topic = LaunchConfiguration('system_ready_topic')
+    require_start_motion = LaunchConfiguration('require_start_motion')
+    start_motion_topic = LaunchConfiguration('start_motion_topic')
 
     def make_stack(context):
         process_env = clean_process_environment(domain_id.perform(context))
@@ -142,6 +144,10 @@ def generate_launch_description():
                     require_system_ready.perform(context)
                 ),
                 'system_ready_topic': system_ready_topic.perform(context),
+                'require_start_motion': launch_bool(
+                    require_start_motion.perform(context)
+                ),
+                'start_motion_topic': start_motion_topic.perform(context),
             }],
             env=process_env,
         )
@@ -290,6 +296,17 @@ def generate_launch_description():
             'system_ready_topic',
             default_value='/system/ready',
             description='Latched global startup barrier topic.',
+        ),
+        DeclareLaunchArgument(
+            'require_start_motion',
+            default_value='false',
+            choices=['true', 'false'],
+            description='Drop/cancel goals until the leader-owned motion latch is true.',
+        ),
+        DeclareLaunchArgument(
+            'start_motion_topic',
+            default_value='/fleet/start_motion',
+            description='Latched leader-owned final motion permission topic.',
         ),
         OpaqueFunction(function=make_stack),
     ])

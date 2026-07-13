@@ -28,17 +28,13 @@ def test_real_bridge_directions_and_control_qos(tmp_path):
     assert main['topics']['/fleet/collision_warning']['qos']['durability'] == (
         'transient_local'
     )
-    assert main['topics']['/fleet/video_ready']['type'] == 'std_msgs/msg/Bool'
-    assert main['topics']['/fleet/video_ready']['qos']['durability'] == (
+    assert main['topics']['/fleet/start_motion']['type'] == 'std_msgs/msg/Bool'
+    assert main['topics']['/fleet/start_motion']['qos']['durability'] == (
         'transient_local'
     )
-    assert main['topics']['/system/ready']['type'] == 'std_msgs/msg/Bool'
-    assert main['topics']['/system/ready']['qos']['durability'] == (
-        'transient_local'
-    )
-    assert main['topics']['/system/readiness_detail']['type'] == (
-        'std_msgs/msg/String'
-    )
+    assert main['topics']['/fleet/readiness_detail']['type'] == 'std_msgs/msg/String'
+    assert '/system/ready' not in main['topics']
+    assert '/fleet/dashboard_ui_ready' not in main['topics']
     assert main['topics']['/fleet/robot_poses']['type'] == (
         'geometry_msgs/msg/PoseArray'
     )
@@ -124,13 +120,11 @@ def test_member_bridge_keeps_risk_topics_off_the_default_pose_status_path(tmp_pa
     assert main['topics']['/fleet/coordination_status']['qos']['durability'] == (
         'transient_local'
     )
-    assert main['topics']['/fleet/video_ready']['qos']['durability'] == (
+    assert main['topics']['/fleet/start_motion']['qos']['durability'] == (
         'transient_local'
     )
-    assert main['topics']['/system/ready']['qos']['durability'] == (
-        'transient_local'
-    )
-    assert main['topics']['/system/readiness']['type'] == 'std_msgs/msg/String'
+    assert '/system/ready' not in main['topics']
+    assert '/system/readiness' not in main['topics']
     assert main['topics']['/fleet/robot_poses']['type'] == (
         'geometry_msgs/msg/PoseArray'
     )
@@ -242,9 +236,11 @@ def test_leader_to_pc_bridge_is_visualization_only(tmp_path):
     assert (config['from_domain'], config['to_domain']) == (24, 30)
     assert config['topics']['/map']['qos']['reliability'] == 'reliable'
     assert config['topics']['/map']['qos']['durability'] == 'transient_local'
-    assert config['topics']['/system/ready']['qos']['durability'] == (
+    assert config['topics']['/fleet/start_motion']['qos']['durability'] == (
         'transient_local'
     )
+    assert '/fleet/readiness_detail' in config['topics']
+    assert '/system/ready' not in config['topics']
     assert '/fleet_debug_markers' in config['topics']
     assert '/risk/risk_map' in config['topics']
     assert '/tf' not in config['topics']

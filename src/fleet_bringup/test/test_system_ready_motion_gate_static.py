@@ -12,6 +12,9 @@ def test_pose_to_nav2_drops_goals_before_system_ready():
     assert "system_ready_topic" in source
     assert "NAV2_GOAL_DROPPED_FOR_SYSTEM_NOT_READY" in source
     assert "clear_pending=True" in source
+    assert "require_start_motion" in source
+    assert "START_MOTION_FALSE_NAV2_CANCELLED" in source
+    assert "NAV2_GOAL_DROPPED_FOR_START_MOTION_FALSE" in source
 
 
 def test_fleet_coordinator_drops_not_stashes_goals_before_system_ready():

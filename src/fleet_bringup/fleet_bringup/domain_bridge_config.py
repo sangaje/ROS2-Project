@@ -77,15 +77,11 @@ def risk_topics() -> Dict[str, Dict]:
 
 
 def system_readiness_topics() -> Dict[str, Dict]:
-    """Latched global startup barrier topics owned by the leader domain."""
+    """Latched fleet-wide startup outputs that cross robot domains."""
     latched = qos(durability='transient_local', depth=1)
     return {
-        '/system/ready': topic('std_msgs/msg/Bool', profile=latched),
-        '/system/readiness': topic('std_msgs/msg/String', profile=latched),
-        '/system/readiness_detail': topic('std_msgs/msg/String', profile=latched),
-        '/fleet/dashboard_backend_ready': topic('std_msgs/msg/Bool', profile=latched),
-        '/fleet/dashboard_ui_ready': topic('std_msgs/msg/Bool', profile=latched),
-        '/fleet/dashboard_readiness_detail': topic('std_msgs/msg/String', profile=latched),
+        '/fleet/start_motion': topic('std_msgs/msg/Bool', profile=latched),
+        '/fleet/readiness_detail': topic('std_msgs/msg/String', profile=latched),
     }
 
 

@@ -40,7 +40,7 @@ class ScoutRLPolicyWorker(Node):
         self.declare_parameter('field_robot_status_topic', '/fleet/field_robot_status')
         self.declare_parameter('require_failover_activation', True)
         self.declare_parameter('require_localization_ready', True)
-        self.declare_parameter('require_system_ready', True)
+        self.declare_parameter('require_system_ready', False)
         self.declare_parameter('system_ready_topic', '/system/ready')
         self.declare_parameter('require_video_ready', True)
         self.declare_parameter('video_ready_topic', '/fleet/video_ready')
@@ -199,9 +199,13 @@ class ScoutRLPolicyWorker(Node):
     def _on_video_ready(self, msg: Bool) -> None:
         previous = self.video_ready
         self.video_ready = bool(msg.data)
+        if previous and not self.video_ready and self.runtime_active:
+            self.runtime_active = False
+            self.runtime.deactivate('start_motion_false')
+            self._publish_zero()
         if self.video_ready != previous:
             self.get_logger().warning(
-                'SCOUT_VIDEO_READY | '
+                'SCOUT_START_MOTION | '
                 f'robot={self.robot_name} ready={self.video_ready} '
                 f'topic={self.video_ready_topic}'
             )

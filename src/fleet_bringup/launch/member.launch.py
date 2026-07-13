@@ -301,8 +301,10 @@ def generate_launch_description():
                     'true' if amcl_enabled else 'false'
                 ),
                 'localization_ready_topic': '/localization_ready',
-                'require_system_ready': 'true',
+                'require_system_ready': 'false',
                 'system_ready_topic': '/system/ready',
+                'require_start_motion': 'true',
+                'start_motion_topic': '/fleet/start_motion',
             }.items(),
         )
 

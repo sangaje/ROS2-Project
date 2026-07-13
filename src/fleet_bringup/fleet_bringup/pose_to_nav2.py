@@ -115,6 +115,12 @@ class PoseToNav2Action(Node):
         self.system_ready_topic = self._abs(str(
             _safe_declare(self, 'system_ready_topic', '/system/ready')
         ))
+        self.require_start_motion = bool(
+            _safe_declare(self, 'require_start_motion', False)
+        )
+        self.start_motion_topic = self._abs(str(
+            _safe_declare(self, 'start_motion_topic', '/fleet/start_motion')
+        ))
         cancel_topic = str(_safe_declare(self, 'cancel_topic', '')).strip()
         self.cancel_topic = self._abs(cancel_topic) if cancel_topic else ''
 
@@ -135,6 +141,7 @@ class PoseToNav2Action(Node):
         )
         self.localization_ready = False
         self.system_ready = not self.require_system_ready
+        self.start_motion = not self.require_start_motion
         if self.require_localization_ready:
             latched_qos = QoSProfile(
                 depth=1,
@@ -159,6 +166,19 @@ class PoseToNav2Action(Node):
                 Bool,
                 self.system_ready_topic,
                 self._on_system_ready,
+                latched_qos,
+            )
+        if self.require_start_motion:
+            latched_qos = QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                history=HistoryPolicy.KEEP_LAST,
+            )
+            self.create_subscription(
+                Bool,
+                self.start_motion_topic,
+                self._on_start_motion,
                 latched_qos,
             )
         if self.cancel_topic:
@@ -204,6 +224,8 @@ class PoseToNav2Action(Node):
             f'localization_ready_topic={self.localization_ready_topic} '
             f'require_system_ready={self.require_system_ready} '
             f'system_ready_topic={self.system_ready_topic} '
+            f'require_start_motion={self.require_start_motion} '
+            f'start_motion_topic={self.start_motion_topic} '
             f'cancel_topic={self.cancel_topic or "disabled"}'
         )
 
@@ -222,6 +244,13 @@ class PoseToNav2Action(Node):
             self.get_logger().warn(
                 'NAV2_GOAL_DROPPED_FOR_SYSTEM_NOT_READY | '
                 f'topic={self.goal_pose_topic} system_ready={self.system_ready_topic}',
+                throttle_duration_sec=2.0,
+            )
+            return
+        if self.require_start_motion and not self.start_motion:
+            self.get_logger().warn(
+                'NAV2_GOAL_DROPPED_FOR_START_MOTION_FALSE | '
+                f'topic={self.goal_pose_topic} start_motion={self.start_motion_topic}',
                 throttle_duration_sec=2.0,
             )
             return
@@ -276,6 +305,24 @@ class PoseToNav2Action(Node):
             self.get_logger().warn(
                 'SYSTEM_NOT_READY_NAV2_CANCELLED | '
                 f'topic={self.system_ready_topic} pending_goals_dropped=true'
+            )
+
+    def _on_start_motion(self, msg: Bool) -> None:
+        previous = self.start_motion
+        self.start_motion = bool(msg.data)
+        if self.start_motion and not previous:
+            self.get_logger().warn(
+                f'START_MOTION_FOR_NAV2_GOALS | topic={self.start_motion_topic}'
+            )
+            self.retry_not_before = -1.0e9
+        elif previous and not self.start_motion:
+            self._invalidate_inflight(
+                cause='start_motion_false',
+                clear_pending=True,
+            )
+            self.get_logger().warn(
+                'START_MOTION_FALSE_NAV2_CANCELLED | '
+                f'topic={self.start_motion_topic} pending_goals_dropped=true'
             )
 
     def _on_cancel(self, msg: Bool) -> None:
@@ -359,6 +406,8 @@ class PoseToNav2Action(Node):
         if self._nav2_lifecycle_blocks_send(now):
             return
         if self._system_ready_blocks_send(now):
+            return
+        if self._start_motion_blocks_send(now):
             return
         if self._localization_blocks_send(now):
             return
@@ -446,6 +495,18 @@ class PoseToNav2Action(Node):
             self.get_logger().warn(
                 'NAV2_GOAL_DROPPED_FOR_SYSTEM_READY | '
                 f'waiting for {self.system_ready_topic}=true'
+            )
+            self.last_wait_log_time = now
+        return True
+
+    def _start_motion_blocks_send(self, now: float) -> bool:
+        if not self.require_start_motion or self.start_motion:
+            return False
+        self.pending_goal = None
+        if now - self.last_wait_log_time >= 5.0:
+            self.get_logger().warn(
+                'NAV2_GOAL_DROPPED_FOR_START_MOTION | '
+                f'waiting for {self.start_motion_topic}=true'
             )
             self.last_wait_log_time = now
         return True

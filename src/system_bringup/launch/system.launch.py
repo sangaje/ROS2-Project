@@ -500,8 +500,10 @@ def generate_launch_description():
                         'self_pose_topic': self_pose_topic,
                         'require_localization_ready': not scout_owns_slam,
                         'localization_ready_topic': '/localization_ready',
-                        'require_system_ready': True,
+                        'require_system_ready': False,
                         'system_ready_topic': '/system/ready',
+                        'require_start_motion': True,
+                        'start_motion_topic': '/fleet/start_motion',
                         'follow_distance_m': 0.70,
                         'follow_goal_period_sec': 1.0,
                         'follow_goal_update_distance_m': 0.30,
@@ -519,6 +521,7 @@ def generate_launch_description():
                         'settle_duration_sec': 3.0,
                         'max_spin_retries': 3,
                         'cmd_vel_topic': DEFAULT_CMD_VEL_TOPIC,
+                        'external_rl_cmd_topic': '/fleet/active_scout_rl_cmd',
                         'use_stamped_cmd_vel': True,
                     }],
                     env=process_env,
@@ -554,10 +557,10 @@ def generate_launch_description():
                                 'false' if scout_owns_slam else 'true'
                             ),
                             'require_video_ready': require_video_ready.perform(context),
-                            'video_ready_topic': video_ready_topic.perform(context),
-                            'require_system_ready': 'true',
+                            'video_ready_topic': '/fleet/start_motion',
+                            'require_system_ready': 'false',
                             'system_ready_topic': '/system/ready',
-                            'cmd_vel_topic': DEFAULT_CMD_VEL_TOPIC,
+                            'cmd_vel_topic': '/fleet/active_scout_rl_cmd',
                             'use_stamped_cmd_vel': 'true',
                             'enable_velocity_safety_filter': 'true',
                         }.items(),
@@ -877,8 +880,8 @@ def generate_launch_description():
                             omx_camera_reconnect_period_sec.perform(context)
                         ),
                         'omx_camera_required': omx_camera_required.perform(context),
-                        'require_video_ready': require_video_ready.perform(context),
-                        'video_ready_topic': video_ready_topic.perform(context),
+                        'require_start_motion': require_video_ready.perform(context),
+                        'start_motion_topic': '/fleet/start_motion',
                         'start_patrol_planner': (
                             start_patrol_planner.perform(context)
                         ),
@@ -937,8 +940,8 @@ def generate_launch_description():
                             'require_video_ready': launch_bool(
                                 require_video_ready.perform(context)
                             ),
-                            'video_ready_topic': video_ready_topic.perform(context),
-                            'require_system_ready': True,
+                            'video_ready_topic': '/fleet/start_motion',
+                            'require_system_ready': False,
                             'system_ready_topic': '/system/ready',
                             'scout_pose_timeout_sec': float(
                                 scout_pose_timeout_sec.perform(context)
@@ -1040,6 +1043,9 @@ def generate_launch_description():
                         'member_nav_path_topic': '/member_plan',
                         'omx_waypoint_route_topic': '/omx/waypoint_route',
                         'video_ready_topic': video_ready_topic.perform(context),
+                        'start_motion_topic': '/fleet/start_motion',
+                        'readiness_detail_topic': '/fleet/readiness_detail',
+                        'system_ready_topic': '/system/ready',
                         'video_ready_max_age_sec': 3.0,
                     }],
                     env=process_env,
@@ -1601,9 +1607,8 @@ def generate_launch_description():
             default_value='true',
             choices=['true', 'false'],
             description=(
-                'Hold Scout RL, leader shadow motion, and OMX Waffle Nav2 '
-                'until the unified dashboard has received the required '
-                'video streams.'
+                'Require dashboard/video readiness before publishing the '
+                'leader-owned /fleet/start_motion motion barrier.'
             ),
         ),
         DeclareLaunchArgument(

@@ -488,6 +488,10 @@ def generate_launch_description():
                         'use_sim_time': simulation,
                         'goal_pose_topic': '/fleet/leader_coord_goal',
                         'cancel_topic': '/fleet/leader_nav_cancel',
+                        'require_system_ready': False,
+                        'system_ready_topic': '/system/ready',
+                        'require_start_motion': True,
+                        'start_motion_topic': '/fleet/start_motion',
                     }],
                     env=process_env,
                 ),
@@ -523,8 +527,10 @@ def generate_launch_description():
                         'true' if not cartographer_owned else 'false'
                     ),
                     'localization_ready_topic': '/localization_ready',
-                    'require_system_ready': 'true',
+                    'require_system_ready': 'false',
                     'system_ready_topic': '/system/ready',
+                    'require_start_motion': 'true',
+                    'start_motion_topic': '/fleet/start_motion',
                 }.items(),
             )
 
