@@ -114,7 +114,7 @@ def launch_setup(context, *args, **kwargs):
         arguments=yolo_args,
         parameters=[{
             'waffle_frame_candidates': ['base_link', 'base_footprint'],
-            'require_localization_ready': True,
+            'require_localization_ready': False,
             'localization_ready_topic': '/localization_ready',
         }],
         additional_env=_with_virtualenv_site_packages({
@@ -143,7 +143,7 @@ def launch_setup(context, *args, **kwargs):
                 # gate on a separately-computed AMCL covariance check here,
                 # or the two can disagree.
                 'require_amcl_ready': False,
-                'require_localization_ready': True,
+                'require_localization_ready': False,
                 'localization_ready_topic': '/localization_ready',
                 'max_pending_goal_age_sec': 300.0,
                 'goal_ack_timeout_sec': 5.0,
@@ -199,6 +199,18 @@ def launch_setup(context, *args, **kwargs):
             ),
             'max_candidate_cells': int(
                 LaunchConfiguration('patrol_max_candidate_cells').perform(context)
+            ),
+            'view_standoff_distance_m': float(
+                LaunchConfiguration('patrol_view_standoff_distance_m').perform(context)
+            ),
+            'view_candidate_count': int(
+                LaunchConfiguration('patrol_view_candidate_count').perform(context)
+            ),
+            'require_clear_view': _is_true(
+                LaunchConfiguration('patrol_require_clear_view').perform(context)
+            ),
+            'publish_period_sec': float(
+                LaunchConfiguration('patrol_publish_period_sec').perform(context)
             ),
         }],
     )
@@ -289,7 +301,7 @@ def generate_launch_description():
             'patrol_planner_delay_sec', default_value='6.0',
             description='Small grace before starting patrol_planner.'),
         DeclareLaunchArgument(
-            'patrol_min_risk', default_value='40',
+            'patrol_min_risk', default_value='8',
             description='Absolute 0-100 risk cutoff for patrol candidate extraction.'),
         DeclareLaunchArgument(
             'patrol_relative_threshold_ratio', default_value='0.55',
@@ -300,6 +312,19 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'patrol_max_candidate_cells', default_value='2000',
             description='Maximum top-risk cells evaluated by patrol_planner NMS per cycle.'),
+        DeclareLaunchArgument(
+            'patrol_view_standoff_distance_m', default_value='1.2',
+            description='Nav2 standoff distance from each risk hotspot so OMX can look at it.'),
+        DeclareLaunchArgument(
+            'patrol_view_candidate_count', default_value='16',
+            description='Number of radial free-cell candidates around each risk hotspot.'),
+        DeclareLaunchArgument(
+            'patrol_require_clear_view', default_value='true',
+            choices=['true', 'false'],
+            description='Require line-of-sight from patrol goal to the risk hotspot.'),
+        DeclareLaunchArgument(
+            'patrol_publish_period_sec', default_value='3.0',
+            description='How often risk patrol goals are refreshed.'),
         DeclareLaunchArgument(
             'debug_stream', default_value='true',
             description='yolo_node 의 Flask MJPEG 디버그 스트림 켜기'),

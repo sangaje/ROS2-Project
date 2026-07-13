@@ -52,7 +52,11 @@ def test_leader_can_own_risk_map_from_scout_sources():
     assert 'include_risk_outputs=not launch_bool' in text
     assert "package='bayesian_risk_map'" in text
     assert "'pose_topic': scout_pose_topic.perform(context)" in text
+    assert "'map_qos_durability': 'transient_local'" in text
     assert "'detection_source': 'flask_topic'" in text
+    assert "'target_class': '-1'" in text
+    assert "'positive_projection_mode': 'range_cone'" in text
+    assert "'leader_visible_risk_decay_per_sec': 3.5" in text
 
 
 def test_scout_can_run_cartographer_without_local_risk_map():

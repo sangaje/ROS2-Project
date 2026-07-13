@@ -97,6 +97,17 @@ def test_omx_scan_sweep_can_center_on_risk_map():
     assert 'center_yaw_rad: float | None = None' in controller_source
 
 
+def test_jetson_launch_prioritizes_risk_patrol_without_localization_gate():
+    launch_source = (
+        Path(__file__).parents[1] / 'launch' / 'jetson.launch.py'
+    ).read_text(encoding='utf-8')
+
+    assert "'require_localization_ready': False" in launch_source
+    assert "'patrol_min_risk', default_value='8'" in launch_source
+    assert "'patrol_publish_period_sec', default_value='3.0'" in launch_source
+    assert "'patrol_view_standoff_distance_m', default_value='1.2'" in launch_source
+
+
 def test_camera_read_exceptions_do_not_kill_omx_loop():
     node_source = (
         Path(__file__).parents[1] / 'omx_aim' / 'yolo_node.py'

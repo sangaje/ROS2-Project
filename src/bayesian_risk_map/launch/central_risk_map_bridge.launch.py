@@ -154,7 +154,7 @@ topics:
             {
                 'use_sim_time': LaunchConfiguration('use_sim_time'),
                 'map_topic': LaunchConfiguration('map_topic'),
-                'map_qos_durability': 'volatile',
+                'map_qos_durability': 'transient_local',
                 'map_frame': LaunchConfiguration('map_frame'),
                 'base_frame': LaunchConfiguration('base_frame'),
                 'pose_source': 'topic',

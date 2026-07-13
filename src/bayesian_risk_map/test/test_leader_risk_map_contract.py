@@ -30,5 +30,6 @@ def test_central_risk_bridge_defaults_to_scout_pose():
 
     assert "'source_pose_topic'" in source
     assert "source_pose_topic.perform(context)" in source
+    assert "'map_qos_durability': 'transient_local'" in source
     assert "DeclareLaunchArgument('source_pose_topic', default_value='/member_pose')" in source
     assert "DeclareLaunchArgument('pose_topic', default_value='/member_pose')" in source
