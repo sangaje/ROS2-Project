@@ -155,6 +155,14 @@ class LeaderUnifiedDashboard(Node):
         self.robot_stale_timeout_sec = float(_declare(self, 'robot_stale_timeout_sec', 3.0))
         self.map_stale_timeout_sec = float(_declare(self, 'map_stale_timeout_sec', 30.0))
         self.risk_stale_timeout_sec = float(_declare(self, 'risk_stale_timeout_sec', 10.0))
+        self.cmd_vel_topic = str(_declare(self, 'cmd_vel_topic', '/cmd_vel'))
+        self.cmd_vel_topic_type = str(
+            _declare(self, 'cmd_vel_topic_type', 'geometry_msgs/msg/TwistStamped')
+        ).strip()
+        self.cmd_vel_nav_topic = str(_declare(self, 'cmd_vel_nav_topic', '/cmd_vel_nav'))
+        self.cmd_vel_nav_topic_type = str(
+            _declare(self, 'cmd_vel_nav_topic_type', 'geometry_msgs/msg/TwistStamped')
+        ).strip()
 
         self._lock = threading.RLock()
         self._grids: Dict[str, Dict[str, Any]] = {
@@ -288,9 +296,18 @@ class LeaderUnifiedDashboard(Node):
         self.create_subscription(String, '/omx/fire_status', lambda msg: self._set_omx('fire_status', msg.data, '/omx/fire_status', 'std_msgs/msg/String'), 10)
         self.create_subscription(Bool, '/omx/fire_disable', lambda msg: self._set_omx('fire_disabled', bool(msg.data), '/omx/fire_disable', 'std_msgs/msg/Bool'), 10)
         self.create_subscription(Point, '/omx/error_norm', self._on_aim_error, 10)
-        self.create_subscription(Twist, '/cmd_vel', self._on_cmd_vel, 10)
-        self.create_subscription(TwistStamped, '/cmd_vel', self._on_cmd_vel_stamped, 10)
-        self.create_subscription(TwistStamped, '/cmd_vel_nav', self._on_cmd_vel_nav_stamped, 10)
+        if self.cmd_vel_topic_type == 'geometry_msgs/msg/Twist':
+            self.create_subscription(Twist, self.cmd_vel_topic, self._on_cmd_vel, 10)
+        else:
+            self.create_subscription(
+                TwistStamped, self.cmd_vel_topic, self._on_cmd_vel_stamped, 10
+            )
+        if self.cmd_vel_nav_topic_type == 'geometry_msgs/msg/Twist':
+            self.create_subscription(Twist, self.cmd_vel_nav_topic, self._on_cmd_vel_nav, 10)
+        else:
+            self.create_subscription(
+                TwistStamped, self.cmd_vel_nav_topic, self._on_cmd_vel_nav_stamped, 10
+            )
         self.create_subscription(Empty, '/omx/fire', lambda msg: self._on_empty_event('fire'), 10)
         self.create_subscription(Empty, '/omx/nav_cancel', lambda msg: self._on_empty_event('nav_cancel'), 10)
         self.create_subscription(Empty, '/omx/patrol_complete', lambda msg: self._on_empty_event('patrol_complete'), 10)
@@ -963,6 +980,15 @@ class LeaderUnifiedDashboard(Node):
             value,
             '/cmd_vel_nav',
             'geometry_msgs/msg/TwistStamped',
+        )
+
+    def _on_cmd_vel_nav(self, msg: Twist) -> None:
+        value = self._cmd_vel_value(msg)
+        self._set_omx(
+            'leader_cmd_vel_nav',
+            value,
+            self.cmd_vel_nav_topic,
+            'geometry_msgs/msg/Twist',
         )
 
     def _on_empty_event(self, key: str) -> None:

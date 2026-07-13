@@ -245,8 +245,10 @@ class LeaderShadowFollow(Node):
         self.create_subscription(PoseStamped, self.follower_pose_topic, self._on_follower_scout_pose, 20)
         self.create_subscription(Path, self.leader_path_topic, self._on_path, 10)
         self.create_subscription(Odometry, self.odom_topic, self._on_odom, 10)
-        self.create_subscription(TwistStamped, self.cmd_vel_topic, self._on_cmd_vel_stamped, 10)
-        self.create_subscription(Twist, self.cmd_vel_topic, self._on_cmd_vel, 10)
+        if self.use_stamped_cmd_vel:
+            self.create_subscription(TwistStamped, self.cmd_vel_topic, self._on_cmd_vel_stamped, 10)
+        else:
+            self.create_subscription(Twist, self.cmd_vel_topic, self._on_cmd_vel, 10)
         self.create_subscription(OccupancyGrid, self.map_topic, self._on_map, map_qos)
         self.create_subscription(String, self.failover_state_topic, self._on_failover_state, latched_qos)
         self.create_subscription(String, self.active_scout_id_topic, self._on_active_scout_id, latched_qos)
