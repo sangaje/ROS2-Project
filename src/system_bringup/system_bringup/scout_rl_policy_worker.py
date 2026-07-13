@@ -1,38 +1,147 @@
 #!/usr/bin/env python3
-"""Standalone ACTIVE_SCOUT policy process with failover activation gates."""
+"""Minimal ACTIVE_SCOUT SAC worker.
+
+This worker is deliberately small.  It does not wait for Nav2, localization,
+TF, dashboard readiness, failover recovery, or the old heavyweight confidence
+pipeline.  It loads the frozen SAC checkpoint, builds a valid observation from
+the latest LaserScan plus the latest SLAM map, derives/publishes a lightweight
+confidence map, and publishes the resulting velocity command directly to
+/cmd_vel.
+"""
 
 from __future__ import annotations
 
-import json
-import os
+import math
+import threading
 import time
-from dataclasses import replace
+import traceback
 from typing import Optional
 
+import numpy as np
 import rclpy
 from geometry_msgs.msg import Twist, TwistStamped
+from nav_msgs.msg import OccupancyGrid
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool, String
 
-from .rl_activation_gate import GateInputs, RLWorkerState, evaluate_activation_gate
-from .rl_policy_contract import active_scout_config
-from .role_contract import RoleMessage, parse_epoch, parse_role_message
-from .scout_rl_runtime import ActiveScoutRLRuntime
+from turtlebot3_rl_training.observation import (
+    LidarPreprocessorConfig,
+    build_exploration_observation,
+)
+
+from .rl_policy_contract import active_scout_config, load_deployment_model, probe_checkpoint
+from .role_contract import RoleMessage, parse_role_message
 
 
-# Compatibility import surface for existing direct callers.  The canonical
-# parser now lives next to the field-robot role contract.
 RoleUpdate = RoleMessage
 parse_role_update = parse_role_message
 
 
 class ScoutRLPolicyWorker(Node):
-    """Run deterministic RL only after failover ownership is fully settled."""
+    """Run the deployment policy with only the checks needed to publish."""
 
     def __init__(self) -> None:
         super().__init__('scout_rl_policy_worker')
+        self._declare_compatible_parameters()
+        get = self.get_parameter
+
+        self.robot_name = str(get('robot_name').value).strip() or 'scout'
+        self.role_topic = str(get('role_topic').value).strip() or f'/{self.robot_name}/role'
+        self.cmd_vel_topic = str(get('cmd_vel_topic').value).strip() or '/cmd_vel'
+        self.config = active_scout_config()
+        self.map_topic = str(get('map_topic').value).strip() or self.config.map_topic
+        self.confidence_map_topic = str(get('confidence_map_topic').value).strip()
+        self.use_stamped = bool(get('use_stamped_cmd_vel').value)
+        self.direct_rl_start = bool(get('direct_rl_start').value)
+        self.require_system_ready = bool(get('require_system_ready').value)
+        self.system_ready_topic = str(get('system_ready_topic').value).strip()
+        self.emergency_stop_distance_m = max(
+            0.0, float(get('emergency_stop_distance_m').value)
+        )
+
+        self.lidar = LidarPreprocessorConfig(
+            canonical_front_zero=self.config.lidar.canonical_front_zero,
+            front_index=self.config.lidar.front_index,
+            angle_offset_deg=self.config.lidar.angle_offset_deg,
+            flip_lr=self.config.lidar.flip_lr,
+            uniform_angle_resample=self.config.lidar.uniform_angle_resample,
+            median_kernel=self.config.lidar.median_kernel,
+            lowpass_kernel=self.config.lidar.lowpass_kernel,
+            obstacle_margin_m=self.config.lidar.obstacle_margin_m,
+        )
+
+        self.model = None
+        self.model_error = ''
+        self.model_loading = True
+        self.model_load_started = time.monotonic()
+        self.role_active = bool(get('initial_role_active').value) or self.direct_rl_start
+        self.system_ready = not self.require_system_ready
+        self.latest_scan: Optional[LaserScan] = None
+        self.latest_scan_at = 0.0
+        self.latest_map: Optional[OccupancyGrid] = None
+        self.latest_map_at = 0.0
+        self.latest_confidence_grid: Optional[np.ndarray] = None
+        self.previous_action = np.zeros(2, dtype=np.float32)
+        self.history_vector: list[np.ndarray] = []
+        self.history_map: list[np.ndarray] = []
+        self.predict_count = 0
+        self.publish_count = 0
+        self.first_command_logged = False
+        self.last_wait_log_at = 0.0
+
+        if self.use_stamped:
+            self.cmd_pub = self.create_publisher(TwistStamped, self.cmd_vel_topic, 10)
+        else:
+            self.cmd_pub = self.create_publisher(Twist, self.cmd_vel_topic, 10)
+        self.confidence_pub = self.create_publisher(
+            OccupancyGrid,
+            self.confidence_map_topic,
+            1,
+        )
+
+        latched_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+        self.create_subscription(String, self.role_topic, self._on_role, latched_qos)
+        self.create_subscription(
+            LaserScan,
+            self.config.scan_topic,
+            self._on_scan,
+            qos_profile_sensor_data,
+        )
+        map_qos = QoSProfile(
+            depth=1,
+            history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self.create_subscription(OccupancyGrid, self.map_topic, self._on_map, map_qos)
+        if self.require_system_ready:
+            self.create_subscription(Bool, self.system_ready_topic, self._on_system_ready, latched_qos)
+
+        self.create_timer(self.config.control_dt_sec, self._policy_tick)
+        self.create_timer(1.0, self._status_tick)
+        self.create_timer(1.0, self._publish_confidence_map)
+        self._start_model_loader()
+
+        self.get_logger().warning(
+            'SCOUT_RL_MINIMAL_WORKER_READY | '
+            f'robot={self.robot_name} role_active={self.role_active} '
+            f'cmd_vel={self.cmd_vel_topic} stamped={self.use_stamped} '
+            f'scan_topic={self.config.scan_topic} '
+            f'map_topic={self.map_topic} confidence_topic={self.confidence_map_topic} '
+            f'checkpoint={self.config.checkpoint} '
+            f'direct_rl_start={self.direct_rl_start} '
+            f'emergency_stop_distance_m={self.emergency_stop_distance_m:.2f}'
+        )
+
+    def _declare_compatible_parameters(self) -> None:
         self.declare_parameter('robot_name', 'scout22')
         self.declare_parameter('role_topic', '')
         self.declare_parameter('initial_role_active', False)
@@ -45,1022 +154,334 @@ class ScoutRLPolicyWorker(Node):
         self.declare_parameter('require_localization_ready', True)
         self.declare_parameter('require_system_ready', False)
         self.declare_parameter('system_ready_topic', '/system/ready')
-        self.declare_parameter('require_start_motion', True)
+        self.declare_parameter('require_start_motion', False)
         self.declare_parameter('start_motion_topic', '/fleet/start_motion')
         self.declare_parameter('direct_rl_start', True)
         self.declare_parameter('motion_readiness_detail_topic', '/fleet/scout_motion_ready_detail')
         self.declare_parameter('motion_release_stable_sec', 0.0)
         self.declare_parameter('startup_sensor_max_age_sec', 2.0)
-        # Backward-compatible names accepted by old launch files. They no
-        # longer control the final motion barrier.
-        self.declare_parameter('require_video_ready', True)
+        self.declare_parameter('require_video_ready', False)
         self.declare_parameter('video_ready_topic', '/fleet/start_motion')
         self.declare_parameter('cmd_vel_topic', '/cmd_vel')
+        self.declare_parameter('map_topic', '')
+        self.declare_parameter('confidence_map_topic', '/rl_confidence_map')
         self.declare_parameter('use_stamped_cmd_vel', True)
-        self.declare_parameter('enable_velocity_safety_filter', True)
+        self.declare_parameter('enable_velocity_safety_filter', False)
         self.declare_parameter('odom_topic', '/odom')
-        self.declare_parameter('max_odom_age_sec', 0.8)
+        self.declare_parameter('max_odom_age_sec', 2.0)
+        self.declare_parameter('emergency_stop_distance_m', 0.20)
 
-        get = self.get_parameter
-        self.robot_name = str(get('robot_name').value).strip()
-        self.role_topic = str(get('role_topic').value).strip() or f'/{self.robot_name}/role'
-        initial_active = bool(get('initial_role_active').value)
-        self.failover_state_topic = str(get('failover_state_topic').value)
-        self.active_scout_id_topic = str(get('active_scout_id_topic').value)
-        self.scout_epoch_topic = str(get('scout_epoch_topic').value)
-        self.localization_ready_topic = str(get('localization_ready_topic').value)
-        self.field_robot_status_topic = str(get('field_robot_status_topic').value)
-        self.require_failover_activation = bool(get('require_failover_activation').value)
-        self.require_localization_ready = bool(get('require_localization_ready').value)
-        self.require_system_ready = bool(get('require_system_ready').value)
-        self.system_ready_topic = str(get('system_ready_topic').value)
-        requested_start_motion = bool(get('require_start_motion').value)
-        self.direct_rl_start = bool(get('direct_rl_start').value)
-        self.require_start_motion = bool(requested_start_motion and not self.direct_rl_start)
-        self.start_motion_topic = str(get('start_motion_topic').value).strip()
-        self.motion_readiness_detail_topic = str(
-            get('motion_readiness_detail_topic').value
-        ).strip() or '/fleet/scout_motion_ready_detail'
-        self.motion_release_stable_sec = max(
-            0.0, float(get('motion_release_stable_sec').value)
-        )
-        self.startup_sensor_max_age_sec = max(
-            0.05, float(get('startup_sensor_max_age_sec').value)
-        )
-        legacy_topic = str(get('video_ready_topic').value).strip()
-        if not self.start_motion_topic:
-            self.start_motion_topic = legacy_topic or '/fleet/start_motion'
-        self.require_video_ready = self.require_start_motion
-        self.video_ready_topic = self.start_motion_topic
-        self.cmd_vel_topic = str(get('cmd_vel_topic').value)
-        self.use_stamped = bool(get('use_stamped_cmd_vel').value)
-        self.enable_velocity_safety_filter = bool(
-            get('enable_velocity_safety_filter').value
-        )
-        self.odom_topic = str(get('odom_topic').value).strip() or '/odom'
-        self.max_odom_age_sec = max(0.05, float(get('max_odom_age_sec').value))
+    def _start_model_loader(self) -> None:
+        def load() -> None:
+            self.get_logger().warning(
+                f'SCOUT_MODEL_LOAD_START | model_path={self.config.checkpoint}'
+            )
+            try:
+                model = load_deployment_model()
+                probe_checkpoint(model=model)
+            except Exception as exc:  # noqa: BLE001
+                self.model_error = f'{exc}'
+                self.get_logger().error(
+                    'SCOUT_MODEL_LOAD_FAILED | '
+                    f'error={exc}\n{traceback.format_exc()}'
+                )
+                model = None
+            self.model = model
+            self.model_loading = False
+            elapsed_ms = int((time.monotonic() - self.model_load_started) * 1000.0)
+            self.get_logger().warning(
+                'SCOUT_MODEL_READY_PIPELINE | '
+                f'load_success={model is not None} elapsed_ms={elapsed_ms} '
+                f'error={self.model_error}'
+            )
 
-        self.desired_role = 'ACTIVE_SCOUT' if initial_active else 'IDLE'
-        self.role_epoch = 0
-        self.failover_epoch = 0
-        self.active_scout_id = self.robot_name if initial_active else ''
-        self.failover_state = 'NORMAL_OPERATION'
-        self.localization_ready = False
-        self.system_ready = not self.require_system_ready
-        self.role_localization_ready: Optional[bool] = None
-        self.role_recovery_complete: Optional[bool] = True if initial_active else None
-        self.status_recovery_complete = bool(initial_active)
-        self.nav_goal_inactive = bool(initial_active)
-        self.process_start_mono = time.monotonic()
-        self.global_start_motion = not requested_start_motion
-        self.start_motion = self._local_motion_release()
-        self.video_ready = self.start_motion
-        self.motion_authority = 'NONE'
-        self.worker_state = RLWorkerState.STANDBY
-        self.runtime_active = False
-        self.last_gate_reason = 'startup'
-        self.last_debug_wall = -1.0e9
-        self.last_odom_debug_wall = -1.0e9
-        self.startup_released = False
-        self._motion_ready_since: Optional[float] = None
-        self._startup_events_ms: dict[str, Optional[int]] = {
-            'role_active': 0 if initial_active else None,
-            'active_scout_id': 0 if initial_active else None,
-            'lease_valid': 0 if initial_active else None,
-            'start_motion': 0 if self._local_motion_release() else None,
-            'first_nonzero_cmd': None,
-        }
-        self._last_timeline_log_mono = -1.0e9
-        self._startup_timeout_logged = False
-        self._startup_bottleneck_logged = False
-        self._last_role_update_tuple = (
-            self.desired_role,
-            self.role_epoch,
-            self.active_scout_id,
-            self.role_localization_ready,
-            self.role_recovery_complete,
-        )
-
-        if self.use_stamped:
-            self.cmd_pub = self.create_publisher(TwistStamped, self.cmd_vel_topic, 10)
-        else:
-            self.cmd_pub = self.create_publisher(Twist, self.cmd_vel_topic, 10)
-
-        latched_qos = QoSProfile(
-            depth=1,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
-            history=HistoryPolicy.KEEP_LAST,
-        )
-        self.create_subscription(String, self.role_topic, self._on_role, latched_qos)
-        self.create_subscription(String, self.failover_state_topic, self._on_failover_state, latched_qos)
-        self.create_subscription(String, self.active_scout_id_topic, self._on_active_scout_id, latched_qos)
-        self.create_subscription(String, self.scout_epoch_topic, self._on_scout_epoch, latched_qos)
-        self.create_subscription(Bool, self.localization_ready_topic, self._on_localization_ready, latched_qos)
-        if self.require_system_ready:
-            self.create_subscription(Bool, self.system_ready_topic, self._on_system_ready, latched_qos)
-        if self.require_start_motion:
-            self.create_subscription(Bool, self.start_motion_topic, self._on_start_motion, latched_qos)
-        self.create_subscription(String, self.field_robot_status_topic, self._on_field_status, 10)
-        self.motion_readiness_pub = self.create_publisher(
-            String, self.motion_readiness_detail_topic, latched_qos
-        )
-
-        self.runtime = ActiveScoutRLRuntime(
-            self,
-            self._publish_command,
-            config=replace(
-                active_scout_config(),
-                odom_topic=self.odom_topic,
-                max_odom_age_sec=self.max_odom_age_sec,
-            ),
-            enable_velocity_safety_filter=self.enable_velocity_safety_filter,
-        )
-        # A short but non-aggressive gate rate leaves executor capacity for
-        # scan/map callbacks on the hardware inference Jetson.
-        self.create_timer(0.25, self._evaluate_gate)
-        self.get_logger().warning(
-            'RL_WORKER_READY | '
-            f'robot={self.robot_name} domain={os.environ.get("ROS_DOMAIN_ID", "")} '
-            'backend=external_worker standby=true '
-            f'cmd_topic={self.cmd_vel_topic}'
-        )
-        self.get_logger().warning(
-            'SCOUT_RL_STANDBY | '
-            f'robot={self.robot_name} epoch={self.role_epoch} '
-            f'role_topic={self.role_topic} cmd_vel={self.cmd_vel_topic} '
-            f'initial_active={initial_active} '
-            f'require_failover_activation={self.require_failover_activation} '
-            f'require_system_ready={self.require_system_ready}:{self.system_ready_topic} '
-            f'require_start_motion={self.require_start_motion}:{self.start_motion_topic} '
-            f'direct_rl_start={self.direct_rl_start} '
-            f'motion_readiness_detail_topic={self.motion_readiness_detail_topic} '
-            f'motion_release_stable_sec={self.motion_release_stable_sec:.2f} '
-            f'startup_sensor_max_age_sec={self.startup_sensor_max_age_sec:.2f} '
-            f'requested_start_motion_gate={requested_start_motion} '
-            f'odom_topic={self.odom_topic} max_odom_age_sec={self.max_odom_age_sec:.2f}'
-        )
-
-    def _now(self) -> float:
-        return self.get_clock().now().nanoseconds * 1.0e-9
-
-    def _local_motion_release(self) -> bool:
-        return bool(self.direct_rl_start or not self.require_start_motion or self.global_start_motion)
-
-    def _process_age_ms(self) -> int:
-        return int((time.monotonic() - self.process_start_mono) * 1000.0)
-
-    def _mark_startup_event(self, name: str) -> None:
-        if self._startup_events_ms.get(name) is None:
-            self._startup_events_ms[name] = self._process_age_ms()
+        threading.Thread(target=load, name='scout_rl_model_loader', daemon=True).start()
 
     def _on_role(self, msg: String) -> None:
-        update = parse_role_update(msg.data, self.robot_name)
+        update = parse_role_message(msg.data, self.robot_name)
         if update is None:
-            self.get_logger().warning('SCOUT_RL_ROLE_IGNORED | malformed')
             return
         if update.robot and update.robot != self.robot_name:
             return
-        epoch = self.role_epoch if update.epoch is None else update.epoch
-        if epoch < self.failover_epoch:
+        role = str(getattr(update.role, 'value', update.role)).strip().upper()
+        was_active = self.role_active
+        self.role_active = role == 'ACTIVE_SCOUT'
+        if was_active != self.role_active:
             self.get_logger().warning(
-                'SCOUT_RL_ROLE_IGNORED | '
-                f'stale_epoch={epoch} failover_epoch={self.failover_epoch}'
+                f'SCOUT_RL_ROLE | role={role} active={self.role_active}'
             )
-            return
-        if epoch < self.role_epoch:
-            return
-        next_role = update.role.value
-        next_active_scout_id = (
-            update.active_scout_id
-            if update.active_scout_id is not None
-            else self.active_scout_id
-        )
-        next_tuple = (
-            next_role,
-            epoch,
-            next_active_scout_id,
-            update.localization_ready,
-            update.recovery_complete,
-        )
-        if next_tuple == self._last_role_update_tuple:
-            return
-        self.role_epoch = epoch
-        self.desired_role = next_role
-        self.role_localization_ready = update.localization_ready
-        self.role_recovery_complete = update.recovery_complete
-        self.active_scout_id = next_active_scout_id
-        self._last_role_update_tuple = next_tuple
-        if self.desired_role == 'ACTIVE_SCOUT':
-            self._mark_startup_event('role_active')
-        if self.active_scout_id == self.robot_name:
-            self._mark_startup_event('active_scout_id')
-            self._mark_startup_event('lease_valid')
-        self.get_logger().info(
-            'RL_ROLE_UPDATE | '
-            f'robot={self.robot_name} role={self.desired_role} '
-            f'epoch={self.role_epoch} active_scout={self.active_scout_id or "(unset)"}'
-        )
-        self._evaluate_gate()
-
-    def _on_failover_state(self, msg: String) -> None:
-        self.failover_state = str(msg.data).strip().upper() or 'NORMAL_OPERATION'
-        self._evaluate_gate()
-
-    def _on_active_scout_id(self, msg: String) -> None:
-        active_scout_id = str(msg.data).strip()
-        if active_scout_id == self.active_scout_id:
-            return
-        self.active_scout_id = active_scout_id
-        if self.active_scout_id == self.robot_name:
-            self._mark_startup_event('active_scout_id')
-            self._mark_startup_event('lease_valid')
-        self._evaluate_gate()
-
-    def _on_scout_epoch(self, msg: String) -> None:
-        epoch = parse_epoch(str(msg.data).strip())
-        if epoch is None:
-            return
-        if epoch <= self.failover_epoch:
-            return
-        self.failover_epoch = epoch
-        self._evaluate_gate()
-
-    def _on_localization_ready(self, msg: Bool) -> None:
-        self.localization_ready = bool(msg.data)
-        self._evaluate_gate()
+            if not self.role_active:
+                self._publish_zero()
 
     def _on_system_ready(self, msg: Bool) -> None:
-        previous = self.system_ready
         self.system_ready = bool(msg.data)
-        if previous and not self.system_ready and self.runtime_active:
-            self.runtime_active = False
-            self.runtime.deactivate('system_not_ready')
+        if not self.system_ready:
             self._publish_zero()
-        if self.system_ready != previous:
-            self.get_logger().warning(
-                'SCOUT_SYSTEM_READY | '
-                f'robot={self.robot_name} ready={self.system_ready} '
-                f'topic={self.system_ready_topic}'
-            )
-        self._evaluate_gate()
 
-    def _on_start_motion(self, msg: Bool) -> None:
-        previous = self._local_motion_release()
-        self.global_start_motion = bool(msg.data)
-        self.start_motion = self._local_motion_release()
-        self.video_ready = self.start_motion
-        if previous and not self.start_motion and self.runtime_active:
-            self.runtime_active = False
-            self.runtime.deactivate('start_motion_false')
+    def _on_scan(self, msg: LaserScan) -> None:
+        self.latest_scan = msg
+        self.latest_scan_at = time.monotonic()
+
+    def _on_map(self, msg: OccupancyGrid) -> None:
+        if int(msg.info.width) <= 0 or int(msg.info.height) <= 0:
+            return
+        if len(msg.data) != int(msg.info.width) * int(msg.info.height):
+            return
+        self.latest_map = msg
+        self.latest_map_at = time.monotonic()
+        self.latest_confidence_grid = self._confidence_from_map(msg)
+
+    def _policy_tick(self) -> None:
+        if not self._motion_allowed():
+            self._wait_log(self._blocking_reason())
             self._publish_zero()
-        if self._local_motion_release() != previous:
-            if self.start_motion:
-                self._mark_startup_event('start_motion')
-            self.get_logger().warning(
-                'SCOUT_START_MOTION | '
-                f'robot={self.robot_name} global_ready={self.global_start_motion} '
-                f'local_motion_release={self._local_motion_release()} '
-                f'topic={self.start_motion_topic}'
-            )
-        if self._local_motion_release() and not previous:
-            self.startup_released = True
-            self.get_logger().warning(
-                'SCOUT_RL_RESUME_REQUEST | '
-                f'robot={self.robot_name} reason=local_motion_release '
-                'stale_action_dropped=true latest_sensors_retained=true'
-            )
-        self._evaluate_gate()
+            return
+        scan = self.latest_scan
+        if scan is None:
+            self._wait_log('scan_missing')
+            self._publish_zero()
+            return
+        if self.latest_map is None:
+            self._wait_log('map_missing')
+            self._publish_zero()
+            return
+        if time.monotonic() - self.latest_scan_at > self.config.max_scan_age_sec:
+            self._wait_log('scan_stale')
+            self._publish_zero()
+            return
+        if time.monotonic() - self.latest_map_at > self.config.max_map_age_sec:
+            self._wait_log('map_stale')
+            self._publish_zero()
+            return
 
-    def _on_video_ready(self, msg: Bool) -> None:
-        self._on_start_motion(msg)
-
-    def _on_field_status(self, msg: String) -> None:
         try:
-            data = json.loads(msg.data)
-        except (json.JSONDecodeError, TypeError):
-            return
-        if not isinstance(data, dict):
-            return
-        if str(data.get('robot', '')).strip() != self.robot_name:
-            return
-        epoch = parse_epoch(data.get('epoch'))
-        if epoch is not None and epoch < self.failover_epoch:
-            return
-        if epoch is not None and epoch > self.role_epoch:
-            self.role_epoch = epoch
-        status = str(data.get('status', data.get('role', ''))).strip().upper()
-        self.motion_authority = str(data.get('motion_authority', 'NONE')).strip().upper()
-        self.status_recovery_complete = bool(
-            data.get('recovery_complete', False)
-            or data.get('active_scout_ready', False)
-            or status == 'ACTIVE_SCOUT_READY'
-        )
-        active_goal_count = int(data.get('active_goal_count', 0) or 0)
-        pending_goal_count = int(data.get('pending_goal_count', 0) or 0)
-        nav_goal_active = bool(data.get('nav_goal_active', False))
-        self.nav_goal_inactive = (
-            active_goal_count == 0
-            and pending_goal_count == 0
-            and not nav_goal_active
-            and self.motion_authority not in (
-                'FAILOVER_RECOVERY_NAV',
-                'NORMAL_FOLLOW',
-                'LOCALIZATION_SPIN',
-            )
-        )
-        status_localization = (
-            data.get('localization_ready')
-            if isinstance(data.get('localization_ready'), bool) else None
-        )
-        if status_localization is not None:
-            self.localization_ready = status_localization
-        self._evaluate_gate()
-
-    def _build_gate_inputs(self) -> GateInputs:
-        active_scout_matches = self.active_scout_id == self.robot_name
-        if not self.active_scout_id and self.failover_epoch == 0:
-            active_scout_matches = True
-        recovery_complete = bool(
-            self.role_recovery_complete
-            or self.status_recovery_complete
-            or (
-                self.failover_epoch == 0
-                and self.failover_state in ('', 'NORMAL_OPERATION')
-            )
-        )
-        localization_ready = bool(
-            self.localization_ready
-            or (self.role_localization_ready is True)
-        )
-        sensor_ready = self.runtime.sensor_ready()
-        if self.require_system_ready and not self.system_ready:
-            sensor_ready = False
-        return GateInputs(
-            role=self.desired_role,
-            role_robot_matches=True,
-            role_epoch=self.role_epoch,
-            failover_epoch=self.failover_epoch,
-            active_scout_matches=active_scout_matches,
-            failover_state=self.failover_state,
-            localization_ready=localization_ready,
-            recovery_complete=recovery_complete,
-            nav_goal_inactive=self.nav_goal_inactive,
-            motion_authority=self.motion_authority,
-            model_ready=self.runtime.ready,
-            sensor_ready=sensor_ready,
-            tf_ready=self.runtime.tf_ready(),
-            require_failover_activation=self.require_failover_activation,
-            require_localization_ready=self.require_localization_ready,
-            # Raw scan/odom/map freshness (sensor_ready) is not the same as
-            # the derived MapSnapshot the RL policy actually predicts from
-            # being fresh -- see ActiveScoutRLRuntime.observation_ready().
-            observation_ready=self.runtime.observation_ready(),
-        )
-
-    def _warmup_allowed(self, gate: GateInputs) -> bool:
-        role_active = self.desired_role.strip().upper() == 'ACTIVE_SCOUT'
-        if not role_active or not gate.active_scout_matches:
-            return False
-        if self.require_failover_activation and self.role_epoch < self.failover_epoch:
-            return False
-        if self.direct_rl_start:
-            if self.require_system_ready and not self.system_ready:
-                return False
-            return True
-        if self.require_failover_activation and not gate.recovery_complete:
-            return False
-        if self.require_localization_ready and not gate.localization_ready:
-            return False
-        if self.require_system_ready and not self.system_ready:
-            return False
-        return True
-
-    def _direct_rl_gate_state(self, gate: GateInputs) -> tuple[RLWorkerState, str]:
-        """Minimal ACTIVE_SCOUT gate; runtime handles model/sensor waiting."""
-        role_active = self.desired_role.strip().upper() == 'ACTIVE_SCOUT'
-        if not role_active:
-            return RLWorkerState.STANDBY, 'role_not_active_scout'
-        if self.require_failover_activation and self.role_epoch < self.failover_epoch:
-            return RLWorkerState.STANDBY, 'stale_epoch'
-        if self.require_failover_activation and not gate.active_scout_matches:
-            return RLWorkerState.STANDBY, 'active_scout_id_mismatch'
-        if self.require_system_ready and not self.system_ready:
-            return RLWorkerState.WAIT_MOTION_RELEASE, 'system_not_ready'
-        if not self._local_motion_release():
-            return RLWorkerState.WAIT_MOTION_RELEASE, 'start_motion_false'
-        return RLWorkerState.ACTIVE, 'direct_rl_role_ready'
-
-    def _evaluate_gate(self) -> None:
-        if not hasattr(self, 'runtime'):
-            return
-        gate = self._build_gate_inputs()
-        if self._warmup_allowed(gate):
-            self.runtime.warmup('active_scout_startup')
-        if self.direct_rl_start:
-            state, reason = self._direct_rl_gate_state(gate)
-        else:
-            state, reason = evaluate_activation_gate(gate)
-        if state == RLWorkerState.ACTIVE and not self._local_motion_release():
-            state = RLWorkerState.WAIT_MOTION_RELEASE
-            reason = 'startup_not_released' if not self.startup_released else 'start_motion_false'
-        if state == RLWorkerState.ACTIVE and self.require_system_ready and not self.system_ready:
-            state = RLWorkerState.WAIT_MOTION_RELEASE
-            reason = 'system_not_ready'
-        self.last_gate_reason = reason
-        if state != self.worker_state:
-            self.worker_state = state
-            self._log_state_transition(state, reason)
-        should_activate = state == RLWorkerState.ACTIVE
-        if should_activate and not self.runtime_active:
-            self.get_logger().warning(
-                'SCOUT_RL_ACTIVATING | '
-                f'robot={self.robot_name} epoch={self.role_epoch}'
-            )
-            self.runtime_active = True
-            self.runtime.activate()
-            self.get_logger().warning(
-                'SCOUT_RL_ACTIVE | '
-                f'robot={self.robot_name} epoch={self.role_epoch}'
-            )
-        elif (
-            not should_activate
-            and self.runtime_active
-            and state in (RLWorkerState.WAIT_SENSOR_READY, RLWorkerState.WAIT_OBSERVATION_READY)
-            and self._local_motion_release()
-            and (self.system_ready or not self.require_system_ready)
-        ):
-            self.runtime.hold(reason)
-        elif not should_activate and self.runtime_active:
-            self.runtime_active = False
-            self.runtime.deactivate(reason)
-            self._publish_zero()
-        self._log_rl_debug(gate, state, reason)
-        self._publish_motion_readiness(gate, state, reason)
-
-    def _publish_motion_readiness(
-        self,
-        gate: GateInputs,
-        state: RLWorkerState,
-        reason: str,
-    ) -> None:
-        now = self._now()
-        runtime = self.runtime.debug_snapshot()
-        max_age_ms = self.startup_sensor_max_age_sec * 1000.0
-        scan_age_ms = float(runtime.get('scan_age_ms', -1.0))
-        odom_age_ms = float(runtime.get('odom_age_ms', -1.0))
-        map_age_ms = float(runtime.get('map_age_ms', -1.0))
-        role_active = self.desired_role.strip().upper() == 'ACTIVE_SCOUT'
-        lease_valid = bool(
-            gate.active_scout_matches
-            and gate.role_epoch >= gate.failover_epoch
-        )
-        motion_authority_available = bool(
-            gate.nav_goal_inactive
-            and self.motion_authority in ('', 'NONE', 'ACTIVE_SCOUT_RL')
-        )
-        conditions = {
-            'role_active': role_active,
-            'lease_valid': lease_valid,
-            'model_ready': bool(self.runtime.ready),
-            'scan_ready': 0.0 <= scan_age_ms < max_age_ms,
-            'odom_ready': 0.0 <= odom_age_ms < max_age_ms,
-            'map_ready': map_age_ms >= 0.0,
-            'tf_ready': bool(runtime.get('tf_ready', False)),
-            'observation_ready': bool(runtime.get('observation_ready', False)),
-        }
-        minimum_ready = bool(
-            all(conditions.values())
-            and motion_authority_available
-        )
-        if minimum_ready:
-            if self._motion_ready_since is None:
-                self._motion_ready_since = now
-            stable_elapsed_ms = (now - self._motion_ready_since) * 1000.0
-        else:
-            self._motion_ready_since = None
-            stable_elapsed_ms = 0.0
-        release_ready = bool(
-            minimum_ready
-            and stable_elapsed_ms >= self.motion_release_stable_sec * 1000.0
-        )
-        blocking_reason = 'none'
-        for key, ok in conditions.items():
-            if not ok:
-                blocking_reason = key.replace('_ready', '_stale')
-                if key == 'role_active':
-                    blocking_reason = 'role_inactive'
-                elif key == 'lease_valid':
-                    blocking_reason = 'lease_expired'
-                elif key == 'model_ready':
-                    blocking_reason = 'model_not_ready'
-                elif key == 'map_ready':
-                    blocking_reason = 'map_missing'
-                elif key == 'tf_ready':
-                    blocking_reason = 'tf_unavailable'
-                break
-        if blocking_reason == 'none' and not motion_authority_available:
-            blocking_reason = 'motion_authority_unavailable'
-        release_state = (
-            'RELEASED'
-            if self._local_motion_release() else (
-                'STABLE_CHECK' if minimum_ready else 'WAITING'
-            )
-        )
-        payload = {
-            'robot': self.robot_name,
-            'ready': release_ready,
-            'conditions_ready': minimum_ready,
-            'state': release_state,
-            'role': self.desired_role,
-            'active_scout_id': self.active_scout_id,
-            'epoch': self.role_epoch,
-            'failover_epoch': self.failover_epoch,
-            'lease_valid': lease_valid,
-            'motion_authority_available': motion_authority_available,
-            'motion_authority': self.motion_authority,
-            'direct_rl_start': self.direct_rl_start,
-            'global_start_motion': self.global_start_motion,
-            'local_motion_release': self._local_motion_release(),
-            'stable_elapsed_ms': int(stable_elapsed_ms),
-            'stable_required_ms': int(self.motion_release_stable_sec * 1000.0),
-            'blocking_reason': blocking_reason,
-            'gate_state': state.value,
-            'gate_reason': reason,
-            'scan_age_ms': int(scan_age_ms),
-            'odom_age_ms': int(odom_age_ms),
-            'map_age_ms': int(map_age_ms),
-            'map_tick_count': int(runtime.get('map_tick_count', 0) or 0),
-            'snapshot_update_count': int(
-                runtime.get('snapshot_update_count', 0) or 0
-            ),
-            'snapshot_age_ms': int(float(runtime.get('map_snapshot_age_ms', -1.0))),
-            'scan_generation': int(runtime.get('scan_generation', 0) or 0),
-            'odom_generation': int(runtime.get('odom_callback_count', 0) or 0),
-            'map_generation': int(runtime.get('map_generation', 0) or 0),
-            **conditions,
-        }
-        self.motion_readiness_pub.publish(
-            String(data=json.dumps(payload, sort_keys=True))
-        )
-        self._update_startup_timeline(runtime, blocking_reason)
-        ready_count = sum(1 for ok in conditions.values() if ok)
-        self.get_logger().warning(
-            'MOTION_RELEASE_PROGRESS | '
-            f'ready_conditions={ready_count}/{len(conditions)} '
-            f'stable_elapsed_ms={int(stable_elapsed_ms)} '
-            f'blocking_reason={blocking_reason}',
-            throttle_duration_sec=1.0,
-        )
-
-    def _update_startup_timeline(
-        self,
-        runtime: dict[str, object],
-        blocking_reason: str,
-    ) -> None:
-        for runtime_key, event_key in (
-            ('model_ready_at_ms', 'model_ready'),
-            ('first_scan_at_ms', 'first_scan'),
-            ('first_odom_at_ms', 'first_odom'),
-            ('first_map_at_ms', 'first_map'),
-            ('tf_ready_at_ms', 'tf_ready'),
-            ('first_observation_at_ms', 'first_observation'),
-            ('first_predict_at_ms', 'first_predict'),
-            ('first_nonzero_action_at_ms', 'first_nonzero_action'),
-            ('first_nonzero_cmd_at_ms', 'first_nonzero_cmd'),
-        ):
-            value = runtime.get(runtime_key)
-            if isinstance(value, int) and self._startup_events_ms.get(event_key) is None:
-                self._startup_events_ms[event_key] = value
-        now_mono = time.monotonic()
-        if now_mono - self._last_timeline_log_mono < 1.0:
-            return
-        self._last_timeline_log_mono = now_mono
-        events = self._startup_events_ms
-        self.get_logger().warning(
-            'SCOUT_STARTUP_TIMELINE | '
-            f'process_age_ms={self._process_age_ms()} '
-            f'role_active_at_ms={events.get("role_active")} '
-            f'active_scout_id_at_ms={events.get("active_scout_id")} '
-            f'lease_valid_at_ms={events.get("lease_valid")} '
-            f'model_ready_at_ms={events.get("model_ready")} '
-            f'first_scan_at_ms={events.get("first_scan")} '
-            f'first_odom_at_ms={events.get("first_odom")} '
-            f'first_map_at_ms={events.get("first_map")} '
-            f'tf_ready_at_ms={events.get("tf_ready")} '
-            f'first_observation_at_ms={events.get("first_observation")} '
-            f'start_motion_at_ms={events.get("start_motion")} '
-            f'first_predict_at_ms={events.get("first_predict")} '
-            f'first_nonzero_action_at_ms={events.get("first_nonzero_action")} '
-            f'first_nonzero_cmd_at_ms={events.get("first_nonzero_cmd")} '
-            f'current_blocking_reason={blocking_reason}'
-        )
-        self._log_startup_timeout_if_needed(runtime, blocking_reason)
-        self._log_startup_bottleneck_if_ready(blocking_reason)
-
-    def _log_startup_timeout_if_needed(
-        self,
-        runtime: dict[str, object],
-        blocking_reason: str,
-    ) -> None:
-        if self._startup_timeout_logged or self._process_age_ms() < 5000:
-            return
-        if self._startup_events_ms.get('first_predict') is not None:
-            return
-        self._startup_timeout_logged = True
-        missing = [
-            key for key in (
-                'role_active',
-                'active_scout_id',
-                'lease_valid',
-                'model_ready',
-                'first_scan',
-                'first_odom',
-                'first_map',
-                'tf_ready',
-                'first_observation',
-                'start_motion',
-            )
-            if self._startup_events_ms.get(key) is None
-        ]
-        self.get_logger().error(
-            'SCOUT_STARTUP_TIMEOUT | '
-            f'elapsed_sec={self._process_age_ms() / 1000.0:.1f} '
-            f'missing_conditions={missing} '
-            f'last_scan_age_ms={float(runtime.get("scan_age_ms", -1.0)):.0f} '
-            f'last_odom_age_ms={float(runtime.get("odom_age_ms", -1.0)):.0f} '
-            f'last_map_age_ms={float(runtime.get("map_age_ms", -1.0)):.0f} '
-            f'tf_ready={runtime.get("tf_ready")} '
-            f'observation_ready={runtime.get("observation_ready")} '
-            f'blocking_reason={blocking_reason}'
-        )
-
-    def _log_startup_bottleneck_if_ready(self, blocking_reason: str) -> None:
-        if self._startup_bottleneck_logged:
-            return
-        if self._startup_events_ms.get('first_predict') is None:
-            return
-        ordered = [
-            ('role_active', 'role initialization'),
-            ('active_scout_id', 'active scout id'),
-            ('lease_valid', 'lease validation'),
-            ('model_ready', 'model load'),
-            ('first_scan', 'scan receive'),
-            ('first_odom', 'odom receive'),
-            ('first_map', 'map receive'),
-            ('tf_ready', 'TF lookup'),
-            ('first_observation', 'observation snapshot'),
-            ('start_motion', 'motion release'),
-            ('first_predict', 'policy inference'),
-            ('first_nonzero_cmd', 'command publish'),
-        ]
-        last_ms = 0
-        worst_stage = 'startup'
-        worst_delay = 0
-        for key, label in ordered:
-            value = self._startup_events_ms.get(key)
-            if value is None:
-                continue
-            delay = max(0, int(value) - int(last_ms))
-            if delay > worst_delay:
-                worst_delay = delay
-                worst_stage = label
-            last_ms = int(value)
-        self._startup_bottleneck_logged = True
-        self.get_logger().warning(
-            'SCOUT_STARTUP_BOTTLENECK | '
-            f'stage={worst_stage} delay_ms={worst_delay} cause={blocking_reason}'
-        )
-        runtime = self.runtime.debug_snapshot()
-        self.get_logger().warning(
-            'SCOUT_OBSERVATION_MINIMAL_DEBUG | '
-            f'map_tick_count={runtime.get("map_tick_count", 0)} '
-            f'snapshot_update_count={runtime.get("snapshot_update_count", 0)} '
-            f'snapshot_age_ms={float(runtime.get("map_snapshot_age_ms", -1.0)):.0f} '
-            f'scan_generation={runtime.get("scan_generation", 0)} '
-            f'odom_generation={runtime.get("odom_callback_count", 0)} '
-            f'map_generation={runtime.get("map_generation", 0)} '
-            f'tf_ready={runtime.get("tf_ready", False)} '
-            f'observation_ready={runtime.get("observation_ready", False)} '
-            f'blocking_reason={blocking_reason}',
-            throttle_duration_sec=1.0,
-        )
-
-    def _debug_blocking_reason(
-        self,
-        gate: GateInputs,
-        state: RLWorkerState,
-        reason: str,
-        runtime: dict[str, object],
-    ) -> str:
-        role = self.desired_role.strip().upper()
-        if role != 'ACTIVE_SCOUT':
-            return 'role_inactive'
-        if self.require_failover_activation and not gate.active_scout_matches:
-            return 'lease_expired'
-        if not self._local_motion_release():
-            if not self.startup_released:
-                return 'startup_not_released'
-            return 'start_motion_false'
-        if self.require_system_ready and not self.system_ready:
-            return 'system_not_ready'
-        if state == RLWorkerState.WAIT_LOCALIZATION:
-            return 'localization_not_ready'
-        if state == RLWorkerState.WAIT_MOTION_RELEASE:
-            return 'cmd_vel_authority_lost'
-        if not bool(runtime.get('ready', False)):
-            return 'model_not_ready'
-        if state == RLWorkerState.WAIT_SENSOR_READY:
-            scan_age = float(runtime.get('scan_age_ms', -1.0))
-            odom_age = float(runtime.get('odom_age_ms', -1.0))
-            map_age = float(runtime.get('map_age_ms', -1.0))
-            max_scan_ms = self.runtime.config.max_scan_age_sec * 1000.0
-            max_odom_ms = self.runtime.config.max_odom_age_sec * 1000.0
-            max_map_ms = self.runtime.config.max_map_age_sec * 1000.0
-            if scan_age < 0.0 or scan_age > max_scan_ms:
-                return 'scan_stale'
-            if odom_age < 0.0 or odom_age > max_odom_ms:
-                return 'odom_stale'
-            if map_age < 0.0 or map_age > max_map_ms:
-                return 'map_stale'
-            if not bool(runtime.get('policy_worker_alive', False)):
-                return 'policy_worker_dead'
-            return 'observation_not_ready'
-        if state == RLWorkerState.WAIT_OBSERVATION_READY:
-            return 'observation_stale'
-        if str(runtime.get('last_stop_reason', '')) == 'inference_timeout':
-            return 'inference_timeout'
-        if not bool(runtime.get('safety_allowed', True)):
-            return 'safety_stop'
-        if state == RLWorkerState.ACTIVE:
-            return 'none'
-        return reason
-
-    def _log_rl_debug(
-        self,
-        gate: GateInputs,
-        state: RLWorkerState,
-        reason: str,
-    ) -> None:
-        now = self._now()
-        if now - self.last_debug_wall < 1.0:
-            return
-        self.last_debug_wall = now
-        runtime = self.runtime.debug_snapshot()
-        blocking = self._debug_blocking_reason(gate, state, reason, runtime)
-        role_active = self.desired_role.strip().upper() == 'ACTIVE_SCOUT'
-        raw_nonzero = (
-            abs(float(runtime['raw_cmd_linear'])) > 1.0e-4
-            or abs(float(runtime['raw_cmd_angular'])) > 1.0e-4
-        )
-        final_nonzero = (
-            abs(float(runtime['final_cmd_linear'])) > 1.0e-4
-            or abs(float(runtime['final_cmd_angular'])) > 1.0e-4
-        )
-        hardware_publish_allowed = bool(
-            role_active
-            and gate.active_scout_matches
-            and self._local_motion_release()
-            and state == RLWorkerState.ACTIVE
-        )
-        self.get_logger().warning(
-            'SCOUT_RL_DEBUG | '
-            f'robot={self.robot_name} '
-            f'role={self.desired_role} '
-            f'role_active={role_active} '
-            f'active_scout_id={self.active_scout_id or "(unset)"} '
-            f'epoch={self.role_epoch} '
-            f'lease_valid={gate.active_scout_matches} '
-            f'direct_rl_start={self.direct_rl_start} '
-            f'global_start_motion={self.global_start_motion} '
-            f'local_motion_release={self._local_motion_release()} '
-            f'system_ready={self.system_ready} '
-            f'dashboard_ready={self.video_ready} '
-            f'scan_age_ms={float(runtime["scan_age_ms"]):.0f} '
-            f'map_age_ms={float(runtime["map_age_ms"]):.0f} '
-            f'odom_age_ms={float(runtime["odom_age_ms"]):.0f} '
-            f'observation_ready={runtime["observation_ready"]} '
-            f'blocking_inputs={runtime["blocking_inputs"]} '
-            f'policy_worker_alive={runtime["policy_worker_alive"]} '
-            f'model_loading={runtime.get("model_loading", False)} '
-            f'model_loading_elapsed_ms={float(runtime.get("model_loading_elapsed_ms", -1.0)):.0f} '
-            f'model_error={runtime.get("model_error", "")} '
-            f'inference_age_ms={float(runtime["inference_age_ms"]):.0f} '
-            f'raw_action_linear={float(runtime["raw_cmd_linear"]):.3f} '
-            f'raw_action_angular={float(runtime["raw_cmd_angular"]):.3f} '
-            f'safety_allowed={runtime["safety_allowed"]} '
-            f'final_cmd_linear={float(runtime["final_cmd_linear"]):.3f} '
-            f'final_cmd_angular={float(runtime["final_cmd_angular"]):.3f} '
-            f'cmd_vel_published={runtime["cmd_vel_published"]} '
-            f'cmd_vel_message_published={runtime["cmd_vel_message_published"]} '
-            f'cmd_vel_nonzero_published={runtime["cmd_vel_nonzero_published"]} '
-            f'last_nonzero_cmd_age_ms={float(runtime["last_nonzero_cmd_age_ms"]):.0f} '
-            f'zero_hold_active={runtime["zero_hold_active"]} '
-            f'gate_state={state.value} gate_reason={reason} '
-            f'blocking_reason={blocking}'
-        )
-        self.get_logger().warning(
-            'DIRECT_RL_START | '
-            f'enabled={self.direct_rl_start} '
-            f'role_ready={role_active and gate.active_scout_matches} '
-            f'model_ready={self.runtime.ready} '
-            f'model_loading={runtime.get("model_loading", False)} '
-            f'model_loading_elapsed_ms={float(runtime.get("model_loading_elapsed_ms", -1.0)):.0f} '
-            f'model_error={runtime.get("model_error", "")} '
-            f'scan_ready={float(runtime["scan_age_ms"]) >= 0.0} '
-            f'odom_ready={float(runtime["odom_age_ms"]) >= 0.0} '
-            f'observation_ready={runtime["observation_ready"]} '
-            f'global_start_motion={self.global_start_motion} '
-            f'local_motion_release={self._local_motion_release()} '
-            f'predict_triggered={int(runtime.get("predict_attempt_count", 0) or 0)} '
-            f'blocking_reason={blocking}'
-        )
-        self.get_logger().warning(
-            'SCOUT_RL_GATE | '
-            f'role_active={role_active} '
-            f'global_start_motion={self.global_start_motion} '
-            f'local_motion_release={self._local_motion_release()} '
-            f'raw_action_nonzero={raw_nonzero} '
-            f'final_command_nonzero={final_nonzero} '
-            f'hardware_publish_allowed={hardware_publish_allowed} '
-            f'blocking_reason={blocking}'
-        )
-        self.get_logger().warning(
-            'SCOUT_STARTUP_PIPELINE | '
-            f'role={self.desired_role} '
-            f'active_scout_id={self.active_scout_id or "(unset)"} '
-            f'global_start_motion={self.global_start_motion} '
-            f'local_motion_release={self._local_motion_release()} '
-            f'sensor_pipeline_enabled={runtime["sensor_pipeline_enabled"]} '
-            f'motion_pipeline_enabled={runtime["motion_pipeline_enabled"]} '
-            f'scan_ready={float(runtime["scan_age_ms"]) >= 0.0} '
-            f'odom_ready={runtime["odom_ready"]} '
-            f'map_ready={float(runtime["map_age_ms"]) >= 0.0} '
-            f'tf_ready={runtime["tf_ready"]} '
-            f'map_tick_count={runtime["map_tick_count"]} '
-            f'map_update_success_count={runtime["map_update_success_count"]} '
-            f'map_snapshot_ready={runtime["map_snapshot_exists"]} '
-            f'observation_ready={runtime["observation_ready"]} '
-            f'dashboard_ready={self.video_ready} '
-            f'blocking_reason={blocking}'
-        )
-        self.get_logger().warning(
-            'SCOUT_OBSERVATION_PIPELINE | '
-            f'scan_rx={float(runtime["scan_age_ms"]) >= 0.0} '
-            f'scan_generation=see_map_tick '
-            f'map_rx={float(runtime["map_age_ms"]) >= 0.0} '
-            f'map_generation=see_map_tick '
-            f'odom_rx={float(runtime["odom_age_ms"]) >= 0.0} '
-            f'odom_generation={runtime["odom_callback_count"]} '
-            f'tf_ready={runtime["tf_ready"]} '
-            f'map_tick_enabled={runtime["sensor_pipeline_enabled"]} '
-            f'map_tick_count={runtime["map_tick_count"]} '
-            f'map_update_attempt_count={runtime["map_update_attempt_count"]} '
-            f'map_update_success_count={runtime["map_update_success_count"]} '
-            f'map_snapshot_exists={runtime["map_snapshot_exists"]} '
-            f'map_snapshot_age_ms={float(runtime["map_snapshot_age_ms"]):.0f} '
-            f'history_length={runtime["history_length"]} '
-            f'observation_ready={runtime["observation_ready"]} '
-            f'blocking_reason={runtime["blocking_inputs"]}'
-        )
-        self._log_odom_debug(runtime, blocking)
-
-    def _log_odom_debug(self, runtime: dict[str, object], blocking: str) -> None:
-        now = self._now()
-        if now - self.last_odom_debug_wall < 2.0:
-            return
-        self.last_odom_debug_wall = now
-        callback_count = int(runtime.get('odom_callback_count', 0) or 0)
-        publisher_count = self.count_publishers(self.odom_topic)
-        subscription_count = self.count_subscribers(self.odom_topic)
-        qos_compatible = publisher_count > 0 and callback_count > 0
-        self.get_logger().warning(
-            'SCOUT_ODOM_DEBUG | '
-            f'configured_topic={self.odom_topic} '
-            f'resolved_topic={runtime.get("odom_topic", self.odom_topic)} '
-            f'publisher_count={publisher_count} '
-            f'subscription_count={subscription_count} '
-            f'qos_compatible={qos_compatible} '
-            f'frame_id={runtime.get("odom_frame_id", "") or "(empty)"} '
-            f'child_frame_id={runtime.get("odom_child_frame_id", "") or "(empty)"} '
-            f'source_stamp_age_ms={float(runtime.get("odom_source_stamp_age_ms", -1.0)):.0f} '
-            f'receive_age_ms={float(runtime.get("odom_age_ms", -1.0)):.0f} '
-            f'position_finite={bool(runtime.get("odom_position_finite", False))} '
-            f'orientation_finite={bool(runtime.get("odom_orientation_finite", False))} '
-            f'linear_velocity={float(runtime.get("odom_linear_velocity", 0.0)):.3f} '
-            f'angular_velocity={float(runtime.get("odom_angular_velocity", 0.0)):.3f} '
-            f'callback_count={callback_count} '
-            f'blocking_reason={blocking}'
-        )
-
-    def _log_state_transition(self, state: RLWorkerState, reason: str) -> None:
-        if state == RLWorkerState.RECOVERY_NAVIGATING:
-            self.get_logger().warning(
-                f'SCOUT_RECOVERY_NAV_ACTIVE | robot={self.robot_name}'
-            )
-        elif state == RLWorkerState.WAIT_LOCALIZATION:
-            self.get_logger().warning(
-                f'SCOUT_WAIT_LOCALIZATION | robot={self.robot_name} reason={reason}'
-            )
-        elif state == RLWorkerState.WAIT_MOTION_RELEASE:
-            self.get_logger().warning(
-                f'SCOUT_WAIT_MOTION_RELEASE | robot={self.robot_name} reason={reason}'
-            )
-        elif state == RLWorkerState.WAIT_SENSOR_READY:
-            self.get_logger().warning(
-                f'SCOUT_WAIT_SENSOR_READY | robot={self.robot_name} reason={reason} '
-                f'inputs={self.runtime.readiness_summary()} '
-                f'system_ready={self.system_ready}/{self.require_system_ready} '
-                f'start_motion={self.start_motion}/{self.require_start_motion}'
-            )
-        elif state == RLWorkerState.WAIT_OBSERVATION_READY:
-            self.get_logger().warning(
-                f'SCOUT_WAIT_OBSERVATION_READY | robot={self.robot_name} reason={reason} '
-                'raw_sensor_and_tf_ready=true internal_map_snapshot_stale=true'
-            )
-        elif state == RLWorkerState.ACTIVE:
-            self.get_logger().warning(
-                'RL_ACTIVATION_GATE | '
-                f'robot={self.robot_name} role={self.desired_role} '
-                f'epoch={self.role_epoch} reason={reason} '
-                f'direct_rl_start={self.direct_rl_start} '
-                f'model_ready={self.runtime.ready} '
-                f'sensor_ready={self.runtime.sensor_ready()} '
-                f'observation_ready={self.runtime.observation_ready()} '
-                f'nav_idle={self.nav_goal_inactive} '
-                f'system_ready={self.system_ready} '
-                f'start_motion={self._local_motion_release()}'
-            )
-        elif state == RLWorkerState.STANDBY:
-            self.get_logger().warning(
-                f'SCOUT_RL_STANDBY | robot={self.robot_name} reason={reason}'
-            )
-        elif state == RLWorkerState.FAILED:
+            observation = self._build_observation(scan)
+            started = time.monotonic()
+            action, _ = self.model.predict(observation, deterministic=True)
+            predict_ms = (time.monotonic() - started) * 1000.0
+            command = self._command_from_action(np.asarray(action, dtype=np.float32))
+        except Exception as exc:  # noqa: BLE001
             self.get_logger().error(
-                f'SCOUT_RL_FAILED | robot={self.robot_name} reason={reason}'
-            )
-
-    def _publish_command(self, linear_x: float, angular_z: float) -> None:
-        if not self._local_motion_release() and (linear_x != 0.0 or angular_z != 0.0):
-            self.get_logger().warning(
-                'SCOUT_FIRST_ACTION_DEBUG | '
-                'predict_called=true '
-                f'raw_linear={float(linear_x):.3f} raw_angular={float(angular_z):.3f} '
-                'safety_linear=unknown safety_angular=unknown '
-                'authority_allowed=false '
-                'hardware_linear=0.000 hardware_angular=0.000 '
-                'blocking_stage=hardware_gate_zeroed',
+                f'SCOUT_RL_DIRECT_PREDICT_FAILED | {exc}\n{traceback.format_exc()}',
                 throttle_duration_sec=1.0,
             )
             self._publish_zero()
             return
-        if not self.runtime_active and (linear_x != 0.0 or angular_z != 0.0):
+
+        self.previous_action = command.copy()
+        self.predict_count += 1
+        self._publish_command(float(command[0]), float(command[1]))
+        if not self.first_command_logged or self.predict_count % 10 == 0:
+            self.first_command_logged = True
+            self.get_logger().warning(
+                'SCOUT_RL_DIRECT_CMD | '
+                f'predict_count={self.predict_count} predict_ms={predict_ms:.1f} '
+                f'linear_x={float(command[0]):.3f} angular_z={float(command[1]):.3f} '
+                f'publish_count={self.publish_count}'
+            )
+
+    def _motion_allowed(self) -> bool:
+        return bool(
+            self.role_active
+            and self.model is not None
+            and not self.model_loading
+            and (self.system_ready or not self.require_system_ready)
+        )
+
+    def _blocking_reason(self) -> str:
+        if not self.role_active:
+            return 'role_not_active_scout'
+        if self.model_loading:
+            return 'model_loading'
+        if self.model is None:
+            return f'model_error:{self.model_error}'
+        if self.require_system_ready and not self.system_ready:
+            return 'system_not_ready'
+        return 'unknown'
+
+    def _wait_log(self, reason: str) -> None:
+        now = time.monotonic()
+        if now - self.last_wait_log_at < 1.0:
             return
+        self.last_wait_log_at = now
+        load_ms = int((now - self.model_load_started) * 1000.0)
+        self.get_logger().warning(
+            'SCOUT_RL_DIRECT_WAIT | '
+            f'reason={reason} role_active={self.role_active} '
+            f'model_loading={self.model_loading} model_ready={self.model is not None} '
+            f'model_load_elapsed_ms={load_ms} scan_received={self.latest_scan is not None} '
+            f'map_received={self.latest_map is not None}'
+        )
+
+    def _build_observation(self, scan: LaserScan) -> dict[str, np.ndarray]:
+        vector = build_exploration_observation(
+            scan_ranges=scan.ranges,
+            coverage_ratio=1.0,
+            coverage_delta=0.0,
+            frontier_distance=3.5,
+            frontier_angle=0.0,
+            target_priority=0.0,
+            mean_confidence=50.0,
+            stale_ratio=0.0,
+            low_confidence_ratio=0.0,
+            prev_action=self.previous_action,
+            num_lidar_bins=self.config.lidar_bins,
+            max_linear_speed=self.config.action_high[0],
+            max_angular_speed=self.config.action_high[1],
+            scan_angle_min=scan.angle_min,
+            scan_angle_increment=scan.angle_increment,
+            scan_angle_max=scan.angle_max,
+            include_target_priority=False,
+            trim_extra_stats=self.config.trim_extra_stats,
+            lidar_config=self.lidar,
+        ).astype(np.float32)
+        if vector.shape != (self.config.vector_dim,):
+            raise RuntimeError(f'vector shape mismatch: {vector.shape}')
+
+        map_obs = self._map_observation()
+        if not self.history_vector:
+            self.history_vector = [vector.copy() for _ in range(self.config.history_len)]
+            self.history_map = [map_obs.copy() for _ in range(self.config.history_len)]
+        else:
+            self.history_vector.append(vector.copy())
+            self.history_map.append(map_obs.copy())
+            self.history_vector = self.history_vector[-self.config.history_len:]
+            self.history_map = self.history_map[-self.config.history_len:]
+
+        return {
+            'map': map_obs,
+            'map_seq': np.stack(self.history_map, axis=0).astype(np.float32),
+            'seq': np.stack(self.history_vector, axis=0).astype(np.float32),
+            'vector': vector,
+        }
+
+    def _map_observation(self) -> np.ndarray:
+        slam_map = self.latest_map
+        if slam_map is None:
+            raise RuntimeError('map is not ready')
+        width = int(slam_map.info.width)
+        height = int(slam_map.info.height)
+        grid = np.asarray(slam_map.data, dtype=np.int16).reshape((height, width))
+        sample = self._resize_nearest(grid, self.config.map_obs_size)
+
+        confidence = self.latest_confidence_grid
+        if confidence is None:
+            confidence = self._confidence_from_map(slam_map)
+        confidence_sample = self._resize_nearest(
+            confidence.astype(np.float32),
+            self.config.map_obs_size,
+        )
+
+        map_obs = np.zeros(
+            (4, self.config.map_obs_size, self.config.map_obs_size),
+            dtype=np.float32,
+        )
+        known = sample >= 0
+        occupied = sample >= 50
+        free = known & ~occupied
+        unknown = ~known
+        map_obs[0, free] = 1.0
+        map_obs[1, unknown] = 1.0
+        map_obs[2, occupied] = 1.0
+        map_obs[3, :, :] = np.clip(confidence_sample / 100.0, 0.0, 1.0)
+        return map_obs
+
+    @staticmethod
+    def _resize_nearest(grid: np.ndarray, size: int) -> np.ndarray:
+        height, width = grid.shape
+        ys = np.linspace(0, max(height - 1, 0), int(size)).astype(np.int32)
+        xs = np.linspace(0, max(width - 1, 0), int(size)).astype(np.int32)
+        return grid[ys[:, None], xs[None, :]]
+
+    def _confidence_from_map(self, slam_map: OccupancyGrid) -> np.ndarray:
+        width = int(slam_map.info.width)
+        height = int(slam_map.info.height)
+        grid = np.asarray(slam_map.data, dtype=np.int16).reshape((height, width))
+        confidence = np.zeros((height, width), dtype=np.float32)
+        known = grid >= 0
+        occupied = grid >= 50
+        confidence[known] = 70.0
+        confidence[occupied] = 100.0
+        return confidence
+
+    def _publish_confidence_map(self) -> None:
+        slam_map = self.latest_map
+        confidence = self.latest_confidence_grid
+        if slam_map is None or confidence is None:
+            return
+        msg = OccupancyGrid()
+        msg.header = slam_map.header
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.info = slam_map.info
+        msg.data = np.clip(confidence, 0.0, 100.0).astype(np.int8).reshape(-1).tolist()
+        self.confidence_pub.publish(msg)
+
+    def _command_from_action(self, action: np.ndarray) -> np.ndarray:
+        raw = action.reshape(-1)[:2].astype(np.float32)
+        command = np.clip(
+            raw,
+            np.asarray(self.config.action_low, dtype=np.float32),
+            np.asarray(self.config.action_high, dtype=np.float32),
+        ).astype(np.float32)
+        scan = self.latest_scan
+        if scan is not None and self._front_min(scan) < self.emergency_stop_distance_m:
+            command[:] = 0.0
+        return command
+
+    def _front_min(self, scan: LaserScan) -> float:
+        ranges = np.asarray(scan.ranges, dtype=np.float32)
+        if ranges.size == 0:
+            return float('inf')
+        ranges = np.nan_to_num(ranges, nan=float('inf'), posinf=float('inf'), neginf=0.0)
+        angle_min = float(scan.angle_min)
+        angle_increment = float(scan.angle_increment)
+        if not math.isfinite(angle_increment) or abs(angle_increment) < 1.0e-9:
+            return float(np.min(ranges))
+        angles = angle_min + np.arange(ranges.size, dtype=np.float32) * angle_increment
+        front = np.abs(np.arctan2(np.sin(angles), np.cos(angles))) <= math.radians(25.0)
+        if not np.any(front):
+            return float(np.min(ranges))
+        return float(np.min(ranges[front]))
+
+    def _publish_command(self, linear_x: float, angular_z: float) -> None:
         if self.use_stamped:
             msg = TwistStamped()
             msg.header.stamp = self.get_clock().now().to_msg()
             msg.header.frame_id = 'base_footprint'
-            msg.twist.linear.x = float(linear_x)
-            msg.twist.angular.z = float(angular_z)
+            msg.twist.linear.x = linear_x
+            msg.twist.angular.z = angular_z
         else:
             msg = Twist()
-            msg.linear.x = float(linear_x)
-            msg.angular.z = float(angular_z)
+            msg.linear.x = linear_x
+            msg.angular.z = angular_z
         self.cmd_pub.publish(msg)
-        if abs(float(linear_x)) > 1.0e-4 or abs(float(angular_z)) > 1.0e-4:
-            self._mark_startup_event('first_nonzero_cmd')
+        self.publish_count += 1
 
     def _publish_zero(self) -> None:
-        if self.use_stamped:
-            msg = TwistStamped()
-            msg.header.stamp = self.get_clock().now().to_msg()
-            msg.header.frame_id = 'base_footprint'
-            msg.twist.linear.x = 0.0
-            msg.twist.angular.z = 0.0
-        else:
-            msg = Twist()
-            msg.linear.x = 0.0
-            msg.angular.z = 0.0
-        self.cmd_pub.publish(msg)
+        self._publish_command(0.0, 0.0)
 
-    def destroy_node(self) -> None:
-        try:
-            self.runtime.shutdown()
-        finally:
-            super().destroy_node()
+    def _status_tick(self) -> None:
+        scan_age_ms = (
+            (time.monotonic() - self.latest_scan_at) * 1000.0
+            if self.latest_scan is not None else -1.0
+        )
+        map_age_ms = (
+            (time.monotonic() - self.latest_map_at) * 1000.0
+            if self.latest_map is not None else -1.0
+        )
+        self.get_logger().info(
+            'SCOUT_RL_DIRECT_STATUS | '
+            f'role_active={self.role_active} model_ready={self.model is not None} '
+            f'model_loading={self.model_loading} scan_age_ms={scan_age_ms:.0f} '
+            f'map_age_ms={map_age_ms:.0f} confidence_ready={self.latest_confidence_grid is not None} '
+            f'predict_count={self.predict_count} publish_count={self.publish_count}'
+        )
 
 
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = ScoutRLPolicyWorker()
-    # 5 largely-independent callback groups now share this executor: the
-    # node's own default group (role/failover/status subs + gate timer),
-    # the sensor group (scan/odom/map/confidence_seed + watchdog/model_state),
-    # the fast observation tick, the heavy confidence tick, and the policy
-    # tick. Two threads let a slow heavy-tick invocation starve the fast
-    # tick/policy tick of executor time, which is the exact failure mode
-    # this split is meant to eliminate -- give each group real headroom.
-    executor = MultiThreadedExecutor(num_threads=6)
+    executor = MultiThreadedExecutor(num_threads=3)
     executor.add_node(node)
     try:
         executor.spin()
