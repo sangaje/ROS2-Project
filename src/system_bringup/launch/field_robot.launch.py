@@ -33,6 +33,7 @@ def generate_launch_description():
     field_enable_cartographer = LaunchConfiguration('field_enable_cartographer')
     field_enable_amcl = LaunchConfiguration('field_enable_amcl')
     map_authority_eligible = LaunchConfiguration('map_authority_eligible')
+    forward_field_map_to_main = LaunchConfiguration('forward_field_map_to_main')
     camera_sender_device = LaunchConfiguration('camera_sender_device')
     flask_server_url = LaunchConfiguration('flask_server_url')
 
@@ -87,6 +88,10 @@ def generate_launch_description():
             'camera_sender_device': camera_sender_device.perform(context),
             'flask_server_url': flask_server_url.perform(context),
             'enable_scout_failover': 'true',
+            'forward_field_map_to_main': _bool_text(
+                forward_field_map_to_main.perform(context),
+                False,
+            ),
         }
         if not _bool_text(map_authority_eligible.perform(context), default_map_authority) == 'true':
             launch_args['start_cartographer'] = 'false'
@@ -141,6 +146,17 @@ def generate_launch_description():
             ),
         ),
         DeclareLaunchArgument('map_authority_eligible', default_value=''),
+        DeclareLaunchArgument(
+            'forward_field_map_to_main',
+            default_value='false',
+            choices=['true', 'false'],
+            description=(
+                'Forward this field robot local /map through its member/'
+                'follower bridge. Keep false for normal ACTIVE_SCOUT and '
+                'FOLLOWER operation; use only for explicit takeover/commit '
+                'tests.'
+            ),
+        ),
         DeclareLaunchArgument('camera_sender_device', default_value='/dev/video1'),
         DeclareLaunchArgument('flask_server_url', default_value='http://orin-jetson:5005/detect'),
         OpaqueFunction(function=make_stack),

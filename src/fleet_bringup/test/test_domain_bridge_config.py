@@ -63,9 +63,7 @@ def test_real_bridge_directions_and_control_qos(tmp_path):
     assert follower['topics']['/fleet/follow_enabled']['qos']['durability'] == (
         'transient_local'
     )
-    assert follower['topics']['/burger_scan_relay']['remap'] == (
-        '/follower25/scan'
-    )
+    assert '/burger_scan_relay' not in follower['topics']
     assert '/risk/risk_map' not in follower['topics']
     assert '/risk/person_probability_map' not in follower['topics']
     assert '/risk/evidence_markers' not in follower['topics']
@@ -97,6 +95,7 @@ def test_follower_scan_topic_uses_its_domain_id(tmp_path):
     _, follower_path = write_fleet_bridge_configs(
         24,
         31,
+        include_follower_scan=True,
         output_directory=tmp_path,
     )
     follower = yaml.safe_load(follower_path.read_text())
@@ -204,13 +203,12 @@ def test_risk_to_leader_bridge_is_one_way_map_source(tmp_path):
 
     assert (config['from_domain'], config['to_domain']) == (22, 24)
     assert config['topics']['/map']['remap'] == '/field/scout22/map'
-    assert config['topics']['/rl_confidence_map']['remap'] == (
-        '/scout22/rl_confidence_map'
-    )
     assert config['topics']['/map']['qos']['reliability'] == 'reliable'
     assert config['topics']['/map']['qos']['durability'] == 'transient_local'
     assert config['topics']['/map']['qos']['history'] == 'keep_last'
-    assert config['topics']['/member_pose']['type'] == 'geometry_msgs/msg/PoseStamped'
+    assert '/member_pose' not in config['topics']
+    assert '/scout/signal' not in config['topics']
+    assert '/rl_confidence_map' not in config['topics']
     assert config['topics']['/risk/yolo_detections']['type'] == 'std_msgs/msg/String'
     assert '/tf' not in config['topics']
     assert '/tf_static' not in config['topics']
@@ -226,7 +224,7 @@ def test_risk_to_leader_bridge_can_exclude_scout_risk_outputs(tmp_path):
     config = yaml.safe_load(path.read_text())
 
     assert '/map' in config['topics']
-    assert '/member_pose' in config['topics']
+    assert '/member_pose' not in config['topics']
     assert '/risk/yolo_detections' in config['topics']
     assert '/risk/risk_map' not in config['topics']
     assert '/risk/person_probability_map' not in config['topics']
@@ -280,6 +278,11 @@ def test_candidate_field_bridge_uses_identity_namespaces(tmp_path):
         c['topics']['/map']['remap'] == '/field/scout22/map'
         for c in from_configs
         if c['from_domain'] == 22
+    )
+    assert all(
+        '/map' not in c['topics']
+        for c in from_configs
+        if c['from_domain'] == 21
     )
 
 

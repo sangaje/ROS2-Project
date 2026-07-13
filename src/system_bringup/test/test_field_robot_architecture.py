@@ -16,6 +16,7 @@ def test_field_robot_launch_is_single_entrypoint_for_scout_and_follower():
     assert "'start_risk_map': 'false'" in source
     assert "'enable_yolo': 'false'" in source
     assert "'start_camera_sender': _bool_text" in source
+    assert "'forward_field_map_to_main': _bool_text" in source
     assert "field_enable_exploration" in source
     assert "field_enable_cartographer" in source
     assert "field_enable_amcl" in source
@@ -28,6 +29,8 @@ def test_system_launch_routes_field_observations_to_robot_topics():
 
     assert "field_observation_topic = f'/field/{scout_robot_name}/risk_observation'" in source
     assert "'output_topic': field_observation_topic" in source
+    assert "'active_max_upload_mbps': '0.5' if follower_camera_mode else '2.5'" in source
+    assert "'width': '320' if follower_camera_mode else '640'" in source
     assert "'pose_topic': (" in source
     assert "'active_roles': 'ACTIVE_SCOUT,SCOUT,FOLLOWER,RECOVERING'" in source
     assert "'observation_topics': [" in source
@@ -44,5 +47,7 @@ def test_leader_map_input_uses_field_robot_namespaces():
     ).read_text(encoding='utf-8')
 
     assert "f'/field/{active_scout_robot_name.perform(context)}/map'" in leader
+    assert "map_source_topic=(" in system
+    assert "/map_out" in system
     assert "default_value='/field/follower21/map'" in leader
     assert "f'/field/{follower_robot_name.perform(context)}/map'" in system

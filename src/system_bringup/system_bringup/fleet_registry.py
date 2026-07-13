@@ -16,6 +16,7 @@ class FieldRobotSpec:
     domain_id: int
     initial_role: str = 'STANDBY'
     map_capable: bool = True
+    map_authority: bool = False
     camera_capable: bool = True
 
 
@@ -40,11 +41,14 @@ def _robot_from_mapping(data: dict[str, Any]) -> FieldRobotSpec | None:
         domain = int(data.get('domain_id'))
     except (TypeError, ValueError):
         return None
+    initial_role = str(data.get('initial_role', 'STANDBY')).strip().upper() or 'STANDBY'
+    default_authority = initial_role in ('ACTIVE_SCOUT', 'SCOUT', 'RECOVERING')
     return FieldRobotSpec(
         robot_name=name,
         domain_id=domain,
-        initial_role=str(data.get('initial_role', 'STANDBY')).strip().upper() or 'STANDBY',
+        initial_role=initial_role,
         map_capable=_bool(data.get('map_capable'), True),
+        map_authority=_bool(data.get('map_authority'), default_authority),
         camera_capable=_bool(data.get('camera_capable'), True),
     )
 
@@ -96,6 +100,7 @@ def build_legacy_registry(
             robot_name=str(active_scout_robot_name).strip() or 'scout22',
             domain_id=int(str(risk_domain_id).strip()),
             initial_role='ACTIVE_SCOUT',
+            map_authority=True,
         ))
     if str(follower_domain_id).strip():
         name = str(follower_robot_name).strip() or 'follower21'
@@ -105,6 +110,7 @@ def build_legacy_registry(
                 robot_name=name,
                 domain_id=domain,
                 initial_role='FOLLOWER',
+                map_authority=False,
             ))
     return robots
 
@@ -118,6 +124,7 @@ def registry_to_json(registry: Iterable[FieldRobotSpec]) -> str:
                     'domain_id': robot.domain_id,
                     'initial_role': robot.initial_role,
                     'map_capable': robot.map_capable,
+                    'map_authority': robot.map_authority,
                     'camera_capable': robot.camera_capable,
                 }
                 for robot in registry

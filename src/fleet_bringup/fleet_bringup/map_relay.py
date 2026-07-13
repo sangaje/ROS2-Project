@@ -28,6 +28,7 @@ never publish to /map at the same time.
 """
 import rclpy
 import hashlib
+import time
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from nav_msgs.msg import OccupancyGrid
@@ -43,6 +44,7 @@ class MapRelay(Node):
         self.declare_parameter('takeover_grace_sec', 2.0)
         self.declare_parameter('standby_confirm_sec', 2.0)
         self.declare_parameter('relay_without_primary', False)
+        self.declare_parameter('max_publish_rate_hz', 1.0)
         self.declare_parameter('active_scout_id_topic', '')
         self.declare_parameter('primary_scout_id', 'scout22')
         self.declare_parameter('follower_scout_id', 'follower21')
@@ -61,6 +63,13 @@ class MapRelay(Node):
         )
         self.relay_without_primary = bool(
             self.get_parameter('relay_without_primary').value
+        )
+        self.max_publish_rate_hz = max(
+            0.0, float(self.get_parameter('max_publish_rate_hz').value)
+        )
+        self.min_publish_period_sec = (
+            1.0 / self.max_publish_rate_hz
+            if self.max_publish_rate_hz > 0.0 else 0.0
         )
         self.active_scout_id_topic = str(
             self.get_parameter('active_scout_id_topic').value
@@ -99,6 +108,8 @@ class MapRelay(Node):
         self._first_bridged_logged = False
         self._first_output_logged = False
         self._last_published_signature = None
+        self._last_publish_mono_sec = 0.0
+        self._pending_rate_limited = False
 
         self._pub = self.create_publisher(
             OccupancyGrid, self.output_topic, pub_qos
@@ -137,6 +148,7 @@ class MapRelay(Node):
             f'{self.output_topic} (transient_local), only if no other '
             f'publisher is active on {self.output_topic}; '
             f'relay_without_primary={self.relay_without_primary} '
+            f'max_publish_rate_hz={self.max_publish_rate_hz:.2f} '
             f'active_scout_topic={self.active_scout_id_topic or "(disabled)"} '
             f'follower_input={self.follower_input_topic or "(disabled)"}'
         )
@@ -256,6 +268,8 @@ class MapRelay(Node):
                     f'{self.input_topic} -> {self.output_topic}'
                 )
                 self._publish_latest()
+            elif self._pending_rate_limited:
+                self._publish_latest()
             return
 
         now = self._now_sec()
@@ -344,8 +358,22 @@ class MapRelay(Node):
                 'MAP_RELAY_DUPLICATE_SKIPPED | unchanged map sample'
             )
             return False
+        now = time.monotonic()
+        elapsed = now - self._last_publish_mono_sec
+        if (
+            self.min_publish_period_sec > 0.0
+            and self._last_publish_mono_sec > 0.0
+            and elapsed < self.min_publish_period_sec
+        ):
+            self._pending_rate_limited = True
+            self.get_logger().debug(
+                'MAP_RELAY_RATE_LIMITED | latest map retained for next slot'
+            )
+            return False
         self._pub.publish(source)
         self._last_published_signature = signature
+        self._last_publish_mono_sec = now
+        self._pending_rate_limited = False
         self.get_logger().info(
             f'Map relayed: {source.info.width}x{source.info.height} @ '
             f'{source.info.resolution:.3f}m/cell',

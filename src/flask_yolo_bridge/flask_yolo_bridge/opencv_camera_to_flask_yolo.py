@@ -65,6 +65,12 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         self.standby_max_rate_hz = float(
             self.declare_parameter('standby_max_rate_hz', min(1.0, self.max_rate_hz)).value
         )
+        self.active_max_upload_mbps = float(
+            self.declare_parameter('active_max_upload_mbps', 2.5).value
+        )
+        self.standby_max_upload_mbps = float(
+            self.declare_parameter('standby_max_upload_mbps', 0.5).value
+        )
         self.http_worker_count = int(self.declare_parameter('http_worker_count', 1).value)
         self.jpeg_quality = int(self.declare_parameter('jpeg_quality', 60).value)
         self.timeout_sec = float(self.declare_parameter('timeout_sec', 1.0).value)
@@ -200,6 +206,10 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         self.encode_ms_samples = deque(maxlen=120)
         self.rtt_ms_samples = deque(maxlen=120)
         self.capture_age_ms_samples = deque(maxlen=120)
+        self.jpeg_size_samples = deque(maxlen=120)
+        self.tx_bytes_window = deque(maxlen=240)
+        self.tx_budget_tokens = 0.0
+        self.tx_budget_last_mono_sec = time.monotonic()
         self.active_device = ''
         self.next_open_attempt_mono_sec = 0.0
         self.read_fail_streak = 0
@@ -235,6 +245,8 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             f'camera_fps={self.camera_fps:.1f} fourcc={self.fourcc or "default"} '
             f'server={self.server_url} out={self.output_topic} rate={self.max_rate_hz:.2f}Hz '
             f'active_rate={self.active_max_rate_hz:.2f}Hz standby_rate={self.standby_max_rate_hz:.2f}Hz '
+            f'active_budget={self.active_max_upload_mbps:.2f}Mbps '
+            f'standby_budget={self.standby_max_upload_mbps:.2f}Mbps '
             f'http_workers={max(1, self.http_worker_count)} '
             f'jpeg_quality={self.jpeg_quality} timeout={self.timeout_sec:.2f}s '
             f'connect_timeout={self.connect_timeout_sec:.2f}s read_timeout={self.read_timeout_sec:.2f}s '
@@ -578,7 +590,18 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         jpeg, w, h = self.encode_jpeg(frame)
         encode_ms = (time.monotonic() - encode_start) * 1000.0
         self.encode_ms_samples.append(encode_ms)
-        self.sent_count += 1
+        self.jpeg_size_samples.append(float(len(jpeg)))
+        if not self._consume_upload_budget(len(jpeg)):
+            self.drop_count += 1
+            self.get_logger().warn(
+                'OPENCV_HTTP_YOLO_TX_BUDGET_DROP | '
+                f'robot={self.robot_name or "unknown"} role={self.current_role} '
+                f'jpeg_bytes={len(jpeg)} budget_mbps={self._current_upload_budget_mbps():.2f} '
+                f'seq={seq}',
+                throttle_duration_sec=2.0,
+            )
+            self.log_periodic()
+            return
         files = {'image': ('frame.jpg', jpeg, 'image/jpeg')}
         data = dict(meta or {})
         data.update({
@@ -596,6 +619,8 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             timeout=(self.connect_timeout_sec, self.read_timeout_sec),
         )
         roundtrip_sec = time.monotonic() - request_start
+        self.sent_count += 1
+        self.tx_bytes_window.append((time.monotonic(), int(len(jpeg))))
         self.rtt_ms_samples.append(roundtrip_sec * 1000.0)
         resp.raise_for_status()
         payload = resp.json()
@@ -683,6 +708,30 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             return max(0.1, float(self.active_max_rate_hz))
         return max(0.1, float(self.standby_max_rate_hz))
 
+    def _current_upload_budget_mbps(self) -> float:
+        role = str(self.current_role or '').strip().upper()
+        if role in self.publish_roles:
+            return max(0.0, float(self.active_max_upload_mbps))
+        return max(0.0, float(self.standby_max_upload_mbps))
+
+    def _consume_upload_budget(self, byte_count: int) -> bool:
+        budget_mbps = self._current_upload_budget_mbps()
+        if budget_mbps <= 0.0:
+            return True
+        now = time.monotonic()
+        elapsed = max(0.0, now - self.tx_budget_last_mono_sec)
+        self.tx_budget_last_mono_sec = now
+        bytes_per_sec = budget_mbps * 125000.0
+        burst_capacity = max(65536.0, bytes_per_sec * 2.0)
+        self.tx_budget_tokens = min(
+            burst_capacity,
+            self.tx_budget_tokens + elapsed * bytes_per_sec,
+        )
+        if self.tx_budget_tokens < float(byte_count):
+            return False
+        self.tx_budget_tokens -= float(byte_count)
+        return True
+
     def _current_role_allows_publish(self) -> bool:
         return str(self.current_role or '').strip().upper() in self.publish_roles
 
@@ -698,6 +747,8 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         encode = self._sample_summary(self.encode_ms_samples)
         rtt = self._sample_summary(self.rtt_ms_samples)
         age = self._sample_summary(self.capture_age_ms_samples)
+        jpeg = self._sample_summary(self.jpeg_size_samples)
+        tx_mbps = self._recent_tx_mbps(now=time.monotonic())
         self.get_logger().info(
             f'OPENCV_HTTP_YOLO_STATUS | captured={self.rx_count} sent={self.sent_count} '
             f'ok={self.ok_count} fail={self.fail_count} replaced={self.drop_count} '
@@ -705,6 +756,8 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             f'role={self.current_role} upload_rate={self._current_upload_rate_hz():.2f} '
             f'publish_enabled={self._current_role_allows_publish()} '
             f'output_fps={output_fps:.2f} '
+            f'tx_mbps={tx_mbps:.3f} jpeg_bytes_p50={jpeg[0]:.0f} '
+            f'p95={jpeg[1]:.0f} max={jpeg[2]:.0f} '
             f'camera_encode_ms_p50={encode[0]:.1f} p95={encode[1]:.1f} max={encode[2]:.1f} '
             f'network_rtt_ms_p50={rtt[0]:.1f} p95={rtt[1]:.1f} max={rtt[2]:.1f} '
             f'end_to_end_frame_age_ms_p50={age[0]:.1f} p95={age[1]:.1f} max={age[2]:.1f} '
@@ -720,6 +773,16 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         p50 = statistics.median(ordered)
         p95_index = min(len(ordered) - 1, int(round(0.95 * (len(ordered) - 1))))
         return float(p50), float(ordered[p95_index]), float(max(ordered))
+
+    def _recent_tx_mbps(self, *, now: float) -> float:
+        cutoff = now - 10.0
+        while self.tx_bytes_window and self.tx_bytes_window[0][0] < cutoff:
+            self.tx_bytes_window.popleft()
+        if not self.tx_bytes_window:
+            return 0.0
+        span = max(1.0, now - self.tx_bytes_window[0][0])
+        total_bytes = sum(item[1] for item in self.tx_bytes_window)
+        return (float(total_bytes) * 8.0) / (span * 1_000_000.0)
 
     def destroy_node(self):
         self.stop_threads = True

@@ -21,7 +21,7 @@ def qos(
     return profile
 
 
-def map_qos(depth: int = 5) -> Dict:
+def map_qos(depth: int = 1) -> Dict:
     """Preserve map late-joiner semantics across domain_bridge."""
     return qos(reliability='reliable', durability='transient_local', depth=depth)
 
@@ -141,20 +141,29 @@ def validate_no_duplicate_bridge_routes(configs: Iterable[Dict]) -> None:
             seen[key] = name
 
 
-def field_robot_identity_topics(robot_name: str, *, pose_source: str) -> Dict[str, Dict]:
+def validate_bridge_config_files(paths: Iterable[Path]) -> None:
+    """Load generated domain_bridge YAML files and reject duplicate routes."""
+    configs = []
+    for path in paths:
+        with Path(path).open('r', encoding='utf-8') as handle:
+            configs.append(yaml.safe_load(handle) or {})
+    validate_no_duplicate_bridge_routes(configs)
+
+
+def field_robot_identity_topics(
+    robot_name: str,
+    *,
+    pose_source: str,
+    include_map: bool = True,
+) -> Dict[str, Dict]:
     """Robot-domain outputs remapped into stable leader-domain identity topics."""
     robot = str(robot_name).strip()
     if not robot:
         raise ValueError('robot_name is required for identity bridge topics')
-    return {
+    topics = {
         pose_source: topic(
             'geometry_msgs/msg/PoseStamped',
             remap=f'/field/{robot}/pose',
-        ),
-        '/map': topic(
-            'nav_msgs/msg/OccupancyGrid',
-            remap=f'/field/{robot}/map',
-            profile=map_qos(depth=5),
         ),
         '/scout/signal': topic(
             'std_msgs/msg/String',
@@ -171,6 +180,13 @@ def field_robot_identity_topics(robot_name: str, *, pose_source: str) -> Dict[st
             profile=qos(reliability='best_effort', durability='volatile', depth=5),
         ),
     }
+    if include_map:
+        topics['/map'] = topic(
+            'nav_msgs/msg/OccupancyGrid',
+            remap=f'/field/{robot}/map',
+            profile=map_qos(),
+        )
+    return topics
 
 
 def write_fleet_bridge_configs(
@@ -179,6 +195,8 @@ def write_fleet_bridge_configs(
     *,
     simulation: bool = False,
     forward_map_to_main: bool = False,
+    include_follower_scan: bool = False,
+    include_leader_map: bool = True,
     output_directory: Optional[Path] = None,
 ) -> Tuple[Path, Path]:
     """Create the two directional domain_bridge configurations.
@@ -196,11 +214,6 @@ def write_fleet_bridge_configs(
         )
     main_topics.update({
         **system_readiness_topics(),
-        '/map': topic(
-            'nav_msgs/msg/OccupancyGrid',
-            remap='/map_bridge',
-            profile=map_qos(depth=5),
-        ),
         '/leader_pose': topic('geometry_msgs/msg/PoseStamped'),
         '/member_pose': topic('geometry_msgs/msg/PoseStamped'),
         '/omx/target_detected': topic(
@@ -279,6 +292,12 @@ def write_fleet_bridge_configs(
             profile=qos(depth=1),
         ),
     })
+    if include_leader_map:
+        main_topics['/map'] = topic(
+            'nav_msgs/msg/OccupancyGrid',
+            remap='/map_bridge',
+            profile=map_qos(),
+        )
     if simulation:
         main_topics.update({
             '/burger/scan': topic(
@@ -323,17 +342,18 @@ def write_fleet_bridge_configs(
             'std_msgs/msg/String',
             profile=qos(reliability='best_effort', durability='volatile', depth=5),
         ),
-        '/burger_scan_relay': topic(
+    }
+    if include_follower_scan:
+        follower_topics['/burger_scan_relay'] = topic(
             'sensor_msgs/msg/LaserScan',
             remap=f'/follower{int(follower_domain)}/scan',
             profile=qos('best_effort'),
-        ),
-    }
+        )
     if forward_map_to_main:
         follower_topics['/map'] = topic(
             'nav_msgs/msg/OccupancyGrid',
             remap=f'/field/follower{int(follower_domain)}/map',
-            profile=map_qos(depth=5),
+            profile=map_qos(),
         )
         follower_topics['/rl_confidence_map'] = topic(
             'nav_msgs/msg/OccupancyGrid',
@@ -346,24 +366,28 @@ def write_fleet_bridge_configs(
             remap='/burger/cmd_vel',
         )
 
-    main_to_follower = _write_runtime_config(
-        f'{prefix}main_{main_domain}_to_follower_{follower_domain}_',
-        {
+    main_config = {
         'name': f'{prefix}main_{main_domain}_to_follower_{follower_domain}',
         'from_domain': int(main_domain),
         'to_domain': int(follower_domain),
         'topics': main_topics,
-        },
-        output_directory,
-    )
-    follower_to_main = _write_runtime_config(
-        f'{prefix}follower_{follower_domain}_to_main_{main_domain}_',
-        {
+    }
+    follower_config = {
         'name': f'{prefix}follower_{follower_domain}_to_main_{main_domain}',
         'from_domain': int(follower_domain),
         'to_domain': int(main_domain),
         'topics': follower_topics,
-        },
+    }
+    validate_no_duplicate_bridge_routes([main_config, follower_config])
+
+    main_to_follower = _write_runtime_config(
+        f'{prefix}main_{main_domain}_to_follower_{follower_domain}_',
+        main_config,
+        output_directory,
+    )
+    follower_to_main = _write_runtime_config(
+        f'{prefix}follower_{follower_domain}_to_main_{main_domain}_',
+        follower_config,
         output_directory,
     )
 
@@ -376,6 +400,7 @@ def write_member_bridge_configs(
     *,
     forward_map_to_main: bool = False,
     forward_risk_to_main: bool = False,
+    include_leader_map: bool = True,
     output_directory: Optional[Path] = None,
 ) -> Tuple[Path, Path]:
     """Create the two directional domain_bridge configurations for a plain
@@ -385,11 +410,6 @@ def write_member_bridge_configs(
     """
     main_topics = {
         **system_readiness_topics(),
-        '/map': topic(
-            'nav_msgs/msg/OccupancyGrid',
-            remap='/map_bridge',
-            profile=map_qos(depth=5),
-        ),
         '/leader_pose': topic('geometry_msgs/msg/PoseStamped'),
         '/omx/target_detected': topic(
             'std_msgs/msg/Bool',
@@ -445,6 +465,12 @@ def write_member_bridge_configs(
             profile=qos(depth=1),
         ),
     }
+    if include_leader_map:
+        main_topics['/map'] = topic(
+            'nav_msgs/msg/OccupancyGrid',
+            remap='/map_bridge',
+            profile=map_qos(),
+        )
     member_topics = {
         '/member_pose': topic('geometry_msgs/msg/PoseStamped'),
         '/scout/signal': topic(
@@ -470,7 +496,7 @@ def write_member_bridge_configs(
         member_topics['/map'] = topic(
             'nav_msgs/msg/OccupancyGrid',
             remap=f'/field/scout{int(member_domain)}/map',
-            profile=map_qos(depth=5),
+            profile=map_qos(),
         )
         member_topics['/rl_confidence_map'] = topic(
             'nav_msgs/msg/OccupancyGrid',
@@ -478,24 +504,28 @@ def write_member_bridge_configs(
             profile=qos(durability='transient_local', depth=1),
         )
 
-    main_to_member = _write_runtime_config(
-        f'main_{main_domain}_to_member_{member_domain}_',
-        {
+    main_config = {
         'name': f'main_{main_domain}_to_member_{member_domain}',
         'from_domain': int(main_domain),
         'to_domain': int(member_domain),
         'topics': main_topics,
-        },
-        output_directory,
-    )
-    member_to_main = _write_runtime_config(
-        f'member_{member_domain}_to_main_{main_domain}_',
-        {
+    }
+    member_config = {
         'name': f'member_{member_domain}_to_main_{main_domain}',
         'from_domain': int(member_domain),
         'to_domain': int(main_domain),
         'topics': member_topics,
-        },
+    }
+    validate_no_duplicate_bridge_routes([main_config, member_config])
+
+    main_to_member = _write_runtime_config(
+        f'main_{main_domain}_to_member_{member_domain}_',
+        main_config,
+        output_directory,
+    )
+    member_to_main = _write_runtime_config(
+        f'member_{member_domain}_to_main_{main_domain}_',
+        member_config,
         output_directory,
     )
 
@@ -507,6 +537,9 @@ def write_risk_to_leader_bridge_config(
     leader_domain: int,
     *,
     include_map: bool = True,
+    map_source_topic: str = '/map',
+    include_identity_topics: bool = False,
+    include_rl_confidence_map: bool = False,
     include_risk_outputs: bool = True,
     output_directory: Optional[Path] = None,
 ) -> Path:
@@ -520,8 +553,13 @@ def write_risk_to_leader_bridge_config(
     all_risk_topics = risk_topics()
     topics = {
         '/risk/yolo_detections': all_risk_topics['/risk/yolo_detections'],
-        '/member_pose': topic('geometry_msgs/msg/PoseStamped'),
     }
+    if include_identity_topics:
+        topics['/member_pose'] = topic('geometry_msgs/msg/PoseStamped')
+        topics['/scout/signal'] = topic(
+            'std_msgs/msg/String',
+            profile=qos(reliability='best_effort', durability='volatile', depth=5),
+        )
     if include_risk_outputs:
         topics.update(
             {
@@ -530,16 +568,14 @@ def write_risk_to_leader_bridge_config(
                 if name != '/risk/yolo_detections'
             }
         )
-    topics['/scout/signal'] = topic(
-        'std_msgs/msg/String',
-        profile=qos(reliability='best_effort', durability='volatile', depth=5),
-    )
     if include_map:
-        topics['/map'] = topic(
+        source = str(map_source_topic).strip() or '/map'
+        topics[source] = topic(
             'nav_msgs/msg/OccupancyGrid',
             remap=f'/field/scout{int(risk_domain)}/map',
-            profile=map_qos(depth=5),
+            profile=map_qos(),
         )
+    if include_rl_confidence_map:
         topics['/rl_confidence_map'] = topic(
             'nav_msgs/msg/OccupancyGrid',
             remap='/scout22/rl_confidence_map',
@@ -613,11 +649,19 @@ def write_field_robot_candidate_bridge_configs(
             'to_domain': domain,
             'topics': main_topics,
         }
+        role = str(item.get('initial_role', '')).strip().upper()
+        include_map = bool(item.get('map_capable', True)) and bool(
+            item.get('map_authority', role in ('ACTIVE_SCOUT', 'SCOUT', 'RECOVERING'))
+        )
         from_robot = {
             'name': f'field_{robot}_{domain}_to_main_{main_domain}',
             'from_domain': domain,
             'to_domain': int(main_domain),
-            'topics': field_robot_identity_topics(robot, pose_source=pose_source),
+            'topics': field_robot_identity_topics(
+                robot,
+                pose_source=pose_source,
+                include_map=include_map,
+            ),
         }
         configs.extend([to_robot, from_robot])
     validate_no_duplicate_bridge_routes(configs)
@@ -640,7 +684,7 @@ def write_leader_to_pc_bridge_config(
     topics = {
         '/map': topic(
             'nav_msgs/msg/OccupancyGrid',
-            profile=map_qos(depth=5),
+            profile=map_qos(),
         ),
         **system_readiness_topics(),
         **risk_topics(),

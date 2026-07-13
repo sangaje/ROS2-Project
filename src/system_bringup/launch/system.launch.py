@@ -110,6 +110,7 @@ def generate_launch_description():
     enable_pc_visualization_bridge = LaunchConfiguration(
         'enable_pc_visualization_bridge'
     )
+    forward_field_map_to_main = LaunchConfiguration('forward_field_map_to_main')
     member_domain_id = LaunchConfiguration('member_domain_id')
     follower_domain_id = LaunchConfiguration('follower_domain_id')
     fleet_registry_file = LaunchConfiguration('fleet_registry_file')
@@ -372,17 +373,11 @@ def generate_launch_description():
         if fleet_role_value in ('follower', 'member'):
             fleet_launch_args['main_domain_id'] = str(main_domain)
             fleet_launch_args['forward_map_to_main'] = (
-                # The leader-owned risk bridge is the single authoritative
-                # 22->20 map/risk path.  Keeping this member bridge pose and
-                # status-only avoids two domain_bridge processes publishing
-                # the same map/risk samples into domain 20.
-                'true'
-                if (
-                    fleet_role_value == 'follower'
-                    and launch_bool(start_cartographer.perform(context))
-                    and not launch_bool(enable_amcl.perform(context))
-                )
-                else 'false'
+                forward_field_map_to_main.perform(context)
+            )
+        if fleet_role_value == 'member':
+            fleet_launch_args['receive_leader_map'] = (
+                'false' if scout_owns_slam else 'true'
             )
         if fleet_role_value in ('leader', 'member'):
             nav2_value = start_nav2.perform(context)
@@ -606,6 +601,11 @@ def generate_launch_description():
                         risk_domain,
                         domain,
                         include_map=not leader_owns_map,
+                        map_source_topic=(
+                            f'/field/{active_scout_robot_name.perform(context)}/map_out'
+                        ),
+                        include_identity_topics=False,
+                        include_rl_confidence_map=False,
                         include_risk_outputs=not launch_bool(
                             start_leader_risk_map.perform(context)
                         ),
@@ -1204,6 +1204,27 @@ def generate_launch_description():
                     'start_rviz': 'false',
                 }.items(),
             ))
+            if scout_owns_slam:
+                actions.append(TimerAction(
+                    period=2.0,
+                    actions=[Node(
+                        package='fleet_bringup',
+                        executable='map_relay',
+                        name='scout_map_gateway',
+                        output='screen',
+                        parameters=[{
+                            'use_sim_time': False,
+                            'input_topic': '/map',
+                            'output_topic': f'/field/{scout_robot_name}/map_out',
+                            'check_period_sec': 0.2,
+                            'relay_without_primary': True,
+                            'max_publish_rate_hz': 0.75,
+                        }],
+                        env=process_env,
+                        respawn=True,
+                        respawn_delay=3.0,
+                    )],
+                ))
 
         if camera_sender_on:
             sender_share = get_package_share_directory('flask_yolo_bridge')
@@ -1211,22 +1232,25 @@ def generate_launch_description():
                 sender_share, 'launch', 'opencv_camera_to_flask_yolo.launch.py'
             )
             role_gating_on = launch_bool(enable_scout_failover.perform(context))
+            follower_camera_mode = fleet_role_value == 'follower'
             actions.append(IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(sender_launch_path),
                 launch_arguments={
                     'device': camera_sender_device.perform(context),
                     'server_url': flask_server_url.perform(context),
                     'output_topic': field_observation_topic,
-                    'width': '1920',
-                    'height': '1080',
-                    'send_width': '640',
-                    'send_height': '360',
-                    'camera_fps': '15.0',
-                    'max_rate_hz': '7.0',
-                    'active_max_rate_hz': '7.0',
-                    'standby_max_rate_hz': '1.0',
+                    'width': '320' if follower_camera_mode else '640',
+                    'height': '180' if follower_camera_mode else '360',
+                    'send_width': '320' if follower_camera_mode else '640',
+                    'send_height': '180' if follower_camera_mode else '360',
+                    'camera_fps': '2.0' if follower_camera_mode else '8.0',
+                    'max_rate_hz': '1.0' if follower_camera_mode else '6.0',
+                    'active_max_rate_hz': '1.0' if follower_camera_mode else '6.0',
+                    'standby_max_rate_hz': '0.5' if follower_camera_mode else '0.75',
+                    'active_max_upload_mbps': '0.5' if follower_camera_mode else '2.5',
+                    'standby_max_upload_mbps': '0.25' if follower_camera_mode else '0.5',
                     'http_worker_count': '1',
-                    'jpeg_quality': '60',
+                    'jpeg_quality': '55' if follower_camera_mode else '58',
                     'timeout_sec': '1.0',
                     'connect_timeout_sec': '0.3',
                     'read_timeout_sec': '1.8',
@@ -1531,6 +1555,18 @@ def generate_launch_description():
             default_value='true',
             choices=['true', 'false'],
             description='Leader role only: bridge selected visualization/debug topics to pc_domain_id.',
+        ),
+        DeclareLaunchArgument(
+            'forward_field_map_to_main',
+            default_value='false',
+            choices=['true', 'false'],
+            description=(
+                'Field robot only: allow the member/follower bridge to send '
+                'its local /map to the leader. Default false; ACTIVE_SCOUT '
+                'maps use the dedicated rate-limited risk->leader map '
+                'gateway, and FOLLOWER maps stay local until explicit '
+                'takeover/commit testing enables this.'
+            ),
         ),
         DeclareLaunchArgument(
             'member_domain_id',

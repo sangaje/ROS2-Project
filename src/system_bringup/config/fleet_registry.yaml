@@ -7,10 +7,12 @@ field_robots:
     domain_id: 22
     initial_role: ACTIVE_SCOUT
     map_capable: true
+    map_authority: true
     camera_capable: true
 
   - robot_name: follower21
     domain_id: 21
     initial_role: FOLLOWER
     map_capable: true
+    map_authority: false
     camera_capable: true

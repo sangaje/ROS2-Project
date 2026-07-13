@@ -237,6 +237,7 @@ def generate_launch_description():
                     'check_period_sec': 0.2,
                     'takeover_grace_sec': 0.0,
                     'relay_without_primary': True,
+                    'max_publish_rate_hz': 1.0,
                     'active_scout_id_topic': active_scout_id_topic,
                     'primary_scout_id': active_scout_robot_name,
                     'follower_scout_id': follower_robot_name,

@@ -46,6 +46,7 @@ def generate_launch_description():
     hardware_param_file = LaunchConfiguration('hardware_param_file')
     forward_map_to_main = LaunchConfiguration('forward_map_to_main')
     forward_risk_to_main = LaunchConfiguration('forward_risk_to_main')
+    receive_leader_map = LaunchConfiguration('receive_leader_map')
     initial_x = LaunchConfiguration('member_initial_x')
     initial_y = LaunchConfiguration('member_initial_y')
     initial_yaw = LaunchConfiguration('member_initial_yaw')
@@ -82,6 +83,7 @@ def generate_launch_description():
                 member_domain,
                 forward_map_to_main=launch_bool(forward_map_to_main.perform(context)),
                 forward_risk_to_main=launch_bool(forward_risk_to_main.perform(context)),
+                include_leader_map=launch_bool(receive_leader_map.perform(context)),
             )
             bridges = [
                 Node(
@@ -326,7 +328,14 @@ def generate_launch_description():
                     ' | pose_type=geometry_msgs/msg/PoseStamped',
                 ]),
                 TimerAction(period=bridge_t, actions=bridges),
-                TimerAction(period=relay_t, actions=[map_relay, member_pose]),
+                TimerAction(
+                    period=relay_t,
+                    actions=(
+                        [map_relay, member_pose]
+                        if launch_bool(receive_leader_map.perform(context))
+                        else [member_pose]
+                    ),
+                ),
             ])
         if amcl is not None:
             actions.append(TimerAction(
@@ -409,6 +418,17 @@ def generate_launch_description():
                 'Bridge risk topics directly from this member to the leader. '
                 'Leave false when the leader runs its dedicated risk->leader '
                 'bridge, which is the normal three-robot topology.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'receive_leader_map',
+            default_value='true',
+            choices=['true', 'false'],
+            description=(
+                'Receive leader /map as /map_bridge and start map_relay. '
+                'Set false for an ACTIVE_SCOUT with local Cartographer; '
+                'that robot should export its own map, not consume the '
+                'leader copy of it.'
             ),
         ),
         DeclareLaunchArgument('member_initial_x', default_value='0.0'),

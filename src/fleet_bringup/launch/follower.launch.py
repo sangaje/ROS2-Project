@@ -42,6 +42,7 @@ def generate_launch_description():
     start_robot_bringup = LaunchConfiguration('start_robot_bringup')
     hardware_param_file = LaunchConfiguration('hardware_param_file')
     forward_map_to_main = LaunchConfiguration('forward_map_to_main')
+    include_follower_scan = LaunchConfiguration('include_follower_scan')
     follow_distance = LaunchConfiguration('follow_distance')
     start_legacy_follower = LaunchConfiguration('start_legacy_follower')
     initial_x = LaunchConfiguration('follower_initial_x')
@@ -61,6 +62,7 @@ def generate_launch_description():
             )
         main_domain = int(main_domain_value)
         process_env = clean_process_environment(str(follower_domain))
+        amcl_enabled = launch_bool(enable_amcl.perform(context))
 
         nav2_source = os.path.join(
             package_share,
@@ -88,6 +90,8 @@ def generate_launch_description():
             follower_domain,
             simulation=simulation,
             forward_map_to_main=launch_bool(forward_map_to_main.perform(context)),
+            include_follower_scan=launch_bool(include_follower_scan.perform(context)),
+            include_leader_map=amcl_enabled,
         )
         bridges = [
             Node(
@@ -146,7 +150,7 @@ def generate_launch_description():
             respawn_delay=3.0,
         )
 
-        relay_nodes = [map_relay]
+        relay_nodes = [map_relay] if amcl_enabled else []
         robot_state_publisher = None
         if simulation:
             gazebo_share = get_package_share_directory('turtlebot3_gazebo')
@@ -197,8 +201,6 @@ def generate_launch_description():
                 }],
                 env=process_env,
             ))
-
-        amcl_enabled = launch_bool(enable_amcl.perform(context))
         auto = launch_bool(auto_localize.perform(context))
         require_ready_for_follow = bool(amcl_enabled and not simulation)
 
@@ -517,6 +519,16 @@ def generate_launch_description():
             description=(
                 'Bridge this robot-owned /map back to the leader domain as '
                 '/map_bridge. Enable only when this follower/scout owns SLAM.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'include_follower_scan',
+            default_value='false',
+            choices=['true', 'false'],
+            description=(
+                'Bridge /burger_scan_relay to the leader domain. Default '
+                'false because leader control uses compact pose/status/ack '
+                'topics, not follower raw LaserScan.'
             ),
         ),
         DeclareLaunchArgument(
