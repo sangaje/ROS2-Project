@@ -245,6 +245,8 @@ class ActiveScoutRLRuntime:
         self._last_policy_action = np.zeros(2, dtype=np.float32)
         self._last_command = np.zeros(2, dtype=np.float32)
         self._last_command_at = 0.0
+        self._last_inference_at = 0.0
+        self._last_safety_allowed = True
         self._activated_at = 0.0
         self._last_error_at = 0.0
         self._last_tf_stamp_fallback_at = 0.0
@@ -407,6 +409,42 @@ class ActiveScoutRLRuntime:
             f'expected_map={self.config.map_frame}'
         )
 
+    def debug_snapshot(self) -> dict[str, object]:
+        snapshot = self._sensor_snapshot()
+        now = time.monotonic()
+        map_snapshot = self._map_snapshot
+        observation_ready = bool(
+            self._fresh(snapshot, now)
+            and map_snapshot is not None
+            and now - map_snapshot.updated_at <= self.config.max_scan_age_sec
+        )
+        return {
+            'active': self._active,
+            'ready': self.ready,
+            'scan_age_ms': (
+                (now - snapshot.scan_received_at) * 1000.0
+                if snapshot.scan is not None else -1.0
+            ),
+            'map_age_ms': (
+                (now - snapshot.map_received_at) * 1000.0
+                if snapshot.slam_map is not None else -1.0
+            ),
+            'observation_ready': observation_ready,
+            'policy_worker_alive': self._model_loading or self.ready,
+            'inference_age_ms': (
+                (now - self._last_inference_at) * 1000.0
+                if self._last_inference_at > 0.0 else -1.0
+            ),
+            'raw_cmd_linear': float(self._last_policy_action[0]),
+            'raw_cmd_angular': float(self._last_policy_action[1]),
+            'safety_allowed': self._last_safety_allowed,
+            'final_cmd_linear': float(self._last_command[0]),
+            'final_cmd_angular': float(self._last_command[1]),
+            'cmd_vel_published': self._last_command_at > 0.0,
+            'last_stop_reason': self._last_stop_reason,
+            'last_error': self._last_error.splitlines()[-1] if self._last_error else '',
+        }
+
     def tf_ready(self) -> bool:
         snapshot = self._sensor_snapshot()
         if snapshot.scan is None:
@@ -457,6 +495,9 @@ class ActiveScoutRLRuntime:
         self._active = False
         self._reset_episode_state()
         self._stop(reason)
+
+    def hold(self, reason: str) -> None:
+        self._hold(reason)
 
     def shutdown(self) -> None:
         self.deactivate('runtime_shutdown')
@@ -776,6 +817,10 @@ class ActiveScoutRLRuntime:
                 if self.enable_velocity_safety_filter
                 else self._raw_policy_command(self._last_policy_action)
             )
+            self._last_safety_allowed = bool(
+                np.linalg.norm(command) > 1.0e-4
+                or np.linalg.norm(self._last_policy_action) <= 1.0e-4
+            )
         except Exception as exc:  # noqa: BLE001
             self.counters.predict_failure_count += 1
             self._last_error = traceback.format_exc()
@@ -788,6 +833,7 @@ class ActiveScoutRLRuntime:
         self._previous_action = command.copy()
         self._last_command = command.copy()
         self._last_command_at = now
+        self._last_inference_at = now
         self.counters.predict_success_count += 1
         self.publish_command(float(command[0]), float(command[1]))
         self._log_heartbeat()
@@ -815,6 +861,7 @@ class ActiveScoutRLRuntime:
         """Keep the role active while a startup/transient data gate recovers."""
         self._last_stop_reason = reason
         self._last_command_at = time.monotonic()
+        self._last_command = np.zeros(2, dtype=np.float32)
         self.publish_command(0.0, 0.0)
         self._log_heartbeat()
 
@@ -952,6 +999,7 @@ class ActiveScoutRLRuntime:
         self._active = False
         self._last_stop_reason = reason
         self._last_command_at = 0.0
+        self._last_command = np.zeros(2, dtype=np.float32)
         self.publish_command(0.0, 0.0)
         if was_active:
             self.node.get_logger().error(f'SCOUT_RL_STOP | reason={reason}')

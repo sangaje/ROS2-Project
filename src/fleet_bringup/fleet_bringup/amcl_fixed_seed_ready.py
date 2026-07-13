@@ -81,10 +81,16 @@ class AmclFixedSeedReady(Node):
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
         )
+        scan_qos = QoSProfile(
+            depth=5,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+        )
         self.ready_pub = self.create_publisher(Bool, self.ready_topic, latched_qos)
         self.create_subscription(OccupancyGrid, self.map_topic, self._on_map, map_qos)
-        self.create_subscription(
-            LaserScan, self.scan_topic, self._on_scan, ReliabilityPolicy.BEST_EFFORT
+        self.scan_sub = self.create_subscription(
+            LaserScan, self.scan_topic, self._on_scan, scan_qos
         )
         self.create_subscription(Odometry, self.odom_topic, self._on_odom, 10)
         self.create_subscription(
@@ -111,6 +117,13 @@ class AmclFixedSeedReady(Node):
         self.done = False
         self.last_map_wall: Optional[float] = None
         self.map_valid = False
+        self.last_scan_frame = ''
+        self.last_scan_stamp_sec = -1.0
+        self.last_scan_ranges = 0
+        self.last_scan_finite_ranges = 0
+        self.last_scan_range_min = float('nan')
+        self.last_scan_range_max = float('nan')
+        self.last_scan_source_age_ms = -1.0
 
         self._publish_ready(False)
         self.create_timer(self.check_period_sec, self._tick)
@@ -137,8 +150,26 @@ class AmclFixedSeedReady(Node):
         self.map_known_cells = sum(1 for cell in msg.data if cell >= 0)
         self.last_map_wall = self._now()
 
-    def _on_scan(self, msg: LaserScan) -> None:  # noqa: ARG002
-        self.last_scan_wall = self._now()
+    def _on_scan(self, msg: LaserScan) -> None:
+        now = self._now()
+        self.last_scan_wall = now
+        stamp = msg.header.stamp
+        self.last_scan_stamp_sec = float(stamp.sec) + float(stamp.nanosec) * 1.0e-9
+        self.last_scan_frame = str(msg.header.frame_id or '').strip().lstrip('/')
+        self.last_scan_ranges = len(msg.ranges)
+        finite = [
+            float(value)
+            for value in msg.ranges
+            if math.isfinite(float(value))
+        ]
+        self.last_scan_finite_ranges = len(finite)
+        self.last_scan_range_min = min(finite) if finite else float('nan')
+        self.last_scan_range_max = max(finite) if finite else float('nan')
+        self.last_scan_source_age_ms = (
+            max(0.0, (now - self.last_scan_stamp_sec) * 1000.0)
+            if self.last_scan_stamp_sec > 0.0
+            else -1.0
+        )
 
     def _on_odom(self, msg: Odometry) -> None:  # noqa: ARG002
         self.last_odom_wall = self._now()
@@ -191,6 +222,22 @@ class AmclFixedSeedReady(Node):
 
     def _readiness_state(self) -> tuple[bool, str, dict]:
         scan_fresh = self._fresh(self.last_scan_wall, self.max_scan_age_sec)
+        scan_rx = self.last_scan_wall is not None
+        scan_nonempty = scan_rx and self.last_scan_ranges > 0 and self.last_scan_finite_ranges > 0
+        scan_frame_ok = bool(self.last_scan_frame)
+        scan_stamp_ok = (
+            not scan_rx
+            or self.last_scan_stamp_sec <= 0.0
+            or self.last_scan_source_age_ms <= max(self.max_scan_age_sec * 1000.0, 5000.0)
+        )
+        if not scan_rx or not scan_frame_ok:
+            scan_tf_ok = False
+            scan_tf_age_ms = -1.0
+        elif self.last_scan_frame == self.base_frame:
+            scan_tf_ok = True
+            scan_tf_age_ms = 0.0
+        else:
+            scan_tf_ok, scan_tf_age_ms = self._tf_status(self.base_frame, self.last_scan_frame)
         odom_fresh = self._fresh(self.last_odom_wall, self.max_odom_age_sec)
         amcl_fresh = self._fresh(self.last_amcl_wall, self.max_amcl_age_sec)
         cov_ok = self.xy_cov <= self.max_xy_cov and self.yaw_cov <= self.max_yaw_cov
@@ -207,7 +254,12 @@ class AmclFixedSeedReady(Node):
             'initial_pose_applied': self.initial_pose_applied,
             'map_valid': self.map_valid,
             'map_ready': self.map_known_cells >= self.min_known_map_cells,
+            'scan_rx': scan_rx,
             'scan_fresh': scan_fresh,
+            'scan_nonempty': scan_nonempty,
+            'scan_frame_ok': scan_frame_ok,
+            'scan_stamp_ok': scan_stamp_ok,
+            'scan_tf_ok': scan_tf_ok,
             'odom_fresh': odom_fresh,
             'amcl_pose_fresh': amcl_fresh,
             'amcl_pose_finite': self.amcl_pose_finite,
@@ -217,17 +269,48 @@ class AmclFixedSeedReady(Node):
             'amcl_lifecycle_active': lifecycle_active,
             '_map_odom_tf_age_ms': map_odom_age_ms,
             '_odom_base_tf_age_ms': odom_base_age_ms,
+            '_scan_tf_age_ms': scan_tf_age_ms,
         }
-        reason = 'ready'
-        for key, value in checks.items():
-            if key.startswith('_'):
-                continue
-            if not value:
-                reason = key
-                break
+        reason = self._blocking_reason(checks)
         return all(value for key, value in checks.items() if not key.startswith('_')), reason, checks
 
+    def _blocking_reason(self, checks: dict) -> str:
+        if not checks['initial_pose_applied']:
+            return 'initial_pose_missing'
+        if not checks['map_valid']:
+            return 'map_invalid'
+        if not checks['map_ready']:
+            return 'map_not_ready'
+        if not checks['scan_rx']:
+            return 'scan_missing'
+        if not checks['scan_fresh']:
+            return 'scan_stale'
+        if not checks['scan_nonempty']:
+            return 'scan_empty'
+        if not checks['scan_frame_ok']:
+            return 'scan_frame_missing'
+        if not checks['scan_stamp_ok']:
+            return 'scan_timestamp_out_of_range'
+        if not checks['scan_tf_ok']:
+            return 'scan_tf_unavailable'
+        if not checks['odom_fresh']:
+            return 'odom_stale'
+        if not checks['amcl_pose_fresh']:
+            return 'amcl_pose_stale'
+        if not checks['amcl_pose_finite']:
+            return 'amcl_pose_invalid'
+        if not checks['covariance_ok']:
+            return 'covariance_unstable'
+        if not checks['map_odom_tf']:
+            return 'map_odom_tf_unavailable'
+        if not checks['odom_base_tf']:
+            return 'odom_base_tf_unavailable'
+        if not checks['amcl_lifecycle_active']:
+            return 'amcl_lifecycle_inactive'
+        return 'none'
+
     def _log_localization_debug(self, *, ready: bool, reason: str, checks: dict) -> None:
+        self._log_scan_debug(checks)
         self.get_logger().warning(
             'LEADER_LOCALIZATION_DEBUG | '
             f'mode=amcl '
@@ -252,6 +335,33 @@ class AmclFixedSeedReady(Node):
             f'readiness_publisher_count={self.count_publishers(self.ready_topic)} '
             f'localization_ready={ready} '
             f'blocking_reason={reason}',
+            throttle_duration_sec=2.0,
+        )
+
+    def _resolved_topic(self, topic: str) -> str:
+        try:
+            return self.resolve_topic_name(topic)
+        except Exception:  # noqa: BLE001
+            return topic
+
+    def _log_scan_debug(self, checks: dict) -> None:
+        self.get_logger().warning(
+            'LEADER_SCAN_DEBUG | '
+            f'configured_topic={self.scan_topic} '
+            f'resolved_topic={self._resolved_topic(self.scan_topic)} '
+            f'publisher_count={self.count_publishers(self.scan_topic)} '
+            f'subscription_count={self.count_subscribers(self.scan_topic)} '
+            f'frame_id={self.last_scan_frame or "(none)"} '
+            f'source_stamp_age_ms={self.last_scan_source_age_ms:.0f} '
+            f'receive_age_ms={self._age(self.last_scan_wall) * 1000.0:.0f} '
+            f'ranges_count={self.last_scan_ranges} '
+            f'range_min={self.last_scan_range_min:.3f} '
+            f'range_max={self.last_scan_range_max:.3f} '
+            f'finite_ranges={self.last_scan_finite_ranges} '
+            f'scan_tf={checks["scan_tf_ok"]} '
+            f'scan_tf_age_ms={checks["_scan_tf_age_ms"]:.0f} '
+            f'qos_compatible=best_effort_sensor_data '
+            f'blocking_reason={self._blocking_reason(checks)}',
             throttle_duration_sec=2.0,
         )
 

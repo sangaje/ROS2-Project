@@ -492,3 +492,33 @@ def test_runtime_accepts_takeover_confidence_seed_without_rl_package_changes():
     assert 'np.maximum(target, merged, out=target)' in source
     assert 'SCOUT_RL_CONFIDENCE_SEED_APPLIED' in source
     assert 'def _publish_policy_scan_from_raw' in source
+
+
+def test_scout_rl_worker_logs_recoverable_runtime_gate_debug():
+    source = (
+        Path(__file__).parents[1]
+        / 'system_bringup'
+        / 'scout_rl_policy_worker.py'
+    ).read_text(encoding='utf-8')
+    runtime = (
+        Path(__file__).parents[1]
+        / 'system_bringup'
+        / 'scout_rl_runtime.py'
+    ).read_text(encoding='utf-8')
+
+    assert 'SCOUT_RL_DEBUG |' in source
+    assert 'SCOUT_RL_GATE |' in source
+    assert 'blocking_reason=' in source
+    assert 'startup_not_released' in source
+    assert 'start_motion_false' in source
+    assert 'raw_action_linear=' in source
+    assert 'raw_action_nonzero=' in source
+    assert 'scan_stale' in source
+    assert 'map_stale' in source
+    assert 'policy_worker_dead' in source
+    assert 'SCOUT_RL_RESUME_REQUEST |' in source
+    assert 'self.runtime.hold(reason)' in source
+    assert 'def debug_snapshot' in runtime
+    assert 'def hold(self, reason: str)' in runtime
+    assert "'observation_ready'" in runtime
+    assert "'inference_age_ms'" in runtime

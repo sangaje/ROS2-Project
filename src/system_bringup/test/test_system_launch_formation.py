@@ -31,8 +31,12 @@ def test_system_launch_uses_fixed_seed_localization_and_faster_nav2_leader_defau
     assert "'leader_shadow_max_linear_vel',\n            default_value='0.26'" in text
     assert "'leader_shadow_catchup_max_linear_vel',\n            default_value='0.26'" in text
     assert "'leader_shadow_max_angular_vel',\n            default_value='1.00'" in text
-    assert "'leader_shadow_goal_update_period_sec',\n            default_value='1.0'" in text
-    assert "'leader_shadow_goal_min_change_m',\n            default_value='0.35'" in text
+    assert "'leader_shadow_follow_distance_m',\n            default_value='0.40'" in text
+    assert "'leader_shadow_stop_distance_m',\n            default_value='0.30'" in text
+    assert "'leader_shadow_resume_distance_m',\n            default_value='0.46'" in text
+    assert "'leader_shadow_far_distance_m',\n            default_value='0.80'" in text
+    assert "'leader_shadow_goal_update_period_sec',\n            default_value='0.5'" in text
+    assert "'leader_shadow_goal_min_change_m',\n            default_value='0.12'" in text
     assert "'follow_goal_update_distance_m': 0.30" in text
     assert "'follow_startup_leader_motion_m': 0.30" in text
 

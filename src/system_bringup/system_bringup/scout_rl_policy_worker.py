@@ -96,6 +96,8 @@ class ScoutRLPolicyWorker(Node):
         self.worker_state = RLWorkerState.STANDBY
         self.runtime_active = False
         self.last_gate_reason = 'startup'
+        self.last_debug_wall = -1.0e9
+        self.startup_released = False
 
         if self.use_stamped:
             self.cmd_pub = self.create_publisher(TwistStamped, self.cmd_vel_topic, 10)
@@ -142,6 +144,9 @@ class ScoutRLPolicyWorker(Node):
             f'require_start_motion={self.require_start_motion}:{self.start_motion_topic} '
             f'requested_start_motion_gate={requested_start_motion}'
         )
+
+    def _now(self) -> float:
+        return self.get_clock().now().nanoseconds * 1.0e-9
 
     def _on_role(self, msg: String) -> None:
         update = parse_role_update(msg.data, self.robot_name)
@@ -220,6 +225,13 @@ class ScoutRLPolicyWorker(Node):
                 'SCOUT_START_MOTION | '
                 f'robot={self.robot_name} ready={self.start_motion} '
                 f'topic={self.start_motion_topic}'
+            )
+        if self.start_motion and not previous:
+            self.startup_released = True
+            self.get_logger().warning(
+                'SCOUT_RL_RESUME_REQUEST | '
+                f'robot={self.robot_name} reason=start_motion_true '
+                'stale_action_dropped=true latest_sensors_retained=true'
             )
         self._evaluate_gate()
 
@@ -328,10 +340,124 @@ class ScoutRLPolicyWorker(Node):
                 'SCOUT_RL_ACTIVE | '
                 f'robot={self.robot_name} epoch={self.role_epoch}'
             )
+        elif (
+            not should_activate
+            and self.runtime_active
+            and state == RLWorkerState.WAIT_SENSOR_READY
+            and self.start_motion
+            and (self.system_ready or not self.require_system_ready)
+        ):
+            self.runtime.hold(reason)
         elif not should_activate and self.runtime_active:
             self.runtime_active = False
             self.runtime.deactivate(reason)
             self._publish_zero()
+        self._log_rl_debug(gate, state, reason)
+
+    def _debug_blocking_reason(
+        self,
+        gate: GateInputs,
+        state: RLWorkerState,
+        reason: str,
+        runtime: dict[str, object],
+    ) -> str:
+        role = self.desired_role.strip().upper()
+        if role != 'ACTIVE_SCOUT':
+            return 'role_inactive'
+        if self.require_failover_activation and not gate.active_scout_matches:
+            return 'lease_expired'
+        if self.require_start_motion and not self.start_motion:
+            if not self.startup_released:
+                return 'startup_not_released'
+            return 'start_motion_false'
+        if self.require_system_ready and not self.system_ready:
+            return 'system_not_ready'
+        if state == RLWorkerState.WAIT_LOCALIZATION:
+            return 'localization_not_ready'
+        if state == RLWorkerState.WAIT_MOTION_RELEASE:
+            return 'cmd_vel_authority_lost'
+        if state == RLWorkerState.WAIT_SENSOR_READY:
+            scan_age = float(runtime.get('scan_age_ms', -1.0))
+            map_age = float(runtime.get('map_age_ms', -1.0))
+            max_scan_ms = self.runtime.config.max_scan_age_sec * 1000.0
+            max_map_ms = self.runtime.config.max_map_age_sec * 1000.0
+            if scan_age < 0.0 or scan_age > max_scan_ms:
+                return 'scan_stale'
+            if map_age < 0.0 or map_age > max_map_ms:
+                return 'map_stale'
+            if not bool(runtime.get('policy_worker_alive', False)):
+                return 'policy_worker_dead'
+            return 'observation_not_ready'
+        if str(runtime.get('last_stop_reason', '')) == 'inference_timeout':
+            return 'inference_timeout'
+        if not bool(runtime.get('safety_allowed', True)):
+            return 'safety_stop'
+        if state == RLWorkerState.ACTIVE:
+            return 'none'
+        return reason
+
+    def _log_rl_debug(
+        self,
+        gate: GateInputs,
+        state: RLWorkerState,
+        reason: str,
+    ) -> None:
+        now = self._now()
+        if now - self.last_debug_wall < 1.0:
+            return
+        self.last_debug_wall = now
+        runtime = self.runtime.debug_snapshot()
+        blocking = self._debug_blocking_reason(gate, state, reason, runtime)
+        role_active = self.desired_role.strip().upper() == 'ACTIVE_SCOUT'
+        raw_nonzero = (
+            abs(float(runtime['raw_cmd_linear'])) > 1.0e-4
+            or abs(float(runtime['raw_cmd_angular'])) > 1.0e-4
+        )
+        final_nonzero = (
+            abs(float(runtime['final_cmd_linear'])) > 1.0e-4
+            or abs(float(runtime['final_cmd_angular'])) > 1.0e-4
+        )
+        hardware_publish_allowed = bool(
+            role_active
+            and gate.active_scout_matches
+            and self.start_motion
+            and state == RLWorkerState.ACTIVE
+        )
+        self.get_logger().warning(
+            'SCOUT_RL_DEBUG | '
+            f'robot={self.robot_name} '
+            f'role={self.desired_role} '
+            f'role_active={role_active} '
+            f'active_scout_id={self.active_scout_id or "(unset)"} '
+            f'epoch={self.role_epoch} '
+            f'lease_valid={gate.active_scout_matches} '
+            f'start_motion={self.start_motion} '
+            f'system_ready={self.system_ready} '
+            f'dashboard_ready={self.video_ready} '
+            f'scan_age_ms={float(runtime["scan_age_ms"]):.0f} '
+            f'map_age_ms={float(runtime["map_age_ms"]):.0f} '
+            f'odom_age_ms=-1 '
+            f'observation_ready={runtime["observation_ready"]} '
+            f'policy_worker_alive={runtime["policy_worker_alive"]} '
+            f'inference_age_ms={float(runtime["inference_age_ms"]):.0f} '
+            f'raw_action_linear={float(runtime["raw_cmd_linear"]):.3f} '
+            f'raw_action_angular={float(runtime["raw_cmd_angular"]):.3f} '
+            f'safety_allowed={runtime["safety_allowed"]} '
+            f'final_cmd_linear={float(runtime["final_cmd_linear"]):.3f} '
+            f'final_cmd_angular={float(runtime["final_cmd_angular"]):.3f} '
+            f'cmd_vel_published={runtime["cmd_vel_published"]} '
+            f'gate_state={state.value} gate_reason={reason} '
+            f'blocking_reason={blocking}'
+        )
+        self.get_logger().warning(
+            'SCOUT_RL_GATE | '
+            f'role_active={role_active} '
+            f'start_motion={self.start_motion} '
+            f'raw_action_nonzero={raw_nonzero} '
+            f'final_command_nonzero={final_nonzero} '
+            f'hardware_publish_allowed={hardware_publish_allowed} '
+            f'blocking_reason={blocking}'
+        )
 
     def _log_state_transition(self, state: RLWorkerState, reason: str) -> None:
         if state == RLWorkerState.RECOVERY_NAVIGATING:

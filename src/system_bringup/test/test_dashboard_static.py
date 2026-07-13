@@ -30,6 +30,10 @@ def test_dashboard_publishes_latched_video_ready_after_all_streams_arrive():
     assert "blocking_panels=" in source
     assert "system_readiness_detail_topic" in source
     assert "self._publish_start_motion(False" in source
+    assert "STARTUP_COORDINATOR |" in source
+    assert "STARTUP_NOT_RELEASED" in source
+    assert "leader_unified_dashboard_startup_coordinator" in source
+    assert "publisher_count" in source
     assert "DurabilityPolicy.TRANSIENT_LOCAL" in source
     assert "yolo_frames" in source
     assert "inference_frames" in source

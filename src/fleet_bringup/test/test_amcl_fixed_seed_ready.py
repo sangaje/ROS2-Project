@@ -36,6 +36,20 @@ def test_fixed_seed_ready_requires_tf_and_lifecycle_active():
     assert "readiness_publisher_count=" in SOURCE
 
 
+def test_fixed_seed_ready_reports_real_scan_blocking_reasons():
+    assert "LEADER_SCAN_DEBUG |" in SOURCE
+    assert "qos_compatible=best_effort_sensor_data" in SOURCE
+    assert "publisher_count=" in SOURCE
+    assert "subscription_count=" in SOURCE
+    assert "scan_missing" in SOURCE
+    assert "scan_stale" in SOURCE
+    assert "scan_frame_missing" in SOURCE
+    assert "scan_tf_unavailable" in SOURCE
+    assert "scan_timestamp_out_of_range" in SOURCE
+    assert "scan_empty" in SOURCE
+    assert "return 'scan_fresh'" not in SOURCE
+
+
 def test_launch_files_pass_absolute_localization_ready_topic():
     root = Path(__file__).parents[2]
     for relative in (

@@ -28,12 +28,13 @@ def test_critical_launches_do_not_gate_on_process_exit():
         assert forbidden.isdisjoint(_names_used(path)), path
 
 
-def test_leader_localization_splits_amcl_and_costmap_scans():
+def test_leader_localization_uses_local_scan_for_amcl_and_costmaps():
     text = (LAUNCH_DIR / 'leader.launch.py').read_text(encoding='utf-8')
     assert "'amcl_scan_topic'," in text
     assert "'costmap_scan_topic'," in text
-    assert "default_value='/scan'" in text
-    assert "default_value='/scan_filtered'" in text
+    assert text.count("default_value='/scan'") >= 2
+    assert "or '/scan'" in text
+    assert "or '/scan_filtered'" not in text
     assert "'topic': scan_topic_value" not in text
     assert "'scan_topic': scan_topic_value" not in text
 

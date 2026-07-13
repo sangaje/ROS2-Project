@@ -77,7 +77,16 @@ def test_leader_shadow_backend_is_explicit_and_debug_logs_motion_chain():
     assert "self.declare_parameter('leader_follow_backend', 'nav2')" in source
     assert "self.follow_backend not in ('nav2', 'direct')" in source
     assert "LEADER_FOLLOW_DEBUG |" in source
+    assert "LEADER_NAV2_PIPELINE |" in source
+    assert "goal_accepted=" in source
+    assert "target_behind_scout=" in source
+    assert "target_mode=" in source
+    assert "hold_no_safe_rear_goal" in source
+    assert "stopped_close_to_scout" in source
+    assert "hold_resume_hysteresis" in source
     assert "path_age_ms" in source
+    assert "controller_cmd_age_ms" in source
+    assert "hardware_cmd_age_ms" in source
     assert "nonzero_cmd_age_ms" in source
     assert "odom_motion" in source
     assert "DeclareLaunchArgument(\n            'leader_follow_backend'" in launch

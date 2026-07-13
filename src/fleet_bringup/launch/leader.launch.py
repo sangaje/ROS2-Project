@@ -167,7 +167,7 @@ def generate_launch_description():
         costmap_scan_topic_value = (
             '/scan'
             if simulation
-            else costmap_scan_topic.perform(context).strip() or '/scan_filtered'
+            else costmap_scan_topic.perform(context).strip() or '/scan'
         )
         auto_localize_enabled = (
             not cartographer_owned
@@ -819,10 +819,10 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'costmap_scan_topic',
-            default_value='/scan_filtered',
+            default_value='/scan',
             description=(
-                'Real external-map leader mode: filtered LaserScan consumed '
-                'only by Nav2 obstacle layers.'
+                'Real external-map leader mode: local Leader LaserScan consumed '
+                'by Nav2 obstacle layers. Defaults to the same /scan topic as AMCL.'
             ),
         ),
         DeclareLaunchArgument(

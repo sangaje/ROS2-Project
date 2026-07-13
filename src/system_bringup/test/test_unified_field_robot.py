@@ -385,7 +385,7 @@ def test_nav2_shadow_goal_starts_even_when_leader_begins_next_to_scout():
     node.original_scout_id = 'scout22'
     node.follower_robot_name = 'follower21'
     node.leader_pose = _pose(0.0, 0.0)
-    node.original_scout_pose = _pose(0.10, 0.0)
+    node.original_scout_pose = _pose(1.0, 0.0)
     node.original_scout_wall = 10.0
     node.follower_scout_pose = None
     node.follower_scout_wall = -1.0e9
@@ -404,16 +404,18 @@ def test_nav2_shadow_goal_starts_even_when_leader_begins_next_to_scout():
     node.last_nominal_target = None
     node.goal_period = 0.0
     node.goal_min_change = 0.05
-    node.follow_distance = 1.2
+    node.follow_distance = 0.40
+    node.stop_distance = 0.30
+    node.resume_distance = 0.46
     node.cmd_goal_tolerance = 0.16
-    node.far_distance = 4.5
+    node.far_distance = 0.80
     node.shadow_linear_vel = 0.14
     node.catchup_linear_vel = 0.14
     node.shadow_angular_vel = 0.35
     node.restore_linear_vel = 0.14
     node.restore_angular_vel = 0.35
     node.map_clearance = 0.22
-    node.search_radius = 1.2
+    node.search_radius = 0.80
     node.search_step = 0.15
     node.occupied_threshold = 50
     node.allow_unknown = False
@@ -431,7 +433,10 @@ def test_nav2_shadow_goal_starts_even_when_leader_begins_next_to_scout():
 
     assert len(node.goal_pub.messages) == 1
     goal = node.goal_pub.messages[0]
-    assert -1.3 < goal.pose.position.x < -0.9
+    assert 0.58 < goal.pose.position.x < 0.62
+    assert abs(goal.pose.position.y) < 0.01
+    assert node.last_target_behind_scout is True
+    assert node.last_target_mode == 'exact_rear'
     assert node.shadow_goal_active is True
 
 

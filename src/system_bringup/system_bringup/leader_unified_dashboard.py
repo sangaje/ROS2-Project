@@ -438,6 +438,7 @@ class LeaderUnifiedDashboard(Node):
         self._dashboard_manifest_wall_sec: Optional[float] = None
         self._dashboard_ui_good_since: Optional[float] = None
         self._dashboard_ui_ready = False
+        self._startup_motion_released = False
         self._events: Dict[str, Dict[str, Any]] = {
             'fire': self._empty_event('/omx/fire', 'std_msgs/msg/Empty'),
             'target_processed': self._empty_event(
@@ -912,6 +913,16 @@ class LeaderUnifiedDashboard(Node):
         payload = dict(detail)
         payload['start_motion'] = bool(ready)
         payload['topic'] = self.start_motion_topic
+        payload.setdefault(
+            'phase',
+            'RUNNING' if ready else (
+                'RUNTIME_STOPPED'
+                if self._startup_motion_released
+                else 'STARTUP_NOT_RELEASED'
+            ),
+        )
+        payload['authoritative_publisher'] = 'leader_unified_dashboard_startup_coordinator'
+        payload['publisher_count'] = self.count_publishers(self.start_motion_topic)
         detail_msg = String(data=json.dumps(payload, sort_keys=True))
         self.readiness_detail_pub.publish(detail_msg)
         self.start_motion_detail_pub.publish(detail_msg)
@@ -1180,16 +1191,55 @@ class LeaderUnifiedDashboard(Node):
             self._video_ready = ready
             system_ready = system_ready_snapshot
             start_motion = bool(ready and system_ready)
+            if start_motion:
+                self._startup_motion_released = True
+            phase = (
+                'RUNNING'
+                if start_motion else (
+                    'RUNTIME_STOPPED'
+                    if self._startup_motion_released
+                    else 'STARTUP_NOT_RELEASED'
+                )
+            )
             self._start_motion = start_motion
             published_count = int(self._video_ready_detail.get('published_count', 0))
             detail['published_count'] = published_count
             detail['start_motion'] = start_motion
+            detail['phase'] = phase
             detail['system_ready'] = system_ready
             detail['system_ready_topic'] = self.system_ready_topic
             detail['start_motion_topic'] = self.start_motion_topic
+            detail['authoritative_publisher'] = (
+                'leader_unified_dashboard_startup_coordinator'
+            )
+            detail['publisher_count'] = self.count_publishers(self.start_motion_topic)
             self._video_ready_detail = detail
             self._dashboard_ui_ready = ui_ready
         self._publish_readiness_detail(detail)
+        panel_state = detail.get('dashboard_ui', {}).get('panels', {})
+        blocking_panels = []
+        if isinstance(panel_state, dict):
+            blocking_panels = [
+                name
+                for name, panel in panel_state.items()
+                if isinstance(panel, dict) and not bool(panel.get('ready'))
+            ]
+        self.get_logger().warning(
+            'STARTUP_COORDINATOR | '
+            f'phase={phase} '
+            f'scout_yolo_rendered={panel_state.get("scout_yolo", {}).get("rendered") if isinstance(panel_state.get("scout_yolo"), dict) else None} '
+            f'leader_omx_rendered={panel_state.get("leader_omx", {}).get("rendered") if isinstance(panel_state.get("leader_omx"), dict) else None} '
+            f'map_rendered={panel_state.get("map", {}).get("rendered") if isinstance(panel_state.get("map"), dict) else None} '
+            f'risk_map_rendered={panel_state.get("risk_map", {}).get("rendered") if isinstance(panel_state.get("risk_map"), dict) else None} '
+            f'fleet_state_rendered={panel_state.get("fleet_state", {}).get("rendered") if isinstance(panel_state.get("fleet_state"), dict) else None} '
+            f'browser_heartbeat={bool(ui_detail.get("session_fresh"))} '
+            f'leader_localization_ready={infrastructure.get("leader_localization")} '
+            f'stable_ready_sec={float(ui_detail.get("stable_sec", 0.0) or 0.0):.2f} '
+            f'start_motion={start_motion} '
+            f'publisher_count={self.count_publishers(self.start_motion_topic)} '
+            f'blocking_reasons={detail.get("blocking_reasons", [])}',
+            throttle_duration_sec=1.0,
+        )
         if ready != previous:
             self._publish_video_ready(ready, 'all_video_ready' if ready else 'video_not_ready')
             self.get_logger().warning(
@@ -1200,14 +1250,6 @@ class LeaderUnifiedDashboard(Node):
                 f'omx_frame={omx_frame_ready} omx_stream={omx_stream_ready} ui={ui_ready}'
             )
         if not ready:
-            panel_state = detail.get('dashboard_ui', {}).get('panels', {})
-            blocking_panels = []
-            if isinstance(panel_state, dict):
-                blocking_panels = [
-                    name
-                    for name, panel in panel_state.items()
-                    if isinstance(panel, dict) and not bool(panel.get('ready'))
-                ]
             self.get_logger().warning(
                 'DASHBOARD_READINESS_DETAIL | '
                 f'scout_yolo={scout_ready} '

@@ -1700,7 +1700,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'scout_pose_timeout_sec',
-            default_value='5.0',
+            default_value='0.5',
             description='Maximum age of scout pose allowed for failure target freeze.',
         ),
         DeclareLaunchArgument(
@@ -1729,22 +1729,22 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'leader_shadow_follow_distance_m',
-            default_value='1.2',
-            description='Leader shadow target distance behind active scout movement direction.',
+            default_value='0.40',
+            description='Leader Nav2 target distance behind the active scout yaw direction.',
         ),
         DeclareLaunchArgument(
             'leader_shadow_stop_distance_m',
-            default_value='0.8',
+            default_value='0.30',
             description='Leader stops shadow goal updates when closer than this to the active scout.',
         ),
         DeclareLaunchArgument(
             'leader_shadow_resume_distance_m',
-            default_value='1.3',
+            default_value='0.46',
             description='Leader resumes shadow follow when scout distance reaches this hysteresis threshold.',
         ),
         DeclareLaunchArgument(
             'leader_shadow_far_distance_m',
-            default_value='2.4',
+            default_value='0.80',
             description='Distance where shadow follow permits catch-up speed limits.',
         ),
         DeclareLaunchArgument(
@@ -1764,12 +1764,12 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'leader_shadow_goal_update_period_sec',
-            default_value='1.0',
+            default_value='0.5',
             description='Minimum time between leader shadow Nav2 goal updates.',
         ),
         DeclareLaunchArgument(
             'leader_shadow_goal_min_change_m',
-            default_value='0.35',
+            default_value='0.12',
             description='Minimum shadow target displacement before sending another leader goal.',
         ),
         DeclareLaunchArgument(
