@@ -178,6 +178,12 @@ class OmxYoloNode(Node):
         # Costmap
         self.costmap: Optional[OccupancyGrid] = None
         self._costmap_logged = False
+        self.risk_map: Optional[OccupancyGrid] = None
+        self.risk_map_wall_sec: Optional[float] = None
+        self._risk_map_logged = False
+        self._risk_scan_center_yaw: Optional[float] = None
+        self._risk_scan_center_wall_sec = 0.0
+        self._last_risk_scan_log_t = 0.0
 
         # 내부 모듈
         self.detector = YoloDetector(self.cfg, logger=self.get_logger())
@@ -313,6 +319,13 @@ class OmxYoloNode(Node):
         self.create_subscription(
             OccupancyGrid, self.cfg.patrol.costmap_topic,
             self.on_costmap, 1)
+        if self.cfg.patrol.risk_scan_enabled:
+            self.create_subscription(
+                OccupancyGrid,
+                self.cfg.patrol.risk_map_topic,
+                self.on_risk_map,
+                1,
+            )
         # H2 신규
         self.create_subscription(String, '/waffle/nav_result',
                                  self.on_nav_result, 10)
@@ -426,6 +439,167 @@ class OmxYoloNode(Node):
                 f"Costmap 수신: {msg.info.width}x{msg.info.height} "
                 f"cells @ {msg.info.resolution}m/cell")
             self._costmap_logged = True
+
+    def on_risk_map(self, msg: OccupancyGrid):
+        self.risk_map = msg
+        self.risk_map_wall_sec = time.time()
+        if not self._risk_map_logged:
+            self.get_logger().info(
+                f"Risk map 수신: {msg.info.width}x{msg.info.height} "
+                f"cells @ {msg.info.resolution}m/cell "
+                f"topic={self.cfg.patrol.risk_map_topic}")
+            self._risk_map_logged = True
+
+    @staticmethod
+    def _occgrid_origin_yaw(info) -> float:
+        q = info.origin.orientation
+        return math.atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z),
+        )
+
+    def _occgrid_cell_center_world(self, info, gx: int, gy: int):
+        resolution = float(info.resolution)
+        lx = (float(gx) + 0.5) * resolution
+        ly = (float(gy) + 0.5) * resolution
+        yaw = self._occgrid_origin_yaw(info)
+        c = math.cos(yaw)
+        s = math.sin(yaw)
+        ox = float(info.origin.position.x)
+        oy = float(info.origin.position.y)
+        return ox + c * lx - s * ly, oy + s * lx + c * ly
+
+    def _focus_scan_center_yaw(self) -> Optional[float]:
+        focus = self.sm.current_focus or self.sm.current_parent
+        if focus is None:
+            return None
+        coord_map = getattr(focus, 'coord_map', None)
+        if coord_map is None:
+            return None
+        arm = self.transform_map_to_arm_base(coord_map)
+        if arm is None:
+            return None
+        ax, ay, _ = arm
+        if math.hypot(ax, ay) < 1.0e-3:
+            return None
+        return math.atan2(ay, ax)
+
+    def _risk_map_scan_center_yaw(self, now: float) -> Optional[float]:
+        if not self.cfg.patrol.risk_scan_enabled:
+            return None
+        if self.risk_map is None or self.risk_map_wall_sec is None:
+            return None
+        if now - self.risk_map_wall_sec > 5.0:
+            return None
+        if now - self._risk_scan_center_wall_sec < 0.5:
+            return self._risk_scan_center_yaw
+
+        pose = self.get_waffle_xy_yaw()
+        if pose is None:
+            self._risk_scan_center_yaw = None
+            self._risk_scan_center_wall_sec = now
+            return None
+
+        rx, ry, ryaw = pose
+        msg = self.risk_map
+        info = msg.info
+        width = int(info.width)
+        height = int(info.height)
+        if width <= 0 or height <= 0 or info.resolution <= 0.0:
+            return None
+
+        min_value = int(self.cfg.patrol.risk_scan_min_value)
+        max_distance = float(self.cfg.patrol.risk_scan_max_distance_m)
+        yaw_limit = math.radians(float(self.cfg.patrol.risk_scan_center_yaw_limit_deg))
+        stride = max(1, int(self.cfg.patrol.risk_scan_sample_stride))
+        candidates = []
+
+        for gy in range(stride // 2, height, stride):
+            row = gy * width
+            for gx in range(stride // 2, width, stride):
+                idx = row + gx
+                if idx < 0 or idx >= len(msg.data):
+                    continue
+                value = int(msg.data[idx])
+                if value < min_value:
+                    continue
+                wx, wy = self._occgrid_cell_center_world(info, gx, gy)
+                dx = wx - rx
+                dy = wy - ry
+                distance = math.hypot(dx, dy)
+                if distance < 0.20 or distance > max_distance:
+                    continue
+                relative_yaw = wrap_angle(math.atan2(dy, dx) - ryaw)
+                if abs(relative_yaw) > yaw_limit:
+                    continue
+                score = float(value) / (1.0 + distance)
+                candidates.append((score, value, distance, relative_yaw, wx, wy))
+
+        candidates.sort(reverse=True)
+        if not candidates:
+            self._risk_scan_center_yaw = None
+            self._risk_scan_center_wall_sec = now
+            return None
+
+        selected = []
+        for candidate in candidates[:24]:
+            _, _, _, _, wx, wy = candidate
+            if self.costmap is not None:
+                los = self._los_between((rx, ry), (wx, wy))
+                if los == LOSResult.BLOCKED:
+                    continue
+            selected.append(candidate)
+            if len(selected) >= 8:
+                break
+
+        if not selected:
+            self._risk_scan_center_yaw = None
+            self._risk_scan_center_wall_sec = now
+            return None
+
+        sin_sum = 0.0
+        cos_sum = 0.0
+        total = 0.0
+        best = selected[0]
+        for score, value, _distance, relative_yaw, _wx, _wy in selected:
+            weight = max(1.0, score * max(1, value))
+            sin_sum += math.sin(relative_yaw) * weight
+            cos_sum += math.cos(relative_yaw) * weight
+            total += weight
+        center_yaw = math.atan2(sin_sum, cos_sum) if total > 0.0 else best[3]
+        center_yaw = max(-yaw_limit, min(yaw_limit, center_yaw))
+        self._risk_scan_center_yaw = center_yaw
+        self._risk_scan_center_wall_sec = now
+
+        if now - self._last_risk_scan_log_t > 2.0:
+            self._last_risk_scan_log_t = now
+            self.get_logger().info(
+                'OMX_RISK_SCAN_CENTER | '
+                f'yaw={math.degrees(center_yaw):+.1f}deg '
+                f'best_value={best[1]} best_dist={best[2]:.2f}m '
+                f'candidates={len(candidates)} selected={len(selected)}'
+            )
+        return center_yaw
+
+    def scan_sweep_center_yaw(self, now: float) -> Optional[float]:
+        risk_center = self._risk_map_scan_center_yaw(now)
+        if risk_center is not None:
+            return risk_center
+        focus_center = self._focus_scan_center_yaw()
+        if focus_center is not None:
+            limit = math.radians(float(self.cfg.patrol.risk_scan_center_yaw_limit_deg))
+            return max(-limit, min(limit, focus_center))
+        return 0.0
+
+    def execute_scan_sweep(self, now: float) -> None:
+        self._controller_call(
+            'scan_sweep',
+            self.ctrl.scan_sweep,
+            now,
+            self.cfg.patrol.scan_sweep_half_angle_deg,
+            self.cfg.patrol.scan_sweep_period_sec,
+            self.scan_sweep_center_yaw(now),
+        )
 
     # ----- TF helpers -----
 
@@ -1709,13 +1883,7 @@ class OmxYoloNode(Node):
                 )
 
             elif action['action'] == 'scan_sweep':
-                self._controller_call(
-                    'scan_sweep',
-                    self.ctrl.scan_sweep,
-                    now,
-                    self.cfg.patrol.scan_sweep_half_angle_deg,
-                    self.cfg.patrol.scan_sweep_period_sec,
-                )
+                self.execute_scan_sweep(now)
 
             elif action['action'] == 'fire' and vision_valid:
                 processed_map = (self.sm.current_focus.coord_map
@@ -1735,13 +1903,7 @@ class OmxYoloNode(Node):
                 vp = action['nav_goal_xyyaw']
                 if vp is not None:
                     self.publish_nav_goal(vp)
-                self._controller_call(
-                    'scan_sweep',
-                    self.ctrl.scan_sweep,
-                    now,
-                    self.cfg.patrol.scan_sweep_half_angle_deg,
-                    self.cfg.patrol.scan_sweep_period_sec,
-                )
+                self.execute_scan_sweep(now)
 
         self.maybe_retry_waiting_nav_goal(now)
 

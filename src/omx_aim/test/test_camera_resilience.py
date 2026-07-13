@@ -74,7 +74,27 @@ def test_omx_launch_supports_video_only_dry_run_during_motor_faults():
     assert 'OMX_CONTROL_RUNTIME_FALLBACK_VIDEO_ONLY' in node_source
     assert "self._controller_call('go_home', self.ctrl.go_home)" in node_source
     assert "'scan_sweep'," in node_source
-    assert 'self.ctrl.scan_sweep,' in node_source
+    assert 'def execute_scan_sweep(self, now: float)' in node_source
+    assert 'self.scan_sweep_center_yaw(now)' in node_source
+
+
+def test_omx_scan_sweep_can_center_on_risk_map():
+    package_root = Path(__file__).parents[1]
+    node_source = (package_root / 'omx_aim' / 'yolo_node.py').read_text(
+        encoding='utf-8'
+    )
+    config_source = (package_root / 'config' / 'config.yaml').read_text(
+        encoding='utf-8'
+    )
+    controller_source = (package_root / 'omx' / 'controller.py').read_text(
+        encoding='utf-8'
+    )
+
+    assert 'risk_map_topic: "/risk/risk_map"' in config_source
+    assert 'self.on_risk_map' in node_source
+    assert 'def _risk_map_scan_center_yaw' in node_source
+    assert 'OMX_RISK_SCAN_CENTER' in node_source
+    assert 'center_yaw_rad: float | None = None' in controller_source
 
 
 def test_camera_read_exceptions_do_not_kill_omx_loop():

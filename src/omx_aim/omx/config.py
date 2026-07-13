@@ -140,6 +140,12 @@ class PatrolConfig:
     boundary_aim_settle_sec: float = 0.05
     scan_sweep_half_angle_deg: float = 60.0
     scan_sweep_period_sec: float = 5.0
+    risk_scan_enabled: bool = True
+    risk_map_topic: str = "/risk/risk_map"
+    risk_scan_min_value: int = 8
+    risk_scan_max_distance_m: float = 4.0
+    risk_scan_center_yaw_limit_deg: float = 80.0
+    risk_scan_sample_stride: int = 4
     
 @dataclass
 class ViewPoseConfig:

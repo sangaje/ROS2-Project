@@ -177,6 +177,14 @@ patrol:
   # period_sec 를 늘리면 더 느리게 왕복한다.
   scan_sweep_half_angle_deg: 60.0
   scan_sweep_period_sec: 5.0
+  # 남아있는 risk map을 리더 OMX 시야로 지우기 위해, 스캔 중심을 가장
+  # 높은 risk 방향으로 끌고 간다. target/focus가 없으면 정면으로 폴백.
+  risk_scan_enabled: true
+  risk_map_topic: "/risk/risk_map"
+  risk_scan_min_value: 8
+  risk_scan_max_distance_m: 4.0
+  risk_scan_center_yaw_limit_deg: 80.0
+  risk_scan_sample_stride: 4
   max_queue_size: 20
   duplicate_threshold_m: 0.3
   los_check_enabled: true

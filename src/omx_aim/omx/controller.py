@@ -129,7 +129,7 @@ class OmxController:
                        pitch_tick, normalize=False)
 
     def scan_sweep(self, now: float, half_angle_deg: float,
-                   period_sec: float):
+                   period_sec: float, center_yaw_rad: float | None = None):
         """SCANNING 중에도 pan을 좌우로 연속적으로(호를 그리며) 훑는다.
 
         예전 구현은 half_period 마다 목표를 반대쪽 끝으로 순간 이동시켰다
@@ -146,7 +146,9 @@ class OmxController:
 
         if self._scan_sweep_start_t is None:
             self._scan_sweep_start_t = now
-            self._scan_sweep_center_yaw = 0.0
+            self._scan_sweep_center_yaw = (
+                0.0 if center_yaw_rad is None else float(center_yaw_rad)
+            )
             self._scan_sweep_center_pitch = self.pitch
             self._log(
                 "OMX_SCAN_SWEEP_START | "
@@ -154,6 +156,15 @@ class OmxController:
                 f"half_angle={math.degrees(half_angle):.1f}deg "
                 f"period={period_sec:.2f}s"
             )
+        elif center_yaw_rad is not None:
+            center_yaw_rad = float(center_yaw_rad)
+            if abs(center_yaw_rad - self._scan_sweep_center_yaw) > math.radians(5.0):
+                self._scan_sweep_center_yaw = center_yaw_rad
+                self._scan_sweep_start_t = now
+                self._log(
+                    "OMX_SCAN_SWEEP_RECENTER | "
+                    f"center_yaw={math.degrees(center_yaw_rad):+.1f}deg"
+                )
 
         elapsed = max(0.0, now - self._scan_sweep_start_t)
         phase = (elapsed % period_sec) / period_sec  # 0..1, 한 바퀴(왕복) 주기
