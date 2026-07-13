@@ -648,6 +648,9 @@ class ActiveScoutRLRuntime:
             'history_length': len(self._history_vector),
             'tf_ready': self.tf_ready(),
             'policy_worker_alive': self._model_loading or self.ready,
+            'predict_attempt_count': self.counters.predict_attempt_count,
+            'predict_success_count': self.counters.predict_success_count,
+            'predict_failure_count': self.counters.predict_failure_count,
             'inference_age_ms': (
                 (now - self._last_inference_at) * 1000.0
                 if self._last_inference_at > 0.0 else -1.0

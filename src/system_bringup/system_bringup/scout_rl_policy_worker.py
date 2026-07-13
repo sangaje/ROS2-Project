@@ -841,7 +841,7 @@ class ScoutRLPolicyWorker(Node):
             f'observation_ready={runtime["observation_ready"]} '
             f'global_start_motion={self.global_start_motion} '
             f'local_motion_release={self._local_motion_release()} '
-            f'predict_triggered={runtime["predict_attempt_count"]} '
+            f'predict_triggered={int(runtime.get("predict_attempt_count", 0) or 0)} '
             f'blocking_reason={blocking}'
         )
         self.get_logger().warning(

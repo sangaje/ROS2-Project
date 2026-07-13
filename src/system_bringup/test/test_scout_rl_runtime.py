@@ -655,3 +655,5 @@ def test_scout_rl_worker_logs_recoverable_runtime_gate_debug():
     assert 'def hold(self, reason: str)' in runtime
     assert "'observation_ready'" in runtime
     assert "'inference_age_ms'" in runtime
+    assert "'predict_attempt_count': self.counters.predict_attempt_count" in runtime
+    assert 'runtime.get("predict_attempt_count", 0)' in source
