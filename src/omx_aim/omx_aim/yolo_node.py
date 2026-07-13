@@ -1466,10 +1466,15 @@ class OmxYoloNode(Node):
             'confidence': float(confidence or 0.0) if confidence is not None else None,
             'action': str(action.get('action', 'wait')),
             'track_requested': action.get('action') == 'track',
+            'stale_track': bool(action.get('stale_track', False)),
             'track_moved': None if track_moved is None else bool(track_moved),
             'error_norm': (
-                [float(error_norm[0]), float(error_norm[1])]
-                if error_norm is not None else None
+                [float(action['error'][0]), float(action['error'][1])]
+                if action.get('error') is not None
+                else (
+                    [float(error_norm[0]), float(error_norm[1])]
+                    if error_norm is not None else None
+                )
             ),
             'deadband': [
                 float(self.cfg.ibvs.deadband_x),
@@ -1494,6 +1499,7 @@ class OmxYoloNode(Node):
                 'OMX_AIM_DEBUG | '
                 f"state={payload['state']} action={payload['action']} "
                 f"detected={payload['detected']} error={payload['error_norm']} "
+                f"stale_track={payload['stale_track']} "
                 f"moved={payload['track_moved']} armed={payload['armed']} "
                 f"auto_armed={payload['auto_armed']} "
                 f"video_only={payload['control_video_only']}"

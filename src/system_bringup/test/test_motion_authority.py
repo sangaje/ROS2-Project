@@ -61,6 +61,7 @@ def test_leader_shadow_hard_stops_on_best_effort_target_detection():
     assert "self.declare_parameter('pause_on_raw_target_detection', True)" in source
     assert "self.declare_parameter('target_detected_stop_hold_sec', 3.0)" in source
     assert "self.declare_parameter('target_detected_cancel_period_sec', 0.25)" in source
+    assert "now - self.target_detected_wall <= self.target_stop_hold" in source
     assert 'ReliabilityPolicy.BEST_EFFORT' in source
     assert 'def _force_leader_stop_for_target' in source
     assert "self._pulse_cancel()" in source

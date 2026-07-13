@@ -60,6 +60,7 @@ class StateMachine:
         self.cooldown_home_sent: bool = False
         self.fire_start_t: float = 0.0     # 격발 펄스 시작 시각 (home 지연용)
         self.lost_start_t: float = 0.0
+        self.last_track_error: Optional[tuple] = None
 
         self.armed = cfg.autotrack.default_armed if cfg.autotrack else False
         self.last_processed: Optional[tuple] = None
@@ -449,6 +450,7 @@ class StateMachine:
             'cancel_navigation': False,
             'cancel_reason': '',
             'auto_armed': False,
+            'stale_track': False,
         }
 
         # 1. nav_result 처리
@@ -924,6 +926,7 @@ class StateMachine:
     def _on_tracking(self, detected, error_norm, now, action):
         if detected:
             self.lost_start_t = 0.0
+            self.last_track_error = error_norm
             ex, ey = error_norm
             db_x = self.cfg.ibvs.deadband_x
             db_y = self.cfg.ibvs.deadband_y
@@ -948,14 +951,26 @@ class StateMachine:
                     action['lost_coord_map'] = self.current_focus.coord_map
                 action['action'] = 'target_lost'
                 self.lost_start_t = 0.0
+                self.last_track_error = None
                 self._on_focus_done()
+            elif self.last_track_error is not None:
+                action['action'] = 'track'
+                action['error'] = self.last_track_error
+                action['stale_track'] = True
 
     def _on_confirming(self, detected, error_norm, now, action):
         if not detected:
             self._log("CONFIRMING 중 표적 사라짐 -> TRACKING")
             self.transition(State.TRACKING)
             self.confirm_progress = 0.0
+            if self.lost_start_t == 0.0:
+                self.lost_start_t = now
+            if self.last_track_error is not None:
+                action['action'] = 'track'
+                action['error'] = self.last_track_error
+                action['stale_track'] = True
         else:
+            self.last_track_error = error_norm
             ex, ey = error_norm
             scale = self.cfg.fire.confirm_deadband_scale
             confirm_db_x = self.cfg.ibvs.deadband_x * scale
@@ -1011,6 +1026,8 @@ class StateMachine:
         is_boundary = (self.current_focus.target_type == TargetType.BOUNDARY)
         self.current_focus = None
         self.confirm_progress = 0.0
+        self.lost_start_t = 0.0
+        self.last_track_error = None
 
         if is_boundary:
             # boundary 처리 끝. parent 아직 이동 중이면 WAITING_NAV 복귀.
