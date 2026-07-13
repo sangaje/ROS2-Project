@@ -36,6 +36,12 @@ from fleet_bringup.launch_utils import (
     launch_bool,
     with_virtualenv_site_packages,
 )
+from system_bringup.launch_defaults import (
+    DEFAULT_ACTIVE_SCOUT,
+    DEFAULT_CMD_VEL_TOPIC,
+    DEFAULT_FOLLOWER,
+    DEFAULT_ROLE_TOPIC_TEMPLATE,
+)
 
 
 FLEET_LAUNCH_FILES = {
@@ -466,7 +472,7 @@ def generate_launch_description():
                         'spin_timeout_sec': 42.0,
                         'settle_duration_sec': 3.0,
                         'max_spin_retries': 3,
-                        'cmd_vel_topic': '/cmd_vel',
+                        'cmd_vel_topic': DEFAULT_CMD_VEL_TOPIC,
                         'use_stamped_cmd_vel': True,
                     }],
                     env=process_env,
@@ -491,7 +497,9 @@ def generate_launch_description():
                         launch_arguments={
                             'domain_id': str(domain),
                             'robot_name': local_robot_name,
-                            'role_topic': f'/{local_robot_name}/role',
+                            'role_topic': DEFAULT_ROLE_TOPIC_TEMPLATE.format(
+                                robot_name=local_robot_name
+                            ),
                             # The unified role publisher is authoritative;
                             # worker activation never comes from launch args.
                             'initial_role_active': 'false',
@@ -499,7 +507,7 @@ def generate_launch_description():
                             'require_localization_ready': (
                                 'false' if scout_owns_slam else 'true'
                             ),
-                            'cmd_vel_topic': '/cmd_vel',
+                            'cmd_vel_topic': DEFAULT_CMD_VEL_TOPIC,
                             'use_stamped_cmd_vel': 'true',
                             'enable_velocity_safety_filter': 'true',
                         }.items(),
@@ -1297,8 +1305,8 @@ def generate_launch_description():
             description='Enable active-scout liveness watchdog and follower takeover orchestration.',
         ),
         DeclareLaunchArgument('leader_robot_name', default_value='leader'),
-        DeclareLaunchArgument('active_scout_robot_name', default_value='scout22'),
-        DeclareLaunchArgument('follower_robot_name', default_value='follower21'),
+        DeclareLaunchArgument('active_scout_robot_name', default_value=DEFAULT_ACTIVE_SCOUT),
+        DeclareLaunchArgument('follower_robot_name', default_value=DEFAULT_FOLLOWER),
         DeclareLaunchArgument(
             'leader_initial_x',
             default_value='0.0',

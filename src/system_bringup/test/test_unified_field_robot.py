@@ -5,6 +5,7 @@ from geometry_msgs.msg import PoseStamped, TwistStamped
 from std_msgs.msg import Bool, String
 
 from system_bringup.leader_shadow_follow import LeaderShadowFollow
+from system_bringup.nav_goal_manager import NavGoalManager
 from system_bringup.unified_field_robot import (
     MotionAuthority,
     parse_epoch,
@@ -99,15 +100,8 @@ def _bare_field(now=10.0):
     node._now = lambda: float(now)
     node.robot_name = 'follower21'
     node.epoch = 2
-    node.goal_epoch = 0
     node.role = Role.RECOVERY_NAVIGATING
     node.motion_authority = MotionAuthority.NONE
-    node.pending_nav_goal = None
-    node.pending_nav_source = None
-    node.active_goal_handle = None
-    node.active_goal_source = None
-    node.inflight_goal_ids = set()
-    node.cancel_requests = 0
     node.rl_runtime = None
     node.rl_backend = 'external_worker'
     node.scout_rl_enabled = True
@@ -134,6 +128,17 @@ def _bare_field(now=10.0):
     node.last_linear_speed = 0.0
     node.last_angular_speed = 0.0
     node.nav_retry_not_before = -1.0e9
+    node.nav = NavGoalManager(
+        node.nav_client,
+        now_stamp=lambda: Time(),
+        copy_pose=node._copy_pose,
+        log=logger,
+        set_authority=node._set_authority,
+        current_authority=lambda: node.motion_authority,
+        on_goal_sent=node._on_nav_goal_sent,
+        on_failure=node._handle_nav_failure,
+        on_result=node._on_nav_result,
+    )
     return node, logger
 
 
@@ -147,25 +152,24 @@ def test_epoch_parser_rejects_truncated_and_boolean_values():
 
 def test_recovery_goal_has_one_inflight_send_only():
     node, _ = _bare_field()
-    node.pending_nav_goal = _pose(1.0, 2.0)
-    node.pending_nav_source = 'RECOVERY'
+    node._queue_nav_goal(_pose(1.0, 2.0), 'RECOVERY')
 
     node._dispatch_pending_nav_goal()
     node._dispatch_pending_nav_goal()
 
     assert len(node.nav_client.sent) == 1
-    assert node.inflight_goal_ids == {1}
-    assert node.pending_nav_goal is None
+    assert node.nav.inflight_goal_ids == {1}
+    assert node.nav.pending_goal is None
     assert node.motion_authority == MotionAuthority.FAILOVER_RECOVERY_NAV
 
 
 def test_stale_recovery_result_cannot_advance_role():
     node, logger = _bare_field()
-    node.goal_epoch = 8
+    node.nav.goal_epoch = 8
     transitions = []
     node._enter_role = lambda role, reason: transitions.append((role, reason))
 
-    node._goal_result_cb(_Future(_Result(4)), goal_id=7, source='RECOVERY')
+    node.nav._goal_result_cb(_Future(_Result(4)), goal_id=7, source='RECOVERY')
 
     assert transitions == []
     assert any('STALE_FIELD_NAV_RESULT_IGNORED' in text for _, text in logger.messages)
@@ -173,16 +177,16 @@ def test_stale_recovery_result_cannot_advance_role():
 
 def test_success_without_fresh_arrival_does_not_advance_mission():
     node, _ = _bare_field()
-    node.goal_epoch = 3
-    node.active_goal_handle = object()
-    node.active_goal_source = 'RECOVERY'
+    node.nav.goal_epoch = 3
+    node.nav.active_goal_handle = object()
+    node.nav.active_goal_source = 'RECOVERY'
     node.motion_authority = MotionAuthority.FAILOVER_RECOVERY_NAV
     node.recovery_target = _pose(3.0, 0.0)
     node._at_pose = lambda target: False
     transitions = []
     node._enter_role = lambda role, reason: transitions.append((role, reason))
 
-    node._goal_result_cb(_Future(_Result(4)), goal_id=3, source='RECOVERY')
+    node.nav._goal_result_cb(_Future(_Result(4)), goal_id=3, source='RECOVERY')
 
     assert transitions == []
     assert node.recovery_nav_failures == 1
@@ -249,9 +253,9 @@ def test_recovery_does_not_advance_on_pose_distance_before_nav_success():
 def test_recovery_nav_success_pose_and_stop_mark_arrival():
     node, _ = _bare_field(now=10.0)
     node.role = Role.RECOVERY_NAVIGATING
-    node.goal_epoch = 3
-    node.active_goal_handle = object()
-    node.active_goal_source = 'RECOVERY'
+    node.nav.goal_epoch = 3
+    node.nav.active_goal_handle = object()
+    node.nav.active_goal_source = 'RECOVERY'
     node.recovery_target = _pose(1.0, 1.0)
     node.self_pose = _pose(1.0, 1.0)
     node.self_pose_wall = 10.0
@@ -261,7 +265,7 @@ def test_recovery_nav_success_pose_and_stop_mark_arrival():
     transitions = []
     node._enter_role = lambda role, reason: transitions.append((role, reason))
 
-    node._goal_result_cb(_Future(_Result(4)), goal_id=3, source='RECOVERY')
+    node.nav._goal_result_cb(_Future(_Result(4)), goal_id=3, source='RECOVERY')
 
     assert node.recovery_arrived is True
     assert transitions == [

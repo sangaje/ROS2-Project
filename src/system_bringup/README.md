@@ -289,6 +289,19 @@ SAC를 만들지 않고 role, epoch, Nav2 goal, motion authority, role/status만
 `in_process`는 테스트 호환용이며 `start_rl_worker:=false`와 함께만 쓸 수 있다.
 두 backend를 동시에 실행하면 launch가 오류로 중단한다.
 
+내부 orchestration은 다음 경계로 나뉜다. 이 분리는 topic, message type,
+기본 launch 인자 및 RL policy contract를 바꾸지 않는다.
+
+- `role_contract.py`: role JSON, legacy role string, robot ID, epoch 검증
+- `rl_activation_gate.py`: ACTIVE_SCOUT, epoch, localization, Nav2 release 및
+  runtime readiness를 판단하는 순수 gate
+- `motion_authority.py`: Nav2, localization spin, external/in-process RL의
+  단일 non-safety command owner
+- `nav_goal_manager.py`: Nav2 pending/inflight/accepted/cancel lifecycle
+
+`turtlebot3_rl_training`의 학습, observation/action, model loading 및 policy
+파일은 이 orchestration 정리의 대상이 아니며 수정하지 않는다.
+
 각 domain 확인:
 
 ```zsh

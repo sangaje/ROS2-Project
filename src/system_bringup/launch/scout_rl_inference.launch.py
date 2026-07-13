@@ -12,6 +12,10 @@ from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
 from fleet_bringup.launch_utils import dds_launch_environment
+from system_bringup.launch_defaults import (
+    DEFAULT_ACTIVE_SCOUT,
+    DEFAULT_CMD_VEL_TOPIC,
+)
 
 
 def generate_launch_description():
@@ -49,7 +53,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'robot_name',
-            default_value='scout22',
+            default_value=DEFAULT_ACTIVE_SCOUT,
             description='Robot name used to derive the default role topic.',
         ),
         DeclareLaunchArgument(
@@ -96,7 +100,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'cmd_vel_topic',
-            default_value='/cmd_vel',
+            default_value=DEFAULT_CMD_VEL_TOPIC,
             description='Velocity topic owned by this inference process.',
         ),
         DeclareLaunchArgument(

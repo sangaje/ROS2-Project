@@ -23,6 +23,8 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool, String
 
+from .motion_authority import MotionAuthority
+from .role_contract import parse_epoch
 
 class FailoverState(Enum):
     NORMAL_OPERATION = 'NORMAL_OPERATION'
@@ -43,19 +45,6 @@ def heartbeat_qos_profile() -> QoSProfile:
         durability=DurabilityPolicy.VOLATILE,
         history=HistoryPolicy.KEEP_LAST,
     )
-
-
-def parse_epoch(value) -> Optional[int]:
-    """Return a non-negative integer epoch without silently truncating values."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value if value >= 0 else None
-    if isinstance(value, str):
-        text = value.strip()
-        if text.isdigit():
-            return int(text)
-    return None
 
 
 def is_finite_map_pose(msg: PoseStamped) -> bool:
@@ -362,7 +351,9 @@ class ScoutFailoverCoordinator(Node):
             and not nav_goal_active
             and pending_goal_count == 0
             and active_goal_count == 0
-            and motion_authority in ('', 'NONE', 'ACTIVE_SCOUT_RL')
+            and motion_authority in (
+                '', MotionAuthority.NONE.value, MotionAuthority.ACTIVE_SCOUT_RL.value
+            )
         ):
             return
         self.active_scout_id = robot

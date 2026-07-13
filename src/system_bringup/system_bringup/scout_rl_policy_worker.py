@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from enum import Enum
 import json
 import os
 from typing import Optional
@@ -16,143 +14,15 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool, String
 
+from .rl_activation_gate import GateInputs, RLWorkerState, evaluate_activation_gate
+from .role_contract import RoleMessage, parse_epoch, parse_role_message
 from .scout_rl_runtime import ActiveScoutRLRuntime
 
 
-class RLWorkerState(Enum):
-    STANDBY = 'STANDBY'
-    RECOVERY_NAVIGATING = 'RECOVERY_NAVIGATING'
-    WAIT_LOCALIZATION = 'WAIT_LOCALIZATION'
-    WAIT_MOTION_RELEASE = 'WAIT_MOTION_RELEASE'
-    WAIT_SENSOR_READY = 'WAIT_SENSOR_READY'
-    ACTIVE = 'ACTIVE'
-    FAILED = 'FAILED'
-
-
-@dataclass(frozen=True)
-class RoleUpdate:
-    role: str
-    robot: str
-    epoch: Optional[int]
-    active_scout_id: Optional[str]
-    localization_ready: Optional[bool]
-    recovery_complete: Optional[bool]
-
-
-@dataclass(frozen=True)
-class GateInputs:
-    role: str
-    role_robot_matches: bool
-    role_epoch: int
-    failover_epoch: int
-    active_scout_matches: bool
-    failover_state: str
-    localization_ready: bool
-    recovery_complete: bool
-    nav_goal_inactive: bool
-    motion_authority: str
-    model_ready: bool
-    sensor_ready: bool
-    tf_ready: bool
-    require_failover_activation: bool
-    require_localization_ready: bool
-
-
-def parse_epoch(value) -> Optional[int]:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value if value >= 0 else None
-    if isinstance(value, str) and value.strip().isdigit():
-        return int(value.strip())
-    return None
-
-
-def _optional_bool(value) -> Optional[bool]:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        key = value.strip().lower()
-        if key in ('true', '1', 'yes', 'y'):
-            return True
-        if key in ('false', '0', 'no', 'n'):
-            return False
-    return None
-
-
-def parse_role_update(raw: str, robot_name: str) -> Optional[RoleUpdate]:
-    text = str(raw or '').strip()
-    if not text:
-        return None
-    if not text.startswith('{'):
-        return RoleUpdate(
-            role=text.upper(),
-            robot=robot_name,
-            epoch=None,
-            active_scout_id=None,
-            localization_ready=None,
-            recovery_complete=None,
-        )
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(payload, dict):
-        return None
-    role = str(payload.get('role', payload.get('status', 'IDLE'))).strip().upper()
-    robot = str(payload.get('robot', robot_name)).strip() or robot_name
-    return RoleUpdate(
-        role=role,
-        robot=robot,
-        epoch=parse_epoch(payload.get('epoch')),
-        active_scout_id=(
-            str(payload['active_scout_id']).strip()
-            if payload.get('active_scout_id') is not None else None
-        ),
-        localization_ready=_optional_bool(payload.get('localization_ready')),
-        recovery_complete=_optional_bool(payload.get('recovery_complete')),
-    )
-
-
-def evaluate_activation_gate(gate: GateInputs) -> tuple[RLWorkerState, str]:
-    role = gate.role.strip().upper()
-    failover_state = gate.failover_state.strip().upper()
-    motion_authority = gate.motion_authority.strip().upper()
-    require_failover = gate.require_failover_activation
-    if role in ('FAILED',):
-        return RLWorkerState.FAILED, 'role_failed'
-    if (
-        role in ('RECOVERY_NAVIGATING', 'FOLLOWER', 'IDLE')
-        or (
-            require_failover
-            and (
-                failover_state in ('RECOVERY_NAVIGATING', 'FAILOVER_TRIGGERED')
-                or motion_authority == 'FAILOVER_RECOVERY_NAV'
-            )
-        )
-    ):
-        return RLWorkerState.RECOVERY_NAVIGATING, 'recovery_or_non_scout_role'
-    if role != 'ACTIVE_SCOUT' or not gate.role_robot_matches:
-        return RLWorkerState.STANDBY, 'role_not_active_scout'
-    if require_failover and gate.role_epoch < gate.failover_epoch:
-        return RLWorkerState.STANDBY, 'stale_epoch'
-    if require_failover and not gate.active_scout_matches:
-        return RLWorkerState.STANDBY, 'active_scout_id_mismatch'
-    if gate.require_localization_ready and not gate.localization_ready:
-        return RLWorkerState.WAIT_LOCALIZATION, 'localization_not_ready'
-    if require_failover and not gate.recovery_complete:
-        return RLWorkerState.WAIT_LOCALIZATION, 'recovery_not_complete'
-    if (
-        not gate.nav_goal_inactive
-        or (
-            require_failover
-            and motion_authority not in ('NONE', 'ACTIVE_SCOUT_RL', '')
-        )
-    ):
-        return RLWorkerState.WAIT_MOTION_RELEASE, 'motion_authority_busy'
-    if not gate.model_ready or not gate.sensor_ready or not gate.tf_ready:
-        return RLWorkerState.WAIT_SENSOR_READY, 'runtime_inputs_not_ready'
-    return RLWorkerState.ACTIVE, 'activation_gate_passed'
+# Compatibility import surface for existing direct callers.  The canonical
+# parser now lives next to the field-robot role contract.
+RoleUpdate = RoleMessage
+parse_role_update = parse_role_message
 
 
 class ScoutRLPolicyWorker(Node):
@@ -263,7 +133,7 @@ class ScoutRLPolicyWorker(Node):
         if epoch < self.role_epoch:
             return
         self.role_epoch = epoch
-        self.desired_role = update.role
+        self.desired_role = update.role.value
         self.role_localization_ready = update.localization_ready
         self.role_recovery_complete = update.recovery_complete
         if update.active_scout_id is not None:
@@ -329,7 +199,10 @@ class ScoutRLPolicyWorker(Node):
                 'LOCALIZATION_SPIN',
             )
         )
-        status_localization = _optional_bool(data.get('localization_ready'))
+        status_localization = (
+            data.get('localization_ready')
+            if isinstance(data.get('localization_ready'), bool) else None
+        )
         if status_localization is not None:
             self.localization_ready = status_localization
         self._evaluate_gate()
