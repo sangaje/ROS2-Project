@@ -1,4 +1,5 @@
 import json
+import time
 from pathlib import Path
 
 from builtin_interfaces.msg import Time
@@ -167,6 +168,24 @@ def test_recovery_goal_has_one_inflight_send_only():
     assert node.nav.inflight_goal_ids == {1}
     assert node.nav.pending_goal is None
     assert node.motion_authority == MotionAuthority.FAILOVER_RECOVERY_NAV
+
+
+def test_follow_nav_goal_acceptance_timeout_returns_manager_to_idle():
+    node, logger = _bare_field()
+    node.role = Role.FOLLOWER
+    node.motion_authority = MotionAuthority.NORMAL_FOLLOW
+    node.nav.goal_epoch = 1
+    node.nav.inflight_goal_ids = {1}
+    node.nav.inflight_goal_meta = {
+        1: ('FOLLOW', time.monotonic() - 3.0),
+    }
+
+    node.nav.recover_timeouts()
+
+    assert node.nav.inflight_goal_ids == set()
+    assert node.nav.is_idle
+    assert node.motion_authority == MotionAuthority.NONE
+    assert any('FIELD_NAV_GOAL_ACCEPTANCE_TIMEOUT' in text for _, text in logger.messages)
 
 
 def test_stale_recovery_result_cannot_advance_role():
@@ -437,6 +456,93 @@ def test_nav2_shadow_goal_starts_even_when_leader_begins_next_to_scout():
     assert abs(goal.pose.position.y) < 0.01
     assert node.last_target_behind_scout is True
     assert node.last_target_mode == 'exact_rear'
+    assert node.shadow_goal_active is True
+
+
+def test_leader_shadow_republishes_when_nav2_pipeline_never_executes():
+    now = {'value': 10.0}
+    node = LeaderShadowFollow.__new__(LeaderShadowFollow)
+    logger = _Logger()
+    node.get_logger = lambda: logger
+    node.get_clock = lambda: _Clock()
+    node._now = lambda: now['value']
+    node.enabled = True
+    node.start_wall = 0.0
+    node.startup_grace = 0.0
+    node.require_localization_ready = False
+    node.localization_ready = True
+    node.require_system_ready = False
+    node.system_ready = True
+    node.require_video_ready = False
+    node.video_ready = True
+    node.pause_on_omx_aiming = False
+    node.pause_on_raw_target_detection = False
+    node.target_detected_wall = -1.0e9
+    node.target_stop_hold = 3.0
+    node.failover_state = 'NORMAL_OPERATION'
+    node.active_scout_id = 'scout22'
+    node.original_scout_id = 'scout22'
+    node.follower_robot_name = 'follower21'
+    node.leader_pose = _pose(0.0, 0.0)
+    node.leader_pose_wall = now['value']
+    node.original_scout_pose = _pose(1.0, 0.0)
+    node.original_scout_wall = now['value']
+    node.follower_scout_pose = None
+    node.follower_scout_wall = -1.0e9
+    node.scout_pose_timeout = 5.0
+    node.mode = LeaderMode.IDLE
+    node.omx_state = ''
+    node.direct_shadow_cmd_vel = False
+    node.shadow_active = True
+    node.shadow_goal_active = False
+    node.direct_cmd_active = False
+    node.map_msg = None
+    node.heading = 0.0
+    node.previous_scout_sample = None
+    node.last_goal = None
+    node.last_goal_wall = -1.0e9
+    node.last_path_wall = -1.0e9
+    node.last_cmd_vel_wall = -1.0e9
+    node.last_nonzero_cmd_wall = -1.0e9
+    node.last_odom_wall = -1.0e9
+    node.odom_motion = False
+    node.odom_delta_m = 0.0
+    node.previous_distance_to_scout = None
+    node.distance_decreased = False
+    node.last_nominal_target = None
+    node.goal_period = 0.5
+    node.goal_min_change = 0.05
+    node.nav_execution_timeout = 2.0
+    node.follow_distance = 0.40
+    node.stop_distance = 0.30
+    node.resume_distance = 0.46
+    node.cmd_goal_tolerance = 0.16
+    node.far_distance = 0.80
+    node.shadow_linear_vel = 0.14
+    node.catchup_linear_vel = 0.14
+    node.shadow_angular_vel = 0.35
+    node.restore_linear_vel = 0.14
+    node.restore_angular_vel = 0.35
+    node.map_clearance = 0.22
+    node.search_radius = 0.80
+    node.search_step = 0.15
+    node.occupied_threshold = 50
+    node.allow_unknown = False
+    node.scan_fov_deg = 60.0
+    node.speed_limit_pending = False
+    node.speed_profile = None
+    node.controller_client = _ServiceClient()
+    node.goal_pub = _Publisher()
+    node.goal_debug_pub = _Publisher()
+    node.cancel_pub = _Publisher()
+    node.cmd_pub = _Publisher()
+    node.state_pub = _Publisher()
+
+    node._tick()
+    now['value'] = 12.2
+    node._tick()
+
+    assert len(node.goal_pub.messages) == 2
     assert node.shadow_goal_active is True
 
 

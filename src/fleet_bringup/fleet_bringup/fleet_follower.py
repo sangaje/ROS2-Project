@@ -67,6 +67,7 @@ class FleetFollower(Node):
         self.declare_parameter('goal_update_distance', 0.10)
         self.declare_parameter('goal_refresh_sec', 3.0)
         self.declare_parameter('action_wait_timeout_sec', 1.0)
+        self.declare_parameter('goal_response_timeout_sec', 2.0)
         self.declare_parameter('cancel_previous_goal', False)
         self.declare_parameter('start_following', True)
         self.declare_parameter('use_scan_space_selection', True)
@@ -125,6 +126,9 @@ class FleetFollower(Node):
         self.action_wait_timeout = max(
             0.0, float(parameter('action_wait_timeout_sec').value)
         )
+        self.goal_response_timeout = max(
+            0.5, float(parameter('goal_response_timeout_sec').value)
+        )
         self.cancel_previous_goal = bool(
             parameter('cancel_previous_goal').value
         )
@@ -175,6 +179,7 @@ class FleetFollower(Node):
         # _should_send to re-send -- otherwise a settled, successfully
         # reached follow goal got needlessly re-issued every few seconds.
         self.last_goal_outcome = 'none'
+        self.pending_goal_response_since = -1.0e9
         self._current_slot_offset: Optional[float] = None
         self._pending_slot_offset: Optional[float] = None
         self.wait_log_time = -1.0e9
@@ -558,6 +563,7 @@ class FleetFollower(Node):
         if not self.follow_enabled:
             return
         now = self._now()
+        self._recover_goal_response_timeout(now)
         if self.require_start_motion and not self.start_motion:
             self._log_follow_debug('start_motion_false')
             return
@@ -582,9 +588,7 @@ class FleetFollower(Node):
         if self.require_localization_ready and not self.localization_ready:
             self._log_follow_debug('localization_not_ready')
             return
-        if not self.navigation_client.wait_for_server(
-            timeout_sec=self.action_wait_timeout
-        ):
+        if not self.navigation_client.server_is_ready():
             self._log_follow_debug('nav_server_unavailable')
             return
         distance_to_leader = math.hypot(
@@ -614,6 +618,7 @@ class FleetFollower(Node):
         )
         self.last_goal_time = self._now()
         self.last_goal_outcome = 'pending'
+        self.pending_goal_response_since = self.last_goal_time
         self._current_slot_offset = self._pending_slot_offset
         self.goal_count += 1
         goal_id = self.goal_count
@@ -667,6 +672,8 @@ class FleetFollower(Node):
         )
 
     def _goal_response_callback(self, future, goal_id: int) -> None:
+        if goal_id == self.goal_count:
+            self.pending_goal_response_since = -1.0e9
         try:
             handle = future.result()
         except Exception as error:
@@ -703,6 +710,25 @@ class FleetFollower(Node):
         if goal_id == self.active_goal_id:
             self.active_goal_handle = None
             self.active_goal_id = 0
+
+    def _recover_goal_response_timeout(self, now: float) -> None:
+        if self.last_goal_outcome != 'pending':
+            return
+        if self.active_goal_handle is not None:
+            return
+        if self.pending_goal_response_since < 0.0:
+            return
+        if now - self.pending_goal_response_since < self.goal_response_timeout:
+            return
+        self.goal_count += 1
+        self.active_goal_id = 0
+        self.active_goal_handle = None
+        self.last_goal_xy = None
+        self.last_goal_outcome = 'failed'
+        self.pending_goal_response_since = -1.0e9
+        self.get_logger().warning(
+            'FOLLOW_GOAL_RESPONSE_TIMEOUT | retry_with_latest_target=true'
+        )
 
 
 def main() -> None:

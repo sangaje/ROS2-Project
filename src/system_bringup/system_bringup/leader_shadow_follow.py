@@ -105,6 +105,7 @@ class LeaderShadowFollow(Node):
         self.declare_parameter('leader_restore_max_angular_vel', 1.00)
         self.declare_parameter('leader_shadow_goal_update_period_sec', 0.5)
         self.declare_parameter('leader_shadow_goal_min_change_m', 0.12)
+        self.declare_parameter('leader_shadow_nav_execution_timeout_sec', 2.0)
         self.declare_parameter('leader_shadow_cmd_goal_tolerance_m', 0.16)
         self.declare_parameter('leader_shadow_cmd_linear_scale', 1.0)
         self.declare_parameter('leader_shadow_cmd_angular_scale', 1.0)
@@ -175,7 +176,7 @@ class LeaderShadowFollow(Node):
         self.scout_pose_timeout = max(0.2, float(get('scout_pose_timeout_sec').value))
         self.startup_grace = max(0.0, float(get('startup_grace_sec').value))
 
-        self.follow_distance = max(0.5, float(get('leader_shadow_follow_distance_m').value))
+        self.follow_distance = max(0.1, float(get('leader_shadow_follow_distance_m').value))
         self.stop_distance = max(0.2, float(get('leader_shadow_stop_distance_m').value))
         self.resume_distance = max(self.stop_distance, float(get('leader_shadow_resume_distance_m').value))
         self.far_distance = max(self.resume_distance, float(get('leader_shadow_far_distance_m').value))
@@ -189,6 +190,9 @@ class LeaderShadowFollow(Node):
         self.restore_angular_vel = max(self.shadow_angular_vel, float(get('leader_restore_max_angular_vel').value))
         self.goal_period = max(0.3, float(get('leader_shadow_goal_update_period_sec').value))
         self.goal_min_change = max(0.05, float(get('leader_shadow_goal_min_change_m').value))
+        self.nav_execution_timeout = max(
+            0.5, float(get('leader_shadow_nav_execution_timeout_sec').value)
+        )
         self.cmd_goal_tolerance = max(0.03, float(get('leader_shadow_cmd_goal_tolerance_m').value))
         self.cmd_linear_scale = max(0.1, float(get('leader_shadow_cmd_linear_scale').value))
         self.cmd_angular_scale = max(0.1, float(get('leader_shadow_cmd_angular_scale').value))
@@ -905,11 +909,23 @@ class LeaderShadowFollow(Node):
             return False
         if self.last_goal is None:
             return True
+        if self._nav_execution_stalled(now):
+            self.shadow_goal_active = False
+            return True
         distance = math.hypot(
             goal.pose.position.x - self.last_goal.pose.position.x,
             goal.pose.position.y - self.last_goal.pose.position.y,
         )
         return distance >= self.goal_min_change
+
+    def _nav_execution_stalled(self, now: float) -> bool:
+        if not self.shadow_goal_active or self.last_goal_wall < 0.0:
+            return False
+        if now - self.last_goal_wall < self.nav_execution_timeout:
+            return False
+        plan_after_goal = self.last_path_wall >= self.last_goal_wall
+        cmd_after_goal = self.last_cmd_vel_wall >= self.last_goal_wall
+        return not plan_after_goal and not cmd_after_goal
 
     def _publish_direct_shadow_cmd(self, goal: PoseStamped, *, catchup: bool) -> None:
         leader = self.leader_pose

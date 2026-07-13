@@ -953,9 +953,7 @@ def generate_launch_description():
                         if launch_bool(leader_shadow_direct_cmd_vel.perform(context))
                         else 'nav2'
                     )
-                actions.append(TimerAction(
-                    period=3.0,
-                    actions=[Node(
+                actions.append(Node(
                         package='system_bringup',
                         executable='leader_shadow_follow',
                         name='leader_shadow_follow',
@@ -989,7 +987,7 @@ def generate_launch_description():
                             'scout_pose_timeout_sec': float(
                                 scout_pose_timeout_sec.perform(context)
                             ),
-                            'startup_grace_sec': 2.0,
+                            'startup_grace_sec': 0.0,
                             'leader_shadow_follow_distance_m': float(
                                 leader_shadow_follow_distance_m.perform(context)
                             ),
@@ -1049,7 +1047,6 @@ def generate_launch_description():
                         env=process_env,
                         respawn=True,
                         respawn_delay=3.0,
-                    )],
                 ))
             if launch_bool(unified_dashboard.perform(context)):
                 actions.append(Node(

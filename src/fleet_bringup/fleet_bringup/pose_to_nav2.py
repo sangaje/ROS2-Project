@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from functools import partial
+import time
 from typing import Optional
 
 import rclpy
@@ -198,6 +199,7 @@ class PoseToNav2Action(Node):
         self.current_goal_id = 0
         self.pending_goal: Optional[PoseStamped] = None
         self.inflight_goal_ids = set()
+        self.inflight_goal_meta: dict[int, tuple[PoseStamped, float]] = {}
         self.goal_count = 0
         self.last_wait_log_time = -1.0e9
         self.retry_not_before = -1.0e9
@@ -213,6 +215,7 @@ class PoseToNav2Action(Node):
             'result': 0,
         }
         self.retry_timer = self.create_timer(0.25, self._try_send_pending)
+        self.goal_response_timeout_sec = 2.0
 
         self.get_logger().info(
             'POSE_TO_NAV2_ACTION_READY | '
@@ -242,18 +245,16 @@ class PoseToNav2Action(Node):
     def _on_goal_pose(self, msg: PoseStamped) -> None:
         if self.require_system_ready and not self.system_ready:
             self.get_logger().warn(
-                'NAV2_GOAL_DROPPED_FOR_SYSTEM_NOT_READY | '
+                'NAV2_GOAL_HELD_FOR_SYSTEM_NOT_READY | '
                 f'topic={self.goal_pose_topic} system_ready={self.system_ready_topic}',
                 throttle_duration_sec=2.0,
             )
-            return
         if self.require_start_motion and not self.start_motion:
             self.get_logger().warn(
-                'NAV2_GOAL_DROPPED_FOR_START_MOTION_FALSE | '
+                'NAV2_GOAL_HELD_FOR_START_MOTION_FALSE | '
                 f'topic={self.goal_pose_topic} start_motion={self.start_motion_topic}',
                 throttle_duration_sec=2.0,
             )
-            return
         # Keep only the newest command while Nav2 is starting. Dropping a goal
         # here makes an RViz goal appear to vanish with no way to recover it.
         self.pending_goal = deepcopy(msg)
@@ -398,6 +399,7 @@ class PoseToNav2Action(Node):
         )
 
     def _try_send_pending(self) -> None:
+        self._recover_action_timeouts()
         if self.pending_goal is None:
             return
         now = self.get_clock().now().nanoseconds * 1.0e-9
@@ -468,6 +470,7 @@ class PoseToNav2Action(Node):
             )
             return
         self.inflight_goal_ids.add(request_id)
+        self.inflight_goal_meta[request_id] = (deepcopy(goal.pose), time.monotonic())
         future.add_done_callback(
             partial(
                 self._goal_response_cb,
@@ -490,11 +493,10 @@ class PoseToNav2Action(Node):
     def _system_ready_blocks_send(self, now: float) -> bool:
         if not self.require_system_ready or self.system_ready:
             return False
-        self.pending_goal = None
         if now - self.last_wait_log_time >= 5.0:
             self.get_logger().warn(
-                'NAV2_GOAL_DROPPED_FOR_SYSTEM_READY | '
-                f'waiting for {self.system_ready_topic}=true'
+                'NAV2_GOAL_HELD_FOR_SYSTEM_READY | '
+                f'waiting for {self.system_ready_topic}=true | latest goal retained'
             )
             self.last_wait_log_time = now
         return True
@@ -502,11 +504,10 @@ class PoseToNav2Action(Node):
     def _start_motion_blocks_send(self, now: float) -> bool:
         if not self.require_start_motion or self.start_motion:
             return False
-        self.pending_goal = None
         if now - self.last_wait_log_time >= 5.0:
             self.get_logger().warn(
-                'NAV2_GOAL_DROPPED_FOR_START_MOTION | '
-                f'waiting for {self.start_motion_topic}=true'
+                'NAV2_GOAL_HELD_FOR_START_MOTION | '
+                f'waiting for {self.start_motion_topic}=true | latest goal retained'
             )
             self.last_wait_log_time = now
         return True
@@ -603,6 +604,7 @@ class PoseToNav2Action(Node):
         sent_goal: PoseStamped,
     ) -> None:
         self.inflight_goal_ids.discard(goal_id)
+        self.inflight_goal_meta.pop(goal_id, None)
         try:
             goal_handle = future.result()
         except Exception as exc:  # noqa: BLE001
@@ -727,6 +729,27 @@ class PoseToNav2Action(Node):
             f'cause={cause} retry={attempt}/{limit} in={delay:.1f}s'
         )
         return True
+
+    def _recover_action_timeouts(self) -> None:
+        now = time.monotonic()
+        stale_ids = [
+            goal_id
+            for goal_id, (_, sent_at) in self.inflight_goal_meta.items()
+            if now - sent_at >= self.goal_response_timeout_sec
+        ]
+        for goal_id in stale_ids:
+            sent_goal = self.inflight_goal_meta.get(goal_id, (None, now))[0]
+            self.inflight_goal_ids.discard(goal_id)
+            self.inflight_goal_meta.pop(goal_id, None)
+            if goal_id == self.goal_count and self.pending_goal is None and sent_goal is not None:
+                self.goal_count += 1
+                self.pending_goal = deepcopy(sent_goal)
+                self.retry_not_before = -1.0e9
+                self.navigation_active = None
+            self.get_logger().warning(
+                'NAV2_GOAL_RESPONSE_TIMEOUT | '
+                f'goal_id={goal_id} latest={self.goal_count}'
+            )
 
     def _feedback_cb(self, feedback_msg) -> None:
         fb = feedback_msg.feedback

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from functools import partial
+import time
 from typing import Callable, Optional
 
 from geometry_msgs.msg import PoseStamped
@@ -45,9 +46,13 @@ class NavGoalManager:
         self.active_goal_handle = None
         self.active_goal_source: Optional[str] = None
         self.inflight_goal_ids: set[int] = set()
+        self.inflight_goal_meta: dict[int, tuple[str, float]] = {}
         self.cancel_requests = 0
+        self.cancel_started_at: Optional[float] = None
         self.pending_goal: Optional[PoseStamped] = None
         self.pending_source: Optional[str] = None
+        self.acceptance_timeout_sec = 2.0
+        self.cancel_timeout_sec = 2.0
 
     @property
     def active_goal_count(self) -> int:
@@ -63,12 +68,14 @@ class NavGoalManager:
 
     def request_goal(self, pose: PoseStamped, source: str) -> None:
         """Keep only the latest goal, canceling the prior accepted one."""
+        self.recover_timeouts()
         self.pending_goal = self._copy_pose(pose)
         self.pending_source = source
         if self.active_goal_handle is not None or self.inflight_goal_ids:
             self.invalidate(f'new_{source}_goal', clear_pending=False)
 
     def dispatch(self, *, source_allowed: Callable[[str], bool], can_send: Callable[[], bool], action_name: str) -> None:
+        self.recover_timeouts()
         if self.pending_goal is None or self.pending_source is None:
             return
         source = self.pending_source
@@ -101,6 +108,7 @@ class NavGoalManager:
             self._on_failure(source, 'send_exception')
             return
         self.inflight_goal_ids.add(goal_id)
+        self.inflight_goal_meta[goal_id] = (source, time.monotonic())
         authority = (
             MotionAuthority.NORMAL_FOLLOW
             if source == 'FOLLOW' else MotionAuthority.FAILOVER_RECOVERY_NAV
@@ -115,6 +123,8 @@ class NavGoalManager:
 
     def invalidate(self, reason: str, *, clear_pending: bool) -> None:
         self.goal_epoch += 1
+        self.inflight_goal_ids.clear()
+        self.inflight_goal_meta.clear()
         if clear_pending:
             self.pending_goal = None
             self.pending_source = None
@@ -128,6 +138,7 @@ class NavGoalManager:
 
     def _goal_response_cb(self, future, *, goal_id: int, source: str) -> None:
         self.inflight_goal_ids.discard(goal_id)
+        self.inflight_goal_meta.pop(goal_id, None)
         try:
             handle = future.result()
         except Exception as exc:  # noqa: BLE001
@@ -182,10 +193,13 @@ class NavGoalManager:
             self._log.warning(f'FIELD_NAV_CANCEL_ERROR | reason={reason} {exc}')
             return
         self.cancel_requests += 1
+        self.cancel_started_at = self.cancel_started_at or time.monotonic()
         future.add_done_callback(partial(self._cancel_response_cb, goal_id=goal_id, reason=reason))
 
     def _cancel_response_cb(self, future, *, goal_id: int, reason: str) -> None:
         self.cancel_requests = max(0, self.cancel_requests - 1)
+        if self.cancel_requests == 0:
+            self.cancel_started_at = None
         try:
             response = future.result()
             count = len(getattr(response, 'goals_canceling', []) or [])
@@ -198,3 +212,37 @@ class NavGoalManager:
             f'FIELD_NAV_CANCEL_ACK | goal_id={goal_id} '
             f'reason={reason} goals_canceling={count}'
         )
+
+    def recover_timeouts(self) -> None:
+        """Return bounded async states to IDLE so the next tick can retry."""
+        now = time.monotonic()
+        stale_ids = [
+            goal_id
+            for goal_id, (_, sent_at) in self.inflight_goal_meta.items()
+            if now - sent_at >= self.acceptance_timeout_sec
+        ]
+        for goal_id in stale_ids:
+            source = self.inflight_goal_meta.get(goal_id, ('UNKNOWN', now))[0]
+            self.inflight_goal_ids.discard(goal_id)
+            self.inflight_goal_meta.pop(goal_id, None)
+            if goal_id == self.goal_epoch:
+                self.goal_epoch += 1
+                if self._current_authority() in NAV_AUTHORITIES:
+                    self._set_authority(MotionAuthority.NONE, 'goal_acceptance_timeout')
+                self._on_failure(source, 'goal_acceptance_timeout')
+            self._log.warning(
+                f'FIELD_NAV_GOAL_ACCEPTANCE_TIMEOUT | source={source} goal_id={goal_id}'
+            )
+        if (
+            self.cancel_requests > 0
+            and self.cancel_started_at is not None
+            and now - self.cancel_started_at >= self.cancel_timeout_sec
+        ):
+            dropped = self.cancel_requests
+            self.cancel_requests = 0
+            self.cancel_started_at = None
+            if self._current_authority() in NAV_AUTHORITIES:
+                self._set_authority(MotionAuthority.NONE, 'cancel_timeout')
+            self._log.warning(
+                f'FIELD_NAV_CANCEL_TIMEOUT | requests={dropped}'
+            )

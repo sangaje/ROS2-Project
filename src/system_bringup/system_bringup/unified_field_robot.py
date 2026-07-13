@@ -569,6 +569,7 @@ class UnifiedFieldRobot(Node):
         if not self.enable_follow:
             return
         now = self._now()
+        self.nav.recover_timeouts()
         if not self._start_motion_allowed():
             self._log_follow_gate('start_motion_false')
             return
@@ -1004,6 +1005,7 @@ class UnifiedFieldRobot(Node):
         )
 
     def _nav_motion_quiesced(self) -> bool:
+        self.nav.recover_timeouts()
         return self.nav.is_idle
 
     def _non_rl_motion_quiesced(self) -> bool:
