@@ -178,6 +178,7 @@ def generate_launch_description():
     start_rl_worker = LaunchConfiguration('start_rl_worker')
     rl_initial_role_active = LaunchConfiguration('rl_initial_role_active')
     start_omx_aim = LaunchConfiguration('start_omx_aim')
+    omx_dry_run = LaunchConfiguration('omx_dry_run')
     start_yolo_server = LaunchConfiguration('start_yolo_server')
     yolo_server_delay_sec = LaunchConfiguration('yolo_server_delay_sec')
     yolo_server_host = LaunchConfiguration('yolo_server_host')
@@ -715,6 +716,7 @@ def generate_launch_description():
                         'yolo_node_model_path': (
                             yolo_server_model_path.perform(context)
                         ),
+                        'omx_dry_run': omx_dry_run.perform(context),
                         'omx_camera_index': omx_camera_index.perform(context),
                         'omx_camera_device': omx_camera_device.perform(context),
                         'omx_camera_backend': omx_camera_backend.perform(context),
@@ -1568,6 +1570,15 @@ def generate_launch_description():
             default_value='true',
             choices=['true', 'false'],
             description='Leader role only: include Jetson/OMX AIM component launch.',
+        ),
+        DeclareLaunchArgument(
+            'omx_dry_run',
+            default_value='false',
+            choices=['true', 'false'],
+            description=(
+                'Leader role only: run OMX camera/YOLO/dashboard without '
+                'Dynamixel motor communication or arm motion.'
+            ),
         ),
         DeclareLaunchArgument(
             'start_yolo_server',

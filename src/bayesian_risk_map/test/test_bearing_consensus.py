@@ -295,7 +295,7 @@ def test_leader_valid_miss_is_consumed_once_and_only_decays_visible_cells():
     )
 
 
-def test_leader_observation_requires_fresh_completed_inference_once():
+def test_leader_observation_uses_local_receipt_time_across_robot_clocks():
     class Clock:
         class Now:
             nanoseconds = 20_000_000_000
@@ -328,4 +328,7 @@ def test_leader_observation_requires_fresh_completed_inference_once():
         'inference_ran': True,
         'detected': False,
     }
-    assert node.consume_leader_observation() is None
+    # The leader and scout clocks may differ. A freshly received, sequenced
+    # frame must still contribute a single visibility miss.
+    node.leader_observation_wall = 20.0
+    assert node.consume_leader_observation() == (False, 20.0)

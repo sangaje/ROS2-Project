@@ -56,6 +56,7 @@ def _with_virtualenv_site_packages(env):
 
 def launch_setup(context, *args, **kwargs):
     debug_stream = _is_true(LaunchConfiguration('debug_stream').perform(context))
+    omx_dry_run = _is_true(LaunchConfiguration('omx_dry_run').perform(context))
     start_yolo_server = _is_true(
         LaunchConfiguration('start_yolo_server').perform(context)
     )
@@ -81,6 +82,10 @@ def launch_setup(context, *args, **kwargs):
 
     # yolo_node CLI 인자 조립
     yolo_args = ['--no-display']
+    if omx_dry_run:
+        # Leave all Dynamixel traffic untouched while validating the camera,
+        # TensorRT inference, and MJPEG dashboard path.
+        yolo_args.append('--dry-run')
     if debug_stream:
         yolo_args += ['--debug-stream', '--debug-port', debug_port]
 
@@ -251,6 +256,13 @@ def generate_launch_description():
                 'YOLO TensorRT engine used by omx_yolo_node. Pass an '
                 'absolute path only when the file lives outside the '
                 'workspace on this Jetson.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'omx_dry_run', default_value='false', choices=['true', 'false'],
+            description=(
+                'Run OMX camera/YOLO/dashboard without opening the Dynamixel '
+                'bus or moving the arm. Useful while diagnosing motor faults.'
             ),
         ),
         DeclareLaunchArgument(

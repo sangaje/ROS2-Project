@@ -80,6 +80,9 @@ class LeaderShadowFollow(Node):
         self.declare_parameter('localization_ready_topic', '/localization_ready')
         self.declare_parameter('target_detected_topic', '/omx/target_detected')
         self.declare_parameter('target_detected_stop_hold_sec', 1.0)
+        self.declare_parameter('pause_on_raw_target_detection', False)
+        self.declare_parameter('omx_state_topic', '/omx/state')
+        self.declare_parameter('pause_on_omx_aiming', True)
         self.declare_parameter('scout_pose_timeout_sec', 2.5)
         self.declare_parameter('startup_grace_sec', 8.0)
 
@@ -140,6 +143,11 @@ class LeaderShadowFollow(Node):
         self.target_stop_hold = max(
             0.1, float(get('target_detected_stop_hold_sec').value)
         )
+        self.pause_on_raw_target_detection = bool(
+            get('pause_on_raw_target_detection').value
+        )
+        self.omx_state_topic = str(get('omx_state_topic').value)
+        self.pause_on_omx_aiming = bool(get('pause_on_omx_aiming').value)
         self.scout_pose_timeout = max(0.2, float(get('scout_pose_timeout_sec').value))
         self.startup_grace = max(0.0, float(get('startup_grace_sec').value))
 
@@ -227,6 +235,7 @@ class LeaderShadowFollow(Node):
             self._on_target_detected,
             10,
         )
+        self.create_subscription(String, self.omx_state_topic, self._on_omx_state, 10)
         if self.scan_enabled:
             self.create_subscription(LaserScan, self.scan_topic, self._on_scan, 10)
 
@@ -241,6 +250,7 @@ class LeaderShadowFollow(Node):
         self.localization_ready = not self.require_localization_ready
         self.target_detected = False
         self.target_detected_wall = -1.0e9
+        self.omx_state = ''
         self.leader_pose: Optional[PoseStamped] = None
         self.original_scout_pose: Optional[PoseStamped] = None
         self.follower_scout_pose: Optional[PoseStamped] = None
@@ -340,6 +350,14 @@ class LeaderShadowFollow(Node):
         if self.target_detected:
             self.target_detected_wall = self._now()
 
+    def _on_omx_state(self, msg: String) -> None:
+        self.omx_state = str(msg.data).strip().upper()
+
+    @staticmethod
+    def _is_omx_aiming(state: str) -> bool:
+        """Only confirmed aiming/firing may preempt leader shadow motion."""
+        return str(state).strip().upper() in ('CONFIRMING', 'FIRING')
+
     def _on_scan(self, msg: LaserScan) -> None:
         self.last_scan_wall = self._now()
         stamp = msg.header.stamp
@@ -363,7 +381,18 @@ class LeaderShadowFollow(Node):
             self._set_controller_speed_limit(False)
             self._publish_state('waiting_localization_ready')
             return
-        if self._now() - self.target_detected_wall <= self.target_stop_hold:
+        if self.pause_on_omx_aiming and self._is_omx_aiming(self.omx_state):
+            self._cancel_shadow_goal('omx_aiming')
+            self._stop_direct_cmd('omx_aiming')
+            self._publish_twist(0.0, 0.0)
+            self.mode = LeaderMode.IDLE
+            self._set_controller_speed_limit(False)
+            self._publish_state('omx_aiming_hold')
+            return
+        if (
+            self.pause_on_raw_target_detection
+            and self._now() - self.target_detected_wall <= self.target_stop_hold
+        ):
             self._cancel_shadow_goal('target_detected')
             self._stop_direct_cmd('target_detected')
             self._publish_twist(0.0, 0.0)
@@ -763,6 +792,7 @@ class LeaderShadowFollow(Node):
             'active_scout_id': self.active_scout_id,
             'failover_state': self.failover_state,
             'shadow_active': self.shadow_active,
+            'omx_state': self.omx_state,
             'scan_fov_deg': self.scan_fov_deg,
             'scan_heading_reference': 'leader_current_heading',
         }

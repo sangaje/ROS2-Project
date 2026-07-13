@@ -1213,7 +1213,10 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.leader_camera_yaw = float(msg.data)
         self.leader_camera_yaw_wall = self.get_clock().now().nanoseconds * 1e-9
 
-    def get_leader_pose(self) -> Optional[Tuple[float, float, float]]:
+    def get_leader_pose(
+        self,
+        observation: Optional[dict] = None,
+    ) -> Optional[Tuple[float, float, float]]:
         """Leader's (x, y, yaw) for visibility raycasting -- yaw is where
         the OMX camera is actually pointed, not the robot base heading.
         /leader_pose only gives the base pose; the camera pans
@@ -1231,13 +1234,22 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         p = self.leader_pose_msg.pose.position
         q = self.leader_pose_msg.pose.orientation
         base_yaw = yaw_from_quaternion(q)
-        if (
-            self.leader_camera_yaw is None
-            or self.leader_camera_yaw_wall is None
-            or now - self.leader_camera_yaw_wall > self.leader_camera_yaw_max_age_sec
+        camera_offset = None
+        if isinstance(observation, dict):
+            try:
+                value = float(observation.get('camera_yaw_rad'))
+                if math.isfinite(value):
+                    camera_offset = value
+            except (TypeError, ValueError):
+                pass
+        if camera_offset is None and (
+            self.leader_camera_yaw is not None
+            and self.leader_camera_yaw_wall is not None
+            and now - self.leader_camera_yaw_wall <= self.leader_camera_yaw_max_age_sec
         ):
+            camera_offset = self.leader_camera_yaw
+        if camera_offset is None:
             return None
-        camera_offset = self.leader_camera_yaw
         return (float(p.x), float(p.y), base_yaw + camera_offset)
 
     def consume_leader_observation(self):
@@ -1270,15 +1282,11 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             and isinstance(payload.get('detected'), bool)
         ):
             return None
-        capture_sec = payload.get('capture_stamp', payload.get('publish_stamp', now))
-        try:
-            capture_sec = float(capture_sec)
-        except (TypeError, ValueError):
-            return None
-        if not math.isfinite(capture_sec):
-            return None
-        if abs(now - capture_sec) > self.leader_observation_max_age_sec:
-            return None
+        # This topic crosses Jetson -> Burger DDS domains. Source wall clocks
+        # are not guaranteed to be synchronized, so capture_stamp cannot be
+        # compared with this node's clock. Receipt time is local, fresh, and
+        # sequence-scoped, which preserves one-miss-per-frame semantics.
+        capture_sec = wall
         self.last_leader_observation_sequence = sequence
         return bool(payload['detected']), capture_sec
 
@@ -3128,7 +3136,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             # view during this tick.
             if self.enable_leader_visibility_tracking:
                 leader_observation = self.consume_leader_observation()
-                leader_pose = self.get_leader_pose()
+                leader_pose = self.get_leader_pose(self.leader_observation)
                 leader_valid_detection = bool(
                     leader_observation is not None
                     and leader_pose is not None

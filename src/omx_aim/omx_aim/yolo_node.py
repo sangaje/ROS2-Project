@@ -1895,7 +1895,16 @@ class OmxYoloNode(Node):
             self.detector.release()
         cv2.destroyAllWindows()
         if hasattr(self, 'ctrl'):
-            self.ctrl.disconnect()
+            try:
+                self.ctrl.disconnect()
+            except Exception as exc:  # noqa: BLE001
+                # A latched Dynamixel hardware fault can reject Torque_Enable
+                # during shutdown.  The process is already stopping, so do
+                # not turn that actuator-side failure into a node crash.
+                self.get_logger().warning(
+                    'OMX_CONTROL_DISCONNECT_ERROR | '
+                    f'controller_error={type(exc).__name__}: {exc}'
+                )
         super().destroy_node()
 
 
