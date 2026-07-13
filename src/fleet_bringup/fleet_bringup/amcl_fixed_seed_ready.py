@@ -239,12 +239,24 @@ class AmclFixedSeedReady(Node):
         else:
             scan_tf_ok, scan_tf_age_ms = self._tf_status(self.base_frame, self.last_scan_frame)
         odom_fresh = self._fresh(self.last_odom_wall, self.max_odom_age_sec)
-        amcl_fresh = self._fresh(self.last_amcl_wall, self.max_amcl_age_sec)
         cov_ok = self.xy_cov <= self.max_xy_cov and self.yaw_cov <= self.max_yaw_cov
         map_odom_tf, map_odom_age_ms = self._tf_status(
             self.global_frame,
             self.odom_frame,
         )
+        # Nav2's AMCL only republishes /amcl_pose after the robot moves past
+        # update_min_d/update_min_a -- while stationary (the normal state
+        # right after a fixed-seed initial pose, before start_motion is
+        # released) it legitimately never republishes again, so amcl_pose_age
+        # grows without bound even though localization itself is fine. AMCL
+        # still rebroadcasts map->odom TF every filter cycle regardless of
+        # motion, so a fresh TF is direct evidence the last received pose and
+        # covariance are still authoritative -- accept that as fresh too,
+        # instead of waiting forever for a pose republish that requires
+        # motion this same readiness gate is blocking.
+        amcl_topic_fresh = self._fresh(self.last_amcl_wall, self.max_amcl_age_sec)
+        amcl_pose_received = self.last_amcl_wall is not None
+        amcl_fresh = amcl_topic_fresh or (amcl_pose_received and map_odom_tf)
         odom_base_tf, odom_base_age_ms = self._tf_status(
             self.odom_frame,
             self.base_frame,
