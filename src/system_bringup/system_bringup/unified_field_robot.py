@@ -235,6 +235,7 @@ class UnifiedFieldRobot(Node):
             )
 
         self.epoch = 0
+        self._last_role_tuple = (self.role.value, '', self.epoch)
         self.nav_retry_not_before = -1.0e9
         self.recovery_nav_failures = 0
         self.recovery_nav_succeeded = False
@@ -463,15 +464,20 @@ class UnifiedFieldRobot(Node):
             return
         if epoch < self.epoch:
             return
+        new_role = Role.ACTIVE_SCOUT if active == self.robot_name else Role.IDLE
+        next_tuple = (new_role.value, active, epoch)
+        if next_tuple == self._last_role_tuple:
+            return
         self.get_logger().info(
             'ROLE_STATE | '
             f'old={self.role.value} new='
-            f'{Role.ACTIVE_SCOUT.value if active == self.robot_name else Role.IDLE.value} '
+            f'{new_role.value} '
             f'reason=fleet_role_update robot_name={self.robot_name} '
             f'active_scout_robot_name={active or self.active_scout_robot_name} '
             f'fleet_role={self.fleet_role}',
             throttle_duration_sec=2.0,
         )
+        self._last_role_tuple = next_tuple
         if active != self.robot_name and epoch >= self.epoch and self.role == Role.ACTIVE_SCOUT:
             self.epoch = epoch
             self._enter_role(Role.IDLE, reason='higher_epoch_not_active')
@@ -496,6 +502,10 @@ class UnifiedFieldRobot(Node):
             )
             return
         role = update.role
+        next_tuple = (role.value, update.active_scout_id or '', epoch)
+        if next_tuple == self._last_role_tuple:
+            return
+        self._last_role_tuple = next_tuple
         self.epoch = epoch
         if role == Role.RECOVERY_NAVIGATING:
             target_pose = self._pose_from_json(
@@ -842,6 +852,7 @@ class UnifiedFieldRobot(Node):
             if self.scout_rl_enabled:
                 self.get_logger().warning(f'[SCOUT_RL] DEACTIVATED role={role.value}')
         self.role = role
+        self._last_role_tuple = (role.value, self.active_scout_robot_name, self.epoch)
         if role == Role.ACTIVE_SCOUT:
             if self.scout_rl_enabled:
                 self.get_logger().warning('[SCOUT_RL] ACTIVATED role=ACTIVE_SCOUT')

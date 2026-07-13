@@ -70,6 +70,7 @@ class RuntimeCounters:
     scan_callback_count: int = 0
     odom_callback_count: int = 0
     map_callback_count: int = 0
+    map_tick_count: int = 0
     pose_success_count: int = 0
     confidence_update_attempt_count: int = 0
     confidence_update_success_count: int = 0
@@ -232,6 +233,7 @@ class ActiveScoutRLRuntime:
         self.on_ready = on_ready
         self.enable_velocity_safety_filter = bool(enable_velocity_safety_filter)
         self._active = False
+        self._sensor_pipeline_enabled = False
         self._lock = threading.Lock()
         self._map_state_lock = threading.Lock()
         self._model_lock = threading.Lock()
@@ -478,6 +480,8 @@ class ActiveScoutRLRuntime:
         )
         return {
             'active': self._active,
+            'sensor_pipeline_enabled': self._sensor_pipeline_enabled,
+            'motion_pipeline_enabled': self._active,
             'ready': self.ready,
             'scan_age_ms': (
                 (now - snapshot.scan_received_at) * 1000.0
@@ -506,6 +510,16 @@ class ActiveScoutRLRuntime:
             'odom_angular_velocity': odom_angular_velocity,
             'blocking_inputs': ','.join(blocking_inputs) if blocking_inputs else 'none',
             'observation_ready': observation_ready,
+            'map_tick_count': self.counters.map_tick_count,
+            'map_update_attempt_count': self.counters.confidence_update_attempt_count,
+            'map_update_success_count': self.counters.confidence_update_success_count,
+            'map_snapshot_exists': map_snapshot is not None,
+            'map_snapshot_age_ms': (
+                (now - map_snapshot.updated_at) * 1000.0
+                if map_snapshot is not None else -1.0
+            ),
+            'history_length': len(self._history_vector),
+            'tf_ready': self.tf_ready(),
             'policy_worker_alive': self._model_loading or self.ready,
             'inference_age_ms': (
                 (now - self._last_inference_at) * 1000.0
@@ -549,7 +563,9 @@ class ActiveScoutRLRuntime:
         return True
 
     def activate(self) -> None:
-        self._reset_episode_state()
+        if not self._sensor_pipeline_enabled:
+            self._reset_episode_state()
+        self._sensor_pipeline_enabled = True
         self._active = True
         self._activated_at = time.monotonic()
         self._last_stop_reason = ''
@@ -567,8 +583,22 @@ class ActiveScoutRLRuntime:
             self.node.get_logger().error(f'SCOUT_RL_UNAVAILABLE | {self._model_error}')
             return
 
+    def warmup(self, reason: str = 'startup_warmup') -> None:
+        if self._sensor_pipeline_enabled:
+            return
+        self._reset_episode_state()
+        self._sensor_pipeline_enabled = True
+        self._active = False
+        self._last_stop_reason = reason
+        self._last_command = np.zeros(2, dtype=np.float32)
+        self._last_command_at = 0.0
+        self.node.get_logger().warning(
+            f'SCOUT_RL_WARMUP | reason={reason} motion_pipeline_enabled=false'
+        )
+
     def deactivate(self, reason: str) -> None:
         self._active = False
+        self._sensor_pipeline_enabled = False
         self._reset_episode_state()
         self._stop(reason)
 
@@ -875,8 +905,9 @@ class ActiveScoutRLRuntime:
         )
 
     def _map_tick(self) -> None:
-        if not self._active:
+        if not self._sensor_pipeline_enabled:
             return
+        self.counters.map_tick_count += 1
         snapshot = self._sensor_snapshot()
         now = time.monotonic()
         if not self._fresh(snapshot, now):
@@ -902,7 +933,7 @@ class ActiveScoutRLRuntime:
                     snapshot.scan,
                     robot_xy,
                     robot_yaw,
-                    publish=True,
+                    publish=self._active,
                     slam_map=snapshot.slam_map,
                     sensor_xy=sensor_xy,
                     sensor_yaw=sensor_yaw,
@@ -917,6 +948,8 @@ class ActiveScoutRLRuntime:
                     updated_at=now,
                 )
             self.counters.confidence_update_success_count += 1
+            if not self._active:
+                self._warm_observation(snapshot.scan)
             self._log_heartbeat()
         except TransformException as exc:
             self._last_error = f'TransformException: {exc}'
@@ -928,6 +961,19 @@ class ActiveScoutRLRuntime:
             self._warn_throttled(f'SCOUT_RL_WAIT_MAP_UPDATE | {exc}\n{self._last_error}')
             self._hold('waiting_for_map_update')
             return
+
+    def _warm_observation(self, scan: LaserScan) -> None:
+        map_snapshot = self._map_snapshot
+        if map_snapshot is None:
+            return
+        try:
+            with self._map_state_lock:
+                self._build_observation(scan, map_snapshot)
+        except Exception as exc:  # noqa: BLE001
+            self._last_error = traceback.format_exc()
+            self._warn_throttled(
+                f'SCOUT_RL_WARMUP_OBSERVATION_FAILED | {exc}\n{self._last_error}'
+            )
 
     def _policy_tick(self) -> None:
         if not self._active or self.model is None:

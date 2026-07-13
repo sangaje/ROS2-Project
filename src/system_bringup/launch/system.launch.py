@@ -308,19 +308,23 @@ def generate_launch_description():
             if _tracked_cmd_vel_adapter_enabled(leader_hardware_file):
                 leader_cmd_vel_topic = '/cmd_vel_nav'
 
-        # Will this scout end up owning its own SLAM (risk map's
-        # Cartographer, via start_cartographer:=true + enable_amcl:=false)?
-        # Applies whether the scout is currently in member or follower
-        # fleet_role -- a follower is just a scout temporarily tailing the
-        # leader instead of exploring (RL suspended above), and its risk
-        # map/camera/Cartographer keep running regardless. If so it needs
-        # the wheel odometry's own odom->base_footprint TF broadcast
-        # disabled, or Cartographer's map->odom(->base_footprint) fights
-        # it and TF splits into two disconnected trees.
+        follower_initial_role = (
+            role_value == 'scout' and fleet_role_value == 'follower'
+        )
+        cartographer_requested = launch_bool(start_cartographer.perform(context))
+        risk_map_requested = launch_bool(start_risk_map.perform(context))
+        if follower_initial_role:
+            cartographer_requested = False
+            risk_map_requested = False
+
+        # Only the initial ACTIVE_SCOUT/member stack may own local SLAM at
+        # startup. A FOLLOWER uses the Leader shared map for AMCL/Nav2; a
+        # takeover owner must start Cartographer explicitly after failure is
+        # confirmed.
         scout_owns_slam = (
             role_value == 'scout'
-            and fleet_role_value in ('member', 'follower')
-            and launch_bool(start_cartographer.perform(context))
+            and fleet_role_value == 'member'
+            and cartographer_requested
             and not launch_bool(enable_amcl.perform(context))
         )
         scout_rl_owns_cmd_vel = (
@@ -377,7 +381,9 @@ def generate_launch_description():
         if fleet_role_value in ('follower', 'member'):
             fleet_launch_args['main_domain_id'] = str(main_domain)
             fleet_launch_args['forward_map_to_main'] = (
-                forward_field_map_to_main.perform(context)
+                'false'
+                if follower_initial_role
+                else forward_field_map_to_main.perform(context)
             )
         if fleet_role_value == 'member':
             fleet_launch_args['receive_leader_map'] = (
@@ -428,6 +434,17 @@ def generate_launch_description():
                 ' standalone on domain ', str(domain),
                 ' without cross-domain fleet bridge.',
             ]))
+        if follower_initial_role:
+            actions.append(LogInfo(msg=[
+                'FOLLOWER_CAPABILITY_STATUS | robot=',
+                follower_robot_name.perform(context),
+                ' role=FOLLOWER active_scout_id=',
+                active_scout_robot_name.perform(context),
+                ' follow_enabled=true amcl_enabled=true nav2_enabled=true ',
+                'cartographer_enabled=false rl_enabled=false ',
+                'confidence_enabled=false map_authority=false ',
+                'local_map_outbound=false blocking_reason=normal_follower',
+            ]))
         if scout_rl_owns_cmd_vel and launch_bool(start_nav2.perform(context)):
             actions.append(LogInfo(msg=[
                 'SYSTEM_BRINGUP | scout member RL owns /cmd_vel; forcing ',
@@ -450,10 +467,17 @@ def generate_launch_description():
             role_value == 'scout'
             and (
                 fleet_role_value == 'member'
-                or launch_bool(enable_scout_failover.perform(context))
+                or (
+                    launch_bool(enable_scout_failover.perform(context))
+                    and not follower_initial_role
+                )
             )
         ):
-            local_exploration = launch_bool(enable_exploration.perform(context))
+            local_exploration = (
+                False
+                if follower_initial_role
+                else launch_bool(enable_exploration.perform(context))
+            )
             if local_exploration and rl_backend_value == 'external_worker':
                 actions.append(LogInfo(msg=[
                     'SYSTEM_BRINGUP | ACTIVE_SCOUT RL backend=external_worker; '
@@ -1150,15 +1174,12 @@ def generate_launch_description():
         camera_sender_on = launch_bool(start_camera_sender.perform(context))
         field_observation_topic = f'/field/{scout_robot_name}/risk_observation'
 
-        if (
-            launch_bool(start_risk_map.perform(context))
-            or launch_bool(start_cartographer.perform(context))
-        ):
+        if risk_map_requested or cartographer_requested:
             risk_share = get_package_share_directory('bayesian_risk_map')
             risk_launch_path = os.path.join(
                 risk_share, 'launch', 'real_robot_risk_slam.launch.py'
             )
-            cartographer_on = launch_bool(start_cartographer.perform(context))
+            cartographer_on = cartographer_requested
             if cartographer_on and fleet_stack_owns_slam:
                 if fleet_role_value in ('member', 'follower'):
                     hint = 'Set enable_amcl:=false when turning start_cartographer on.'
@@ -1208,7 +1229,9 @@ def generate_launch_description():
                     'start_cartographer': (
                         'true' if cartographer_on else 'false'
                     ),
-                    'start_risk_map': start_risk_map.perform(context),
+                    'start_risk_map': (
+                        'true' if risk_map_requested else 'false'
+                    ),
                     'cartographer_configuration_basename': configured_lua,
                     'start_camera': risk_start_camera,
                     'start_teleop': start_teleop.perform(context),

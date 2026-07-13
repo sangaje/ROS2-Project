@@ -131,8 +131,21 @@ def test_leader_can_own_risk_map_from_scout_sources():
 def test_scout_can_run_cartographer_without_local_risk_map():
     text = SYSTEM_LAUNCH.read_text(encoding='utf-8')
 
-    assert 'or launch_bool(start_cartographer.perform(context))' in text
-    assert "'start_risk_map': start_risk_map.perform(context)" in text
+    assert 'risk_map_requested or cartographer_requested' in text
+    assert "'true' if risk_map_requested else 'false'" in text
+    assert "fleet_role_value == 'member'" in text
+
+
+def test_follower_startup_forces_slam_and_rl_off():
+    text = SYSTEM_LAUNCH.read_text(encoding='utf-8')
+
+    assert 'follower_initial_role = (' in text
+    assert 'cartographer_requested = False' in text
+    assert 'risk_map_requested = False' in text
+    assert "local_exploration = (\n                False\n                if follower_initial_role" in text
+    assert "'false'\n                if follower_initial_role\n                else forward_field_map_to_main.perform(context)" in text
+    assert 'FOLLOWER_CAPABILITY_STATUS | robot=' in text
+    assert 'cartographer_enabled=false rl_enabled=false' in text
 
 
 def test_follower_map_forwarding_is_explicit_for_takeover_commit():

@@ -336,8 +336,6 @@ class ScoutRLPolicyWorker(Node):
             or (self.role_localization_ready is True)
         )
         sensor_ready = self.runtime.sensor_ready()
-        if not self.start_motion:
-            sensor_ready = False
         if self.require_system_ready and not self.system_ready:
             sensor_ready = False
         return GateInputs(
@@ -358,11 +356,33 @@ class ScoutRLPolicyWorker(Node):
             require_localization_ready=self.require_localization_ready,
         )
 
+    def _warmup_allowed(self, gate: GateInputs) -> bool:
+        role_active = self.desired_role.strip().upper() == 'ACTIVE_SCOUT'
+        if not role_active or not gate.active_scout_matches:
+            return False
+        if self.require_failover_activation and self.role_epoch < self.failover_epoch:
+            return False
+        if self.require_failover_activation and not gate.recovery_complete:
+            return False
+        if self.require_localization_ready and not gate.localization_ready:
+            return False
+        if self.require_system_ready and not self.system_ready:
+            return False
+        return True
+
     def _evaluate_gate(self) -> None:
         if not hasattr(self, 'runtime'):
             return
         gate = self._build_gate_inputs()
+        if self._warmup_allowed(gate):
+            self.runtime.warmup('active_scout_startup')
         state, reason = evaluate_activation_gate(gate)
+        if state == RLWorkerState.ACTIVE and not self.start_motion:
+            state = RLWorkerState.WAIT_MOTION_RELEASE
+            reason = 'startup_not_released' if not self.startup_released else 'start_motion_false'
+        if state == RLWorkerState.ACTIVE and self.require_system_ready and not self.system_ready:
+            state = RLWorkerState.WAIT_MOTION_RELEASE
+            reason = 'system_not_ready'
         self.last_gate_reason = reason
         if state != self.worker_state:
             self.worker_state = state
@@ -501,6 +521,43 @@ class ScoutRLPolicyWorker(Node):
             f'final_command_nonzero={final_nonzero} '
             f'hardware_publish_allowed={hardware_publish_allowed} '
             f'blocking_reason={blocking}'
+        )
+        self.get_logger().warning(
+            'SCOUT_STARTUP_PIPELINE | '
+            f'role={self.desired_role} '
+            f'active_scout_id={self.active_scout_id or "(unset)"} '
+            f'start_motion={self.start_motion} '
+            f'sensor_pipeline_enabled={runtime["sensor_pipeline_enabled"]} '
+            f'motion_pipeline_enabled={runtime["motion_pipeline_enabled"]} '
+            f'scan_ready={float(runtime["scan_age_ms"]) >= 0.0} '
+            f'odom_ready={runtime["odom_ready"]} '
+            f'map_ready={float(runtime["map_age_ms"]) >= 0.0} '
+            f'tf_ready={runtime["tf_ready"]} '
+            f'map_tick_count={runtime["map_tick_count"]} '
+            f'map_update_success_count={runtime["map_update_success_count"]} '
+            f'map_snapshot_ready={runtime["map_snapshot_exists"]} '
+            f'observation_ready={runtime["observation_ready"]} '
+            f'dashboard_ready={self.video_ready} '
+            f'blocking_reason={blocking}'
+        )
+        self.get_logger().warning(
+            'SCOUT_OBSERVATION_PIPELINE | '
+            f'scan_rx={float(runtime["scan_age_ms"]) >= 0.0} '
+            f'scan_generation=see_map_tick '
+            f'map_rx={float(runtime["map_age_ms"]) >= 0.0} '
+            f'map_generation=see_map_tick '
+            f'odom_rx={float(runtime["odom_age_ms"]) >= 0.0} '
+            f'odom_generation={runtime["odom_callback_count"]} '
+            f'tf_ready={runtime["tf_ready"]} '
+            f'map_tick_enabled={runtime["sensor_pipeline_enabled"]} '
+            f'map_tick_count={runtime["map_tick_count"]} '
+            f'map_update_attempt_count={runtime["map_update_attempt_count"]} '
+            f'map_update_success_count={runtime["map_update_success_count"]} '
+            f'map_snapshot_exists={runtime["map_snapshot_exists"]} '
+            f'map_snapshot_age_ms={float(runtime["map_snapshot_age_ms"]):.0f} '
+            f'history_length={runtime["history_length"]} '
+            f'observation_ready={runtime["observation_ready"]} '
+            f'blocking_reason={runtime["blocking_inputs"]}'
         )
         self._log_odom_debug(runtime, blocking)
 
