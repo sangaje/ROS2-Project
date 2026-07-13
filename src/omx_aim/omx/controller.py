@@ -14,8 +14,22 @@ from __future__ import annotations
 import math
 import time
 
-from omx.hardware import build_bus, get_dxl_symbols, ARM_MOTORS, MOTOR_ORDER
 from omx.config import Config
+
+try:
+    from omx.hardware import build_bus, get_dxl_symbols, ARM_MOTORS, MOTOR_ORDER
+    _HARDWARE_IMPORT_ERROR = None
+except ModuleNotFoundError as exc:
+    build_bus = None
+    get_dxl_symbols = None
+    ARM_MOTORS = ("shoulder_pan", "shoulder_lift", "elbow_flex")
+    MOTOR_ORDER = (
+        "shoulder_pan",
+        "shoulder_lift",
+        "elbow_flex",
+        "wrist_flex",
+    )
+    _HARDWARE_IMPORT_ERROR = exc
 
 
 TICKS_PER_REV = 4096
@@ -34,7 +48,14 @@ class OmxController:
     def __init__(self, cfg: Config, dry_run: bool = False, logger=None):
         self.cfg = cfg
         self.dry_run = dry_run
-        self.bus = None if dry_run else build_bus(cfg.motor.port)
+        if dry_run:
+            self.bus = None
+        else:
+            if build_bus is None:
+                raise RuntimeError(
+                    "lerobot is required for OMX hardware control"
+                ) from _HARDWARE_IMPORT_ERROR
+            self.bus = build_bus(cfg.motor.port)
         self.yaw = 0.0
         self.pitch = 0.0
         self.logger = logger
@@ -47,6 +68,8 @@ class OmxController:
         self._scan_sweep_start_t = None
         self._scan_sweep_center_yaw = 0.0
         self._scan_sweep_center_pitch = 0.0
+        self._last_scan_recenter_log_t = 0.0
+        self._last_scan_sweep_log_t = 0.0
 
     def _log(self, msg, level="info"):
         if self.logger:
@@ -60,6 +83,10 @@ class OmxController:
         if self.dry_run:
             self._log("[dry-run] OMX 연결 생략")
             return
+        if get_dxl_symbols is None:
+            raise RuntimeError(
+                "lerobot is required for OMX hardware control"
+            ) from _HARDWARE_IMPORT_ERROR
         s = get_dxl_symbols()
         OperatingMode = s["OperatingMode"]
 
@@ -130,16 +157,11 @@ class OmxController:
 
     def scan_sweep(self, now: float, half_angle_deg: float,
                    period_sec: float, center_yaw_rad: float | None = None):
-        """SCANNING 중에도 pan을 좌우로 연속적으로(호를 그리며) 훑는다.
+        """SCANNING 중에도 pan을 좌우로 연속적으로 훑는다.
 
-        예전 구현은 half_period 마다 목표를 반대쪽 끝으로 순간 이동시켰다
-        -- 서보가 실제로 그 끝까지 도달하기 전에 목표가 또 뒤집히면
-        중간에서 방향이 꺾여서 period_sec 를 아무리 늘려도(서보 속도가
-        그에 못 미치면) 절대 끝까지 못 가는 경우가 있었다. 대신 매 tick
-        마다 목표 각도를 삼각파로 조금씩(연속적으로) 옮겨서 서보가 항상
-        "바로 앞"의 목표를 매끄럽게 뒤쫓게 한다 -- 서보가 못 따라가도
-        방향은 위상에 따라서만 바뀌므로 순간이동/중간에 꺾이는 문제
-        자체가 없고, 늦게라도 결국 양 끝까지 도달한다.
+        스윕 중심은 risk map/관심 방향에 맞춰 바뀔 수 있지만, 중심이
+        바뀔 때마다 위상을 0으로 되돌리면 카메라가 한쪽 끝 명령만 계속
+        받는다. 그래서 중심만 갱신하고 진행 중인 사인파 위상은 유지한다.
         """
         period_sec = max(0.5, float(period_sec))
         half_angle = math.radians(max(0.0, float(half_angle_deg)))
@@ -160,17 +182,27 @@ class OmxController:
             center_yaw_rad = float(center_yaw_rad)
             if abs(center_yaw_rad - self._scan_sweep_center_yaw) > math.radians(5.0):
                 self._scan_sweep_center_yaw = center_yaw_rad
-                self._scan_sweep_start_t = now
-                self._log(
-                    "OMX_SCAN_SWEEP_RECENTER | "
-                    f"center_yaw={math.degrees(center_yaw_rad):+.1f}deg"
-                )
+                if now - self._last_scan_recenter_log_t >= 1.0:
+                    self._last_scan_recenter_log_t = now
+                    self._log(
+                        "OMX_SCAN_SWEEP_RECENTER | "
+                        f"center_yaw={math.degrees(center_yaw_rad):+.1f}deg "
+                        "phase=continuous"
+                    )
 
         elapsed = max(0.0, now - self._scan_sweep_start_t)
-        phase = (elapsed % period_sec) / period_sec  # 0..1, 한 바퀴(왕복) 주기
-        triangle = 2.0 * abs(2.0 * phase - 1.0) - 1.0  # +1 -> -1 -> +1 삼각파
-        yaw = self._scan_sweep_center_yaw + triangle * half_angle
+        phase = (elapsed % period_sec) / period_sec  # 0..1, one full sweep cycle
+        wave = math.sin(2.0 * math.pi * phase)
+        yaw = self._scan_sweep_center_yaw + wave * half_angle
         self._write_angles(yaw, self._scan_sweep_center_pitch)
+        if now - self._last_scan_sweep_log_t >= 1.0:
+            self._last_scan_sweep_log_t = now
+            self._log(
+                "OMX_SCAN_SWEEP_CMD | "
+                f"center_yaw={math.degrees(self._scan_sweep_center_yaw):+.1f}deg "
+                f"yaw={math.degrees(yaw):+.1f}deg "
+                f"wave={wave:+.2f} dry_run={self.dry_run}"
+            )
 
     # ----- 조준 -----
 

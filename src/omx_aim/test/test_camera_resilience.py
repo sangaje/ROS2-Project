@@ -137,6 +137,20 @@ def test_omx_scan_sweep_can_center_on_risk_map():
     assert 'def _risk_map_scan_center_yaw' in node_source
     assert 'OMX_RISK_SCAN_CENTER' in node_source
     assert 'center_yaw_rad: float | None = None' in controller_source
+    assert 'math.sin(2.0 * math.pi * phase)' in controller_source
+    assert 'phase=continuous' in controller_source
+    assert controller_source.count('self._scan_sweep_start_t = now') == 1
+
+
+def test_direct_omx_scan_sweep_tool_exists_for_motor_diagnostics():
+    tool_source = (
+        Path(__file__).parents[3] / 'tools' / 'omx_scan_sweep_test.py'
+    ).read_text(encoding='utf-8')
+
+    assert 'OMX_SCAN_SWEEP_TEST' in tool_source
+    assert '--half-angle-deg' in tool_source
+    assert '--leave-torque-on' in tool_source
+    assert 'ctrl.scan_sweep(' in tool_source
 
 
 def test_jetson_launch_prioritizes_risk_patrol_without_localization_gate():
