@@ -12,6 +12,18 @@ def test_omx_camera_uses_v4l2_preflight_and_reconnect_contract():
     assert 'OMX_CAMERA_BUSY' in source
     assert 'self._pending_first_frame = frame' in source
     assert 'self._reopen_period_sec' in source
+    assert 'def _camera_source_candidates' in source
+    assert 'active={source}' in source
+    assert "('AUTO', cv2.CAP_ANY)" in source
+
+
+def test_scan_sweep_is_centered_on_forward_heading():
+    source = (Path(__file__).parents[1] / 'omx' / 'controller.py').read_text(
+        encoding='utf-8'
+    )
+
+    assert 'self._scan_sweep_center_yaw = 0.0' in source
+    assert 'self._scan_sweep_center_yaw = self.yaw' not in source
 
 
 def test_invalid_camera_frames_do_not_short_circuit_omx_navigation_loop():

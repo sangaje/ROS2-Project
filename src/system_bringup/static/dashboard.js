@@ -201,11 +201,50 @@ function worldToCell(meta, x, y) {
   };
 }
 
+function cellToWorld(meta, cellX, cellY) {
+  const o = meta.origin;
+  const yaw = o.yaw || 0.0;
+  const c = Math.cos(yaw);
+  const s = Math.sin(yaw);
+  const lx = cellX * meta.resolution;
+  const ly = cellY * meta.resolution;
+  return {
+    x: o.x + c * lx - s * ly,
+    y: o.y + s * lx + c * ly,
+  };
+}
+
 function cellToCanvas(meta, vp, cell) {
   return {
     x: vp.x + cell.x * vp.scale,
     y: vp.y + (meta.height - cell.y) * vp.scale,
   };
+}
+
+function gridCornerToCanvas(baseMeta, vp, overlayMeta, cellX, cellY) {
+  const world = cellToWorld(overlayMeta, cellX, cellY);
+  return cellToCanvas(baseMeta, vp, worldToCell(baseMeta, world.x, world.y));
+}
+
+function drawGridImage(img, overlayMeta, baseMeta, vp) {
+  if (!overlayMeta || !Number.isFinite(overlayMeta.width) || !Number.isFinite(overlayMeta.height)) return;
+  if (overlayMeta.width <= 0 || overlayMeta.height <= 0 || overlayMeta.resolution <= 0) return;
+
+  const topLeft = gridCornerToCanvas(baseMeta, vp, overlayMeta, 0, overlayMeta.height);
+  const topRight = gridCornerToCanvas(baseMeta, vp, overlayMeta, overlayMeta.width, overlayMeta.height);
+  const bottomLeft = gridCornerToCanvas(baseMeta, vp, overlayMeta, 0, 0);
+  const a = (topRight.x - topLeft.x) / overlayMeta.width;
+  const b = (topRight.y - topLeft.y) / overlayMeta.width;
+  const c = (bottomLeft.x - topLeft.x) / overlayMeta.height;
+  const d = (bottomLeft.y - topLeft.y) / overlayMeta.height;
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(vp.x, vp.y, vp.w, vp.h);
+  ctx.clip();
+  ctx.setTransform(a, b, c, d, topLeft.x, topLeft.y);
+  ctx.drawImage(img, 0, 0, overlayMeta.width, overlayMeta.height);
+  ctx.restore();
 }
 
 function drawRobot(meta, vp, robot) {
@@ -410,12 +449,12 @@ function draw() {
   const meta = latest.map.metadata;
   const vp = mapViewport(meta);
   if (document.getElementById('layerMap').checked && mapReady) {
-    ctx.drawImage(mapImg, vp.x, vp.y, vp.w, vp.h);
+    drawGridImage(mapImg, meta, meta, vp);
   }
-  if (document.getElementById('layerRisk').checked && riskReady) {
+  if (document.getElementById('layerRisk').checked && riskReady && latest.risk.metadata) {
     ctx.save();
     ctx.globalAlpha = Number(document.getElementById('riskOpacity').value);
-    ctx.drawImage(riskImg, vp.x, vp.y, vp.w, vp.h);
+    drawGridImage(riskImg, latest.risk.metadata, meta, vp);
     ctx.restore();
   }
   if (document.getElementById('layerNavPaths').checked) {

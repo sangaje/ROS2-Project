@@ -140,6 +140,8 @@ class YoloDetector:
         self.frame_width = 0
         self.frame_height = 0
         self._pending_first_frame = None
+        self._active_camera_source = None
+        self._active_camera_backend = None
         self._open_camera(initial=True)
 
         requested_device = str(os.environ.get(
@@ -180,6 +182,26 @@ class YoloDetector:
 
     def _camera_label(self) -> str:
         return str(self.camera_source)
+
+    def _camera_source_candidates(self):
+        sources = [self.camera_source]
+        source_text = str(self.camera_source)
+        if source_text.startswith('/dev/video'):
+            suffix = source_text[len('/dev/video'):]
+            if suffix.isdigit():
+                index = int(suffix)
+                if index not in sources:
+                    sources.append(index)
+        elif isinstance(self.camera_source, str) and source_text.isdigit():
+            index = int(source_text)
+            if index not in sources:
+                sources.append(index)
+        return sources
+
+    def _camera_backend_candidates(self):
+        if self.camera_backend == 'v4l2':
+            return [('V4L2', cv2.CAP_V4L2), ('AUTO', cv2.CAP_ANY)]
+        return [('AUTO', cv2.CAP_ANY)]
 
     def _device_preflight(self) -> tuple[bool, str]:
         if not isinstance(self.camera_source, str) or not self.camera_source.startswith('/'):
@@ -247,24 +269,33 @@ class YoloDetector:
                 )
             return False
 
-        backend = cv2.CAP_V4L2 if self.camera_backend == 'v4l2' else cv2.CAP_ANY
-        self.cap = cv2.VideoCapture(self.camera_source, backend)
-        if self.cap.isOpened():
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            ok, frame = self.cap.read()
-            if ok and frame is not None:
-                self._consecutive_read_failures = 0
-                self.frame_height, self.frame_width = frame.shape[:2]
-                self._pending_first_frame = frame
-                self._set_camera_health(True, 'ready')
-                self._reconnect_attempt = 0
-                self._log(
-                    'OMX_CAMERA_PREFLIGHT | '
-                    f'requested={self._camera_label()} exists=true readable=true '
-                    f'backend={self.camera_backend.upper()} opened=true first_frame=true '
-                    f'width={self.frame_width} height={self.frame_height}'
-                )
-                return True
+        for source in self._camera_source_candidates():
+            for backend_name, backend in self._camera_backend_candidates():
+                cap = cv2.VideoCapture(source, backend)
+                if cap.isOpened():
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    ok, frame = cap.read()
+                    if ok and frame is not None:
+                        self.cap = cap
+                        self._active_camera_source = source
+                        self._active_camera_backend = backend_name
+                        self._consecutive_read_failures = 0
+                        self.frame_height, self.frame_width = frame.shape[:2]
+                        self._pending_first_frame = frame
+                        self._set_camera_health(True, 'ready')
+                        self._reconnect_attempt = 0
+                        self._log(
+                            'OMX_CAMERA_PREFLIGHT | '
+                            f'requested={self._camera_label()} active={source} '
+                            f'exists=true readable=true backend={backend_name} '
+                            f'opened=true first_frame=true '
+                            f'width={self.frame_width} height={self.frame_height}'
+                        )
+                        return True
+                cap.release()
+        self.cap = None
+        self._active_camera_source = None
+        self._active_camera_backend = None
         owner = self._busy_owner()
         reason = 'camera_busy' if owner else 'open_failed'
         changed = self._set_camera_health(False, reason)

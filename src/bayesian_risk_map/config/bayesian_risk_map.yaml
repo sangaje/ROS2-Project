@@ -134,6 +134,16 @@ bayesian_risk_map_node:
     enable_visibility_tracking: true
     visibility_num_rays: 96
     observed_empty_alpha: 0.20
+    enable_leader_visibility_tracking: true
+    leader_pose_topic: "/leader_pose"
+    leader_observation_topic: "/omx/observation_status"
+    leader_camera_yaw_topic: "/omx/camera_yaw"
+    leader_observation_max_age_sec: 2.5
+    leader_camera_yaw_max_age_sec: 2.5
+    leader_camera_hfov_deg: 62.0
+    leader_first_miss_dt_sec: 0.5
+    leader_person_bayes_miss_log_odds_per_sec: 1.2
+    leader_visible_risk_decay_per_sec: 2.0
     diagnostic_publish_rate_hz: 1.0
 
     # Occupancy policy

@@ -425,26 +425,37 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             ).value
         )
         self.leader_observation_max_age_sec = float(
-            self.declare_parameter('leader_observation_max_age_sec', 1.0).value
+            self.declare_parameter('leader_observation_max_age_sec', 2.5).value
         )
         # The leader's actual camera is the OMX pan/tilt head, not the
         # robot's own front -- narrower FOV than the scout's own camera,
         # and it looks wherever the arm is currently pointed, not
         # wherever the robot base happens to be facing.
         self.leader_camera_hfov_deg = float(
-            self.declare_parameter('leader_camera_hfov_deg', 35.0).value
+            self.declare_parameter('leader_camera_hfov_deg', 62.0).value
         )
         self.leader_camera_yaw_topic = str(
             self.declare_parameter('leader_camera_yaw_topic', '/omx/camera_yaw').value
         )
         self.leader_camera_yaw_max_age_sec = float(
-            self.declare_parameter('leader_camera_yaw_max_age_sec', 1.0).value
+            self.declare_parameter('leader_camera_yaw_max_age_sec', 2.5).value
         )
         self.leader_pose_max_age_sec = float(
             self.declare_parameter('leader_pose_max_age_sec', 2.0).value
         )
         self.leader_detected_max_age_sec = float(
             self.declare_parameter('leader_detected_max_age_sec', 1.0).value
+        )
+        self.leader_first_miss_dt_sec = float(
+            self.declare_parameter('leader_first_miss_dt_sec', 0.5).value
+        )
+        self.leader_person_bayes_miss_log_odds_per_sec = float(
+            self.declare_parameter(
+                'leader_person_bayes_miss_log_odds_per_sec', 1.2
+            ).value
+        )
+        self.leader_visible_risk_decay_per_sec = float(
+            self.declare_parameter('leader_visible_risk_decay_per_sec', 2.0).value
         )
 
         # Occupancy policy
@@ -1249,7 +1260,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         ):
             camera_offset = self.leader_camera_yaw
         if camera_offset is None:
-            return None
+            camera_offset = 0.0
         return (float(p.x), float(p.y), base_yaw + camera_offset)
 
     def consume_leader_observation(self):
@@ -2431,6 +2442,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         now_ros_sec: float,
         *,
         dt_override: Optional[float] = None,
+        decay_per_sec_override: Optional[float] = None,
     ) -> bool:
         if (
             not self.enable_visible_risk_decay
@@ -2470,7 +2482,12 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
 
         visible = np.clip(visibility, 0.0, 1.0).astype(np.float32)
         visible[~self.valid_free_mask()] = 0.0
-        decay = max(0.0, float(self.visible_risk_decay_per_sec)) * dt * visible
+        decay_rate = (
+            float(decay_per_sec_override)
+            if decay_per_sec_override is not None
+            else float(self.visible_risk_decay_per_sec)
+        )
+        decay = max(0.0, decay_rate) * dt * visible
         changed = False
 
         for layer_name in (
@@ -2524,8 +2541,9 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.last_leader_miss_capture_sec = capture_sec
         self.update_observed_empty(visibility, False)
         if previous_capture is None:
-            return False
-        dt = clamp(capture_sec - float(previous_capture), 0.0, 1.0)
+            dt = clamp(float(self.leader_first_miss_dt_sec), 0.0, 1.0)
+        else:
+            dt = clamp(capture_sec - float(previous_capture), 0.0, 1.0)
         if dt <= 0.0:
             return False
 
@@ -2546,7 +2564,10 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                 previous = self.person_log_odds_map.copy()
                 visible = np.clip(visibility, 0.0, 1.0).astype(np.float32)
                 visible[~self.risk_memory_mask()] = 0.0
-                miss_rate = max(0.0, float(self.person_bayes_miss_log_odds_per_sec))
+                miss_rate = max(
+                    0.0,
+                    float(self.leader_person_bayes_miss_log_odds_per_sec),
+                )
                 self.person_log_odds_map = np.maximum(
                     0.0,
                     self.person_log_odds_map - miss_rate * dt * visible,
@@ -2561,6 +2582,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             False,
             now_ros_sec,
             dt_override=dt,
+            decay_per_sec_override=self.leader_visible_risk_decay_per_sec,
         ) or changed
 
     def leader_positive_candidate(self, observation, leader_pose):

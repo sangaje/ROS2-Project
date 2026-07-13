@@ -101,7 +101,7 @@ class OmxController:
 
     def reset_scan_sweep(self):
         self._scan_sweep_start_t = None
-        self._scan_sweep_center_yaw = self.yaw
+        self._scan_sweep_center_yaw = 0.0
         self._scan_sweep_center_pitch = self.pitch
 
     def _write_angles(self, yaw: float, pitch: float):
@@ -146,7 +146,7 @@ class OmxController:
 
         if self._scan_sweep_start_t is None:
             self._scan_sweep_start_t = now
-            self._scan_sweep_center_yaw = self.yaw
+            self._scan_sweep_center_yaw = 0.0
             self._scan_sweep_center_pitch = self.pitch
             self._log(
                 "OMX_SCAN_SWEEP_START | "
