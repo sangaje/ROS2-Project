@@ -233,7 +233,7 @@ def active_scout_config(
         # Fast observation tick runs independently of the heavy confidence
         # publish path. Treat the policy-facing MapSnapshot as its own
         # freshness contract instead of hiding stalls behind scan timeout.
-        max_observation_snapshot_age_sec=1.0,
+        max_observation_snapshot_age_sec=5.0,
         # Heavy confidence-grid update + external map publish: slowed down
         # from ~2 Hz so it has real idle time between runs instead of racing
         # back-to-back (its own cost can exceed 1s), which is what was

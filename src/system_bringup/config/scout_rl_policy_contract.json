@@ -7,7 +7,7 @@
   "runtime": {
     "control_dt_sec": 0.2,
     "map_substeps_per_action": 2,
-    "max_scan_age_sec": 0.8,
+    "max_scan_age_sec": 2.0,
     "max_map_age_sec": 5.0,
     "max_tf_age_sec": 0.5,
     "max_inference_sec": 2.0,

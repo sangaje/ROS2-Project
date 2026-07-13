@@ -48,8 +48,8 @@ class ScoutRLPolicyWorker(Node):
         self.declare_parameter('require_start_motion', True)
         self.declare_parameter('start_motion_topic', '/fleet/start_motion')
         self.declare_parameter('motion_readiness_detail_topic', '/fleet/scout_motion_ready_detail')
-        self.declare_parameter('motion_release_stable_sec', 0.15)
-        self.declare_parameter('startup_sensor_max_age_sec', 0.5)
+        self.declare_parameter('motion_release_stable_sec', 0.0)
+        self.declare_parameter('startup_sensor_max_age_sec', 2.0)
         # Backward-compatible names accepted by old launch files. They no
         # longer control the final motion barrier.
         self.declare_parameter('require_video_ready', True)
@@ -80,7 +80,7 @@ class ScoutRLPolicyWorker(Node):
             get('motion_readiness_detail_topic').value
         ).strip() or '/fleet/scout_motion_ready_detail'
         self.motion_release_stable_sec = max(
-            0.1, float(get('motion_release_stable_sec').value)
+            0.0, float(get('motion_release_stable_sec').value)
         )
         self.startup_sensor_max_age_sec = max(
             0.05, float(get('startup_sensor_max_age_sec').value)

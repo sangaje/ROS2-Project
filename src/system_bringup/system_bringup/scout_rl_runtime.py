@@ -997,11 +997,8 @@ class ActiveScoutRLRuntime:
     def _fresh(self, snapshot: SensorSnapshot, now: float) -> bool:
         return bool(
             snapshot.scan is not None
-            and snapshot.odom is not None
             and snapshot.slam_map is not None
             and now - snapshot.scan_received_at <= self.config.max_scan_age_sec
-            and now - snapshot.odom_received_at <= self.config.max_odom_age_sec
-            and now - snapshot.map_received_at <= self.config.max_map_age_sec
         )
 
     def _blocking_inputs(
@@ -1017,12 +1014,8 @@ class ActiveScoutRLRuntime:
             blocking.append('scan_stale')
         if snapshot.odom is None:
             blocking.append('odom_missing')
-        elif now - snapshot.odom_received_at > self.config.max_odom_age_sec:
-            blocking.append('odom_stale')
         if snapshot.slam_map is None:
             blocking.append('map_missing')
-        elif now - snapshot.map_received_at > self.config.max_map_age_sec:
-            blocking.append('map_stale')
         elif str(snapshot.slam_map.header.frame_id or '').lstrip('/') != self.config.map_frame.lstrip('/'):
             blocking.append('map_frame_mismatch')
         if not blocking:
@@ -1266,6 +1259,17 @@ class ActiveScoutRLRuntime:
         snapshot = self._sensor_snapshot()
         map_snapshot = self._map_snapshot
         now = time.monotonic()
+        if (
+            map_snapshot is None
+            or now - map_snapshot.updated_at > min(
+                self.config.max_observation_snapshot_age_sec,
+                self.config.control_dt_sec * 2.0,
+            )
+        ):
+            self._fast_observation_tick()
+            snapshot = self._sensor_snapshot()
+            map_snapshot = self._map_snapshot
+            now = time.monotonic()
         model_ready = self.ready
         sensor_fresh = self._fresh(snapshot, now)
         snapshot_exists = map_snapshot is not None

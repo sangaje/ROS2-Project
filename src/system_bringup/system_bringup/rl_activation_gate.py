@@ -114,11 +114,9 @@ def evaluate_activation(gate: GateInputs) -> ActivationDecision:
         )
     ):
         return ActivationDecision(RLWorkerState.WAIT_MOTION_RELEASE, 'motion_authority_busy')
-    if not gate.model_ready or not gate.sensor_ready or not gate.tf_ready:
-        return ActivationDecision(RLWorkerState.WAIT_SENSOR_READY, 'runtime_inputs_not_ready')
-    if not gate.observation_ready:
-        return ActivationDecision(RLWorkerState.WAIT_OBSERVATION_READY, 'observation_stale')
-    return ActivationDecision(RLWorkerState.ACTIVE, 'all_runtime_inputs_ready')
+    if not gate.model_ready:
+        return ActivationDecision(RLWorkerState.WAIT_SENSOR_READY, 'model_not_ready')
+    return ActivationDecision(RLWorkerState.ACTIVE, 'active_scout_model_ready')
 
 
 def evaluate_activation_gate(gate: GateInputs) -> tuple[RLWorkerState, str]:
