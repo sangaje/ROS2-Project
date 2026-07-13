@@ -27,6 +27,18 @@ def make_node():
     node.positive_projection_mode = 'bearing_consensus'
     node.positive_memory_alpha = 0.85
     node.positive_memory_map = np.zeros_like(node.occ_grid, dtype=np.float32)
+    node.bearing_consensus_map = np.zeros_like(node.occ_grid, dtype=np.float32)
+    node.detection_candidate_map = np.zeros_like(node.occ_grid, dtype=np.float32)
+    node.evidence_points = []
+    node.enable_visible_risk_decay = True
+    node.visible_risk_decay_per_sec = 0.20
+    node.visible_risk_decay_grace_sec = 1.0
+    node.visible_evidence_clear_threshold = 0.5
+    node.last_visible_risk_decay_ros_sec = None
+    node.last_leader_miss_capture_sec = None
+    node.enable_empty_observation_map = True
+    node.observed_empty_alpha = 1.0
+    node.observed_empty_map = np.zeros_like(node.occ_grid, dtype=np.float32)
     node.risk_persist_in_unknown = True
     node.risk_dirty = False
     node.enable_person_probability_map = True
@@ -250,3 +262,70 @@ def test_wall_and_unknown_cells_occlude_visibility_and_protect_memory():
             initial_occluded,
             rel_tol=1e-6,
         )
+
+
+def test_leader_valid_miss_is_consumed_once_and_only_decays_visible_cells():
+    node = make_node()
+    visible_cell = (60, 60)
+    hidden_cell = (60, 70)
+    visibility = np.zeros_like(node.occ_grid, dtype=np.float32)
+    visibility[visible_cell] = 1.0
+
+    candidate = np.zeros_like(node.person_log_odds_map)
+    candidate[visible_cell] = 0.25
+    candidate[hidden_cell] = 0.25
+    node.update_person_bayesian_memory(candidate, None, True, 1.0)
+    node.last_person_detection_ros_sec = None
+    before_visible = float(node.person_probability_map[visible_cell])
+    before_hidden = float(node.person_probability_map[hidden_cell])
+
+    # First valid frame establishes the leader-camera timebase only.
+    assert not node.apply_leader_valid_no_detection(visibility, 10.0, 10.0)
+    assert node.apply_leader_valid_no_detection(visibility, 11.0, 11.0)
+    after_visible = float(node.person_probability_map[visible_cell])
+    after_hidden = float(node.person_probability_map[hidden_cell])
+
+    assert 0.0 < after_visible < before_visible
+    assert math.isclose(after_hidden, before_hidden, rel_tol=1e-6)
+
+    # Replaying the same bridge frame cannot apply the miss a second time.
+    assert not node.apply_leader_valid_no_detection(visibility, 11.0, 11.1)
+    assert math.isclose(
+        float(node.person_probability_map[visible_cell]), after_visible, rel_tol=1e-6
+    )
+
+
+def test_leader_observation_requires_fresh_completed_inference_once():
+    class Clock:
+        class Now:
+            nanoseconds = 20_000_000_000
+
+        def now(self):
+            return self.Now()
+
+    node = make_node()
+    node.get_clock = lambda: Clock()
+    node.leader_observation_max_age_sec = 1.0
+    node.last_leader_observation_sequence = None
+    node.leader_observation_wall = 20.0
+    node.leader_observation = {
+        'sequence': 7,
+        'capture_stamp': 20.0,
+        'camera_ready': True,
+        'frame_valid': True,
+        'inference_ran': True,
+        'detected': False,
+    }
+
+    assert node.consume_leader_observation() == (False, 20.0)
+    assert node.consume_leader_observation() is None
+
+    node.leader_observation = {
+        'sequence': 8,
+        'capture_stamp': 18.0,
+        'camera_ready': True,
+        'frame_valid': True,
+        'inference_ran': True,
+        'detected': False,
+    }
+    assert node.consume_leader_observation() is None

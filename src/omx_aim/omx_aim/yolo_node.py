@@ -233,9 +233,23 @@ class OmxYoloNode(Node):
         self.fps_disp = 0.0
 
         # Publishers
+        self.qos_observation = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=5,
+        )
         self.pub_status = self.create_publisher(String, '/omx/status', 10)
         self.pub_state = self.create_publisher(String, '/omx/state', 10)
-        self.pub_detected = self.create_publisher(Bool, '/omx/target_detected', 10)
+        self.pub_detected = self.create_publisher(
+            Bool, '/omx/target_detected', self.qos_observation
+        )
+        self.pub_camera_ready = self.create_publisher(
+            Bool, '/omx/camera_ready', self.qos_observation
+        )
+        self.pub_observation_status = self.create_publisher(
+            String, '/omx/observation_status', self.qos_observation
+        )
         self.pub_error = self.create_publisher(Point, '/omx/error_norm', 10)
         self.pub_joint = self.create_publisher(JointState, '/omx/joint_state', 10)
         self.pub_fire = self.create_publisher(Empty, '/omx/fire', 10)
@@ -248,7 +262,9 @@ class OmxYoloNode(Node):
         # 보고 있는지 -- risk map 의 leader-visibility fusion 등 다른
         # 도메인 소비자가 "젯슨의 시야 = 로봇 정면"으로 잘못 가정하지
         # 않도록 실제 조준 방향을 별도로 발행한다.
-        self.pub_camera_yaw = self.create_publisher(Float32, '/omx/camera_yaw', 10)
+        self.pub_camera_yaw = self.create_publisher(
+            Float32, '/omx/camera_yaw', self.qos_observation
+        )
         self.pub_queue_size = self.create_publisher(Int32, '/omx/queue_size', 10)
         self.pub_patrol_complete = self.create_publisher(Empty, '/omx/patrol_complete', 10)
         self.pub_queue_markers = self.create_publisher(
@@ -343,6 +359,7 @@ class OmxYoloNode(Node):
         self._active_nav_acked = False
         self._last_nav_retry_t = 0.0
         self._nav_retry_period_sec = 1.0
+        self._observation_sequence = 0
 
         self.get_logger().info(
             f"Timer: 메인 {self.cfg.ibvs.control_hz} Hz, 상태 1 Hz")
@@ -1142,6 +1159,52 @@ class OmxYoloNode(Node):
         msg.data = detected
         self.pub_detected.publish(msg)
 
+    def publish_observation_status(
+        self,
+        *,
+        frame_valid: bool,
+        inference_ran: bool,
+        detected,
+        confidence,
+        bbox=None,
+        reason: str = '',
+    ) -> None:
+        """Publish a validity-aware OMX observation without overloading Bool."""
+        self._observation_sequence += 1
+        now = time.time()
+        ready = bool(getattr(self.detector, 'camera_ready', False))
+        ready_msg = Bool()
+        ready_msg.data = ready
+        self.pub_camera_ready.publish(ready_msg)
+        payload = {
+            'sequence': self._observation_sequence,
+            'capture_stamp': now if frame_valid else None,
+            'publish_stamp': now,
+            'camera_ready': ready,
+            'frame_valid': bool(frame_valid),
+            'inference_ran': bool(inference_ran),
+            'detected': detected if inference_ran else None,
+            'confidence': float(confidence or 0.0) if inference_ran else None,
+            'camera_yaw_rad': float(self.ctrl.yaw),
+            'image_width': int(getattr(self.detector, 'frame_width', 0)),
+            'image_height': int(getattr(self.detector, 'frame_height', 0)),
+            'source': str(getattr(self.detector, 'camera_source', 'unknown')),
+        }
+        if inference_ran and detected and bbox is not None:
+            payload['bbox_xyxy'] = [float(value) for value in bbox]
+        if reason:
+            payload['reason'] = reason
+        msg = String()
+        msg.data = json.dumps(payload, sort_keys=True)
+        self.pub_observation_status.publish(msg)
+
+    def publish_vision_safe_fire_lock(self) -> None:
+        """A missing/invalid frame must never leave the fire path enabled."""
+        msg = Bool()
+        msg.data = True
+        self.pub_fire_disable.publish(msg)
+        self._fire_enable_detection_active = False
+
     def publish_error(self, ex, ey):
         msg = Point()
         msg.x = float(ex)
@@ -1512,29 +1575,40 @@ class OmxYoloNode(Node):
 
     def loop(self):
         frame = self.detector.read_frame()
-        if frame is None:
-            self.get_logger().warn(
-                "프레임 읽기 실패 - 카메라 재연결 시도 중",
-                throttle_duration_sec=2.0,
-            )
-            return
-
-        # 격발 후 COOLDOWN 동안엔 YOLO detect 스킵.
-        # 화면/스트림(read_frame·visualize·debug_stream)은 계속 흐르되,
-        # 재검출로 인한 조기 재격발을 막는다.
-        # COOLDOWN 은 detect 결과(detected·error_norm)를 쓰지 않으므로 안전.
-        if self.sm.state == State.COOLDOWN:
-            detected, error_norm, bbox, conf = False, None, None, None
-        else:
-            detected, error_norm, bbox, conf = self.detector.detect(frame)
-
         now = time.time()
-        action = self.sm.update(detected, error_norm, now)
+        frame_valid = frame is not None
+        inference_ran = False
+        detected, error_norm, bbox, conf = False, None, None, None
+        vision_reason = ''
+        if frame_valid and self.sm.state != State.COOLDOWN:
+            try:
+                detected, error_norm, bbox, conf = self.detector.detect(frame)
+                inference_ran = True
+            except Exception as exc:  # noqa: BLE001
+                vision_reason = f'inference_failed:{type(exc).__name__}'
+                self.get_logger().error(
+                    f'OMX_VISION_UNAVAILABLE | reason={vision_reason}: {exc}',
+                    throttle_duration_sec=2.0,
+                )
+        elif not frame_valid:
+            vision_reason = str(
+                getattr(self.detector, 'camera_failure_reason', 'camera_unavailable')
+            )
+
+        vision_valid = frame_valid and inference_ran
+        # Navigation/state progression is deliberately independent from vision.
+        # Invalid vision is UNKNOWN, never a no-target observation.
+        action = self.sm.update(
+            detected, error_norm, now, vision_valid=vision_valid
+        )
         if action.get('cancel_navigation'):
             self.publish_nav_cancel()
             self.publish_leader_nav_cancel()
-        self.maybe_stop_nav_on_detection(detected, error_norm, conf, now)
-        self.publish_fire_enable_for_aim_state(action, now)
+        if vision_valid:
+            self.maybe_stop_nav_on_detection(detected, error_norm, conf, now)
+            self.publish_fire_enable_for_aim_state(action, now)
+        else:
+            self.publish_vision_safe_fire_lock()
 
         # blocked entries 알림
         for entry in action.get('blocked_entries', []):
@@ -1563,7 +1637,7 @@ class OmxYoloNode(Node):
                     self.cfg.patrol.scan_sweep_period_sec,
                 )
 
-            elif action['action'] == 'fire':
+            elif action['action'] == 'fire' and vision_valid:
                 processed_map = (self.sm.current_focus.coord_map
                                  if self.sm.current_focus else None)
                 self.publish_fire()
@@ -1607,6 +1681,14 @@ class OmxYoloNode(Node):
                 self.sm.on_boundary(coord)
 
         self.publish_detected(detected)
+        self.publish_observation_status(
+            frame_valid=frame_valid,
+            inference_ran=inference_ran,
+            detected=detected,
+            confidence=conf,
+            bbox=bbox,
+            reason=vision_reason,
+        )
         if error_norm is not None:
             self.publish_error(error_norm[0], error_norm[1])
         self.publish_joint_state()
@@ -1617,7 +1699,7 @@ class OmxYoloNode(Node):
 
         # 그리기: display 또는 stream 둘 중 하나라도 필요하면 호출
         need_viz = (not self.no_display) or (self.debug_stream is not None)
-        if need_viz:
+        if need_viz and frame_valid:
             self.visualize(frame, detected, error_norm, bbox, conf, action)
             if self.debug_stream is not None:
                 self.debug_stream.update(frame)

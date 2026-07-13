@@ -35,6 +35,14 @@ def test_real_bridge_directions_and_control_qos(tmp_path):
     assert main['topics']['/member_pose']['type'] == (
         'geometry_msgs/msg/PoseStamped'
     )
+    assert main['topics']['/omx/observation_status']['type'] == 'std_msgs/msg/String'
+    assert main['topics']['/omx/observation_status']['qos'] == {
+        'reliability': 'best_effort',
+        'durability': 'volatile',
+        'history': 'keep_last',
+        'depth': 5,
+    }
+    assert main['topics']['/omx/camera_ready']['type'] == 'std_msgs/msg/Bool'
     assert main['topics']['/failover/active_scout_id']['qos']['durability'] == (
         'transient_local'
     )
@@ -105,6 +113,8 @@ def test_member_bridge_keeps_risk_topics_off_the_default_pose_status_path(tmp_pa
     assert main['topics']['/leader_pose']['type'] == (
         'geometry_msgs/msg/PoseStamped'
     )
+    assert main['topics']['/omx/observation_status']['type'] == 'std_msgs/msg/String'
+    assert main['topics']['/omx/camera_ready']['type'] == 'std_msgs/msg/Bool'
     assert main['topics']['/fleet/coordination_status']['qos']['durability'] == (
         'transient_local'
     )

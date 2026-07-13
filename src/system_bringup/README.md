@@ -315,3 +315,39 @@ ros2 topic hz /scan
 ros2 topic hz /map
 ros2 run tf2_ros tf2_echo map base_footprint
 ```
+
+### Leader OMX Camera Health and Nav2 Independence
+
+The leader OMX camera uses an explicit Linux V4L2 device path. The selection
+order is `OMX_YOLO_CAMERA_DEVICE`, `omx_camera_device`, the legacy
+`OMX_YOLO_CAMERA_INDEX`, then `ibvs.camera_index`. Do not start another local
+camera sender against the same device while OMX owns it.
+
+```bash
+ros2 launch system_bringup system.launch.py \
+  role:=leader \
+  omx_camera_device:=/dev/video0 \
+  omx_camera_backend:=v4l2 \
+  omx_camera_reconnect_period_sec:=1.0 \
+  omx_camera_required:=false
+```
+
+`omx_camera_required:=false` keeps OMX navigation, patrol queues, Nav2 goal
+retry, and fleet orchestration alive when the camera is disconnected. Camera
+loss publishes `/omx/camera_ready=false` and an `/omx/observation_status`
+record with `detected: null`; it is never treated as a valid no-detection.
+The fire path remains disabled until a valid frame drives the aim state.
+
+```bash
+# Run on the leader domain after launch.
+ros2 topic echo /omx/camera_ready
+ros2 topic echo /omx/observation_status
+ros2 topic echo /omx/nav_goal
+ros2 topic echo /waffle/nav_goal_ack
+ros2 topic echo /waffle/nav_result
+```
+
+The leader's valid OMX observation stream is bridged from domain 20 to the
+potential Scout domains. A fresh `detected:false` frame can only decay mapped,
+line-of-sight cells in the OMX FOV; stale, invalid, or missing observations
+preserve the existing Bayesian posterior.

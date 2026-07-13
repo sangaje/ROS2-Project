@@ -432,7 +432,7 @@ class StateMachine:
 
     # ----- update() 메인 -----
 
-    def update(self, detected: bool, error_norm, now: float) -> dict:
+    def update(self, detected: bool, error_norm, now: float, *, vision_valid: bool = True) -> dict:
         action = {
             'action': 'wait',
             'state': self.state,
@@ -472,6 +472,8 @@ class StateMachine:
                 self._handle_nav_result(result, action, now)
 
         detection_preempted_nav = (
+            vision_valid
+            and
             detected
             and error_norm is not None
             and self.state
@@ -516,13 +518,19 @@ class StateMachine:
                 action['scan_sweep'] = True
 
         elif self.state == State.SCANNING:
-            self._on_scanning(detected, error_norm, now, action)
+            if vision_valid:
+                self._on_scanning(detected, error_norm, now, action)
+            else:
+                action['action'] = 'scan_sweep'
+                action['scan_sweep'] = True
 
         elif self.state == State.TRACKING:
-            self._on_tracking(detected, error_norm, now, action)
+            if vision_valid:
+                self._on_tracking(detected, error_norm, now, action)
 
         elif self.state == State.CONFIRMING:
-            self._on_confirming(detected, error_norm, now, action)
+            if vision_valid:
+                self._on_confirming(detected, error_norm, now, action)
 
         elif self.state == State.FIRING:
             action['action'] = 'fire'

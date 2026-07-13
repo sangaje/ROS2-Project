@@ -129,6 +129,22 @@ def write_fleet_bridge_configs(
         ),
         '/leader_pose': topic('geometry_msgs/msg/PoseStamped'),
         '/member_pose': topic('geometry_msgs/msg/PoseStamped'),
+        '/omx/target_detected': topic(
+            'std_msgs/msg/Bool',
+            profile=qos(reliability='best_effort', durability='volatile', depth=5),
+        ),
+        '/omx/camera_ready': topic(
+            'std_msgs/msg/Bool',
+            profile=qos(reliability='best_effort', durability='volatile', depth=5),
+        ),
+        '/omx/camera_yaw': topic(
+            'std_msgs/msg/Float32',
+            profile=qos(reliability='best_effort', durability='volatile', depth=5),
+        ),
+        '/omx/observation_status': topic(
+            'std_msgs/msg/String',
+            profile=qos(reliability='best_effort', durability='volatile', depth=5),
+        ),
         '/plan': topic(
             'nav_msgs/msg/Path',
             remap='/leader_plan',
@@ -287,8 +303,16 @@ def write_member_bridge_configs(
             'std_msgs/msg/Bool',
             profile=qos(reliability='best_effort', durability='volatile', depth=5),
         ),
+        '/omx/camera_ready': topic(
+            'std_msgs/msg/Bool',
+            profile=qos(reliability='best_effort', durability='volatile', depth=5),
+        ),
         '/omx/camera_yaw': topic(
             'std_msgs/msg/Float32',
+            profile=qos(reliability='best_effort', durability='volatile', depth=5),
+        ),
+        '/omx/observation_status': topic(
+            'std_msgs/msg/String',
             profile=qos(reliability='best_effort', durability='volatile', depth=5),
         ),
         '/member_goal_pose': topic('geometry_msgs/msg/PoseStamped'),

@@ -68,6 +68,12 @@ def launch_setup(context, *args, **kwargs):
     )
     yolo_node_model_path = LaunchConfiguration('yolo_node_model_path').perform(context)
     omx_camera_index = LaunchConfiguration('omx_camera_index').perform(context)
+    omx_camera_device = LaunchConfiguration('omx_camera_device').perform(context)
+    omx_camera_backend = LaunchConfiguration('omx_camera_backend').perform(context)
+    omx_camera_reconnect_period_sec = LaunchConfiguration(
+        'omx_camera_reconnect_period_sec'
+    ).perform(context)
+    omx_camera_required = LaunchConfiguration('omx_camera_required').perform(context)
     yolo_server_device = LaunchConfiguration('yolo_server_device').perform(context)
     patrol_delay = float(
         LaunchConfiguration('patrol_planner_delay_sec').perform(context)
@@ -109,6 +115,10 @@ def launch_setup(context, *args, **kwargs):
         additional_env=_with_virtualenv_site_packages({
             'OMX_YOLO_MODEL_PATH': yolo_node_model_path,
             'OMX_YOLO_CAMERA_INDEX': omx_camera_index,
+            'OMX_YOLO_LAUNCH_CAMERA_DEVICE': omx_camera_device,
+            'OMX_YOLO_CAMERA_BACKEND': omx_camera_backend,
+            'OMX_YOLO_CAMERA_RECONNECT_PERIOD_SEC': omx_camera_reconnect_period_sec,
+            'OMX_YOLO_CAMERA_REQUIRED': omx_camera_required,
             # Keep OMX and the Flask server on the same explicitly selected
             # device -- both fall back to CPU automatically if this torch
             # build lacks the requested CUDA kernel.
@@ -245,7 +255,23 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'omx_camera_index', default_value='0',
-            description='OpenCV camera index used by OMX debug/YOLO video.',
+            description='Legacy OpenCV integer camera index used when no device path is set.',
+        ),
+        DeclareLaunchArgument(
+            'omx_camera_device', default_value='/dev/video0',
+            description='Preferred V4L2 camera path, including /dev/v4l/by-id symlinks.',
+        ),
+        DeclareLaunchArgument(
+            'omx_camera_backend', default_value='v4l2', choices=['v4l2', 'auto'],
+            description='OpenCV backend for the OMX camera.',
+        ),
+        DeclareLaunchArgument(
+            'omx_camera_reconnect_period_sec', default_value='1.0',
+            description='Minimum retry period after camera loss.',
+        ),
+        DeclareLaunchArgument(
+            'omx_camera_required', default_value='false', choices=['true', 'false'],
+            description='Diagnostic policy only; false keeps Nav2 running without a camera.',
         ),
         DeclareLaunchArgument(
             'patrol_planner_delay_sec', default_value='6.0',

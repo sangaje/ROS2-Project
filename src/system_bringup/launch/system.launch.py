@@ -189,6 +189,12 @@ def generate_launch_description():
     yolo_server_half = LaunchConfiguration('yolo_server_half')
     omx_yolo_node_delay_sec = LaunchConfiguration('omx_yolo_node_delay_sec')
     omx_camera_index = LaunchConfiguration('omx_camera_index')
+    omx_camera_device = LaunchConfiguration('omx_camera_device')
+    omx_camera_backend = LaunchConfiguration('omx_camera_backend')
+    omx_camera_reconnect_period_sec = LaunchConfiguration(
+        'omx_camera_reconnect_period_sec'
+    )
+    omx_camera_required = LaunchConfiguration('omx_camera_required')
     start_patrol_planner = LaunchConfiguration('start_patrol_planner')
     patrol_planner_delay_sec = LaunchConfiguration('patrol_planner_delay_sec')
     patrol_min_risk = LaunchConfiguration('patrol_min_risk')
@@ -710,6 +716,12 @@ def generate_launch_description():
                             yolo_server_model_path.perform(context)
                         ),
                         'omx_camera_index': omx_camera_index.perform(context),
+                        'omx_camera_device': omx_camera_device.perform(context),
+                        'omx_camera_backend': omx_camera_backend.perform(context),
+                        'omx_camera_reconnect_period_sec': (
+                            omx_camera_reconnect_period_sec.perform(context)
+                        ),
+                        'omx_camera_required': omx_camera_required.perform(context),
                         'start_patrol_planner': (
                             start_patrol_planner.perform(context)
                         ),
@@ -1622,7 +1634,23 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'omx_camera_index', default_value='0',
-            description='Leader role only: OpenCV camera index for OMX debug/YOLO video.',
+            description='Leader role only: legacy OMX integer camera index.',
+        ),
+        DeclareLaunchArgument(
+            'omx_camera_device', default_value='/dev/video0',
+            description='Leader role only: preferred OMX V4L2 device path.',
+        ),
+        DeclareLaunchArgument(
+            'omx_camera_backend', default_value='v4l2', choices=['v4l2', 'auto'],
+            description='Leader role only: OMX OpenCV capture backend.',
+        ),
+        DeclareLaunchArgument(
+            'omx_camera_reconnect_period_sec', default_value='1.0',
+            description='Leader role only: OMX camera reconnect interval.',
+        ),
+        DeclareLaunchArgument(
+            'omx_camera_required', default_value='false', choices=['true', 'false'],
+            description='Leader role only: false leaves Nav2 active when OMX vision is unavailable.',
         ),
         DeclareLaunchArgument(
             'start_patrol_planner',

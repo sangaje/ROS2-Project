@@ -6,6 +6,7 @@ OpenCV VideoCapture + Ultralytics YOLO TensorRT engine. ROS 의존성 없음.
 from __future__ import annotations
 
 import os
+import subprocess
 import time
 
 import cv2
@@ -122,11 +123,23 @@ class YoloDetector:
         self.cfg = cfg
         self.logger = logger
 
-        self.cam_idx = cfg.ibvs.camera_index
+        configured_device = str(getattr(cfg.ibvs, 'camera_device', '')).strip()
+        self.camera_source = configured_device or cfg.ibvs.camera_index
+        self.camera_backend = str(
+            getattr(cfg.ibvs, 'camera_backend', 'v4l2')
+        ).strip().lower()
         self.cap = None
         self._last_reopen_t = 0.0
-        self._reopen_period_sec = 1.0
+        self._reconnect_attempt = 0
+        self._reopen_period_sec = max(
+            0.1, float(getattr(cfg.ibvs, 'camera_reconnect_period_sec', 1.0))
+        )
         self._consecutive_read_failures = 0
+        self.camera_ready = False
+        self.camera_failure_reason = 'startup'
+        self.frame_width = 0
+        self.frame_height = 0
+        self._pending_first_frame = None
         self._open_camera(initial=True)
 
         requested_device = str(os.environ.get(
@@ -165,23 +178,104 @@ class YoloDetector:
         else:
             print(msg)
 
+    def _camera_label(self) -> str:
+        return str(self.camera_source)
+
+    def _device_preflight(self) -> tuple[bool, str]:
+        if not isinstance(self.camera_source, str) or not self.camera_source.startswith('/'):
+            return True, 'index'
+        if not os.path.exists(self.camera_source):
+            return False, 'device_missing'
+        if not os.access(self.camera_source, os.R_OK):
+            return False, 'device_not_readable'
+        return True, 'ready'
+
+    def _busy_owner(self) -> str:
+        if not isinstance(self.camera_source, str) or not self.camera_source.startswith('/'):
+            return ''
+        try:
+            result = subprocess.run(
+                ['fuser', '-v', self.camera_source],
+                capture_output=True, text=True, timeout=1.0, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ''
+        return ' '.join((result.stdout + ' ' + result.stderr).split())
+
+    def _set_camera_health(self, ready: bool, reason: str) -> bool:
+        changed = ready != self.camera_ready or reason != self.camera_failure_reason
+        self.camera_ready = ready
+        self.camera_failure_reason = reason
+        if not changed:
+            return False
+        if ready:
+            self._log(
+                'OMX_CAMERA | RESTORED | '
+                f'device={self._camera_label()} width={self.frame_width} '
+                f'height={self.frame_height}'
+            )
+        else:
+            self._warn(
+                f'OMX_CAMERA | LOST | device={self._camera_label()} reason={reason}'
+            )
+        return True
+
     def _open_camera(self, *, initial: bool = False) -> bool:
         now = time.time()
         if not initial and now - self._last_reopen_t < self._reopen_period_sec:
             return False
         self._last_reopen_t = now
+        if not initial:
+            self._reconnect_attempt += 1
+            self._log(
+                'OMX_CAMERA | RECONNECTING | '
+                f'attempt={self._reconnect_attempt} device={self._camera_label()}'
+            )
 
         if self.cap is not None:
             self.cap.release()
 
-        self.cap = cv2.VideoCapture(self.cam_idx)
+        preflight_ok, preflight_reason = self._device_preflight()
+        if not preflight_ok:
+            changed = self._set_camera_health(False, preflight_reason)
+            exists = os.path.exists(self.camera_source)
+            if changed:
+                self._warn(
+                    'OMX_CAMERA_UNAVAILABLE | '
+                    f'requested={self._camera_label()} exists={str(exists).lower()} '
+                    f'reason={preflight_reason}'
+                )
+            return False
+
+        backend = cv2.CAP_V4L2 if self.camera_backend == 'v4l2' else cv2.CAP_ANY
+        self.cap = cv2.VideoCapture(self.camera_source, backend)
         if self.cap.isOpened():
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            self._consecutive_read_failures = 0
-            self._log(f"카메라 {self.cam_idx} 열림")
-            return True
-
-        self._warn(f"카메라 {self.cam_idx} 열기 실패 - 재연결 대기")
+            ok, frame = self.cap.read()
+            if ok and frame is not None:
+                self._consecutive_read_failures = 0
+                self.frame_height, self.frame_width = frame.shape[:2]
+                self._pending_first_frame = frame
+                self._set_camera_health(True, 'ready')
+                self._reconnect_attempt = 0
+                self._log(
+                    'OMX_CAMERA_PREFLIGHT | '
+                    f'requested={self._camera_label()} exists=true readable=true '
+                    f'backend={self.camera_backend.upper()} opened=true first_frame=true '
+                    f'width={self.frame_width} height={self.frame_height}'
+                )
+                return True
+        owner = self._busy_owner()
+        reason = 'camera_busy' if owner else 'open_failed'
+        changed = self._set_camera_health(False, reason)
+        if changed:
+            if owner:
+                self._warn(f'OMX_CAMERA_BUSY | device={self._camera_label()} owner={owner}')
+            else:
+                self._warn(
+                    'OMX_CAMERA_UNAVAILABLE | '
+                    f'requested={self._camera_label()} exists=true reason={reason}'
+                )
         return False
 
     def read_frame(self):
@@ -190,13 +284,21 @@ class YoloDetector:
             self._open_camera()
             return None
 
+        pending = getattr(self, '_pending_first_frame', None)
+        if pending is not None:
+            self._pending_first_frame = None
+            return pending
+
         ok, frame = self.cap.read()
         if ok and frame is not None:
             self._consecutive_read_failures = 0
+            self.frame_height, self.frame_width = frame.shape[:2]
+            self._set_camera_health(True, 'ready')
             return frame
 
         self._consecutive_read_failures += 1
         if self._consecutive_read_failures >= 5:
+            self._set_camera_health(False, 'read_failed')
             self._open_camera()
         return None
 

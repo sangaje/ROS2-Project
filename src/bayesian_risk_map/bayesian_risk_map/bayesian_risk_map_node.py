@@ -419,6 +419,14 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.leader_detected_topic = str(
             self.declare_parameter('leader_detected_topic', '/omx/target_detected').value
         )
+        self.leader_observation_topic = str(
+            self.declare_parameter(
+                'leader_observation_topic', '/omx/observation_status'
+            ).value
+        )
+        self.leader_observation_max_age_sec = float(
+            self.declare_parameter('leader_observation_max_age_sec', 1.0).value
+        )
         # The leader's actual camera is the OMX pan/tilt head, not the
         # robot's own front -- narrower FOV than the scout's own camera,
         # and it looks wherever the arm is currently pointed, not
@@ -507,6 +515,10 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.leader_detected_wall = None
         self.leader_camera_yaw = None
         self.leader_camera_yaw_wall = None
+        self.leader_observation = None
+        self.leader_observation_wall = None
+        self.last_leader_observation_sequence = None
+        self.last_leader_miss_capture_sec = None
 
         self.visual_seen_map = None
         self.region_id_map = None
@@ -670,11 +682,17 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             self.leader_pose_sub = self.create_subscription(
                 PoseStamped, self.leader_pose_topic, self.on_leader_pose, 10
             )
-            self.leader_detected_sub = self.create_subscription(
-                Bool, self.leader_detected_topic, self.on_leader_detected, 10
+            self.leader_observation_sub = self.create_subscription(
+                String,
+                self.leader_observation_topic,
+                self.on_leader_observation,
+                self.qos_latest_best_effort,
             )
             self.leader_camera_yaw_sub = self.create_subscription(
-                Float32, self.leader_camera_yaw_topic, self.on_leader_camera_yaw, 10
+                Float32,
+                self.leader_camera_yaw_topic,
+                self.on_leader_camera_yaw,
+                self.qos_latest_best_effort,
             )
 
         self.pub_risk = self.create_publisher(OccupancyGrid, '/risk/risk_map', self.qos_grid_pub)
@@ -1181,6 +1199,16 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.leader_detected = bool(msg.data)
         self.leader_detected_wall = self.get_clock().now().nanoseconds * 1e-9
 
+    def on_leader_observation(self, msg: String) -> None:
+        try:
+            payload = json.loads(msg.data)
+        except (json.JSONDecodeError, TypeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        self.leader_observation = payload
+        self.leader_observation_wall = self.get_clock().now().nanoseconds * 1e-9
+
     def on_leader_camera_yaw(self, msg: Float32) -> None:
         self.leader_camera_yaw = float(msg.data)
         self.leader_camera_yaw_wall = self.get_clock().now().nanoseconds * 1e-9
@@ -1203,14 +1231,56 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         p = self.leader_pose_msg.pose.position
         q = self.leader_pose_msg.pose.orientation
         base_yaw = yaw_from_quaternion(q)
-        camera_offset = 0.0
         if (
-            self.leader_camera_yaw is not None
-            and self.leader_camera_yaw_wall is not None
-            and now - self.leader_camera_yaw_wall <= self.leader_camera_yaw_max_age_sec
+            self.leader_camera_yaw is None
+            or self.leader_camera_yaw_wall is None
+            or now - self.leader_camera_yaw_wall > self.leader_camera_yaw_max_age_sec
         ):
-            camera_offset = self.leader_camera_yaw
+            return None
+        camera_offset = self.leader_camera_yaw
         return (float(p.x), float(p.y), base_yaw + camera_offset)
+
+    def consume_leader_observation(self):
+        """Return one fresh valid OMX observation, otherwise UNKNOWN/None.
+
+        A Bool false is not evidence: only a completed inference on a fresh
+        frame can produce a Bayesian miss.  Sequence consumption prevents a
+        slow risk timer from applying one frame repeatedly.
+        """
+        payload = self.leader_observation
+        wall = self.leader_observation_wall
+        if payload is None or wall is None:
+            return None
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if now - wall > self.leader_observation_max_age_sec:
+            return None
+        sequence = payload.get('sequence')
+        if isinstance(sequence, bool):
+            return None
+        try:
+            sequence = int(sequence)
+        except (TypeError, ValueError):
+            return None
+        if sequence == self.last_leader_observation_sequence:
+            return None
+        if not (
+            payload.get('camera_ready') is True
+            and payload.get('frame_valid') is True
+            and payload.get('inference_ran') is True
+            and isinstance(payload.get('detected'), bool)
+        ):
+            return None
+        capture_sec = payload.get('capture_stamp', payload.get('publish_stamp', now))
+        try:
+            capture_sec = float(capture_sec)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(capture_sec):
+            return None
+        if abs(now - capture_sec) > self.leader_observation_max_age_sec:
+            return None
+        self.last_leader_observation_sequence = sequence
+        return bool(payload['detected']), capture_sec
 
     def leader_currently_detecting(self) -> bool:
         if self.leader_detected_wall is None:
@@ -2351,6 +2421,8 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         visibility,
         had_detection: bool,
         now_ros_sec: float,
+        *,
+        dt_override: Optional[float] = None,
     ) -> bool:
         if (
             not self.enable_visible_risk_decay
@@ -2358,7 +2430,8 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             or visibility is None
             or had_detection
         ):
-            self.last_visible_risk_decay_ros_sec = now_ros_sec
+            if dt_override is None:
+                self.last_visible_risk_decay_ros_sec = now_ros_sec
             return False
 
         last_detection = getattr(self, 'last_person_detection_ros_sec', None)
@@ -2367,19 +2440,23 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             and now_ros_sec - float(last_detection)
             < max(0.0, float(self.visible_risk_decay_grace_sec))
         ):
-            self.last_visible_risk_decay_ros_sec = now_ros_sec
+            if dt_override is None:
+                self.last_visible_risk_decay_ros_sec = now_ros_sec
             return False
 
         h, w = self.occ_grid.shape
         if visibility.shape != (h, w):
             return False
 
-        last_update = getattr(self, 'last_visible_risk_decay_ros_sec', None)
-        if last_update is None:
-            dt = 0.0
+        if dt_override is None:
+            last_update = getattr(self, 'last_visible_risk_decay_ros_sec', None)
+            if last_update is None:
+                dt = 0.0
+            else:
+                dt = clamp(now_ros_sec - float(last_update), 0.0, 1.0)
+            self.last_visible_risk_decay_ros_sec = now_ros_sec
         else:
-            dt = clamp(now_ros_sec - float(last_update), 0.0, 1.0)
-        self.last_visible_risk_decay_ros_sec = now_ros_sec
+            dt = clamp(float(dt_override), 0.0, 1.0)
         if dt <= 0.0:
             return False
 
@@ -2422,6 +2499,96 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         if changed:
             self.risk_dirty = True
         return changed
+
+    def apply_leader_valid_no_detection(
+        self,
+        visibility,
+        capture_sec: float,
+        now_ros_sec: float,
+    ) -> bool:
+        """Apply one leader-camera miss without sharing the local timer state.
+
+        The leader's observation sequence is consumed exactly once. Its capture
+        timestamps determine the integration interval, so a delayed or stale
+        bridge message cannot repeatedly clear the same visible cells.
+        """
+        previous_capture = self.last_leader_miss_capture_sec
+        self.last_leader_miss_capture_sec = capture_sec
+        self.update_observed_empty(visibility, False)
+        if previous_capture is None:
+            return False
+        dt = clamp(capture_sec - float(previous_capture), 0.0, 1.0)
+        if dt <= 0.0:
+            return False
+
+        changed = False
+        if (
+            getattr(self, 'enable_person_probability_map', True)
+            and self.person_log_odds_map is not None
+            and visibility is not None
+            and visibility.shape == self.person_log_odds_map.shape
+        ):
+            last_detection = getattr(self, 'last_person_detection_ros_sec', None)
+            grace_elapsed = (
+                last_detection is None
+                or now_ros_sec - float(last_detection)
+                >= max(0.0, float(self.person_bayes_decay_grace_sec))
+            )
+            if grace_elapsed:
+                previous = self.person_log_odds_map.copy()
+                visible = np.clip(visibility, 0.0, 1.0).astype(np.float32)
+                visible[~self.risk_memory_mask()] = 0.0
+                miss_rate = max(0.0, float(self.person_bayes_miss_log_odds_per_sec))
+                self.person_log_odds_map = np.maximum(
+                    0.0,
+                    self.person_log_odds_map - miss_rate * dt * visible,
+                ).astype(np.float32)
+                if np.any(self.person_log_odds_map < previous - 1e-6):
+                    self.refresh_person_probability_map()
+                    self.risk_dirty = True
+                    changed = True
+
+        return self.apply_visible_no_detection_risk_decay(
+            visibility,
+            False,
+            now_ros_sec,
+            dt_override=dt,
+        ) or changed
+
+    def leader_positive_candidate(self, observation, leader_pose):
+        """Project a valid leader detection into the shared map, if complete."""
+        bbox = observation.get('bbox_xyxy')
+        image_w = observation.get('image_width')
+        image_h = observation.get('image_height')
+        confidence = observation.get('confidence')
+        if not (
+            isinstance(bbox, (list, tuple))
+            and len(bbox) == 4
+            and image_w is not None
+            and image_h is not None
+            and confidence is not None
+        ):
+            return None
+        try:
+            bbox = tuple(float(value) for value in bbox)
+            image_w = int(image_w)
+            image_h = int(image_h)
+            confidence = float(confidence)
+        except (TypeError, ValueError):
+            return None
+        if (
+            image_w <= 0
+            or image_h <= 0
+            or not all(math.isfinite(value) for value in (*bbox, confidence))
+        ):
+            return None
+        detection = Detection2D(
+            bbox=bbox,
+            conf=clamp(confidence, 0.0, 1.0),
+            bearing_rad=self.bbox_center_to_bearing(bbox, image_w),
+            range_hat_m=self.bbox_height_to_range(bbox, image_h),
+        )
+        return self.build_detection_candidate_map(leader_pose, [detection])
 
     # ---------------- Live SLAM region segmentation / priority ----------------
 
@@ -2952,40 +3119,71 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                 else robot_pose
             )
             self.visibility_map = self.compute_visibility_map(visibility_pose)
-            combined_visibility = self.visibility_map
-            combined_had_detection = currently_detecting_person
+            leader_observation = None
+            leader_pose = None
+            leader_valid_detection = False
 
-            # Fold in the leader's own view of the shared map: cells it can
-            # see (and isn't currently seeing a person in) count as
-            # observed-empty and decay risk the same as the scout's own
-            # look would, using np.maximum fusion so this never has to
-            # duplicate apply_visible_no_detection_risk_decay's rate-limit
-            # bookkeeping -- it just enriches the one existing call below.
+            # Consume before the local miss update. A valid leader hit is
+            # positive evidence, never permission to decay either camera's
+            # view during this tick.
             if self.enable_leader_visibility_tracking:
+                leader_observation = self.consume_leader_observation()
                 leader_pose = self.get_leader_pose()
-                if leader_pose is not None:
+                leader_valid_detection = bool(
+                    leader_observation is not None
+                    and leader_pose is not None
+                    and leader_observation[0]
+                )
+
+            self.update_visual_seen_map(self.visibility_map)
+            self.update_observed_empty(
+                self.visibility_map,
+                currently_detecting_person or leader_valid_detection,
+            )
+            self.apply_visible_no_detection_risk_decay(
+                self.visibility_map,
+                currently_detecting_person or leader_valid_detection,
+                now_ros_sec,
+            )
+
+            # A leader Bool is intentionally not used here. Only a fresh OMX
+            # status carrying a completed inference can add evidence. A unique
+            # sequence is consumed once, so bridge latency or stale data cannot
+            # repeatedly clear the same map cells.
+            if self.enable_leader_visibility_tracking:
+                if leader_observation is not None and leader_pose is not None:
+                    leader_detected, capture_sec = leader_observation
                     leader_visibility = self.compute_visibility_map(
                         leader_pose, hfov_deg=self.leader_camera_hfov_deg
                     )
-                    combined_visibility = np.maximum(
-                        combined_visibility, leader_visibility
-                    )
-                    combined_had_detection = (
-                        combined_had_detection or self.leader_currently_detecting()
-                    )
-
-            self.update_visual_seen_map(combined_visibility)
-            self.update_observed_empty(combined_visibility, combined_had_detection)
-            self.apply_visible_no_detection_risk_decay(
-                combined_visibility,
-                combined_had_detection,
-                now_ros_sec,
-            )
+                    self.update_visual_seen_map(leader_visibility)
+                    if leader_detected:
+                        candidate = self.leader_positive_candidate(
+                            self.leader_observation,
+                            leader_pose,
+                        )
+                        if candidate is not None:
+                            self.update_positive_memory(candidate)
+                            if bayes_positive_candidate is None:
+                                bayes_positive_candidate = candidate
+                            else:
+                                bayes_positive_candidate = np.maximum(
+                                    bayes_positive_candidate,
+                                    candidate,
+                                )
+                    else:
+                        self.apply_leader_valid_no_detection(
+                            leader_visibility,
+                            capture_sec,
+                            now_ros_sec,
+                        )
 
         self.update_person_bayesian_memory(
             bayes_positive_candidate,
             self.visibility_map if self.enable_visibility_tracking else None,
-            currently_detecting_person,
+            currently_detecting_person or (
+                self.enable_visibility_tracking and leader_valid_detection
+            ),
             now_ros_sec,
         )
 

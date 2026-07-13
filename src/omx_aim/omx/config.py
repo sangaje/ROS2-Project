@@ -60,6 +60,10 @@ class IbvsConfig:
     deadband_x: float         # ← deadband → deadband_x
     deadband_y: float
     control_hz: float
+    camera_device: str = ''
+    camera_backend: str = 'v4l2'
+    camera_reconnect_period_sec: float = 1.0
+    camera_required: bool = False
     # ----- 움직이는 표적 추적 (Phase B) -----
     # 미분 게인. 0 이면 순수 P (기존 동작 유지).
     # 권장 시작값: kp * 0.1 ~ 0.3 (예: kp=0.02 -> kd=0.002~0.006)
@@ -329,6 +333,38 @@ def load_config(path=None):
                 "YOLO runtime model must be a TensorRT .engine/.plan file, "
                 f"got: {yolo_cfg.model_path}"
             )
+
+    camera_device_override = os.environ.get("OMX_YOLO_CAMERA_DEVICE", "").strip()
+    if not camera_device_override:
+        camera_device_override = os.environ.get(
+            "OMX_YOLO_LAUNCH_CAMERA_DEVICE", ""
+        ).strip()
+    if camera_device_override:
+        cfg.ibvs.camera_device = camera_device_override
+
+    camera_backend_override = os.environ.get("OMX_YOLO_CAMERA_BACKEND", "").strip()
+    if camera_backend_override:
+        cfg.ibvs.camera_backend = camera_backend_override
+    reconnect_override = os.environ.get(
+        "OMX_YOLO_CAMERA_RECONNECT_PERIOD_SEC", ""
+    ).strip()
+    if reconnect_override:
+        try:
+            cfg.ibvs.camera_reconnect_period_sec = float(reconnect_override)
+        except ValueError as exc:
+            raise ValueError(
+                'OMX_YOLO_CAMERA_RECONNECT_PERIOD_SEC must be numeric, got '
+                f'{reconnect_override!r}'
+            ) from exc
+
+    required_override = os.environ.get("OMX_YOLO_CAMERA_REQUIRED", "").strip()
+    if required_override:
+        if required_override.lower() not in ('true', 'false'):
+            raise ValueError(
+                'OMX_YOLO_CAMERA_REQUIRED must be true or false, got '
+                f'{required_override!r}'
+            )
+        cfg.ibvs.camera_required = required_override.lower() == 'true'
 
     camera_index_override = os.environ.get("OMX_YOLO_CAMERA_INDEX", "").strip()
     if camera_index_override:
