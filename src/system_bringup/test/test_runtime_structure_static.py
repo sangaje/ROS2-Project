@@ -16,6 +16,7 @@ def test_start_motion_is_the_only_cross_domain_motion_readiness_topic():
     )[0]
     assert "'/fleet/start_motion'" in body
     assert "'/fleet/readiness_detail'" in body
+    assert "'/fleet/start_motion_detail'" in body
     assert "'/system/ready'" not in body
     assert 'dashboard_backend_ready' not in body
     assert 'dashboard_ui_ready' not in body

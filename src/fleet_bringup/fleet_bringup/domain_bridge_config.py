@@ -82,6 +82,7 @@ def system_readiness_topics() -> Dict[str, Dict]:
     return {
         '/fleet/start_motion': topic('std_msgs/msg/Bool', profile=latched),
         '/fleet/readiness_detail': topic('std_msgs/msg/String', profile=latched),
+        '/fleet/start_motion_detail': topic('std_msgs/msg/String', profile=latched),
     }
 
 

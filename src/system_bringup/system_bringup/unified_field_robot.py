@@ -322,10 +322,37 @@ class UnifiedFieldRobot(Node):
     def _on_leader_pose(self, msg: PoseStamped) -> None:
         self.leader_pose = msg
         self.leader_pose_wall = self._now()
+        self._log_pose_pipeline('leader', self.leader_pose_topic, msg, self.leader_pose_wall)
 
     def _on_self_pose(self, msg: PoseStamped) -> None:
         self.self_pose = msg
         self.self_pose_wall = self._now()
+        self._log_pose_pipeline('self', self.self_pose_topic, msg, self.self_pose_wall)
+
+    def _stamp_age_ms(self, msg: PoseStamped) -> float:
+        stamp = msg.header.stamp
+        stamp_sec = float(stamp.sec) + float(stamp.nanosec) * 1.0e-9
+        if stamp_sec <= 0.0:
+            return -1.0
+        return max(0.0, (self._now() - stamp_sec) * 1000.0)
+
+    def _log_pose_pipeline(
+        self,
+        name: str,
+        topic: str,
+        msg: PoseStamped,
+        received_wall: float,
+    ) -> None:
+        receive_age_ms = max(0.0, (self._now() - received_wall) * 1000.0)
+        self.get_logger().warning(
+            'POSE_PIPELINE | '
+            f'node=unified_field_robot robot={self.robot_name} '
+            f'name={name} topic={topic} '
+            f'frame_id={msg.header.frame_id or "(empty)"} '
+            f'source_stamp_age_ms={self._stamp_age_ms(msg):.0f} '
+            f'receive_age_ms={receive_age_ms:.0f}',
+            throttle_duration_sec=3.0,
+        )
 
     def _on_localization_ready(self, msg: Bool) -> None:
         previous = self.localization_ready

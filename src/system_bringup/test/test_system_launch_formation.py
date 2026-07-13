@@ -85,6 +85,8 @@ def test_system_launch_starts_global_readiness_monitor_and_motion_gates():
     assert "'system_ready_topic': '/system/ready'" in text
     assert "'require_system_ready': 'false'" in text
     assert "'readiness_detail_topic': '/fleet/readiness_detail'" in text
+    assert "'start_motion_detail_topic': '/fleet/start_motion_detail'" in text
+    assert "'system_readiness_detail_topic': '/system/readiness_detail'" in text
 
 
 def test_leader_can_own_risk_map_from_scout_sources():

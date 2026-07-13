@@ -42,8 +42,12 @@ class ScoutRLPolicyWorker(Node):
         self.declare_parameter('require_localization_ready', True)
         self.declare_parameter('require_system_ready', False)
         self.declare_parameter('system_ready_topic', '/system/ready')
+        self.declare_parameter('require_start_motion', True)
+        self.declare_parameter('start_motion_topic', '/fleet/start_motion')
+        # Backward-compatible names accepted by old launch files. They no
+        # longer control the final motion barrier.
         self.declare_parameter('require_video_ready', True)
-        self.declare_parameter('video_ready_topic', '/fleet/video_ready')
+        self.declare_parameter('video_ready_topic', '/fleet/start_motion')
         self.declare_parameter('cmd_vel_topic', '/cmd_vel')
         self.declare_parameter('use_stamped_cmd_vel', True)
         self.declare_parameter('enable_velocity_safety_filter', True)
@@ -61,8 +65,14 @@ class ScoutRLPolicyWorker(Node):
         self.require_localization_ready = bool(get('require_localization_ready').value)
         self.require_system_ready = bool(get('require_system_ready').value)
         self.system_ready_topic = str(get('system_ready_topic').value)
-        self.require_video_ready = bool(get('require_video_ready').value)
-        self.video_ready_topic = str(get('video_ready_topic').value)
+        requested_start_motion = bool(get('require_start_motion').value)
+        self.require_start_motion = True
+        self.start_motion_topic = str(get('start_motion_topic').value).strip()
+        legacy_topic = str(get('video_ready_topic').value).strip()
+        if not self.start_motion_topic:
+            self.start_motion_topic = legacy_topic or '/fleet/start_motion'
+        self.require_video_ready = self.require_start_motion
+        self.video_ready_topic = self.start_motion_topic
         self.cmd_vel_topic = str(get('cmd_vel_topic').value)
         self.use_stamped = bool(get('use_stamped_cmd_vel').value)
         self.enable_velocity_safety_filter = bool(
@@ -74,13 +84,14 @@ class ScoutRLPolicyWorker(Node):
         self.failover_epoch = 0
         self.active_scout_id = self.robot_name if initial_active else ''
         self.failover_state = 'NORMAL_OPERATION'
-        self.localization_ready = bool(initial_active)
+        self.localization_ready = False
         self.system_ready = not self.require_system_ready
         self.role_localization_ready: Optional[bool] = None
         self.role_recovery_complete: Optional[bool] = True if initial_active else None
         self.status_recovery_complete = bool(initial_active)
         self.nav_goal_inactive = bool(initial_active)
-        self.video_ready = not self.require_video_ready
+        self.start_motion = False
+        self.video_ready = self.start_motion
         self.motion_authority = 'NONE'
         self.worker_state = RLWorkerState.STANDBY
         self.runtime_active = False
@@ -104,8 +115,7 @@ class ScoutRLPolicyWorker(Node):
         self.create_subscription(Bool, self.localization_ready_topic, self._on_localization_ready, latched_qos)
         if self.require_system_ready:
             self.create_subscription(Bool, self.system_ready_topic, self._on_system_ready, latched_qos)
-        if self.require_video_ready:
-            self.create_subscription(Bool, self.video_ready_topic, self._on_video_ready, latched_qos)
+        self.create_subscription(Bool, self.start_motion_topic, self._on_start_motion, latched_qos)
         self.create_subscription(String, self.field_robot_status_topic, self._on_field_status, 10)
 
         self.runtime = ActiveScoutRLRuntime(
@@ -129,7 +139,8 @@ class ScoutRLPolicyWorker(Node):
             f'initial_active={initial_active} '
             f'require_failover_activation={self.require_failover_activation} '
             f'require_system_ready={self.require_system_ready}:{self.system_ready_topic} '
-            f'require_video_ready={self.require_video_ready}:{self.video_ready_topic}'
+            f'require_start_motion={self.require_start_motion}:{self.start_motion_topic} '
+            f'requested_start_motion_gate={requested_start_motion}'
         )
 
     def _on_role(self, msg: String) -> None:
@@ -196,20 +207,24 @@ class ScoutRLPolicyWorker(Node):
             )
         self._evaluate_gate()
 
-    def _on_video_ready(self, msg: Bool) -> None:
-        previous = self.video_ready
-        self.video_ready = bool(msg.data)
-        if previous and not self.video_ready and self.runtime_active:
+    def _on_start_motion(self, msg: Bool) -> None:
+        previous = self.start_motion
+        self.start_motion = bool(msg.data)
+        self.video_ready = self.start_motion
+        if previous and not self.start_motion and self.runtime_active:
             self.runtime_active = False
             self.runtime.deactivate('start_motion_false')
             self._publish_zero()
-        if self.video_ready != previous:
+        if self.start_motion != previous:
             self.get_logger().warning(
                 'SCOUT_START_MOTION | '
-                f'robot={self.robot_name} ready={self.video_ready} '
-                f'topic={self.video_ready_topic}'
+                f'robot={self.robot_name} ready={self.start_motion} '
+                f'topic={self.start_motion_topic}'
             )
         self._evaluate_gate()
+
+    def _on_video_ready(self, msg: Bool) -> None:
+        self._on_start_motion(msg)
 
     def _on_field_status(self, msg: String) -> None:
         try:
@@ -270,7 +285,7 @@ class ScoutRLPolicyWorker(Node):
             or (self.role_localization_ready is True)
         )
         sensor_ready = self.runtime.sensor_ready()
-        if self.require_video_ready and not self.video_ready:
+        if not self.start_motion:
             sensor_ready = False
         if self.require_system_ready and not self.system_ready:
             sensor_ready = False
@@ -316,6 +331,7 @@ class ScoutRLPolicyWorker(Node):
         elif not should_activate and self.runtime_active:
             self.runtime_active = False
             self.runtime.deactivate(reason)
+            self._publish_zero()
 
     def _log_state_transition(self, state: RLWorkerState, reason: str) -> None:
         if state == RLWorkerState.RECOVERY_NAVIGATING:
@@ -335,14 +351,14 @@ class ScoutRLPolicyWorker(Node):
                 f'SCOUT_WAIT_SENSOR_READY | robot={self.robot_name} reason={reason} '
                 f'inputs={self.runtime.readiness_summary()} '
                 f'system_ready={self.system_ready}/{self.require_system_ready} '
-                f'video_ready={self.video_ready}/{self.require_video_ready}'
+                f'start_motion={self.start_motion}/{self.require_start_motion}'
             )
         elif state == RLWorkerState.ACTIVE:
             self.get_logger().warning(
                 'RL_ACTIVATION_GATE | '
                 f'robot={self.robot_name} role={self.desired_role} '
                 f'epoch={self.role_epoch} model=true scan=true map=true tf=true '
-                f'nav_idle={self.nav_goal_inactive} system=true video=true'
+                f'nav_idle={self.nav_goal_inactive} system=true start_motion=true'
             )
         elif state == RLWorkerState.STANDBY:
             self.get_logger().warning(
@@ -354,6 +370,9 @@ class ScoutRLPolicyWorker(Node):
             )
 
     def _publish_command(self, linear_x: float, angular_z: float) -> None:
+        if not self.start_motion and (linear_x != 0.0 or angular_z != 0.0):
+            self._publish_zero()
+            return
         if not self.runtime_active and (linear_x != 0.0 or angular_z != 0.0):
             return
         if self.use_stamped:
@@ -369,7 +388,17 @@ class ScoutRLPolicyWorker(Node):
         self.cmd_pub.publish(msg)
 
     def _publish_zero(self) -> None:
-        self._publish_command(0.0, 0.0)
+        if self.use_stamped:
+            msg = TwistStamped()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = 'base_footprint'
+            msg.twist.linear.x = 0.0
+            msg.twist.angular.z = 0.0
+        else:
+            msg = Twist()
+            msg.linear.x = 0.0
+            msg.angular.z = 0.0
+        self.cmd_pub.publish(msg)
 
     def destroy_node(self) -> None:
         try:

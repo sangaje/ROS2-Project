@@ -33,6 +33,10 @@ def test_real_bridge_directions_and_control_qos(tmp_path):
         'transient_local'
     )
     assert main['topics']['/fleet/readiness_detail']['type'] == 'std_msgs/msg/String'
+    assert main['topics']['/fleet/start_motion_detail']['type'] == 'std_msgs/msg/String'
+    assert main['topics']['/fleet/start_motion_detail']['qos']['durability'] == (
+        'transient_local'
+    )
     assert '/system/ready' not in main['topics']
     assert '/fleet/dashboard_ui_ready' not in main['topics']
     assert main['topics']['/fleet/robot_poses']['type'] == (
@@ -240,6 +244,7 @@ def test_leader_to_pc_bridge_is_visualization_only(tmp_path):
         'transient_local'
     )
     assert '/fleet/readiness_detail' in config['topics']
+    assert '/fleet/start_motion_detail' in config['topics']
     assert '/system/ready' not in config['topics']
     assert '/fleet_debug_markers' in config['topics']
     assert '/risk/risk_map' in config['topics']

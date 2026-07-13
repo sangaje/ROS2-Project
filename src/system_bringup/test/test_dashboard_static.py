@@ -23,6 +23,10 @@ def test_dashboard_publishes_latched_video_ready_after_all_streams_arrive():
     assert "self.start_motion_pub" in source
     assert "readiness_detail_topic" in source
     assert "self.readiness_detail_pub" in source
+    assert "start_motion_detail_topic" in source
+    assert "self.start_motion_detail_pub" in source
+    assert "blocking_reasons" in source
+    assert "system_readiness_detail_topic" in source
     assert "self._publish_start_motion(False" in source
     assert "DurabilityPolicy.TRANSIENT_LOCAL" in source
     assert "raw_frames" in source

@@ -307,16 +307,22 @@ def test_standalone_policy_worker_is_registered_as_the_separate_process():
     assert 'scout_rl_policy_worker = system_bringup.scout_rl_policy_worker:main' in setup
 
 
-def test_scout_rl_worker_waits_for_dashboard_video_ready_gate():
+def test_scout_rl_worker_requires_leader_start_motion_gate():
     worker = Path(__file__).parents[1] / 'system_bringup' / 'scout_rl_policy_worker.py'
     source = worker.read_text(encoding='utf-8')
 
+    assert "require_start_motion" in source
+    assert "start_motion_topic" in source
+    assert "self.require_start_motion = True" in source
+    assert "self.start_motion = False" in source
+    assert "self.create_subscription(Bool, self.start_motion_topic" in source
+    assert "def _on_start_motion" in source
+    assert "if not self.start_motion" in source
+    assert "self._publish_zero()" in source
     assert "require_video_ready" in source
     assert "video_ready_topic" in source
-    assert "self.create_subscription(Bool, self.video_ready_topic" in source
     assert "def _on_video_ready" in source
     assert "sensor_ready = self.runtime.sensor_ready()" in source
-    assert "not self.video_ready" in source
 
 
 def test_scout_rl_worker_waits_for_global_system_ready_gate():

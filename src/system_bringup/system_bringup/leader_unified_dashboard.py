@@ -129,10 +129,16 @@ class LeaderUnifiedDashboard(Node):
         self.yolo_status_path = str(_declare(self, 'yolo_status_path', '/api/status'))
         self.video_ready_topic = str(_declare(self, 'video_ready_topic', '/fleet/video_ready'))
         self.start_motion_topic = str(_declare(self, 'start_motion_topic', '/fleet/start_motion'))
+        self.start_motion_detail_topic = str(
+            _declare(self, 'start_motion_detail_topic', '/fleet/start_motion_detail')
+        )
         self.readiness_detail_topic = str(
             _declare(self, 'readiness_detail_topic', '/fleet/readiness_detail')
         )
         self.system_ready_topic = str(_declare(self, 'system_ready_topic', '/system/ready'))
+        self.system_readiness_detail_topic = str(
+            _declare(self, 'system_readiness_detail_topic', '/system/readiness_detail')
+        )
         self.require_scout_video_ready = bool(_declare(self, 'require_scout_video_ready', True))
         self.require_omx_video_ready = bool(_declare(self, 'require_omx_video_ready', True))
         self.video_ready_poll_period_sec = float(
@@ -212,6 +218,7 @@ class LeaderUnifiedDashboard(Node):
         self._video_ready = False
         self._start_motion = False
         self._system_ready = False
+        self._system_readiness_detail: Dict[str, Any] = {}
         self._video_ready_detail: Dict[str, Any] = {
             'ready': False,
             'start_motion': False,
@@ -325,6 +332,12 @@ class LeaderUnifiedDashboard(Node):
         self.create_subscription(
             Bool, self.system_ready_topic, self._on_system_ready, video_ready_qos
         )
+        self.create_subscription(
+            String,
+            self.system_readiness_detail_topic,
+            self._on_system_readiness_detail,
+            video_ready_qos,
+        )
         self.video_ready_pub = self.create_publisher(
             Bool, self.video_ready_topic, video_ready_qos
         )
@@ -334,12 +347,15 @@ class LeaderUnifiedDashboard(Node):
         self.readiness_detail_pub = self.create_publisher(
             String, self.readiness_detail_topic, video_ready_qos
         )
+        self.start_motion_detail_pub = self.create_publisher(
+            String, self.start_motion_detail_topic, video_ready_qos
+        )
         self.create_timer(
             max(0.2, self.video_ready_poll_period_sec),
             self._evaluate_video_ready,
         )
         self._publish_video_ready(False, 'startup')
-        self._publish_start_motion(False, {'reason': 'startup'})
+        self._publish_start_motion(False, {'reason': 'startup', 'blocking_reasons': ['startup']})
 
         self._app = self._build_app()
         self._server_thread = threading.Thread(target=self._run_flask, daemon=True)
@@ -742,9 +758,9 @@ class LeaderUnifiedDashboard(Node):
         payload = dict(detail)
         payload['start_motion'] = bool(ready)
         payload['topic'] = self.start_motion_topic
-        self.readiness_detail_pub.publish(String(
-            data=json.dumps(payload, sort_keys=True)
-        ))
+        detail_msg = String(data=json.dumps(payload, sort_keys=True))
+        self.readiness_detail_pub.publish(detail_msg)
+        self.start_motion_detail_pub.publish(detail_msg)
         with self._lock:
             self._topic_state[self.start_motion_topic] = {
                 'value': bool(ready),
@@ -753,6 +769,11 @@ class LeaderUnifiedDashboard(Node):
                 'reason': payload.get('reason', ''),
             }
             self._topic_state[self.readiness_detail_topic] = {
+                'value': payload,
+                'received_wall_sec': time.time(),
+                'type': 'std_msgs/msg/String',
+            }
+            self._topic_state[self.start_motion_detail_topic] = {
                 'value': payload,
                 'received_wall_sec': time.time(),
                 'type': 'std_msgs/msg/String',
@@ -767,8 +788,52 @@ class LeaderUnifiedDashboard(Node):
                 'type': 'std_msgs/msg/Bool',
             }
 
+    def _on_system_readiness_detail(self, msg: String) -> None:
+        try:
+            payload = json.loads(msg.data)
+        except (json.JSONDecodeError, TypeError):
+            payload = {'raw': msg.data}
+        if isinstance(payload, dict):
+            with self._lock:
+                self._system_readiness_detail = payload
+                self._topic_state[self.system_readiness_detail_topic] = {
+                    'value': payload,
+                    'received_wall_sec': time.time(),
+                    'type': 'std_msgs/msg/String',
+                }
+
     def _publish_readiness_detail(self, detail: Dict[str, Any]) -> None:
-        self.readiness_detail_pub.publish(String(data=json.dumps(detail, sort_keys=True)))
+        msg = String(data=json.dumps(detail, sort_keys=True))
+        self.readiness_detail_pub.publish(msg)
+        self.start_motion_detail_pub.publish(msg)
+        with self._lock:
+            now = time.time()
+            self._topic_state[self.readiness_detail_topic] = {
+                'value': detail,
+                'received_wall_sec': now,
+                'type': 'std_msgs/msg/String',
+            }
+            self._topic_state[self.start_motion_detail_topic] = {
+                'value': detail,
+                'received_wall_sec': now,
+                'type': 'std_msgs/msg/String',
+            }
+
+    @staticmethod
+    def _false_reasons(prefix: str, values: Dict[str, Any]) -> list[str]:
+        reasons = []
+        for key, value in values.items():
+            if value is False:
+                reasons.append(f'{prefix}_{key}_not_ready')
+        return reasons
+
+    @staticmethod
+    def _panel_false_reasons(panels: Dict[str, Any]) -> list[str]:
+        reasons = []
+        for name, panel in panels.items():
+            if isinstance(panel, dict) and panel.get('ready') is False:
+                reasons.append(f'dashboard_panel_{name}_not_ready')
+        return reasons
 
     def _on_dashboard_manifest(self, payload: Dict[str, Any]) -> None:
         if not isinstance(payload, dict):
@@ -890,11 +955,49 @@ class LeaderUnifiedDashboard(Node):
         backend_ready = bool(scout_ready and omx_ready)
         ui_ready, ui_detail = self._dashboard_ui_panels_ready(now)
         ready = bool(backend_ready and ui_ready)
+        dashboard_status = {
+            'backend_ready': backend_ready,
+            'ui_ready': ui_ready,
+            'session_fresh': bool(ui_detail.get('session_fresh')),
+            'stable_sec': float(ui_detail.get('stable_sec', 0.0) or 0.0),
+            'stable_required_sec': self.dashboard_stable_duration_sec,
+            'panels': ui_detail.get('panels', {}),
+        }
+        with self._lock:
+            system_detail = dict(self._system_readiness_detail)
+            system_ready_snapshot = self._system_ready
+        infrastructure = {
+            'system_ready': system_ready_snapshot,
+            'leader_localization': system_detail.get('leader_localization'),
+            'follower_localization': system_detail.get('follower_localization'),
+            'leader_nav2': system_detail.get('leader_nav2'),
+            'follower_nav2': system_detail.get('follower_nav2'),
+            'map_tf': system_detail.get('map_tf'),
+        }
+        blocking_reasons = []
+        blocking_reasons.extend(self._false_reasons('infrastructure', infrastructure))
+        blocking_reasons.extend(self._false_reasons('dashboard', {
+            'backend': backend_ready,
+            'ui': ui_ready,
+            'session': bool(ui_detail.get('session_fresh')),
+        }))
+        panels = ui_detail.get('panels', {})
+        if isinstance(panels, dict):
+            blocking_reasons.extend(self._panel_false_reasons(panels))
+        if isinstance(system_detail.get('blocking_reasons'), list):
+            blocking_reasons.extend(
+                f'infrastructure_{reason}'
+                for reason in system_detail['blocking_reasons']
+            )
         detail = {
             'ready': ready,
             'backend_ready': backend_ready,
             'dashboard_ui_ready': ui_ready,
+            'dashboard': dashboard_status,
             'dashboard_ui': ui_detail,
+            'infrastructure': infrastructure,
+            'system_readiness_detail': system_detail,
+            'blocking_reasons': sorted(set(str(item) for item in blocking_reasons)),
             'topic': self.video_ready_topic,
             'scout_required': self.require_scout_video_ready,
             'omx_required': self.require_omx_video_ready,
@@ -914,7 +1017,7 @@ class LeaderUnifiedDashboard(Node):
             previous = self._video_ready
             previous_start_motion = self._start_motion
             self._video_ready = ready
-            system_ready = self._system_ready
+            system_ready = system_ready_snapshot
             start_motion = bool(ready and system_ready)
             self._start_motion = start_motion
             published_count = int(self._video_ready_detail.get('published_count', 0))

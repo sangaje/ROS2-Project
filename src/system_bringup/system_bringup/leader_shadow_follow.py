@@ -307,6 +307,7 @@ class LeaderShadowFollow(Node):
         self.last_target_cancel_wall = -1.0e9
         self.omx_state = ''
         self.leader_pose: Optional[PoseStamped] = None
+        self.leader_pose_wall = -1.0e9
         self.original_scout_pose: Optional[PoseStamped] = None
         self.follower_scout_pose: Optional[PoseStamped] = None
         self.original_scout_wall = -1.0e9
@@ -360,16 +361,20 @@ class LeaderShadowFollow(Node):
 
     def _on_leader_pose(self, msg: PoseStamped) -> None:
         self.leader_pose = msg
+        self.leader_pose_wall = self._now()
+        self._log_pose_pipeline('leader', self.leader_pose_topic, msg, self.leader_pose_wall)
 
     def _on_original_scout_pose(self, msg: PoseStamped) -> None:
         self.original_scout_pose = msg
         self.original_scout_wall = self._now()
+        self._log_pose_pipeline('scout', self.active_pose_topic, msg, self.original_scout_wall)
         if self.active_scout_id == self.original_scout_id:
             self._update_heading_from_pose(msg)
 
     def _on_follower_scout_pose(self, msg: PoseStamped) -> None:
         self.follower_scout_pose = msg
         self.follower_scout_wall = self._now()
+        self._log_pose_pipeline('follower_scout', self.follower_pose_topic, msg, self.follower_scout_wall)
         if self.active_scout_id == self.follower_robot_name:
             self._update_heading_from_pose(msg)
 
@@ -544,6 +549,15 @@ class LeaderShadowFollow(Node):
             self._set_controller_speed_limit(False)
             self._publish_state('waiting_pose')
             self._log_follow_debug('waiting_pose')
+            return
+        pose_invalid_reason = self._pose_pair_invalid_reason(self.leader_pose, scout_pose)
+        if pose_invalid_reason:
+            self._cancel_shadow_goal(f'pose_invalid_{pose_invalid_reason}')
+            self._stop_direct_cmd(f'pose_invalid_{pose_invalid_reason}')
+            self.mode = LeaderMode.IDLE
+            self._set_controller_speed_limit(False)
+            self._publish_state(f'pose_invalid_{pose_invalid_reason}')
+            self._log_follow_debug(f'pose_invalid_{pose_invalid_reason}')
             return
         scout_age = self._now() - scout_wall
         if scout_age > self.scout_pose_timeout:
@@ -972,6 +986,29 @@ class LeaderShadowFollow(Node):
             return -1.0
         return max(0.0, (self._now() - wall) * 1000.0)
 
+    def _stamp_age_ms(self, msg: PoseStamped) -> float:
+        stamp = msg.header.stamp
+        stamp_sec = float(stamp.sec) + float(stamp.nanosec) * 1.0e-9
+        if stamp_sec <= 0.0:
+            return -1.0
+        return max(0.0, (self._now() - stamp_sec) * 1000.0)
+
+    def _log_pose_pipeline(
+        self,
+        name: str,
+        topic: str,
+        msg: PoseStamped,
+        received_wall: float,
+    ) -> None:
+        self.get_logger().warning(
+            'POSE_PIPELINE | '
+            f'node=leader_shadow_follow name={name} topic={topic} '
+            f'frame_id={msg.header.frame_id or "(empty)"} '
+            f'source_stamp_age_ms={self._stamp_age_ms(msg):.0f} '
+            f'receive_age_ms={self._age_ms(received_wall):.0f}',
+            throttle_duration_sec=3.0,
+        )
+
     def _log_follow_debug(
         self,
         reason: str,
@@ -980,6 +1017,13 @@ class LeaderShadowFollow(Node):
         distance_to_scout: Optional[float] = None,
     ) -> None:
         scout_pose, scout_wall = self._active_scout_pose()
+        distance_invalid_reason = ''
+        if self.leader_pose is not None and scout_pose is not None:
+            distance_invalid_reason = self._pose_pair_invalid_reason(
+                self.leader_pose, scout_pose
+            )
+            if distance_to_scout is None and not distance_invalid_reason:
+                distance_to_scout = self._distance_pose(self.leader_pose, scout_pose)
         goal_required = goal is not None and reason not in (
             'at_shadow_target',
             'waiting_pose',
@@ -993,6 +1037,7 @@ class LeaderShadowFollow(Node):
             f'scout_pose_rx={scout_pose is not None} '
             f'scout_pose_age_ms={self._age_ms(scout_wall):.0f} '
             f'leader_pose_rx={self.leader_pose is not None} '
+            f'leader_pose_age_ms={self._age_ms(getattr(self, "leader_pose_wall", -1.0e9)):.0f} '
             f'system_ready={getattr(self, "system_ready", True)} '
             f'dashboard_ready={getattr(self, "video_ready", True)} '
             f'localization_ready={self.localization_ready} '
@@ -1006,6 +1051,7 @@ class LeaderShadowFollow(Node):
             f'odom_age_ms={self._age_ms(getattr(self, "last_odom_wall", -1.0e9)):.0f} '
             f'odom_motion={getattr(self, "odom_motion", False)} '
             f'distance_to_scout={distance_to_scout if distance_to_scout is not None else float("nan"):.3f} '
+            f'distance_invalid_reason={distance_invalid_reason or "none"} '
             f'blocking_reason={reason}',
             throttle_duration_sec=1.0,
         )
@@ -1035,6 +1081,47 @@ class LeaderShadowFollow(Node):
             first.pose.position.x - second.pose.position.x,
             first.pose.position.y - second.pose.position.y,
         )
+
+    @staticmethod
+    def _pose_invalid_reason(msg: PoseStamped) -> str:
+        pose = msg.pose
+        quat = pose.orientation
+        values = (
+            pose.position.x,
+            pose.position.y,
+            pose.position.z,
+            quat.x,
+            quat.y,
+            quat.z,
+            quat.w,
+        )
+        if not all(math.isfinite(float(value)) for value in values):
+            return 'nonfinite'
+        norm = math.sqrt(
+            quat.x * quat.x + quat.y * quat.y + quat.z * quat.z + quat.w * quat.w
+        )
+        if not math.isfinite(norm) or norm < 0.5 or norm > 1.5:
+            return 'bad_quaternion'
+        if not str(msg.header.frame_id).strip():
+            return 'empty_frame'
+        return ''
+
+    def _pose_pair_invalid_reason(
+        self,
+        leader: PoseStamped,
+        scout: PoseStamped,
+    ) -> str:
+        leader_reason = self._pose_invalid_reason(leader)
+        if leader_reason:
+            return f'leader_{leader_reason}'
+        scout_reason = self._pose_invalid_reason(scout)
+        if scout_reason:
+            return f'scout_{scout_reason}'
+        leader_frame = str(leader.header.frame_id).strip().lstrip('/')
+        scout_frame = str(scout.header.frame_id).strip().lstrip('/')
+        if leader_frame and scout_frame and leader_frame != scout_frame:
+            return f'frame_mismatch_{leader_frame}_vs_{scout_frame}'
+        return ''
 
 
 def main(args=None) -> None:

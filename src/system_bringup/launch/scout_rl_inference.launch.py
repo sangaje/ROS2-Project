@@ -34,6 +34,8 @@ def generate_launch_description():
     system_ready_topic = LaunchConfiguration('system_ready_topic')
     require_video_ready = LaunchConfiguration('require_video_ready')
     video_ready_topic = LaunchConfiguration('video_ready_topic')
+    require_start_motion = LaunchConfiguration('require_start_motion')
+    start_motion_topic = LaunchConfiguration('start_motion_topic')
     cmd_vel_topic = LaunchConfiguration('cmd_vel_topic')
     use_stamped_cmd_vel = LaunchConfiguration('use_stamped_cmd_vel')
     enable_velocity_safety_filter = LaunchConfiguration(
@@ -125,6 +127,17 @@ def generate_launch_description():
             description='Latched leader-owned final motion permission topic.',
         ),
         DeclareLaunchArgument(
+            'require_start_motion',
+            default_value='true',
+            choices=['true'],
+            description='Final motion barrier is mandatory; role activation cannot disable it.',
+        ),
+        DeclareLaunchArgument(
+            'start_motion_topic',
+            default_value='/fleet/start_motion',
+            description='Latched leader-owned final motion permission topic.',
+        ),
+        DeclareLaunchArgument(
             'cmd_vel_topic',
             default_value=DEFAULT_CMD_VEL_TOPIC,
             description='Velocity topic owned by this inference process.',
@@ -182,6 +195,11 @@ def generate_launch_description():
                     value_type=bool,
                 ),
                 'video_ready_topic': video_ready_topic,
+                'require_start_motion': ParameterValue(
+                    require_start_motion,
+                    value_type=bool,
+                ),
+                'start_motion_topic': start_motion_topic,
                 'cmd_vel_topic': cmd_vel_topic,
                 'use_stamped_cmd_vel': ParameterValue(
                     use_stamped_cmd_vel,
