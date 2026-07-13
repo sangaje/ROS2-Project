@@ -75,6 +75,10 @@ class LeaderShadowFollow(Node):
             '/controller_server/set_parameters',
         )
         self.declare_parameter('map_topic', '/map')
+        self.declare_parameter('risk_topic', '/risk/risk_map')
+        self.declare_parameter('enable_risk_priority_follow', True)
+        self.declare_parameter('risk_min_value', 1)
+        self.declare_parameter('risk_pose_timeout_sec', 10.0)
         self.declare_parameter('failover_state_topic', '/failover/state')
         self.declare_parameter('active_scout_id_topic', '/failover/active_scout_id')
         self.declare_parameter('active_scout_robot_name', 'scout22')
@@ -151,6 +155,10 @@ class LeaderShadowFollow(Node):
             get('controller_set_parameters_service').value
         )
         self.map_topic = str(get('map_topic').value)
+        self.risk_topic = str(get('risk_topic').value)
+        self.enable_risk_priority = bool(get('enable_risk_priority_follow').value)
+        self.risk_min_value = max(0, min(100, int(get('risk_min_value').value)))
+        self.risk_pose_timeout = max(0.2, float(get('risk_pose_timeout_sec').value))
         self.failover_state_topic = str(get('failover_state_topic').value)
         self.active_scout_id_topic = str(get('active_scout_id_topic').value)
         self.original_scout_id = str(get('active_scout_robot_name').value)
@@ -230,7 +238,7 @@ class LeaderShadowFollow(Node):
         map_qos = QoSProfile(
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            durability=DurabilityPolicy.VOLATILE,
             history=HistoryPolicy.KEEP_LAST,
         )
 
@@ -256,6 +264,7 @@ class LeaderShadowFollow(Node):
         else:
             self.create_subscription(Twist, self.cmd_vel_topic, self._on_cmd_vel, 10)
         self.create_subscription(OccupancyGrid, self.map_topic, self._on_map, map_qos)
+        self.create_subscription(OccupancyGrid, self.risk_topic, self._on_risk_map, map_qos)
         self.create_subscription(String, self.failover_state_topic, self._on_failover_state, latched_qos)
         self.create_subscription(String, self.active_scout_id_topic, self._on_active_scout_id, latched_qos)
         if self.require_localization_ready:
@@ -323,6 +332,10 @@ class LeaderShadowFollow(Node):
         self.original_scout_wall = -1.0e9
         self.follower_scout_wall = -1.0e9
         self.map_msg: Optional[OccupancyGrid] = None
+        self.risk_msg: Optional[OccupancyGrid] = None
+        self.risk_wall = -1.0e9
+        self.last_risk_target: Optional[Point2] = None
+        self.last_risk_value = -1
         self.last_scan_wall = -1.0e9
         self.last_scan_stamp = -1.0
         self.last_path_wall = -1.0e9
@@ -397,6 +410,14 @@ class LeaderShadowFollow(Node):
 
     def _on_map(self, msg: OccupancyGrid) -> None:
         self.map_msg = msg
+
+    def _on_risk_map(self, msg: OccupancyGrid) -> None:
+        if int(msg.info.width) <= 0 or int(msg.info.height) <= 0:
+            return
+        if len(msg.data) != int(msg.info.width) * int(msg.info.height):
+            return
+        self.risk_msg = msg
+        self.risk_wall = self._now()
 
     def _on_path(self, msg: Path) -> None:
         if msg.poses:
@@ -520,63 +541,14 @@ class LeaderShadowFollow(Node):
             self._publish_state('disabled')
             self._log_follow_debug('disabled')
             return
-        if self._now() - self.start_wall < self.startup_grace:
-            self._publish_state('startup_grace')
-            self._log_follow_debug('startup_grace')
-            return
-        if self.require_localization_ready and not self.localization_ready:
-            self._cancel_shadow_goal('waiting_localization_ready')
-            self._stop_direct_cmd('waiting_localization_ready')
-            self.mode = LeaderMode.IDLE
-            self._set_controller_speed_limit(False)
-            self._publish_state('waiting_localization_ready')
-            self._log_follow_debug('waiting_localization_ready')
-            return
-        if getattr(self, 'require_system_ready', False) and not getattr(
-            self, 'system_ready', True
-        ):
-            self._cancel_shadow_goal('waiting_system_ready')
-            self._stop_direct_cmd('waiting_system_ready')
-            self.mode = LeaderMode.IDLE
-            self._set_controller_speed_limit(False)
-            self._publish_state('waiting_system_ready')
-            self._log_follow_debug('waiting_system_ready')
-            return
-        if self.require_video_ready and not self.video_ready:
-            self._cancel_shadow_goal('waiting_video_ready')
-            self._stop_direct_cmd('waiting_video_ready')
-            self.mode = LeaderMode.IDLE
-            self._set_controller_speed_limit(False)
-            self._publish_state('waiting_video_ready')
-            self._log_follow_debug('waiting_video_ready')
-            return
-        if self.pause_on_omx_aiming and self._is_omx_aiming(self.omx_state):
-            self._cancel_shadow_goal('omx_aiming')
-            self._stop_direct_cmd('omx_aiming')
-            self.mode = LeaderMode.IDLE
-            self._set_controller_speed_limit(False)
-            self._publish_state('omx_aiming_hold')
-            self._log_follow_debug('omx_aiming_hold')
-            return
-        if (
-            self.pause_on_raw_target_detection
-            and self._now() - self.target_detected_wall <= self.target_stop_hold
-        ):
-            self._force_leader_stop_for_target('target_detected_hold')
-            self.shadow_active = False
-            self.mode = LeaderMode.IDLE
-            self._set_controller_speed_limit(False)
-            self._publish_state('target_detected_hold')
-            self._log_follow_debug('target_detected_hold')
-            return
-        if not self._failover_allows_shadow():
-            self._stop_shadow_for_failover()
-            self._publish_state('failover_owns_leader_goal')
-            self._log_follow_debug('failover_owns_leader_goal')
+        risk_goal = self._build_risk_goal()
+        if risk_goal is not None:
+            self.mode = LeaderMode.SHADOW_FOLLOW
+            self._publish_nav2_goal(risk_goal, 'risk_goal_sent', catchup=True)
             return
 
         scout_pose, scout_wall = self._active_scout_pose()
-        if self.leader_pose is None or scout_pose is None:
+        if scout_pose is None:
             self._cancel_shadow_goal('waiting_pose')
             self._stop_direct_cmd('waiting_pose')
             self.mode = LeaderMode.IDLE
@@ -584,7 +556,9 @@ class LeaderShadowFollow(Node):
             self._publish_state('waiting_pose')
             self._log_follow_debug('waiting_pose')
             return
-        pose_invalid_reason = self._pose_pair_invalid_reason(self.leader_pose, scout_pose)
+        pose_invalid_reason = self._pose_invalid_reason(scout_pose)
+        if not pose_invalid_reason and self.leader_pose is not None:
+            pose_invalid_reason = self._pose_pair_invalid_reason(self.leader_pose, scout_pose)
         if pose_invalid_reason:
             self._cancel_shadow_goal(f'pose_invalid_{pose_invalid_reason}')
             self._stop_direct_cmd(f'pose_invalid_{pose_invalid_reason}')
@@ -608,14 +582,17 @@ class LeaderShadowFollow(Node):
             if self.active_scout_id != self.original_scout_id
             else LeaderMode.SHADOW_FOLLOW
         )
-        distance_to_scout = self._distance_pose(self.leader_pose, scout_pose)
+        distance_to_scout = (
+            self._distance_pose(self.leader_pose, scout_pose)
+            if self.leader_pose is not None else float('inf')
+        )
         previous_distance = getattr(self, 'previous_distance_to_scout', None)
         self.distance_decreased = (
             previous_distance is not None
             and distance_to_scout < previous_distance - 0.02
         )
         self.previous_distance_to_scout = distance_to_scout
-        if distance_to_scout <= self.stop_distance:
+        if self.leader_pose is not None and distance_to_scout <= self.stop_distance:
             self._cancel_shadow_goal('stopped_close_to_scout')
             self._stop_direct_cmd('stopped_close_to_scout')
             self.shadow_active = False
@@ -630,19 +607,6 @@ class LeaderShadowFollow(Node):
                 distance_to_scout=distance_to_scout,
             )
             return
-        if distance_to_scout < self.resume_distance and not self.shadow_goal_active:
-            self.shadow_active = False
-            self.mode = LeaderMode.IDLE
-            self._set_controller_speed_limit(False)
-            self._publish_state(
-                'hold_resume_hysteresis',
-                distance_to_scout=distance_to_scout,
-            )
-            self._log_follow_debug(
-                'hold_resume_hysteresis',
-                distance_to_scout=distance_to_scout,
-            )
-            return
         goal = self._build_shadow_goal(scout_pose)
         if goal is None:
             self._cancel_shadow_goal('no_feasible_shadow_target')
@@ -650,7 +614,10 @@ class LeaderShadowFollow(Node):
             self._publish_state('no_feasible_shadow_target')
             self._log_follow_debug('no_feasible_shadow_target')
             return
-        distance_to_shadow_goal = self._distance_pose(self.leader_pose, goal)
+        distance_to_shadow_goal = (
+            self._distance_pose(self.leader_pose, goal)
+            if self.leader_pose is not None else float('inf')
+        )
         self.shadow_active = distance_to_shadow_goal > self.cmd_goal_tolerance
         if not self.shadow_active:
             self._cancel_shadow_goal('at_shadow_target')
@@ -665,40 +632,134 @@ class LeaderShadowFollow(Node):
             self._log_follow_debug('at_shadow_target', goal=goal, distance_to_scout=distance_to_scout)
             return
         catchup = distance_to_scout >= self.far_distance
-        if self.direct_shadow_cmd_vel:
-            self._cancel_shadow_goal('direct_shadow_cmd_vel')
-            if not self.direct_cmd_active:
-                self._pulse_cancel()
-            self._set_controller_speed_limit(False)
-            self._publish_direct_shadow_cmd(goal, catchup=catchup)
-            self.goal_debug_pub.publish(goal)
-            self.last_goal = goal
-            self.last_goal_wall = self._now()
-            self._publish_state('direct_cmd', goal=goal, distance_to_scout=distance_to_scout)
-            self._log_follow_debug('direct_cmd', goal=goal, distance_to_scout=distance_to_scout)
-            return
+        self._publish_nav2_goal(
+            goal,
+            'scout_follow_goal_sent',
+            catchup=catchup,
+            distance_to_scout=distance_to_scout,
+        )
 
-        self._stop_direct_cmd('nav2_shadow_goal_mode')
+    def _publish_nav2_goal(
+        self,
+        goal: PoseStamped,
+        reason: str,
+        *,
+        catchup: bool,
+        distance_to_scout: Optional[float] = None,
+    ) -> None:
+        self._stop_direct_cmd('nav2_goal_mode')
         self._publish_cancel(False)
         self._set_controller_speed_limit(True, catchup=catchup)
         if not self._should_publish_goal(goal):
-            self._publish_state('goal_rate_limited')
+            self._publish_state('goal_rate_limited', goal=goal, distance_to_scout=distance_to_scout)
             self._log_follow_debug('goal_rate_limited', goal=goal, distance_to_scout=distance_to_scout)
             return
-
         self.goal_pub.publish(goal)
         self.goal_debug_pub.publish(goal)
         self.last_goal = goal
         self.shadow_goal_active = True
         self.last_goal_wall = self._now()
-        self._publish_state('goal_sent', goal=goal, distance_to_scout=distance_to_scout)
-        self._log_follow_debug('goal_sent', goal=goal, distance_to_scout=distance_to_scout)
+        self._publish_state(reason, goal=goal, distance_to_scout=distance_to_scout)
+        self._log_follow_debug(reason, goal=goal, distance_to_scout=distance_to_scout)
         self.get_logger().warning(
-            '[LEADER_SHADOW] GOAL_SENT | '
-            f'active_scout={self.active_scout_id} '
-            f'x={goal.pose.position.x:.3f} y={goal.pose.position.y:.3f} '
-            f'D={distance_to_scout:.2f} catchup={catchup}'
+            '[LEADER_SHADOW] NAV2_GOAL_SENT | '
+            f'reason={reason} x={goal.pose.position.x:.3f} '
+            f'y={goal.pose.position.y:.3f} catchup={catchup} '
+            f'risk_value={self.last_risk_value}'
         )
+
+    def _build_risk_goal(self) -> Optional[PoseStamped]:
+        if not self.enable_risk_priority or self.risk_msg is None:
+            return None
+        if self._now() - self.risk_wall > self.risk_pose_timeout:
+            return None
+        risk = self.risk_msg
+        width = int(risk.info.width)
+        height = int(risk.info.height)
+        if width <= 0 or height <= 0 or len(risk.data) != width * height:
+            return None
+        best_value = -1
+        best_index = -1
+        for index, raw in enumerate(risk.data):
+            value = int(raw)
+            if value > best_value:
+                best_value = value
+                best_index = index
+        if best_index < 0 or best_value < self.risk_min_value:
+            self.last_risk_target = None
+            self.last_risk_value = best_value
+            return None
+        mx = best_index % width
+        my = best_index // width
+        target = self._map_to_world(risk, mx, my)
+        target = self._nearest_free_point(target)
+        self.last_risk_target = target
+        self.last_risk_value = best_value
+        yaw = 0.0
+        if self.leader_pose is not None:
+            yaw = math.atan2(
+                target[1] - self.leader_pose.pose.position.y,
+                target[0] - self.leader_pose.pose.position.x,
+            )
+        return self._pose_from_xy_yaw(target[0], target[1], yaw)
+
+    def _map_to_world(self, grid: OccupancyGrid, mx: int, my: int) -> Point2:
+        info = grid.info
+        resolution = float(info.resolution)
+        local_x = (float(mx) + 0.5) * resolution
+        local_y = (float(my) + 0.5) * resolution
+        yaw = yaw_from_quaternion(info.origin.orientation)
+        world_x = (
+            float(info.origin.position.x)
+            + math.cos(yaw) * local_x
+            - math.sin(yaw) * local_y
+        )
+        world_y = (
+            float(info.origin.position.y)
+            + math.sin(yaw) * local_x
+            + math.cos(yaw) * local_y
+        )
+        return (world_x, world_y)
+
+    def _nearest_free_point(self, target: Point2) -> Point2:
+        if self._candidate_is_free(target[0], target[1]):
+            return target
+        if self.map_msg is None:
+            return target
+        best: Optional[tuple[float, Point2]] = None
+        max_radius = max(self.search_radius, self.follow_distance, 1.0)
+        radius_steps = max(1, int(math.ceil(max_radius / self.search_step)))
+        for radius_index in range(1, radius_steps + 1):
+            radius = radius_index * self.search_step
+            angle_steps = max(12, int(math.ceil(2.0 * math.pi * radius / self.search_step)))
+            for angle_index in range(angle_steps):
+                theta = 2.0 * math.pi * float(angle_index) / float(angle_steps)
+                candidate = (
+                    target[0] + radius * math.cos(theta),
+                    target[1] + radius * math.sin(theta),
+                )
+                if not self._candidate_is_free(candidate[0], candidate[1]):
+                    continue
+                score = math.hypot(candidate[0] - target[0], candidate[1] - target[1])
+                if best is None or score < best[0]:
+                    best = (score, candidate)
+            if best is not None:
+                return best[1]
+        return target
+
+    def _pose_from_xy_yaw(self, x: float, y: float, yaw: float) -> PoseStamped:
+        goal = PoseStamped()
+        goal.header.frame_id = 'map'
+        goal.header.stamp = self.get_clock().now().to_msg()
+        goal.pose.position.x = float(x)
+        goal.pose.position.y = float(y)
+        goal.pose.position.z = 0.0
+        qx, qy, qz, qw = quaternion_from_yaw(yaw)
+        goal.pose.orientation.x = qx
+        goal.pose.orientation.y = qy
+        goal.pose.orientation.z = qz
+        goal.pose.orientation.w = qw
+        return goal
 
     def _scan_tick(self) -> None:
         if not self.scan_enabled:
@@ -1093,6 +1154,12 @@ class LeaderShadowFollow(Node):
                 'x': round(float(self.last_nominal_target[0]), 3),
                 'y': round(float(self.last_nominal_target[1]), 3),
             }
+        if self.last_risk_target is not None:
+            data['risk_target'] = {
+                'x': round(float(self.last_risk_target[0]), 3),
+                'y': round(float(self.last_risk_target[1]), 3),
+                'value': int(self.last_risk_value),
+            }
         data['target_mode'] = getattr(self, 'last_target_mode', 'none')
         data['target_behind_scout'] = bool(
             getattr(self, 'last_target_behind_scout', False)
@@ -1201,7 +1268,7 @@ class LeaderShadowFollow(Node):
             f'target_behind_scout={getattr(self, "last_target_behind_scout", False)} '
             f'target_free={getattr(self, "last_target_free", False)} '
             f'goal_required={goal_required} '
-            f'goal_sent={reason == "goal_sent"} '
+            f'goal_sent={reason.endswith("goal_sent") or reason == "goal_sent"} '
             f'goal_accepted={getattr(self, "shadow_goal_active", False)} '
             f'goal_status={reason} '
             f'path_received={getattr(self, "last_path_wall", -1.0e9) >= 0.0} '
@@ -1211,6 +1278,10 @@ class LeaderShadowFollow(Node):
             f'odom_age_ms={self._age_ms(getattr(self, "last_odom_wall", -1.0e9)):.0f} '
             f'odom_motion={getattr(self, "odom_motion", False)} '
             f'distance_to_scout={distance_to_scout if distance_to_scout is not None else float("nan"):.3f} '
+            f'risk_enabled={getattr(self, "enable_risk_priority", False)} '
+            f'risk_rx={getattr(self, "risk_msg", None) is not None} '
+            f'risk_age_ms={self._age_ms(getattr(self, "risk_wall", -1.0e9)):.0f} '
+            f'risk_value={getattr(self, "last_risk_value", -1)} '
             f'distance_invalid_reason={distance_invalid_reason or "none"} '
             f'blocking_reason={reason}',
             throttle_duration_sec=1.0,
@@ -1230,7 +1301,7 @@ class LeaderShadowFollow(Node):
     ) -> None:
         if goal is None and self.last_goal is not None:
             goal = self.last_goal
-        goal_sent = reason == 'goal_sent'
+        goal_sent = reason.endswith('goal_sent') or reason == 'goal_sent'
         goal_accepted = bool(
             getattr(self, 'shadow_goal_active', False)
             and getattr(self, 'last_goal_wall', -1.0e9) >= 0.0
