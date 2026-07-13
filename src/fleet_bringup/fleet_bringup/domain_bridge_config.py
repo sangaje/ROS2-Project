@@ -76,6 +76,16 @@ def risk_topics() -> Dict[str, Dict]:
     }
 
 
+def system_readiness_topics() -> Dict[str, Dict]:
+    """Latched global startup barrier topics owned by the leader domain."""
+    latched = qos(durability='transient_local', depth=1)
+    return {
+        '/system/ready': topic('std_msgs/msg/Bool', profile=latched),
+        '/system/readiness': topic('std_msgs/msg/String', profile=latched),
+        '/system/readiness_detail': topic('std_msgs/msg/String', profile=latched),
+    }
+
+
 def _runtime_output_directory(output_directory: Optional[Path]) -> Path:
     output = output_directory or Path(tempfile.gettempdir())
     output.mkdir(parents=True, exist_ok=True)
@@ -122,6 +132,7 @@ def write_fleet_bridge_configs(
             profile=qos('best_effort', depth=10),
         )
     main_topics.update({
+        **system_readiness_topics(),
         '/map': topic(
             'nav_msgs/msg/OccupancyGrid',
             remap='/map_bridge',
@@ -310,6 +321,7 @@ def write_member_bridge_configs(
     the follower's bridge so the same PC RViz can localize it.
     """
     main_topics = {
+        **system_readiness_topics(),
         '/map': topic(
             'nav_msgs/msg/OccupancyGrid',
             remap='/map_bridge',
@@ -494,6 +506,7 @@ def write_leader_to_pc_bridge_config(
             'nav_msgs/msg/OccupancyGrid',
             profile=map_qos(depth=5),
         ),
+        **system_readiness_topics(),
         **risk_topics(),
         '/leader_pose': topic('geometry_msgs/msg/PoseStamped'),
         '/burger_pose': topic('geometry_msgs/msg/PoseStamped'),

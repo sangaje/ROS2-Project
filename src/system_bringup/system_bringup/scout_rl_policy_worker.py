@@ -40,6 +40,8 @@ class ScoutRLPolicyWorker(Node):
         self.declare_parameter('field_robot_status_topic', '/fleet/field_robot_status')
         self.declare_parameter('require_failover_activation', True)
         self.declare_parameter('require_localization_ready', True)
+        self.declare_parameter('require_system_ready', True)
+        self.declare_parameter('system_ready_topic', '/system/ready')
         self.declare_parameter('require_video_ready', True)
         self.declare_parameter('video_ready_topic', '/fleet/video_ready')
         self.declare_parameter('cmd_vel_topic', '/cmd_vel')
@@ -57,6 +59,8 @@ class ScoutRLPolicyWorker(Node):
         self.field_robot_status_topic = str(get('field_robot_status_topic').value)
         self.require_failover_activation = bool(get('require_failover_activation').value)
         self.require_localization_ready = bool(get('require_localization_ready').value)
+        self.require_system_ready = bool(get('require_system_ready').value)
+        self.system_ready_topic = str(get('system_ready_topic').value)
         self.require_video_ready = bool(get('require_video_ready').value)
         self.video_ready_topic = str(get('video_ready_topic').value)
         self.cmd_vel_topic = str(get('cmd_vel_topic').value)
@@ -71,6 +75,7 @@ class ScoutRLPolicyWorker(Node):
         self.active_scout_id = self.robot_name if initial_active else ''
         self.failover_state = 'NORMAL_OPERATION'
         self.localization_ready = bool(initial_active)
+        self.system_ready = not self.require_system_ready
         self.role_localization_ready: Optional[bool] = None
         self.role_recovery_complete: Optional[bool] = True if initial_active else None
         self.status_recovery_complete = bool(initial_active)
@@ -97,6 +102,8 @@ class ScoutRLPolicyWorker(Node):
         self.create_subscription(String, self.active_scout_id_topic, self._on_active_scout_id, latched_qos)
         self.create_subscription(String, self.scout_epoch_topic, self._on_scout_epoch, latched_qos)
         self.create_subscription(Bool, self.localization_ready_topic, self._on_localization_ready, latched_qos)
+        if self.require_system_ready:
+            self.create_subscription(Bool, self.system_ready_topic, self._on_system_ready, latched_qos)
         if self.require_video_ready:
             self.create_subscription(Bool, self.video_ready_topic, self._on_video_ready, latched_qos)
         self.create_subscription(String, self.field_robot_status_topic, self._on_field_status, 10)
@@ -121,6 +128,7 @@ class ScoutRLPolicyWorker(Node):
             f'role_topic={self.role_topic} cmd_vel={self.cmd_vel_topic} '
             f'initial_active={initial_active} '
             f'require_failover_activation={self.require_failover_activation} '
+            f'require_system_ready={self.require_system_ready}:{self.system_ready_topic} '
             f'require_video_ready={self.require_video_ready}:{self.video_ready_topic}'
         )
 
@@ -171,6 +179,21 @@ class ScoutRLPolicyWorker(Node):
 
     def _on_localization_ready(self, msg: Bool) -> None:
         self.localization_ready = bool(msg.data)
+        self._evaluate_gate()
+
+    def _on_system_ready(self, msg: Bool) -> None:
+        previous = self.system_ready
+        self.system_ready = bool(msg.data)
+        if previous and not self.system_ready and self.runtime_active:
+            self.runtime_active = False
+            self.runtime.deactivate('system_not_ready')
+            self._publish_zero()
+        if self.system_ready != previous:
+            self.get_logger().warning(
+                'SCOUT_SYSTEM_READY | '
+                f'robot={self.robot_name} ready={self.system_ready} '
+                f'topic={self.system_ready_topic}'
+            )
         self._evaluate_gate()
 
     def _on_video_ready(self, msg: Bool) -> None:
@@ -245,6 +268,8 @@ class ScoutRLPolicyWorker(Node):
         sensor_ready = self.runtime.sensor_ready()
         if self.require_video_ready and not self.video_ready:
             sensor_ready = False
+        if self.require_system_ready and not self.system_ready:
+            sensor_ready = False
         return GateInputs(
             role=self.desired_role,
             role_robot_matches=True,
@@ -305,6 +330,7 @@ class ScoutRLPolicyWorker(Node):
             self.get_logger().warning(
                 f'SCOUT_WAIT_SENSOR_READY | robot={self.robot_name} reason={reason} '
                 f'inputs={self.runtime.readiness_summary()} '
+                f'system_ready={self.system_ready}/{self.require_system_ready} '
                 f'video_ready={self.video_ready}/{self.require_video_ready}'
             )
         elif state == RLWorkerState.ACTIVE:
@@ -312,7 +338,7 @@ class ScoutRLPolicyWorker(Node):
                 'RL_ACTIVATION_GATE | '
                 f'robot={self.robot_name} role={self.desired_role} '
                 f'epoch={self.role_epoch} model=true scan=true map=true tf=true '
-                f'nav_idle={self.nav_goal_inactive} video=true'
+                f'nav_idle={self.nav_goal_inactive} system=true video=true'
             )
         elif state == RLWorkerState.STANDBY:
             self.get_logger().warning(
@@ -337,6 +363,9 @@ class ScoutRLPolicyWorker(Node):
             msg.linear.x = float(linear_x)
             msg.angular.z = float(angular_z)
         self.cmd_pub.publish(msg)
+
+    def _publish_zero(self) -> None:
+        self._publish_command(0.0, 0.0)
 
     def destroy_node(self) -> None:
         try:

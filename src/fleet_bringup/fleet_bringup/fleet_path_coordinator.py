@@ -95,6 +95,8 @@ class FleetPathCoordinator(Node):
         self.declare_parameter('require_follower_pose', True)
         self.declare_parameter('localization_ready_topic', '/localization_ready')
         self.declare_parameter('require_localization_ready', False)
+        self.declare_parameter('require_system_ready', False)
+        self.declare_parameter('system_ready_topic', '/system/ready')
         self.declare_parameter('direct_goal_passthrough', True)
 
         self.declare_parameter('check_period_sec', 0.30)
@@ -154,6 +156,8 @@ class FleetPathCoordinator(Node):
         self.require_localization_ready = bool(
             get('require_localization_ready').value
         )
+        self.require_system_ready = bool(get('require_system_ready').value)
+        self.system_ready_topic = str(get('system_ready_topic').value)
         self.direct_goal_passthrough = bool(
             get('direct_goal_passthrough').value
         )
@@ -217,6 +221,7 @@ class FleetPathCoordinator(Node):
         self.collision_warning = False
         self.risk_observation_count = 0
         self.localization_ready = False
+        self.system_ready = not self.require_system_ready
 
         self.state = self.IDLE
         self.state_since = self._now()
@@ -319,6 +324,13 @@ class FleetPathCoordinator(Node):
             self._localization_ready_cb,
             coordination_qos,
         )
+        if self.require_system_ready:
+            self.create_subscription(
+                Bool,
+                self.system_ready_topic,
+                self._system_ready_cb,
+                coordination_qos,
+            )
 
         self.member_goal_pub = self.create_publisher(
             PoseStamped, self.member_coord_goal_topic, 10
@@ -357,7 +369,8 @@ class FleetPathCoordinator(Node):
             f'member_pose={self.member_pose_topic} '
             f'motion_trigger={self.motion_trigger_distance:.2f}m '
             f'prediction={self.motion_prediction_horizon:.1f}s '
-            f'evasion={self.evasion_offset:.2f}-{self.evasion_offset_max:.2f}m'
+            f'evasion={self.evasion_offset:.2f}-{self.evasion_offset_max:.2f}m '
+            f'system_gate={self.require_system_ready}:{self.system_ready_topic}'
         )
 
     def _now(self) -> float:
@@ -420,6 +433,18 @@ class FleetPathCoordinator(Node):
     def _localization_ready_cb(self, message: Bool) -> None:
         self.localization_ready = bool(message.data)
 
+    def _system_ready_cb(self, message: Bool) -> None:
+        previous = self.system_ready
+        self.system_ready = bool(message.data)
+        if previous and not self.system_ready:
+            self._clear_all_goal_state()
+            self._publish_safety_state(True)
+        if previous != self.system_ready:
+            self.get_logger().warning(
+                'FLEET_COORDINATOR_SYSTEM_READY | '
+                f'ready={self.system_ready} topic={self.system_ready_topic}'
+            )
+
     def _update_velocity(
         self,
         previous_velocity: Point2,
@@ -461,6 +486,8 @@ class FleetPathCoordinator(Node):
         self.map_msg = message
 
     def _leader_goal_cb(self, message: PoseStamped) -> None:
+        if self._system_ready_blocks_goal('leader'):
+            return
         self.leader_user_goal = self._copy_goal(message)
         if self.direct_goal_passthrough:
             self.leader_resume_goal = self._copy_goal(message)
@@ -478,6 +505,8 @@ class FleetPathCoordinator(Node):
                 )
 
     def _follower_goal_cb(self, message: PoseStamped) -> None:
+        if self._system_ready_blocks_goal('follower'):
+            return
         self.follower_user_goal = self._copy_goal(message)
         self.follower_desired_following = False
         if self.direct_goal_passthrough:
@@ -1107,8 +1136,22 @@ class FleetPathCoordinator(Node):
     def _publish_goal(self, publisher, goal: Optional[PoseStamped]) -> None:
         if goal is None:
             return
+        if self.require_system_ready and not self.system_ready:
+            return
         goal.header.stamp = rclpy.time.Time().to_msg()
         publisher.publish(goal)
+
+    def _system_ready_blocks_goal(self, source: str) -> bool:
+        if not self.require_system_ready or self.system_ready:
+            return False
+        self._clear_all_goal_state()
+        self._publish_safety_state(True)
+        self._publish_direct_status(f'{source} goal dropped before system ready')
+        self.get_logger().warning(
+            'FLEET_GOAL_DROPPED_FOR_SYSTEM_NOT_READY | '
+            f'source={source} topic={self.system_ready_topic}'
+        )
+        return True
 
     def _republish_goals_to_new_consumers(self) -> None:
         leader_count = self.leader_goal_pub.get_subscription_count()
@@ -1234,8 +1277,23 @@ class FleetPathCoordinator(Node):
         self.leader_hold_sent = False
         self.follower_hold_sent = False
 
+    def _clear_all_goal_state(self) -> None:
+        self._clear_generated_goal_state()
+        self.leader_user_goal = None
+        self.follower_user_goal = None
+        self.leader_resume_goal = None
+        self.follower_resume_goal = None
+        self.follower_desired_following = True
+        self.follower_was_following = True
+
     def _tick_direct_nav(self) -> None:
         self._clear_generated_goal_state()
+
+        if self.require_system_ready and not self.system_ready:
+            self._clear_all_goal_state()
+            self._publish_safety_state(True)
+            self._publish_direct_status('waiting for system readiness')
+            return
 
         if self.leader_pose is None:
             self._publish_safety_state(True)
@@ -1486,6 +1544,12 @@ class FleetPathCoordinator(Node):
             return
 
         self._tick_member()
+
+        if self.require_system_ready and not self.system_ready:
+            self._clear_all_goal_state()
+            self._publish_safety_state(True)
+            self._publish_direct_status('waiting for system readiness')
+            return
 
         if self.leader_pose is None:
             self._hold_for_missing_pose()

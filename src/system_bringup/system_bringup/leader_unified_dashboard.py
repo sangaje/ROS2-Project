@@ -133,6 +133,9 @@ class LeaderUnifiedDashboard(Node):
         self.video_ready_poll_period_sec = float(
             _declare(self, 'video_ready_poll_period_sec', 1.0)
         )
+        self.video_ready_max_age_sec = float(
+            _declare(self, 'video_ready_max_age_sec', 3.0)
+        )
         self.robot_stale_timeout_sec = float(_declare(self, 'robot_stale_timeout_sec', 3.0))
         self.map_stale_timeout_sec = float(_declare(self, 'map_stale_timeout_sec', 30.0))
         self.risk_stale_timeout_sec = float(_declare(self, 'risk_stale_timeout_sec', 10.0))
@@ -683,23 +686,44 @@ class LeaderUnifiedDashboard(Node):
         data = yolo.get('data') if isinstance(yolo, dict) else None
         if not isinstance(data, dict):
             data = {}
-        scout_raw_ready = int(data.get('raw_frames', 0) or 0) > 0
-        scout_yolo_ready = int(data.get('yolo_frames', 0) or 0) > 0
-        scout_inference_ready = int(data.get('inference_frames', 0) or 0) > 0
+        raw_age = float(data.get('raw_frame_age_sec', -1.0) or -1.0)
+        yolo_age = float(data.get('yolo_frame_age_sec', -1.0) or -1.0)
+        inference_age = float(data.get('inference_frame_age_sec', -1.0) or -1.0)
+        scout_raw_ready = (
+            int(data.get('raw_frames', 0) or 0) > 0
+            and 0.0 <= raw_age <= self.video_ready_max_age_sec
+        )
+        scout_yolo_ready = (
+            int(data.get('yolo_frames', 0) or 0) > 0
+            and 0.0 <= yolo_age <= self.video_ready_max_age_sec
+        )
+        scout_inference_ready = (
+            int(data.get('inference_frames', 0) or 0) > 0
+            and 0.0 <= inference_age <= self.video_ready_max_age_sec
+        )
         with self._lock:
             observation = self._omx_state.get('observation_status')
             camera_ready = bool(self._omx_state.get('camera_ready'))
+            observation_wall = self._omx_state.get(
+                'observation_status_received_wall_sec'
+            )
+        now = time.time()
+        observation_fresh = (
+            isinstance(observation_wall, (int, float))
+            and now - float(observation_wall) <= self.video_ready_max_age_sec
+        )
         omx_frame_ready = False
         if isinstance(observation, dict):
             omx_frame_ready = bool(
                 observation.get('camera_ready')
                 and observation.get('frame_valid')
                 and observation.get('inference_ran')
+                and observation_fresh
             )
         elif not self.require_omx_video_ready:
             omx_frame_ready = True
         if self.require_omx_video_ready and not omx_frame_ready:
-            omx_frame_ready = camera_ready and bool(observation)
+            omx_frame_ready = camera_ready and bool(observation) and observation_fresh
         scout_ready = (
             scout_raw_ready and scout_yolo_ready and scout_inference_ready
             if self.require_scout_video_ready else True
@@ -715,6 +739,11 @@ class LeaderUnifiedDashboard(Node):
             'scout_yolo_ready': scout_yolo_ready,
             'scout_inference_ready': scout_inference_ready,
             'omx_frame_ready': omx_frame_ready,
+            'raw_frame_age_sec': raw_age,
+            'yolo_frame_age_sec': yolo_age,
+            'inference_frame_age_sec': inference_age,
+            'omx_observation_fresh': observation_fresh,
+            'video_ready_max_age_sec': self.video_ready_max_age_sec,
             'yolo_status': yolo.get('status'),
             'yolo_error': yolo.get('error'),
         }

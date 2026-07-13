@@ -486,6 +486,8 @@ def generate_launch_description():
                         'self_pose_topic': self_pose_topic,
                         'require_localization_ready': not scout_owns_slam,
                         'localization_ready_topic': '/localization_ready',
+                        'require_system_ready': True,
+                        'system_ready_topic': '/system/ready',
                         'follow_distance_m': 0.70,
                         'follow_goal_period_sec': 1.0,
                         'follow_goal_update_distance_m': 0.30,
@@ -538,6 +540,8 @@ def generate_launch_description():
                             ),
                             'require_video_ready': require_video_ready.perform(context),
                             'video_ready_topic': video_ready_topic.perform(context),
+                            'require_system_ready': 'true',
+                            'system_ready_topic': '/system/ready',
                             'cmd_vel_topic': DEFAULT_CMD_VEL_TOPIC,
                             'use_stamped_cmd_vel': 'true',
                             'enable_velocity_safety_filter': 'true',
@@ -882,6 +886,8 @@ def generate_launch_description():
                                 require_video_ready.perform(context)
                             ),
                             'video_ready_topic': video_ready_topic.perform(context),
+                            'require_system_ready': True,
+                            'system_ready_topic': '/system/ready',
                             'scout_pose_timeout_sec': float(
                                 scout_pose_timeout_sec.perform(context)
                             ),
@@ -981,11 +987,40 @@ def generate_launch_description():
                         'member_nav_path_topic': '/member_plan',
                         'omx_waypoint_route_topic': '/omx/waypoint_route',
                         'video_ready_topic': video_ready_topic.perform(context),
+                        'video_ready_max_age_sec': 3.0,
                     }],
                     env=process_env,
                     respawn=True,
                     respawn_delay=3.0,
                 ))
+            actions.append(TimerAction(
+                period=3.0,
+                actions=[Node(
+                    package='system_bringup',
+                    executable='system_readiness_monitor',
+                    name='system_readiness_monitor',
+                    output='screen',
+                    parameters=[{
+                        'map_topic': '/map',
+                        'leader_pose_topic': '/leader_pose',
+                        'scout_pose_topic': scout_pose_topic.perform(context),
+                        'follower_pose_topic': '/burger_pose',
+                        'field_robot_status_topic': '/fleet/field_robot_status',
+                        'leader_localization_ready_topic': '/localization_ready',
+                        'video_ready_topic': video_ready_topic.perform(context),
+                        'require_scout': True,
+                        'require_follower': launch_bool(
+                            require_follower_pose.perform(context)
+                        ),
+                        'ready_topic': '/system/ready',
+                        'readiness_topic': '/system/readiness',
+                        'detail_topic': '/system/readiness_detail',
+                    }],
+                    env=process_env,
+                    respawn=True,
+                    respawn_delay=3.0,
+                )],
+            ))
             if launch_bool(enable_scout_failover.perform(context)):
                 actions.append(Node(
                     package='system_bringup',

@@ -383,6 +383,8 @@ def generate_launch_description():
             parameters=[{
                 'use_sim_time': simulation,
                 'goal_pose_topic': '/burger_goal_pose',
+                'require_system_ready': True,
+                'system_ready_topic': '/system/ready',
             }],
             env=process_env,
         )

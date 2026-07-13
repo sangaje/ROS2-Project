@@ -30,6 +30,8 @@ def generate_launch_description():
     field_robot_status_topic = LaunchConfiguration('field_robot_status_topic')
     require_failover_activation = LaunchConfiguration('require_failover_activation')
     require_localization_ready = LaunchConfiguration('require_localization_ready')
+    require_system_ready = LaunchConfiguration('require_system_ready')
+    system_ready_topic = LaunchConfiguration('system_ready_topic')
     require_video_ready = LaunchConfiguration('require_video_ready')
     video_ready_topic = LaunchConfiguration('video_ready_topic')
     cmd_vel_topic = LaunchConfiguration('cmd_vel_topic')
@@ -107,6 +109,17 @@ def generate_launch_description():
             description='Hold RL movement until the unified dashboard has received every required video stream.',
         ),
         DeclareLaunchArgument(
+            'require_system_ready',
+            default_value='true',
+            choices=['true', 'false'],
+            description='Hold RL movement until the leader-domain /system/ready latch is true.',
+        ),
+        DeclareLaunchArgument(
+            'system_ready_topic',
+            default_value='/system/ready',
+            description='Latched fleet-wide startup readiness topic.',
+        ),
+        DeclareLaunchArgument(
             'video_ready_topic',
             default_value='/fleet/video_ready',
             description='Latched dashboard video readiness topic.',
@@ -159,6 +172,11 @@ def generate_launch_description():
                     require_localization_ready,
                     value_type=bool,
                 ),
+                'require_system_ready': ParameterValue(
+                    require_system_ready,
+                    value_type=bool,
+                ),
+                'system_ready_topic': system_ready_topic,
                 'require_video_ready': ParameterValue(
                     require_video_ready,
                     value_type=bool,

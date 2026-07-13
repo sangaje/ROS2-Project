@@ -61,6 +61,8 @@ def generate_launch_description():
     goal_delay_sec = LaunchConfiguration('goal_delay_sec')
     require_localization_ready = LaunchConfiguration('require_localization_ready')
     localization_ready_topic = LaunchConfiguration('localization_ready_topic')
+    require_system_ready = LaunchConfiguration('require_system_ready')
+    system_ready_topic = LaunchConfiguration('system_ready_topic')
 
     def make_stack(context):
         process_env = clean_process_environment(domain_id.perform(context))
@@ -136,6 +138,10 @@ def generate_launch_description():
                     require_localization_ready.perform(context)
                 ),
                 'localization_ready_topic': localization_ready_topic.perform(context),
+                'require_system_ready': launch_bool(
+                    require_system_ready.perform(context)
+                ),
+                'system_ready_topic': system_ready_topic.perform(context),
             }],
             env=process_env,
         )
@@ -273,6 +279,17 @@ def generate_launch_description():
             'localization_ready_topic',
             default_value='/localization_ready',
             description='Latched Bool topic published by global_localize_kickstart.',
+        ),
+        DeclareLaunchArgument(
+            'require_system_ready',
+            default_value='false',
+            choices=['true', 'false'],
+            description='Drop goals until the leader-owned /system/ready latch is true.',
+        ),
+        DeclareLaunchArgument(
+            'system_ready_topic',
+            default_value='/system/ready',
+            description='Latched global startup barrier topic.',
         ),
         OpaqueFunction(function=make_stack),
     ])

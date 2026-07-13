@@ -522,6 +522,8 @@ def generate_launch_description():
                         'true' if not cartographer_owned else 'false'
                     ),
                     'localization_ready_topic': '/localization_ready',
+                    'require_system_ready': 'true',
+                    'system_ready_topic': '/system/ready',
                 }.items(),
             )
 
@@ -539,6 +541,8 @@ def generate_launch_description():
                 # coordinator prevents it from publishing leader/member goals
                 # while global_localize_kickstart owns /cmd_vel.
                 'require_localization_ready': not cartographer_owned,
+                'require_system_ready': True,
+                'system_ready_topic': '/system/ready',
             }],
             env=process_env,
             respawn=True,

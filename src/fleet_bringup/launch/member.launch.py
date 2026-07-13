@@ -299,6 +299,8 @@ def generate_launch_description():
                     'true' if amcl_enabled else 'false'
                 ),
                 'localization_ready_topic': '/localization_ready',
+                'require_system_ready': 'true',
+                'system_ready_topic': '/system/ready',
             }.items(),
         )
 

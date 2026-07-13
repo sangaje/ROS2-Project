@@ -319,6 +319,18 @@ def test_scout_rl_worker_waits_for_dashboard_video_ready_gate():
     assert "not self.video_ready" in source
 
 
+def test_scout_rl_worker_waits_for_global_system_ready_gate():
+    worker = Path(__file__).parents[1] / 'system_bringup' / 'scout_rl_policy_worker.py'
+    source = worker.read_text(encoding='utf-8')
+
+    assert "require_system_ready" in source
+    assert "system_ready_topic" in source
+    assert "self.create_subscription(Bool, self.system_ready_topic" in source
+    assert "def _on_system_ready" in source
+    assert "not self.system_ready" in source
+    assert "self._publish_zero()" in source
+
+
 def _gate(**overrides):
     values = {
         'role': 'ACTIVE_SCOUT',

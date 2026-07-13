@@ -78,6 +78,8 @@ class LeaderShadowFollow(Node):
         self.declare_parameter('follower_robot_name', 'follower21')
         self.declare_parameter('require_localization_ready', True)
         self.declare_parameter('localization_ready_topic', '/localization_ready')
+        self.declare_parameter('require_system_ready', True)
+        self.declare_parameter('system_ready_topic', '/system/ready')
         self.declare_parameter('require_video_ready', True)
         self.declare_parameter('video_ready_topic', '/fleet/video_ready')
         self.declare_parameter('target_detected_topic', '/omx/target_detected')
@@ -142,6 +144,8 @@ class LeaderShadowFollow(Node):
         self.follower_robot_name = str(get('follower_robot_name').value)
         self.require_localization_ready = bool(get('require_localization_ready').value)
         self.localization_ready_topic = str(get('localization_ready_topic').value)
+        self.require_system_ready = bool(get('require_system_ready').value)
+        self.system_ready_topic = str(get('system_ready_topic').value)
         self.require_video_ready = bool(get('require_video_ready').value)
         self.video_ready_topic = str(get('video_ready_topic').value)
         self.target_detected_topic = str(get('target_detected_topic').value)
@@ -237,6 +241,13 @@ class LeaderShadowFollow(Node):
                 self._on_localization_ready,
                 latched_qos,
             )
+        if self.require_system_ready:
+            self.create_subscription(
+                Bool,
+                self.system_ready_topic,
+                self._on_system_ready,
+                latched_qos,
+            )
         if self.require_video_ready:
             self.create_subscription(
                 Bool,
@@ -269,6 +280,7 @@ class LeaderShadowFollow(Node):
         self.active_scout_id = self.original_scout_id
         self.failover_state = 'NORMAL_OPERATION'
         self.localization_ready = not self.require_localization_ready
+        self.system_ready = not self.require_system_ready
         self.video_ready = not self.require_video_ready
         self.target_detected = False
         self.target_detected_wall = -1.0e9
@@ -314,6 +326,7 @@ class LeaderShadowFollow(Node):
             f'cmd_cap=lin{self.cmd_max_linear_vel:.2f}/ang{self.cmd_max_angular_vel:.2f} '
             f'controller_service={self.controller_set_parameters_service} '
             f'localization_gate={self.require_localization_ready}:{self.localization_ready_topic} '
+            f'system_gate={self.require_system_ready}:{self.system_ready_topic} '
             f'video_gate={self.require_video_ready}:{self.video_ready_topic}'
         )
 
@@ -369,6 +382,17 @@ class LeaderShadowFollow(Node):
                 f'[LEADER_SHADOW] LOCALIZATION_READY | topic={self.localization_ready_topic}'
             )
 
+    def _on_system_ready(self, msg: Bool) -> None:
+        previous = self.system_ready
+        self.system_ready = bool(msg.data)
+        if previous and not self.system_ready:
+            self._cancel_shadow_goal('system_not_ready')
+            self._stop_direct_cmd('system_not_ready')
+        if self.system_ready != previous:
+            self.get_logger().warning(
+                f'[LEADER_SHADOW] SYSTEM_READY | ready={self.system_ready} topic={self.system_ready_topic}'
+            )
+
     def _on_video_ready(self, msg: Bool) -> None:
         previous = self.video_ready
         self.video_ready = bool(msg.data)
@@ -417,6 +441,15 @@ class LeaderShadowFollow(Node):
             self.mode = LeaderMode.IDLE
             self._set_controller_speed_limit(False)
             self._publish_state('waiting_localization_ready')
+            return
+        if getattr(self, 'require_system_ready', False) and not getattr(
+            self, 'system_ready', True
+        ):
+            self._cancel_shadow_goal('waiting_system_ready')
+            self._stop_direct_cmd('waiting_system_ready')
+            self.mode = LeaderMode.IDLE
+            self._set_controller_speed_limit(False)
+            self._publish_state('waiting_system_ready')
             return
         if self.require_video_ready and not self.video_ready:
             self._cancel_shadow_goal('waiting_video_ready')

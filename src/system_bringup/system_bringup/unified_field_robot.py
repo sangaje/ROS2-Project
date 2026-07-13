@@ -71,6 +71,8 @@ class UnifiedFieldRobot(Node):
         self.declare_parameter('self_pose_topic', '/burger_pose')
         self.declare_parameter('localization_ready_topic', '/localization_ready')
         self.declare_parameter('require_localization_ready', True)
+        self.declare_parameter('system_ready_topic', '/system/ready')
+        self.declare_parameter('require_system_ready', True)
         self.declare_parameter('role_command_topic', '/fleet/field_robot_role_cmd')
         self.declare_parameter('fleet_role_topic', '/fleet/scout_role')
         self.declare_parameter('status_topic', '/fleet/field_robot_status')
@@ -124,6 +126,8 @@ class UnifiedFieldRobot(Node):
         self.self_pose_topic = str(get('self_pose_topic').value)
         self.localization_ready_topic = str(get('localization_ready_topic').value)
         self.require_localization_ready = bool(get('require_localization_ready').value)
+        self.system_ready_topic = str(get('system_ready_topic').value)
+        self.require_system_ready = bool(get('require_system_ready').value)
         self.role_command_topic = str(get('role_command_topic').value)
         self.fleet_role_topic = str(get('fleet_role_topic').value)
         self.status_topic = str(get('status_topic').value)
@@ -204,6 +208,10 @@ class UnifiedFieldRobot(Node):
         self.create_subscription(
             Bool, self.localization_ready_topic, self._on_localization_ready, latched_qos
         )
+        if self.require_system_ready:
+            self.create_subscription(
+                Bool, self.system_ready_topic, self._on_system_ready, latched_qos
+            )
 
         self.epoch = 0
         self.nav_retry_not_before = -1.0e9
@@ -214,6 +222,7 @@ class UnifiedFieldRobot(Node):
         self.self_pose: Optional[PoseStamped] = None
         self.self_pose_wall: Optional[float] = None
         self.localization_ready = False
+        self.system_ready = not self.require_system_ready
         self.last_follow_goal_xy: Optional[tuple[float, float]] = None
         self.last_follow_goal_wall = -1.0e9
         self.pending_follow_goal_xy: Optional[tuple[float, float]] = None
@@ -268,7 +277,8 @@ class UnifiedFieldRobot(Node):
             'UNIFIED_FIELD_ROBOT_READY | '
             f'robot={self.robot_name} role={self.role.value} '
             f'nav={self.navigate_action} cmd_vel={self.cmd_vel_topic} '
-            f'rl_backend={self.rl_backend}'
+            f'rl_backend={self.rl_backend} '
+            f'system_gate={self.require_system_ready}:{self.system_ready_topic}'
         )
         if self.in_process_rl_enabled:
             self.get_logger().warning(
@@ -312,6 +322,21 @@ class UnifiedFieldRobot(Node):
             )
             if self.role == Role.ACTIVE_SCOUT:
                 self._activate_rl()
+
+    def _on_system_ready(self, msg: Bool) -> None:
+        previous = self.system_ready
+        self.system_ready = bool(msg.data)
+        if previous and not self.system_ready:
+            self._deactivate_rl('system_not_ready')
+            self._invalidate_nav_goal('system_not_ready', clear_pending=True)
+            self._set_authority(MotionAuthority.NONE, 'system_not_ready')
+            self._publish_command(0.0, 0.0)
+        if self.system_ready != previous:
+            self.get_logger().warning(
+                'FIELD_SYSTEM_READY | '
+                f'robot={self.robot_name} ready={self.system_ready} '
+                f'topic={self.system_ready_topic}'
+            )
 
     def _on_amcl(self, msg: PoseWithCovarianceStamped) -> None:
         cov = msg.pose.covariance
@@ -428,6 +453,11 @@ class UnifiedFieldRobot(Node):
     def _tick_follow(self) -> None:
         if not self.enable_follow:
             return
+        if getattr(self, 'require_system_ready', False) and not getattr(
+            self, 'system_ready', True
+        ):
+            self._log_follow_gate('system_not_ready')
+            return
         if self.leader_pose is None:
             self._log_follow_gate('leader_pose_missing')
             return
@@ -503,6 +533,10 @@ class UnifiedFieldRobot(Node):
         )
 
     def _tick_recovery(self) -> None:
+        if getattr(self, 'require_system_ready', False) and not getattr(
+            self, 'system_ready', True
+        ):
+            return
         if self.recovery_target is None:
             self._enter_role(Role.FAILED, reason='missing_recovery_target')
             return
@@ -644,6 +678,10 @@ class UnifiedFieldRobot(Node):
         )
 
     def _nav_source_allowed(self, source: str) -> bool:
+        if getattr(self, 'require_system_ready', False) and not getattr(
+            self, 'system_ready', True
+        ):
+            return False
         if source == 'FOLLOW':
             return self.role == Role.FOLLOWER and (
                 not self.require_localization_ready or self.localization_ready
@@ -765,7 +803,10 @@ class UnifiedFieldRobot(Node):
             role=self.role,
             scout_enabled=self.scout_rl_enabled,
             require_localization_ready=self.require_localization_ready,
-            localization_ready=self.localization_ready,
+            localization_ready=self.localization_ready and (
+                getattr(self, 'system_ready', True)
+                or not getattr(self, 'require_system_ready', False)
+            ),
             nav_idle=self._nav_motion_quiesced(),
         ))
         if not allowed:
@@ -886,6 +927,8 @@ class UnifiedFieldRobot(Node):
             'nav_goal_active': nav_goal_active,
             'movement_started': self.movement_started,
             'localization_ready': self.localization_ready,
+            'system_ready': getattr(self, 'system_ready', True),
+            'nav_server_ready': self.nav_client.server_is_ready(),
             'recovery_arrived': self.recovery_arrived,
             'recovery_complete': recovery_complete,
             'active_scout_ready': active_scout_ready,

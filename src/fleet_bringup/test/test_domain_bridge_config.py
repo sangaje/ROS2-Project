@@ -30,6 +30,13 @@ def test_real_bridge_directions_and_control_qos(tmp_path):
     assert main['topics']['/fleet/video_ready']['qos']['durability'] == (
         'transient_local'
     )
+    assert main['topics']['/system/ready']['type'] == 'std_msgs/msg/Bool'
+    assert main['topics']['/system/ready']['qos']['durability'] == (
+        'transient_local'
+    )
+    assert main['topics']['/system/readiness_detail']['type'] == (
+        'std_msgs/msg/String'
+    )
     assert main['topics']['/fleet/robot_poses']['type'] == (
         'geometry_msgs/msg/PoseArray'
     )
@@ -119,6 +126,10 @@ def test_member_bridge_keeps_risk_topics_off_the_default_pose_status_path(tmp_pa
     assert main['topics']['/fleet/video_ready']['qos']['durability'] == (
         'transient_local'
     )
+    assert main['topics']['/system/ready']['qos']['durability'] == (
+        'transient_local'
+    )
+    assert main['topics']['/system/readiness']['type'] == 'std_msgs/msg/String'
     assert main['topics']['/fleet/robot_poses']['type'] == (
         'geometry_msgs/msg/PoseArray'
     )
@@ -231,6 +242,9 @@ def test_leader_to_pc_bridge_is_visualization_only(tmp_path):
     assert (config['from_domain'], config['to_domain']) == (24, 30)
     assert config['topics']['/map']['qos']['reliability'] == 'reliable'
     assert config['topics']['/map']['qos']['durability'] == 'transient_local'
+    assert config['topics']['/system/ready']['qos']['durability'] == (
+        'transient_local'
+    )
     assert '/fleet_debug_markers' in config['topics']
     assert '/risk/risk_map' in config['topics']
     assert '/tf' not in config['topics']

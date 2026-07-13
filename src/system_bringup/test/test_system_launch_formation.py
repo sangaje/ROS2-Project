@@ -72,6 +72,18 @@ def test_system_launch_gates_motion_on_dashboard_video_ready():
     assert "'video_ready_topic': video_ready_topic.perform(context)" in text
 
 
+def test_system_launch_starts_global_readiness_monitor_and_motion_gates():
+    text = SYSTEM_LAUNCH.read_text(encoding='utf-8')
+
+    assert "executable='system_readiness_monitor'" in text
+    assert "'ready_topic': '/system/ready'" in text
+    assert "'readiness_topic': '/system/readiness'" in text
+    assert "'detail_topic': '/system/readiness_detail'" in text
+    assert "'require_system_ready': True" in text
+    assert "'system_ready_topic': '/system/ready'" in text
+    assert "'require_system_ready': 'true'" in text
+
+
 def test_leader_can_own_risk_map_from_scout_sources():
     text = SYSTEM_LAUNCH.read_text(encoding='utf-8')
 

@@ -23,6 +23,11 @@ def test_dashboard_publishes_latched_video_ready_after_all_streams_arrive():
     assert "raw_frames" in source
     assert "yolo_frames" in source
     assert "inference_frames" in source
+    assert "video_ready_max_age_sec" in source
+    assert "raw_frame_age_sec" in source
+    assert "yolo_frame_age_sec" in source
+    assert "inference_frame_age_sec" in source
+    assert "observation_status_received_wall_sec" in source
     assert "'/omx/observation_status'" in source
     assert "'/omx/camera_ready'" in source
 

@@ -44,6 +44,7 @@ setup(
             'leader_shadow_follow = system_bringup.leader_shadow_follow:main',
             'scout_failover_coordinator = system_bringup.scout_failover_coordinator:main',
             'scout_rl_policy_worker = system_bringup.scout_rl_policy_worker:main',
+            'system_readiness_monitor = system_bringup.system_readiness_monitor:main',
             'unified_field_robot = system_bringup.unified_field_robot:main',
         ],
     },
