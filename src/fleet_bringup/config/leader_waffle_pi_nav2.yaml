@@ -72,7 +72,7 @@ controller_server:
     # accelerations and longer trajectory rollout so DWB chooses commands the
     # hardware can actually realize instead of constantly asking for impossible
     # catch-up motion.
-    controller_frequency: 18.0
+    controller_frequency: 15.0
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.001
     min_theta_velocity_threshold: 0.001
@@ -99,24 +99,24 @@ controller_server:
       debug_trajectory_details: true
       min_vel_x: -0.08
       min_vel_y: 0.0
-      max_vel_x: 0.26
+      max_vel_x: 0.20
       max_vel_y: 0.0
       # Keep rotation below the range where the loaded chassis arcs wide and
       # diverges from the differential-drive model.
-      max_vel_theta: 1.00
+      max_vel_theta: 0.75
       min_speed_xy: 0.0
-      max_speed_xy: 0.26
+      max_speed_xy: 0.20
       min_speed_theta: 0.0
-      acc_lim_x: 1.20
+      acc_lim_x: 0.70
       acc_lim_y: 0.0
-      acc_lim_theta: 2.20
-      decel_lim_x: -1.20
+      acc_lim_theta: 1.40
+      decel_lim_x: -0.90
       decel_lim_y: 0.0
-      decel_lim_theta: -2.20
+      decel_lim_theta: -1.60
       vx_samples: 20
       vy_samples: 1
-      vtheta_samples: 40
-      sim_time: 1.5
+      vtheta_samples: 32
+      sim_time: 1.2
       linear_granularity: 0.05
       angular_granularity: 0.025
       transform_tolerance: 0.5
@@ -172,9 +172,9 @@ behavior_server:
     transform_tolerance: 0.5
     transform_timeout: 0.1
     simulate_ahead_time: 2.0
-    max_rotational_vel: 1.00
+    max_rotational_vel: 0.75
     min_rotational_vel: 0.12
-    rotational_acc_lim: 2.20
+    rotational_acc_lim: 1.40
     enable_stamped_cmd_vel: true
 
 bt_navigator:
