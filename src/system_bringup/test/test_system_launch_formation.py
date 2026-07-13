@@ -33,3 +33,13 @@ def test_scout_member_pose_is_stabilized_when_cartographer_corrects_while_stoppe
 
     assert "'freeze_when_stationary': True" in text
     assert "'stationary_linear_threshold_m': 0.003" in text
+
+
+def test_system_launch_uses_external_worker_without_in_process_runtime():
+    text = SYSTEM_LAUNCH.read_text(encoding='utf-8')
+
+    assert "default_value='external_worker'" in text
+    assert "'start_rl_worker'" in text
+    assert "'scout_rl_inference.launch.py'" in text
+    assert "'initial_role_active': 'false'" in text
+    assert "'rl_backend': rl_backend_value" in text

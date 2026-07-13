@@ -106,6 +106,7 @@ class UnifiedFieldRobot(Node):
         self.declare_parameter('enable_recovery_mode', True)
         self.declare_parameter('enable_localization_spin', True)
         self.declare_parameter('enable_exploration', True)
+        self.declare_parameter('rl_backend', 'external_worker')
         self.declare_parameter('leader_pose_topic', '/leader_pose')
         self.declare_parameter('self_pose_topic', '/burger_pose')
         self.declare_parameter('localization_ready_topic', '/localization_ready')
@@ -151,6 +152,12 @@ class UnifiedFieldRobot(Node):
         self.enable_recovery = bool(get('enable_recovery_mode').value)
         self.enable_spin = bool(get('enable_localization_spin').value)
         self.enable_exploration = bool(get('enable_exploration').value)
+        self.rl_backend = str(get('rl_backend').value).strip().lower()
+        if self.rl_backend not in ('disabled', 'in_process', 'external_worker'):
+            raise RuntimeError(
+                'rl_backend must be one of disabled, in_process, external_worker; '
+                f'got {self.rl_backend!r}'
+            )
         self.leader_pose_topic = str(get('leader_pose_topic').value)
         self.self_pose_topic = str(get('self_pose_topic').value)
         self.localization_ready_topic = str(get('localization_ready_topic').value)
@@ -197,7 +204,12 @@ class UnifiedFieldRobot(Node):
         self.settle_duration = max(0.0, float(get('settle_duration_sec').value))
         self.max_spin_retries = max(0, int(get('max_spin_retries').value))
         self.heartbeat_period = max(0.1, float(get('heartbeat_period_sec').value))
+        # Capability and execution backend are intentionally separate.  The
+        # normal robot stack owns roles/Nav2 here; external_worker owns SAC.
         self.scout_rl_enabled = bool(self.enable_scout and self.enable_exploration)
+        self.in_process_rl_enabled = bool(
+            self.scout_rl_enabled and self.rl_backend == 'in_process'
+        )
 
         latched_qos = QoSProfile(
             depth=1,
@@ -265,7 +277,7 @@ class UnifiedFieldRobot(Node):
         self.heartbeat_seq = 0
         self.motion_authority = MotionAuthority.NONE
         self.rl_runtime: Optional[ActiveScoutRLRuntime] = None
-        if self.scout_rl_enabled:
+        if self.in_process_rl_enabled:
             self.rl_runtime = ActiveScoutRLRuntime(
                 self,
                 self._publish_rl_command,
@@ -279,12 +291,18 @@ class UnifiedFieldRobot(Node):
         self.get_logger().warning(
             'UNIFIED_FIELD_ROBOT_READY | '
             f'robot={self.robot_name} role={self.role.value} '
-            f'nav={self.navigate_action} cmd_vel={self.cmd_vel_topic}'
+            f'nav={self.navigate_action} cmd_vel={self.cmd_vel_topic} '
+            f'rl_backend={self.rl_backend}'
         )
-        if self.scout_rl_enabled:
+        if self.in_process_rl_enabled:
             self.get_logger().warning(
                 '[SCOUT_RL] ROLE_GATED=true DETERMINISTIC=true SDE=false '
                 'backend=in_process'
+            )
+        elif self.scout_rl_enabled and self.rl_backend == 'external_worker':
+            self.get_logger().warning(
+                '[SCOUT_RL] ROLE_GATED=true backend=external_worker '
+                'runtime=not_created_in_unified_field_robot'
             )
 
     def _now(self) -> float:
@@ -427,6 +445,8 @@ class UnifiedFieldRobot(Node):
             self._tick_spin()
         elif self.role == Role.LOCALIZATION_SETTLE:
             self._tick_localization_settle()
+        elif self.role == Role.ACTIVE_SCOUT:
+            self._activate_rl()
         self._dispatch_pending_nav_goal()
         self._publish_status()
 
@@ -840,7 +860,7 @@ class UnifiedFieldRobot(Node):
         self._enter_role(Role.LOCALIZATION_CHECK, reason='recovery_arrival_verified')
 
     def _activate_rl(self) -> None:
-        if self.rl_runtime is None or self.role != Role.ACTIVE_SCOUT:
+        if self.role != Role.ACTIVE_SCOUT:
             return
         if self.require_localization_ready and not self.localization_ready:
             self.get_logger().warning(
@@ -850,6 +870,14 @@ class UnifiedFieldRobot(Node):
             )
             return
         if not self._nav_motion_quiesced():
+            return
+        if self.rl_backend == 'external_worker' and self.scout_rl_enabled:
+            self._set_authority(
+                MotionAuthority.ACTIVE_SCOUT_RL,
+                'external_worker_motion_release',
+            )
+            return
+        if self.rl_runtime is None:
             return
         self.rl_runtime.activate()
         if self.rl_runtime.active:
@@ -889,7 +917,7 @@ class UnifiedFieldRobot(Node):
             return
         if self.require_localization_ready and not self.localization_ready:
             return
-        if self.scout_rl_enabled and (
+        if self.in_process_rl_enabled and (
             self.motion_authority != MotionAuthority.ACTIVE_SCOUT_RL
             or self.rl_runtime is None
             or not self.rl_runtime.active
@@ -960,9 +988,16 @@ class UnifiedFieldRobot(Node):
             'xy_cov': None if math.isinf(self.xy_cov) else self.xy_cov,
             'yaw_cov': None if math.isinf(self.yaw_cov) else self.yaw_cov,
             'rl_enabled': self.scout_rl_enabled,
-            'rl_active': bool(runtime is not None and runtime.active),
+            'rl_backend': self.rl_backend,
+            'rl_active': bool(
+                (runtime is not None and runtime.active)
+                or (
+                    self.rl_backend == 'external_worker'
+                    and self.motion_authority == MotionAuthority.ACTIVE_SCOUT_RL
+                )
+            ),
             'rl_stop_reason': (
-                runtime.last_stop_reason if runtime is not None else 'disabled'
+                runtime.last_stop_reason if runtime is not None else self.rl_backend
             ),
         }
         msg = String()
@@ -974,6 +1009,9 @@ class UnifiedFieldRobot(Node):
             'robot': self.robot_name,
             'epoch': self.epoch,
             'role': self.role.value,
+            'active_scout_id': (
+                self.robot_name if self.role == Role.ACTIVE_SCOUT else ''
+            ),
             'localization_ready': self.localization_ready,
             'recovery_complete': recovery_complete,
             'active_scout_ready': active_scout_ready,

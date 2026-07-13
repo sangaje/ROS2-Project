@@ -399,8 +399,22 @@ class ActiveScoutRLRuntime:
         scan_frame = str(snapshot.scan.header.frame_id or self.config.scan_frame).lstrip('/')
         try:
             stamp = _stamp_time(snapshot.scan)
-            self._lookup_pose(self.config.map_frame, self.config.base_frame, stamp)
-            self._lookup_pose(self.config.map_frame, scan_frame, stamp)
+            # This runs from the activation gate.  It must never occupy both
+            # executor threads for the full map-update TF timeout while the
+            # Waffle is still bringing its TF tree up.
+            probe_timeout_sec = min(self.config.max_tf_age_sec, 0.05)
+            self._lookup_pose(
+                self.config.map_frame,
+                self.config.base_frame,
+                stamp,
+                timeout_sec=probe_timeout_sec,
+            )
+            self._lookup_pose(
+                self.config.map_frame,
+                scan_frame,
+                stamp,
+                timeout_sec=probe_timeout_sec,
+            )
         except TransformException:
             return False
         return True
@@ -523,13 +537,23 @@ class ActiveScoutRLRuntime:
             and now - snapshot.map_received_at <= self.config.max_map_age_sec
         )
 
-    def _lookup_pose(self, target_frame: str, source_frame: str, stamp: Time) -> tuple[np.ndarray, float]:
+    def _lookup_pose(
+        self,
+        target_frame: str,
+        source_frame: str,
+        stamp: Time,
+        *,
+        timeout_sec: Optional[float] = None,
+    ) -> tuple[np.ndarray, float]:
+        timeout = Duration(seconds=(
+            self.config.max_tf_age_sec if timeout_sec is None else max(0.0, timeout_sec)
+        ))
         try:
             transform = self.tf_buffer.lookup_transform(
                 target_frame,
                 source_frame,
                 stamp,
-                timeout=Duration(seconds=self.config.max_tf_age_sec),
+                timeout=timeout,
             )
         except TransformException:
             # The scout and inference Jetson have independent clocks.  A
@@ -541,7 +565,7 @@ class ActiveScoutRLRuntime:
                 target_frame,
                 source_frame,
                 Time(),
-                timeout=Duration(seconds=self.config.max_tf_age_sec),
+                timeout=timeout,
             )
             now = time.monotonic()
             if now - self._last_tf_stamp_fallback_at >= 5.0:

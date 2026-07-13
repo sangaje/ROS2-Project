@@ -323,6 +323,7 @@ def _gate(**overrides):
         'sensor_ready': True,
         'tf_ready': True,
         'require_failover_activation': True,
+        'require_localization_ready': True,
     }
     values.update(overrides)
     return GateInputs(**values)
@@ -348,6 +349,7 @@ def test_worker_gate_manual_active_scout_skips_failover_localization_gate():
         recovery_complete=False,
         motion_authority='FAILOVER_RECOVERY_NAV',
         require_failover_activation=False,
+        require_localization_ready=False,
     ))
 
     assert state == RLWorkerState.ACTIVE
@@ -387,18 +389,31 @@ def test_worker_gate_accepts_only_fully_ready_failover_owner():
 def test_worker_role_parser_supports_json_and_simple_strings():
     update = parse_role_update(
         '{"role":"ACTIVE_SCOUT","robot":"follower21","epoch":2,'
-        '"localization_ready":true,"recovery_complete":true}',
+        '"active_scout_id":"follower21","localization_ready":true,'
+        '"recovery_complete":true}',
         'follower21',
     )
     assert update.role == 'ACTIVE_SCOUT'
     assert update.robot == 'follower21'
     assert update.epoch == 2
+    assert update.active_scout_id == 'follower21'
     assert update.localization_ready is True
     assert update.recovery_complete is True
 
     simple = parse_role_update('RECOVERY_NAVIGATING', 'follower21')
     assert simple.role == 'RECOVERY_NAVIGATING'
     assert simple.robot == 'follower21'
+    assert simple.active_scout_id is None
+
+
+def test_worker_cartographer_mode_does_not_require_amcl_ready_signal():
+    state, reason = evaluate_activation_gate(_gate(
+        localization_ready=False,
+        require_localization_ready=False,
+    ))
+
+    assert state == RLWorkerState.ACTIVE
+    assert reason == 'activation_gate_passed'
 
 
 def test_runtime_map_subscription_accepts_cartographer_volatile_maps():
@@ -407,6 +422,25 @@ def test_runtime_map_subscription_accepts_cartographer_volatile_maps():
     )
 
     assert 'durability=DurabilityPolicy.VOLATILE' in source
+
+
+def test_runtime_tf_gate_uses_a_short_probe_timeout_before_activation():
+    source = (Path(__file__).parents[1] / 'system_bringup' / 'scout_rl_runtime.py').read_text(
+        encoding='utf-8'
+    )
+
+    assert 'probe_timeout_sec = min(self.config.max_tf_age_sec, 0.05)' in source
+    assert 'timeout_sec=probe_timeout_sec' in source
+
+
+def test_hardware_contract_leaves_budget_for_slow_map_and_inference_callbacks():
+    config = active_scout_config()
+
+    assert config.map_substeps_per_action == 2
+    assert config.max_scan_age_sec == 0.8
+    assert config.max_map_age_sec == 5.0
+    assert config.max_inference_sec == 2.0
+    assert config.command_timeout_sec == 3.0
 
 
 def test_runtime_publishes_the_exact_policy_lidar_debug_topic():

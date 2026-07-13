@@ -109,6 +109,9 @@ def _bare_field(now=10.0):
     node.inflight_goal_ids = set()
     node.cancel_requests = 0
     node.rl_runtime = None
+    node.rl_backend = 'external_worker'
+    node.scout_rl_enabled = True
+    node.in_process_rl_enabled = False
     node.nav_client = _ActionClient()
     node.last_odom_xy = (0.0, 0.0)
     node.nav_start_odom_xy = None
@@ -288,6 +291,21 @@ def test_rl_heartbeat_requires_localization_and_live_runtime():
     payload = json.loads(node.heartbeat_pub.messages[0].data)
     assert payload['robot'] == 'scout22'
     assert payload['epoch'] == 2
+
+
+def test_external_worker_backend_grants_only_motion_authority_not_runtime():
+    node, _ = _bare_field()
+    node.role = Role.ACTIVE_SCOUT
+    node.rl_backend = 'external_worker'
+    node.scout_rl_enabled = True
+    node.rl_runtime = None
+    node.require_localization_ready = False
+    node._nav_motion_quiesced = lambda: True
+
+    node._activate_rl()
+
+    assert node.rl_runtime is None
+    assert node.motion_authority == MotionAuthority.ACTIVE_SCOUT_RL
 
 
 def test_shadow_goal_cancel_is_edge_triggered_on_failover():

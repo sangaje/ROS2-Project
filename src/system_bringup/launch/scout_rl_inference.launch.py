@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Run only the ACTIVE_SCOUT RL inference process.
 
-Use this with the main system launch set to ``enable_exploration:=false`` when
-you want RL inference isolated from the rest of ``unified_field_robot``.
+``system.launch.py`` includes this launch for the canonical external-worker
+backend.  It remains directly runnable for diagnostics.
 """
 
 from launch import LaunchDescription
@@ -25,6 +25,7 @@ def generate_launch_description():
     localization_ready_topic = LaunchConfiguration('localization_ready_topic')
     field_robot_status_topic = LaunchConfiguration('field_robot_status_topic')
     require_failover_activation = LaunchConfiguration('require_failover_activation')
+    require_localization_ready = LaunchConfiguration('require_localization_ready')
     cmd_vel_topic = LaunchConfiguration('cmd_vel_topic')
     use_stamped_cmd_vel = LaunchConfiguration('use_stamped_cmd_vel')
     enable_velocity_safety_filter = LaunchConfiguration(
@@ -36,6 +37,15 @@ def generate_launch_description():
             'domain_id',
             default_value=EnvironmentVariable('ROS_DOMAIN_ID'),
             description='DDS domain where /scan, /map, TF and /cmd_vel live.',
+        ),
+        DeclareLaunchArgument(
+            'require_localization_ready',
+            default_value='true',
+            choices=['true', 'false'],
+            description=(
+                'Require /localization_ready in addition to scan/map/TF. '
+                'Set false for a Cartographer-owned active scout.'
+            ),
         ),
         DeclareLaunchArgument(
             'robot_name',
@@ -126,6 +136,10 @@ def generate_launch_description():
                 'field_robot_status_topic': field_robot_status_topic,
                 'require_failover_activation': ParameterValue(
                     require_failover_activation,
+                    value_type=bool,
+                ),
+                'require_localization_ready': ParameterValue(
+                    require_localization_ready,
                     value_type=bool,
                 ),
                 'cmd_vel_topic': cmd_vel_topic,

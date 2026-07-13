@@ -168,6 +168,9 @@ def generate_launch_description():
         'enable_localization_spin_on_takeover'
     )
     enable_exploration = LaunchConfiguration('enable_exploration')
+    rl_backend = LaunchConfiguration('rl_backend')
+    start_rl_worker = LaunchConfiguration('start_rl_worker')
+    rl_initial_role_active = LaunchConfiguration('rl_initial_role_active')
     start_omx_aim = LaunchConfiguration('start_omx_aim')
     start_yolo_server = LaunchConfiguration('start_yolo_server')
     yolo_server_delay_sec = LaunchConfiguration('yolo_server_delay_sec')
@@ -218,6 +221,30 @@ def generate_launch_description():
             raise ValueError(
                 'role:=leader must use fleet_role:=leader; a member/follower '
                 'stack publishes a different robot pose topic.'
+            )
+        rl_backend_value = rl_backend.perform(context).strip().lower()
+        if rl_backend_value not in ('disabled', 'in_process', 'external_worker'):
+            raise ValueError(
+                'rl_backend must be one of disabled, in_process, external_worker; '
+                f'got {rl_backend_value!r}'
+            )
+        start_rl_worker_value = launch_bool(start_rl_worker.perform(context))
+        if rl_backend_value == 'in_process' and start_rl_worker_value:
+            raise ValueError(
+                'rl_backend:=in_process conflicts with start_rl_worker:=true; '
+                'choose exactly one RL runtime backend.'
+            )
+        if rl_backend_value == 'disabled' and start_rl_worker_value:
+            raise ValueError(
+                'rl_backend:=disabled conflicts with start_rl_worker:=true.'
+            )
+        if (
+            rl_backend_value == 'external_worker'
+            and launch_bool(rl_initial_role_active.perform(context))
+        ):
+            raise ValueError(
+                'external_worker must start role-gated; '
+                'set rl_initial_role_active:=false.'
             )
 
         main_domain_value = main_domain_id.perform(context).strip()
@@ -378,10 +405,15 @@ def generate_launch_description():
             )
         ):
             local_exploration = launch_bool(enable_exploration.perform(context))
-            if local_exploration:
+            if local_exploration and rl_backend_value == 'external_worker':
                 actions.append(LogInfo(msg=[
-                    'SYSTEM_BRINGUP | ACTIVE_SCOUT RL is in-process in '
-                    'unified_field_robot; no eval_policy subprocess is started.',
+                    'SYSTEM_BRINGUP | ACTIVE_SCOUT RL backend=external_worker; '
+                    'unified_field_robot publishes only role/status/nav state.',
+                ]))
+            elif local_exploration and rl_backend_value == 'in_process':
+                actions.append(LogInfo(msg=[
+                    'SYSTEM_BRINGUP | ACTIVE_SCOUT RL backend=in_process; '
+                    'external worker is disabled by mutual exclusion.',
                 ]))
             else:
                 actions.append(LogInfo(msg=[
@@ -418,6 +450,7 @@ def generate_launch_description():
                             enable_localization_spin_on_takeover.perform(context)
                         ),
                         'enable_exploration': local_exploration,
+                        'rl_backend': rl_backend_value,
                         'leader_pose_topic': '/leader_pose',
                         'self_pose_topic': self_pose_topic,
                         'require_localization_ready': not scout_owns_slam,
@@ -441,6 +474,37 @@ def generate_launch_description():
                     respawn_delay=3.0,
                 )],
             ))
+            if (
+                local_exploration
+                and rl_backend_value == 'external_worker'
+                and start_rl_worker_value
+            ):
+                scout_rl_launch = os.path.join(
+                    get_package_share_directory('system_bringup'),
+                    'launch',
+                    'scout_rl_inference.launch.py',
+                )
+                actions.append(TimerAction(
+                    period=1.0,
+                    actions=[IncludeLaunchDescription(
+                        PythonLaunchDescriptionSource(scout_rl_launch),
+                        launch_arguments={
+                            'domain_id': str(domain),
+                            'robot_name': local_robot_name,
+                            'role_topic': f'/{local_robot_name}/role',
+                            # The unified role publisher is authoritative;
+                            # worker activation never comes from launch args.
+                            'initial_role_active': 'false',
+                            'require_failover_activation': 'true',
+                            'require_localization_ready': (
+                                'false' if scout_owns_slam else 'true'
+                            ),
+                            'cmd_vel_topic': '/cmd_vel',
+                            'use_stamped_cmd_vel': 'true',
+                            'enable_velocity_safety_filter': 'true',
+                        }.items(),
+                    )],
+                ))
 
         if role_value == 'leader':
             leader_localization_ready_gate = (
@@ -1442,18 +1506,41 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'enable_localization_spin_on_takeover',
-            default_value='true',
+            default_value='false',
             choices=['true', 'false'],
-            description='Follower-side takeover agent performs 360deg AMCL spin when covariance is poor.',
+            description='Debug-only follower AMCL spin when covariance is poor.',
         ),
         DeclareLaunchArgument(
             'enable_exploration',
             default_value='true',
             choices=['true', 'false'],
             description=(
-                'Enable the deterministic in-process ACTIVE_SCOUT SAC runtime. '
-                'It is role-gated and never starts a remote or eval_policy '
-                'subprocess; false leaves ACTIVE_SCOUT motion stopped.'
+                'Allow this robot to perform ACTIVE_SCOUT RL exploration. '
+                'Execution location is selected independently by rl_backend.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'rl_backend',
+            default_value='external_worker',
+            choices=['disabled', 'in_process', 'external_worker'],
+            description=(
+                'RL runtime backend. external_worker is the canonical '
+                'role-gated local inference process for Burger robots.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'start_rl_worker',
+            default_value='true',
+            choices=['true', 'false'],
+            description='Start the external local scout_rl_policy_worker backend.',
+        ),
+        DeclareLaunchArgument(
+            'rl_initial_role_active',
+            default_value='false',
+            choices=['true', 'false'],
+            description=(
+                'Reserved manual-debug switch. external_worker requires false '
+                'so role/epoch ownership always gates activation.'
             ),
         ),
         DeclareLaunchArgument(

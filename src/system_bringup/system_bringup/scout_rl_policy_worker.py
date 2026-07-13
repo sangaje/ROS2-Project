@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import json
+import os
 from typing import Optional
 
 import rclpy
@@ -33,6 +34,7 @@ class RoleUpdate:
     role: str
     robot: str
     epoch: Optional[int]
+    active_scout_id: Optional[str]
     localization_ready: Optional[bool]
     recovery_complete: Optional[bool]
 
@@ -53,6 +55,7 @@ class GateInputs:
     sensor_ready: bool
     tf_ready: bool
     require_failover_activation: bool
+    require_localization_ready: bool
 
 
 def parse_epoch(value) -> Optional[int]:
@@ -86,6 +89,7 @@ def parse_role_update(raw: str, robot_name: str) -> Optional[RoleUpdate]:
             role=text.upper(),
             robot=robot_name,
             epoch=None,
+            active_scout_id=None,
             localization_ready=None,
             recovery_complete=None,
         )
@@ -101,6 +105,10 @@ def parse_role_update(raw: str, robot_name: str) -> Optional[RoleUpdate]:
         role=role,
         robot=robot,
         epoch=parse_epoch(payload.get('epoch')),
+        active_scout_id=(
+            str(payload['active_scout_id']).strip()
+            if payload.get('active_scout_id') is not None else None
+        ),
         localization_ready=_optional_bool(payload.get('localization_ready')),
         recovery_complete=_optional_bool(payload.get('recovery_complete')),
     )
@@ -130,7 +138,7 @@ def evaluate_activation_gate(gate: GateInputs) -> tuple[RLWorkerState, str]:
         return RLWorkerState.STANDBY, 'stale_epoch'
     if require_failover and not gate.active_scout_matches:
         return RLWorkerState.STANDBY, 'active_scout_id_mismatch'
-    if require_failover and not gate.localization_ready:
+    if gate.require_localization_ready and not gate.localization_ready:
         return RLWorkerState.WAIT_LOCALIZATION, 'localization_not_ready'
     if require_failover and not gate.recovery_complete:
         return RLWorkerState.WAIT_LOCALIZATION, 'recovery_not_complete'
@@ -161,6 +169,7 @@ class ScoutRLPolicyWorker(Node):
         self.declare_parameter('localization_ready_topic', '/localization_ready')
         self.declare_parameter('field_robot_status_topic', '/fleet/field_robot_status')
         self.declare_parameter('require_failover_activation', True)
+        self.declare_parameter('require_localization_ready', True)
         self.declare_parameter('cmd_vel_topic', '/cmd_vel')
         self.declare_parameter('use_stamped_cmd_vel', True)
         self.declare_parameter('enable_velocity_safety_filter', True)
@@ -175,6 +184,7 @@ class ScoutRLPolicyWorker(Node):
         self.localization_ready_topic = str(get('localization_ready_topic').value)
         self.field_robot_status_topic = str(get('field_robot_status_topic').value)
         self.require_failover_activation = bool(get('require_failover_activation').value)
+        self.require_localization_ready = bool(get('require_localization_ready').value)
         self.cmd_vel_topic = str(get('cmd_vel_topic').value)
         self.use_stamped = bool(get('use_stamped_cmd_vel').value)
         self.enable_velocity_safety_filter = bool(
@@ -219,7 +229,15 @@ class ScoutRLPolicyWorker(Node):
             self._publish_command,
             enable_velocity_safety_filter=self.enable_velocity_safety_filter,
         )
-        self.create_timer(0.1, self._evaluate_gate)
+        # A short but non-aggressive gate rate leaves executor capacity for
+        # scan/map callbacks on the hardware inference Jetson.
+        self.create_timer(0.25, self._evaluate_gate)
+        self.get_logger().warning(
+            'RL_WORKER_READY | '
+            f'robot={self.robot_name} domain={os.environ.get("ROS_DOMAIN_ID", "")} '
+            'backend=external_worker standby=true '
+            f'cmd_topic={self.cmd_vel_topic}'
+        )
         self.get_logger().warning(
             'SCOUT_RL_STANDBY | '
             f'robot={self.robot_name} epoch={self.role_epoch} '
@@ -248,6 +266,13 @@ class ScoutRLPolicyWorker(Node):
         self.desired_role = update.role
         self.role_localization_ready = update.localization_ready
         self.role_recovery_complete = update.recovery_complete
+        if update.active_scout_id is not None:
+            self.active_scout_id = update.active_scout_id
+        self.get_logger().info(
+            'RL_ROLE_UPDATE | '
+            f'robot={self.robot_name} role={self.desired_role} '
+            f'epoch={self.role_epoch} active_scout={self.active_scout_id or "(unset)"}'
+        )
         self._evaluate_gate()
 
     def _on_failover_state(self, msg: String) -> None:
@@ -340,6 +365,7 @@ class ScoutRLPolicyWorker(Node):
             sensor_ready=self.runtime.sensor_ready(),
             tf_ready=self.runtime.tf_ready(),
             require_failover_activation=self.require_failover_activation,
+            require_localization_ready=self.require_localization_ready,
         )
 
     def _evaluate_gate(self) -> None:
@@ -387,7 +413,10 @@ class ScoutRLPolicyWorker(Node):
             )
         elif state == RLWorkerState.ACTIVE:
             self.get_logger().warning(
-                f'SCOUT_NAV_AUTHORITY_RELEASED | robot={self.robot_name}'
+                'RL_ACTIVATION_GATE | '
+                f'robot={self.robot_name} role={self.desired_role} '
+                f'epoch={self.role_epoch} model=true scan=true map=true tf=true '
+                f'nav_idle={self.nav_goal_inactive}'
             )
         elif state == RLWorkerState.STANDBY:
             self.get_logger().warning(
