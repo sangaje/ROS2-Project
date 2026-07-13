@@ -131,8 +131,11 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'require_start_motion',
             default_value='true',
-            choices=['true'],
-            description='Final motion barrier is mandatory; role activation cannot disable it.',
+            choices=['true', 'false'],
+            description=(
+                'Hold RL hardware output until start_motion is true. ACTIVE_SCOUT '
+                'local startup may set this false and rely on local readiness gates.'
+            ),
         ),
         DeclareLaunchArgument(
             'start_motion_topic',
