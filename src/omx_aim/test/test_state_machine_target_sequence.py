@@ -7,7 +7,13 @@ from omx.types import State
 def _cfg(*, armed=True, lost_timeout_sec=3.0):
     return SimpleNamespace(
         autotrack=SimpleNamespace(default_armed=armed),
-        fire=SimpleNamespace(lost_timeout_sec=lost_timeout_sec, cooldown_sec=3.0),
+        fire=SimpleNamespace(
+            lost_timeout_sec=lost_timeout_sec,
+            cooldown_sec=3.0,
+            confirm_deadband_scale=1.0,
+            hold_time_sec=0.5,
+        ),
+        ibvs=SimpleNamespace(deadband_x=0.03, deadband_y=0.09),
         patrol=None,
     )
 
@@ -50,3 +56,14 @@ def test_tracking_holds_after_target_disappears_until_timeout():
     action = sm.update(False, None, 13.0, vision_valid=True)
     assert sm.state == State.IDLE
     assert action['action'] == 'target_lost'
+
+
+def test_confirming_immediately_resumes_pd_when_target_leaves_deadband():
+    sm = StateMachine(_cfg(armed=True))
+    sm.state = State.CONFIRMING
+
+    action = sm.update(True, (0.20, 0.02), 10.0, vision_valid=True)
+
+    assert sm.state == State.TRACKING
+    assert action['action'] == 'track'
+    assert action['error'] == (0.20, 0.02)

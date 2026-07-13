@@ -271,6 +271,7 @@ class OmxYoloNode(Node):
         self.pub_target_lost = self.create_publisher(PointStamped, '/omx/target_lost', 10)
         self.pub_target_blocked = self.create_publisher(PointStamped, '/omx/target_blocked', 10)
         self.pub_progress = self.create_publisher(Float32, '/omx/aim_progress', 10)
+        self.pub_aim_debug = self.create_publisher(String, '/omx/aim_debug', 10)
         # 카메라(팬/틸트)가 로봇 base 정면 기준으로 지금 어느 방향을
         # 보고 있는지 -- risk map 의 leader-visibility fusion 등 다른
         # 도메인 소비자가 "젯슨의 시야 = 로봇 정면"으로 잘못 가정하지
@@ -381,6 +382,7 @@ class OmxYoloNode(Node):
         self._last_nav_retry_t = 0.0
         self._nav_retry_period_sec = 1.0
         self._observation_sequence = 0
+        self._last_aim_debug_log_t = 0.0
 
         self.get_logger().info(
             f"Timer: 메인 {self.cfg.ibvs.control_hz} Hz, 상태 1 Hz")
@@ -1439,6 +1441,55 @@ class OmxYoloNode(Node):
         msg.z = 0.0
         self.pub_error.publish(msg)
 
+    def publish_aim_debug(
+        self,
+        *,
+        detected: bool,
+        error_norm,
+        action: dict,
+        track_moved,
+        confidence,
+    ) -> None:
+        payload = {
+            'state': self.sm.state.value,
+            'armed': bool(self.sm.armed),
+            'paused': bool(self.paused),
+            'detected': bool(detected),
+            'confidence': float(confidence or 0.0) if confidence is not None else None,
+            'action': str(action.get('action', 'wait')),
+            'track_requested': action.get('action') == 'track',
+            'track_moved': None if track_moved is None else bool(track_moved),
+            'error_norm': (
+                [float(error_norm[0]), float(error_norm[1])]
+                if error_norm is not None else None
+            ),
+            'deadband': [
+                float(self.cfg.ibvs.deadband_x),
+                float(self.cfg.ibvs.deadband_y),
+            ],
+            'aim_reference_offset_y_norm': float(
+                getattr(self.cfg.ibvs, 'aim_target_offset_y_norm', 0.0)
+            ),
+            'yaw_rad': float(getattr(self.ctrl, 'yaw', 0.0)),
+            'pitch_rad': float(getattr(self.ctrl, 'pitch', 0.0)),
+            'control_video_only': bool(getattr(self, '_control_video_only', False)),
+        }
+        msg = String()
+        msg.data = json.dumps(payload, sort_keys=True)
+        self.pub_aim_debug.publish(msg)
+        now = time.time()
+        if now - self._last_aim_debug_log_t >= 1.0 and (
+            detected or action.get('action') == 'track'
+        ):
+            self._last_aim_debug_log_t = now
+            self.get_logger().info(
+                'OMX_AIM_DEBUG | '
+                f"state={payload['state']} action={payload['action']} "
+                f"detected={payload['detected']} error={payload['error_norm']} "
+                f"moved={payload['track_moved']} armed={payload['armed']} "
+                f"video_only={payload['control_video_only']}"
+            )
+
     def publish_joint_state(self):
         try:
             positions = self.ctrl.read_joint_positions_rad()
@@ -1870,6 +1921,7 @@ class OmxYoloNode(Node):
         for entry in action.get('blocked_entries', []):
             self.publish_target_blocked(entry.coord_map, entry.type_name)
 
+        track_moved = None
         if not self.paused:
             if action['action'] == 'aim':
                 coord_map = action['coord_map']
@@ -1886,7 +1938,7 @@ class OmxYoloNode(Node):
                         f"AIM: map{coord_map} -> arm{coord_arm}")
 
             elif action['action'] == 'track':
-                self._controller_call(
+                track_moved = self._controller_call(
                     'step_ibvs', self.ctrl.step_ibvs, *action['error']
                 )
 
@@ -1943,6 +1995,13 @@ class OmxYoloNode(Node):
         )
         if error_norm is not None:
             self.publish_error(error_norm[0], error_norm[1])
+        self.publish_aim_debug(
+            detected=detected,
+            error_norm=error_norm,
+            action=action,
+            track_moved=track_moved,
+            confidence=conf,
+        )
         self.publish_joint_state()
         self.publish_camera_yaw()
         self.publish_progress(action.get('confirm_progress', 0.0))

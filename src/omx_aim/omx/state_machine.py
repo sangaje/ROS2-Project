@@ -959,6 +959,8 @@ class StateMachine:
                 self._log("CONFIRMING 중 이탈 -> TRACKING")
                 self.transition(State.TRACKING)
                 self.confirm_progress = 0.0
+                action['action'] = 'track'
+                action['error'] = error_norm
             else:
                 elapsed = now - self.confirm_start_t
                 self.confirm_progress = min(

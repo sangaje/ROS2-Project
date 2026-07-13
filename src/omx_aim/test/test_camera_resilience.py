@@ -70,6 +70,18 @@ def test_runtime_motor_fallback_is_visible_in_status_and_observation():
     assert "'control_video_only': bool" in node_source
 
 
+def test_omx_aim_debug_topic_exposes_pd_tracking_contract():
+    node_source = (
+        Path(__file__).parents[1] / 'omx_aim' / 'yolo_node.py'
+    ).read_text(encoding='utf-8')
+
+    assert "'/omx/aim_debug'" in node_source
+    assert 'def publish_aim_debug(' in node_source
+    assert "'track_requested': action.get('action') == 'track'" in node_source
+    assert "'track_moved': None if track_moved is None else bool(track_moved)" in node_source
+    assert "track_moved = self._controller_call(" in node_source
+
+
 def test_fire_disable_is_latched_and_not_republished_every_frame():
     package_root = Path(__file__).parents[1]
     node_source = (package_root / 'omx_aim' / 'yolo_node.py').read_text(
