@@ -596,7 +596,7 @@ def generate_launch_description():
                             'start_motion_topic': '/fleet/start_motion',
                             'require_system_ready': 'false',
                             'system_ready_topic': '/system/ready',
-                            'cmd_vel_topic': '/fleet/active_scout_rl_cmd',
+                            'cmd_vel_topic': DEFAULT_CMD_VEL_TOPIC,
                             'odom_topic': '/odom',
                             'max_odom_age_sec': '2.0',
                             'use_stamped_cmd_vel': 'true',

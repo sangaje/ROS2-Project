@@ -40,11 +40,10 @@ def test_leader_dashboard_is_the_single_start_motion_publisher():
     ]
 
 
-def test_default_system_launch_routes_rl_through_unified_motion_authority():
+def test_default_system_launch_routes_external_rl_directly_to_hardware_cmd_vel():
     launch = _read('src/system_bringup/launch/system.launch.py')
 
     assert "'external_rl_cmd_topic': '/fleet/active_scout_rl_cmd'" in launch
-    assert "'cmd_vel_topic': '/fleet/active_scout_rl_cmd'" in launch
     assert "'cmd_vel_topic': DEFAULT_CMD_VEL_TOPIC" in launch
 
 
