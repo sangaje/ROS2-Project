@@ -90,6 +90,6 @@ def test_follower_takeover_forwards_map_on_hidden_active_scout_bridge():
 
     assert "fleet_role_value == 'follower'" in text
     assert "fleet_launch_args['forward_map_to_main']" in text
-    assert "f'/{follower_robot_name.perform(context)}/map_bridge'" in text
+    assert "f'/field/{follower_robot_name.perform(context)}/map'" in text
     assert "'active_scout_id_topic': active_scout_id_topic" in leader_launch
     assert "'follower_input_topic': follower_map_bridge_topic" in leader_launch

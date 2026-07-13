@@ -13,8 +13,16 @@ import requests
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy, HistoryPolicy, ReliabilityPolicy
+from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import String
 
+from flask_yolo_bridge.observation_contract import (
+    PoseSample,
+    build_observation_metadata,
+    closest_pose_sample,
+    make_boot_id,
+    parse_role_payload,
+)
 from flask_yolo_bridge.ros_param_helpers import FlexibleParameterNodeMixin
 
 
@@ -72,11 +80,41 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         self.publish_empty_detections = self.declare_bool_parameter('publish_empty_detections', True)
         self.enable_role_gating = self.declare_bool_parameter('enable_role_gating', False)
         self.robot_name = str(self.declare_parameter('robot_name', '').value).strip()
+        self.boot_id = str(
+            self.declare_parameter('boot_id', make_boot_id()).value
+        ).strip() or make_boot_id()
+        self.initial_role = str(
+            self.declare_parameter('initial_role', 'ACTIVE_SCOUT').value
+        ).strip().upper() or 'ACTIVE_SCOUT'
+        self.current_role = self.initial_role
+        self.current_role_epoch = 0
         self.role_topic = str(self.declare_parameter('role_topic', '').value).strip()
+        self.pose_topic = str(
+            self.declare_parameter('pose_topic', '/member_pose').value
+        ).strip()
+        self.require_capture_pose = self.declare_bool_parameter(
+            'require_capture_pose',
+            True,
+        )
+        self.pose_history_duration_sec = float(
+            self.declare_parameter('pose_history_duration_sec', 8.0).value
+        )
+        self.max_pose_interpolation_error_sec = float(
+            self.declare_parameter('max_pose_interpolation_error_sec', 0.35).value
+        )
+        self.camera_hfov_deg = float(
+            self.declare_parameter('camera_hfov_deg', 62.0).value
+        )
+        self.camera_calibration_id = str(
+            self.declare_parameter('camera_calibration_id', '').value
+        ).strip()
         self.active_roles = {
             item.strip().upper()
             for item in str(
-                self.declare_parameter('active_roles', 'ACTIVE_SCOUT,SCOUT').value
+                self.declare_parameter(
+                    'active_roles',
+                    'ACTIVE_SCOUT,SCOUT,FOLLOWER,RECOVERING',
+                ).value
             ).split(',')
             if item.strip()
         }
@@ -106,7 +144,7 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
                 depth=1,
             ),
         )
-        if self.enable_role_gating:
+        if self.role_topic:
             role_qos = QoSProfile(
                 reliability=ReliabilityPolicy.RELIABLE,
                 durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -114,12 +152,16 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
                 depth=1,
             )
             self.create_subscription(String, self.role_topic, self.on_role, role_qos)
+        self.pose_history = deque()
+        self.pose_lock = threading.Lock()
+        self.create_subscription(PoseStamped, self.pose_topic, self.on_pose, 10)
         self.http = requests.Session()
 
         self.frame_condition = threading.Condition()
         self.latest_frame = None
         self.latest_capture_sec = 0.0
         self.latest_capture_mono_sec = 0.0
+        self.latest_observation_meta = {}
         self.latest_seq = 0
         self.sent_seq = 0
         self.publish_lock = threading.Lock()
@@ -131,6 +173,7 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         self.ok_count = 0
         self.fail_count = 0
         self.drop_count = 0
+        self.missing_pose_drop_count = 0
         self.last_log_wall_sec = 0.0
         self.ok_timestamps = deque(maxlen=120)
         self.active_device = ''
@@ -173,6 +216,8 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             f'max_http_roundtrip={self.max_http_roundtrip_sec:.2f}s '
             f'max_frame_age={self.max_frame_age_sec:.2f}s '
             f'role_gating={self.enable_role_gating} role_topic={self.role_topic or "none"} '
+            f'pose_topic={self.pose_topic} require_capture_pose={self.require_capture_pose} '
+            f'robot_id={self.robot_name or "unknown"} boot_id={self.boot_id} '
             f'camera_active={self.camera_active} active_roles={sorted(self.active_roles)} '
             f'latest_frame_only=true ros_image_publish=false'
         )
@@ -181,11 +226,11 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         raw = msg.data.strip()
         role = raw
         if raw.startswith('{'):
-            try:
-                payload = json.loads(raw)
-                role = str(payload.get('role', payload.get('status', raw)))
-            except json.JSONDecodeError:
-                role = raw
+            role, epoch = parse_role_payload(raw, self.current_role)
+            self.current_role = role
+            self.current_role_epoch = epoch
+        else:
+            self.current_role = raw.strip().upper()
         is_active = role.strip().upper() in self.active_roles
         if is_active == self.camera_active:
             return
@@ -203,6 +248,48 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         self.get_logger().warning(
             f'OPENCV_CAMERA_ROLE_GATE | role={role} active={self.camera_active} '
             f'robot={self.robot_name or "unknown"}'
+        )
+
+    @staticmethod
+    def stamp_to_sec(stamp) -> float:
+        try:
+            return float(stamp.sec) + float(stamp.nanosec) * 1e-9
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def yaw_from_quaternion(q) -> float:
+        import math
+        return math.atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z),
+        )
+
+    def on_pose(self, msg: PoseStamped) -> None:
+        stamp_sec = self.stamp_to_sec(msg.header.stamp)
+        if stamp_sec <= 0.0:
+            stamp_sec = self.get_clock().now().nanoseconds * 1e-9
+        p = msg.pose.position
+        q = msg.pose.orientation
+        sample = PoseSample(
+            stamp_sec=stamp_sec,
+            x=float(p.x),
+            y=float(p.y),
+            yaw=self.yaw_from_quaternion(q),
+        )
+        cutoff = stamp_sec - max(1.0, self.pose_history_duration_sec)
+        with self.pose_lock:
+            self.pose_history.append(sample)
+            while len(self.pose_history) > 2 and self.pose_history[0].stamp_sec < cutoff:
+                self.pose_history.popleft()
+
+    def lookup_capture_pose(self, capture_sec: float):
+        with self.pose_lock:
+            samples = list(self.pose_history)
+        return closest_pose_sample(
+            samples,
+            capture_sec,
+            self.max_pose_interpolation_error_sec,
         )
 
     def camera_candidates(self):
@@ -331,6 +418,23 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             self.read_fail_streak = 0
             capture_sec = self.get_clock().now().nanoseconds * 1e-9
             capture_mono_sec = time.monotonic()
+            pose, pose_error_sec = self.lookup_capture_pose(capture_sec)
+            if pose is None and self.require_capture_pose:
+                self.drop_count += 1
+                self.missing_pose_drop_count += 1
+                self.get_logger().warn(
+                    'OBSERVATION_MISSING_POSE_DROPPED | '
+                    f'robot_id={self.robot_name or "unknown"} '
+                    f'seq_candidate={self.latest_seq + 1} '
+                    f'capture_ros_sec={capture_sec:.6f} '
+                    f'pose_topic={self.pose_topic} '
+                    f'max_error_sec={self.max_pose_interpolation_error_sec:.3f}',
+                    throttle_duration_sec=2.0,
+                )
+                continue
+            if pose is None:
+                pose = PoseSample(capture_sec, 0.0, 0.0, 0.0)
+                pose_error_sec = float('inf')
             with self.frame_condition:
                 if self.latest_frame is not None and self.latest_seq != self.sent_seq:
                     self.drop_count += 1
@@ -338,6 +442,23 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
                 self.latest_capture_sec = capture_sec
                 self.latest_capture_mono_sec = capture_mono_sec
                 self.latest_seq += 1
+                self.latest_observation_meta = build_observation_metadata(
+                    robot_id=self.robot_name or f'robot_domain_{os.environ.get("ROS_DOMAIN_ID", "unknown")}',
+                    boot_id=self.boot_id,
+                    sequence=self.latest_seq,
+                    role=self.current_role,
+                    role_epoch=self.current_role_epoch,
+                    frame_id=self.frame_id,
+                    camera_hfov_deg=self.camera_hfov_deg,
+                    capture_ros_sec=capture_sec,
+                    capture_wall_sec=time.time(),
+                    capture_mono_sec=capture_mono_sec,
+                    pose=pose,
+                    pose_time_error_sec=pose_error_sec,
+                    image_width=0,
+                    image_height=0,
+                    calibration_id=self.camera_calibration_id,
+                )
                 self.rx_count += 1
                 self.frame_condition.notify()
 
@@ -359,12 +480,13 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
                         self.latest_capture_sec,
                         self.latest_capture_mono_sec,
                         self.latest_seq,
+                        dict(getattr(self, 'latest_observation_meta', {}) or {}),
                     )
                 timeout = 0.1
                 if self.latest_frame is not None and now < next_allowed:
                     timeout = max(0.001, min(0.1, next_allowed - now))
                 self.frame_condition.wait(timeout=timeout)
-        return None, 0.0, 0.0, 0
+        return None, 0.0, 0.0, 0, {}
 
     def encode_jpeg(self, frame) -> bytes:
         import cv2
@@ -391,12 +513,12 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
                 time.sleep(0.1)
                 next_allowed = 0.0
                 continue
-            frame, capture_sec, capture_mono_sec, seq = self.wait_latest_frame(next_allowed)
+            frame, capture_sec, capture_mono_sec, seq, meta = self.wait_latest_frame(next_allowed)
             if frame is None:
                 continue
             next_allowed = time.monotonic() + period
             try:
-                self.post_frame(frame, capture_sec, capture_mono_sec, seq)
+                self.post_frame(frame, capture_sec, capture_mono_sec, seq, meta)
             except Exception as exc:
                 self.fail_count += 1
                 self.reset_http_session()
@@ -413,7 +535,7 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             pass
         self.http = requests.Session()
 
-    def post_frame(self, frame, capture_sec: float, capture_mono_sec: float, seq: int):
+    def post_frame(self, frame, capture_sec: float, capture_mono_sec: float, seq: int, meta: dict):
         frame_age_before_send = time.monotonic() - capture_mono_sec if capture_mono_sec > 0.0 else 0.0
         if self.max_frame_age_sec > 0.0 and frame_age_before_send > self.max_frame_age_sec:
             self.drop_count += 1
@@ -428,12 +550,14 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         jpeg, w, h = self.encode_jpeg(frame)
         self.sent_count += 1
         files = {'image': ('frame.jpg', jpeg, 'image/jpeg')}
-        data = {
+        data = dict(meta or {})
+        data.update({
             'frame_id': self.frame_id,
             'capture_ros_sec': f'{capture_sec:.9f}' if capture_sec > 0.0 else '',
-            'capture_wall_sec': f'{time.time() - frame_age_before_send:.9f}',
             'robot_frame_age_ms_at_send': f'{frame_age_before_send * 1000.0:.3f}',
-        }
+            'image_width': str(int(w)),
+            'image_height': str(int(h)),
+        })
         request_start = time.monotonic()
         resp = self.http.post(
             self.server_url,
@@ -492,6 +616,20 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             payload['image_height'] = int(payload.get('image_height') or h)
             payload['ros_frame_id'] = self.frame_id
             payload['capture_ros_sec'] = capture_sec
+            payload.setdefault('robot_id', data.get('robot_id', self.robot_name))
+            payload.setdefault('boot_id', data.get('boot_id', self.boot_id))
+            payload.setdefault('sequence', int(seq))
+            payload.setdefault('role', data.get('role', self.current_role))
+            payload.setdefault('role_epoch', int(data.get('role_epoch', self.current_role_epoch) or 0))
+            payload.setdefault('capture_pose', {
+                'x': float(data.get('capture_pose_x', 0.0)),
+                'y': float(data.get('capture_pose_y', 0.0)),
+                'yaw': float(data.get('capture_pose_yaw', 0.0)),
+                'stamp_sec': float(data.get('capture_pose_stamp_sec', capture_sec or 0.0)),
+            })
+            payload.setdefault('pose_time_error_ms', float(data.get('pose_time_error_ms', -1.0)))
+            payload.setdefault('capture_to_send_delay_ms', float(data.get('capture_to_send_delay_ms', -1.0)))
+            payload.setdefault('camera_hfov_deg', float(data.get('camera_hfov_deg', self.camera_hfov_deg)))
             payload['robot_bridge_wall_sec'] = time.time()
             payload['robot_frame_age_ms'] = total_frame_age_sec * 1000.0
             payload['http_roundtrip_ms'] = roundtrip_sec * 1000.0
@@ -517,6 +655,7 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         self.get_logger().info(
             f'OPENCV_HTTP_YOLO_STATUS | captured={self.rx_count} sent={self.sent_count} '
             f'ok={self.ok_count} fail={self.fail_count} replaced={self.drop_count} '
+            f'missing_pose={self.missing_pose_drop_count} '
             f'output_fps={output_fps:.2f} out={self.output_topic}'
         )
 

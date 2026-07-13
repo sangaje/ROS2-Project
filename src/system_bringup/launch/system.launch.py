@@ -330,7 +330,7 @@ def generate_launch_description():
                 follower_robot_name.perform(context)
             )
             fleet_launch_args['follower_map_bridge_topic'] = (
-                f'/{follower_robot_name.perform(context)}/map_bridge'
+                f'/field/{follower_robot_name.perform(context)}/map'
             )
         if fleet_role_value in ('follower', 'member'):
             fleet_launch_args['auto_localize'] = (
@@ -630,8 +630,12 @@ def generate_launch_description():
                                 ),
                                 'detection_source': 'flask_topic',
                                 'external_detection_topic': (
-                                    external_detection_topic.perform(context)
+                                    f'/field/{active_scout_robot_name.perform(context)}/risk_observation'
                                 ),
+                                'observation_topics': [
+                                    f'/field/{active_scout_robot_name.perform(context)}/risk_observation',
+                                    f'/field/{follower_robot_name.perform(context)}/risk_observation',
+                                ],
                                 'enable_yolo': False,
                                 'publish_overlay': False,
                                 'publish_debug_image': False,
@@ -670,7 +674,11 @@ def generate_launch_description():
                 actions.append(LogInfo(msg=[
                     'SYSTEM_BRINGUP | leader Jetson owns Bayesian risk map; ',
                     'source pose=', scout_pose_topic.perform(context),
-                    ' detection=', external_detection_topic.perform(context),
+                    ' observations=/field/',
+                    active_scout_robot_name.perform(context),
+                    '/risk_observation,/field/',
+                    follower_robot_name.perform(context),
+                    '/risk_observation',
                     ' map=/map',
                 ]))
 
@@ -1027,6 +1035,7 @@ def generate_launch_description():
             return actions
 
         camera_sender_on = launch_bool(start_camera_sender.perform(context))
+        field_observation_topic = f'/field/{scout_robot_name}/risk_observation'
 
         if (
             launch_bool(start_risk_map.perform(context))
@@ -1113,7 +1122,7 @@ def generate_launch_description():
                 launch_arguments={
                     'device': camera_sender_device.perform(context),
                     'server_url': flask_server_url.perform(context),
-                    'output_topic': external_detection_topic.perform(context),
+                    'output_topic': field_observation_topic,
                     'width': '1920',
                     'height': '1080',
                     'send_width': '1280',
@@ -1129,13 +1138,23 @@ def generate_launch_description():
                     'max_frame_age_sec': '1.5',
                     'enable_role_gating': 'true' if role_gating_on else 'false',
                     'robot_name': scout_robot_name,
+                    'initial_role': (
+                        'FOLLOWER' if fleet_role_value == 'follower'
+                        else 'ACTIVE_SCOUT'
+                    ),
                     'role_topic': f'/{scout_robot_name}/role',
+                    'pose_topic': (
+                        '/burger_pose' if fleet_role_value == 'follower'
+                        else '/member_pose'
+                    ),
+                    'require_capture_pose': 'true',
+                    'camera_hfov_deg': leader_scan_fov_deg.perform(context),
                     'initial_role_active': (
                         'true'
-                        if (not role_gating_on or fleet_role_value == 'member')
+                        if (not role_gating_on or fleet_role_value in ('member', 'follower'))
                         else 'false'
                     ),
-                    'active_roles': 'ACTIVE_SCOUT,SCOUT',
+                    'active_roles': 'ACTIVE_SCOUT,SCOUT,FOLLOWER,RECOVERING',
                 }.items(),
             ))
 
@@ -1254,13 +1273,12 @@ def generate_launch_description():
             ),
         ),
         DeclareLaunchArgument(
-            'start_risk_map', default_value='true',
+            'start_risk_map', default_value='false',
             choices=['true', 'false'],
             description=(
-                'Scout only: turn on the Bayesian risk map stack. Default '
-                'true restores Scout-owned Cartographer/risk processing; '
-                'local YOLO/camera capture remain disabled when '
-                'start_camera_sender:=true.'
+                'Deprecated Field Robot local Bayesian risk map switch. '
+                'Default false: Bayesian risk map is centralized on the '
+                'Leader domain; Field Robots may still run Cartographer.'
             ),
         ),
         DeclareLaunchArgument(

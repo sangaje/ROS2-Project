@@ -231,7 +231,7 @@ def generate_launch_description():
                 output='screen',
                 parameters=[{
                     'use_sim_time': False,
-                    'input_topic': '/map_bridge',
+                    'input_topic': f'/field/{active_scout_robot_name.perform(context)}/map',
                     'output_topic': '/map',
                     'check_period_sec': 0.2,
                     'takeover_grace_sec': 0.0,
@@ -803,7 +803,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'follower_map_bridge_topic',
-            default_value='/follower21/map_bridge',
+            default_value='/field/follower21/map',
             description='Leader-domain follower SLAM map input selected after takeover.',
         ),
         DeclareLaunchArgument('leader_initial_x', default_value='0.0'),

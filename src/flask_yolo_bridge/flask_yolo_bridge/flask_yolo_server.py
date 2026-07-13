@@ -13,6 +13,8 @@ from pathlib import Path
 
 import numpy as np
 
+from flask_yolo_bridge.observation_contract import echo_observation_metadata
+
 
 class InferenceBusyError(RuntimeError):
     pass
@@ -709,6 +711,7 @@ def build_app(args):
         capture_ros_sec = float(request.form.get('capture_ros_sec') or 0.0)
         capture_wall_sec = float(request.form.get('capture_wall_sec') or 0.0)
         robot_frame_age_ms_at_send = float(request.form.get('robot_frame_age_ms_at_send') or -1.0)
+        observation_meta = echo_observation_metadata(request.form)
         raw_age_sec = _request_capture_age_sec(request)
         capture_age_ms = max(0.0, raw_age_sec * 1000.0) if raw_age_sec >= 0.0 else -1.0
 
@@ -793,7 +796,7 @@ def build_app(args):
             inference_ok=True, status_text='YOLO OK',
         )
 
-        return jsonify({
+        response_payload = {
             'ok': True,
             'stamp_wall_sec': time.time(),
             'latency_ms': inference_ms,
@@ -808,7 +811,9 @@ def build_app(args):
             'image_height': int(h),
             'detections': detections,
             'debug_url': f'http://127.0.0.1:{args.port}/',
-        })
+        }
+        response_payload.update(observation_meta)
+        return jsonify(response_payload)
 
     return app
 

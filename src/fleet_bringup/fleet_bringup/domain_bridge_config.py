@@ -245,17 +245,20 @@ def write_fleet_bridge_configs(
             'std_msgs/msg/String',
             profile=qos(durability='transient_local', depth=1),
         ),
+        f'/field/follower{int(follower_domain)}/risk_observation': topic(
+            'std_msgs/msg/String',
+            profile=qos(reliability='best_effort', durability='volatile', depth=5),
+        ),
         '/burger_scan_relay': topic(
             'sensor_msgs/msg/LaserScan',
             remap=f'/follower{int(follower_domain)}/scan',
             profile=qos('best_effort'),
         ),
-        **risk_topics(),
     }
     if forward_map_to_main:
         follower_topics['/map'] = topic(
             'nav_msgs/msg/OccupancyGrid',
-            remap=f'/follower{int(follower_domain)}/map_bridge',
+            remap=f'/field/follower{int(follower_domain)}/map',
             profile=map_qos(depth=5),
         )
         follower_topics['/rl_confidence_map'] = topic(
@@ -381,13 +384,17 @@ def write_member_bridge_configs(
             'std_msgs/msg/String',
             profile=qos(durability='transient_local', depth=1),
         ),
+        f'/field/scout{int(member_domain)}/risk_observation': topic(
+            'std_msgs/msg/String',
+            profile=qos(reliability='best_effort', durability='volatile', depth=5),
+        ),
     }
     if forward_risk_to_main:
         member_topics.update(risk_topics())
     if forward_map_to_main:
         member_topics['/map'] = topic(
             'nav_msgs/msg/OccupancyGrid',
-            remap='/map_bridge',
+            remap=f'/field/scout{int(member_domain)}/map',
             profile=map_qos(depth=5),
         )
         member_topics['/rl_confidence_map'] = topic(
@@ -455,7 +462,7 @@ def write_risk_to_leader_bridge_config(
     if include_map:
         topics['/map'] = topic(
             'nav_msgs/msg/OccupancyGrid',
-            remap='/map_bridge',
+            remap=f'/field/scout{int(risk_domain)}/map',
             profile=map_qos(depth=5),
         )
         topics['/rl_confidence_map'] = topic(

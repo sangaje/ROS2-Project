@@ -57,19 +57,10 @@ def test_real_bridge_directions_and_control_qos(tmp_path):
     assert follower['topics']['/burger_scan_relay']['remap'] == (
         '/follower25/scan'
     )
-    assert follower['topics']['/risk/risk_map']['type'] == (
-        'nav_msgs/msg/OccupancyGrid'
-    )
-    assert follower['topics']['/risk/risk_map']['qos']['durability'] == (
-        'transient_local'
-    )
-    assert follower['topics']['/risk/risk_map']['qos']['depth'] == 1
-    assert follower['topics']['/risk/person_probability_map']['type'] == (
-        'nav_msgs/msg/OccupancyGrid'
-    )
-    assert follower['topics']['/risk/evidence_markers']['type'] == (
-        'visualization_msgs/msg/MarkerArray'
-    )
+    assert '/risk/risk_map' not in follower['topics']
+    assert '/risk/person_probability_map' not in follower['topics']
+    assert '/risk/evidence_markers' not in follower['topics']
+    assert '/field/follower25/risk_observation' in follower['topics']
     assert '/clock' not in main['topics']
     assert '/cmd_vel' not in follower['topics']
     assert main['topics']['/scout22/rl_confidence_map']['remap'] == (
@@ -166,7 +157,7 @@ def test_member_bridge_can_forward_owned_map_to_main(tmp_path):
 
     assert (member['from_domain'], member['to_domain']) == (22, 20)
     assert member['topics']['/map']['type'] == 'nav_msgs/msg/OccupancyGrid'
-    assert member['topics']['/map']['remap'] == '/map_bridge'
+    assert member['topics']['/map']['remap'] == '/field/scout22/map'
     assert member['topics']['/map']['qos']['reliability'] == 'reliable'
     assert member['topics']['/map']['qos']['durability'] == 'transient_local'
 
@@ -182,7 +173,7 @@ def test_follower_bridge_can_forward_owned_map_to_main(tmp_path):
 
     assert (follower['from_domain'], follower['to_domain']) == (21, 20)
     assert follower['topics']['/map']['type'] == 'nav_msgs/msg/OccupancyGrid'
-    assert follower['topics']['/map']['remap'] == '/follower21/map_bridge'
+    assert follower['topics']['/map']['remap'] == '/field/follower21/map'
     assert follower['topics']['/map']['qos']['reliability'] == 'reliable'
     assert follower['topics']['/map']['qos']['durability'] == 'transient_local'
     assert follower['topics']['/rl_confidence_map']['remap'] == (
@@ -199,7 +190,7 @@ def test_risk_to_leader_bridge_is_one_way_map_source(tmp_path):
     config = yaml.safe_load(path.read_text())
 
     assert (config['from_domain'], config['to_domain']) == (22, 24)
-    assert config['topics']['/map']['remap'] == '/map_bridge'
+    assert config['topics']['/map']['remap'] == '/field/scout22/map'
     assert config['topics']['/rl_confidence_map']['remap'] == (
         '/scout22/rl_confidence_map'
     )

@@ -148,6 +148,20 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         # YOLO
         self.detection_source = str(self.declare_parameter('detection_source', 'local_yolo').value).strip().lower()
         self.external_detection_topic = self.declare_parameter('external_detection_topic', '/risk/yolo_detections').value
+        observation_topics_raw = self.declare_parameter(
+            'observation_topics',
+            [],
+        ).value
+        if isinstance(observation_topics_raw, str):
+            self.observation_topics = [
+                item.strip() for item in observation_topics_raw.split(',')
+                if item.strip()
+            ]
+        else:
+            self.observation_topics = [
+                str(item).strip() for item in (observation_topics_raw or [])
+                if str(item).strip()
+            ]
         # Target model contract: model/target_v3 class 0 is the target.
         # Keep external_person_only declared for backwards-compatible old launch files,
         # but select detections exclusively by the explicit target class below.
@@ -567,6 +581,11 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.yolo_drop_count = 0
 
         self.external_detection_rx_count = 0
+        self.external_observation_missing_pose_dropped = 0
+        self.external_observation_duplicate_dropped = 0
+        self.external_observation_out_of_order_dropped = 0
+        self.external_observation_boot_id_by_robot = {}
+        self.external_observation_seq_by_robot = {}
         self.image_rx_count = 0
         self.yolo_frame_count = 0
         self.yolo_det_count = 0
@@ -665,18 +684,22 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             )
         self.image_sub = None
         self.external_detection_sub = None
+        self.external_detection_subs = []
         self.use_opencv_camera = False
         if self.detection_source in ('local_yolo', 'ros_image', 'image'):
             self.image_sub = self.create_subscription(Image, self.image_topic, self.on_image, self.qos_sensor_sub)
         elif self.detection_source in ('opencv_camera', 'direct_camera', 'cv2_camera', 'cv2'):
             self.use_opencv_camera = True
         elif self.detection_source in ('flask_topic', 'external', 'json'):
-            self.external_detection_sub = self.create_subscription(
-                String,
-                self.external_detection_topic,
-                self.on_external_detections,
-                self.qos_latest_best_effort,
-            )
+            topics = self.observation_topics or [self.external_detection_topic]
+            for topic_name in topics:
+                self.external_detection_subs.append(self.create_subscription(
+                    String,
+                    topic_name,
+                    self.on_external_detections,
+                    self.qos_latest_best_effort,
+                ))
+            self.external_detection_sub = self.external_detection_subs[0]
             self.enable_yolo = False
         elif self.detection_source in ('none', 'fake'):
             self.enable_yolo = False
@@ -684,12 +707,15 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             self.get_logger().warn(
                 f'unknown detection_source={self.detection_source}; falling back to flask_topic on {self.external_detection_topic}'
             )
-            self.external_detection_sub = self.create_subscription(
-                String,
-                self.external_detection_topic,
-                self.on_external_detections,
-                self.qos_latest_best_effort,
-            )
+            topics = self.observation_topics or [self.external_detection_topic]
+            for topic_name in topics:
+                self.external_detection_subs.append(self.create_subscription(
+                    String,
+                    topic_name,
+                    self.on_external_detections,
+                    self.qos_latest_best_effort,
+                ))
+            self.external_detection_sub = self.external_detection_subs[0]
             self.enable_yolo = False
         self.clear_point_sub = self.create_subscription(PointStamped, '/risk/clear_point', self.on_clear_point, 10)
         self.clear_all_sub = self.create_subscription(Bool, '/risk/clear_all', self.on_clear_all, 10)
@@ -1711,6 +1737,36 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         if not isinstance(raw_dets, list):
             self.get_logger().warn('external detection ignored: detections is not a list', throttle_duration_sec=2.0)
             return
+        robot_id = str(payload.get('robot_id', payload.get('robot', 'unknown'))).strip() or 'unknown'
+        boot_id = str(payload.get('boot_id', '')).strip()
+        try:
+            observation_seq = int(payload.get('sequence', payload.get('observation_id', -1)))
+        except (TypeError, ValueError):
+            observation_seq = -1
+        if boot_id:
+            previous_boot = self.external_observation_boot_id_by_robot.get(robot_id)
+            if previous_boot and previous_boot != boot_id:
+                self.external_observation_seq_by_robot[robot_id] = -1
+            self.external_observation_boot_id_by_robot[robot_id] = boot_id
+        previous_seq = self.external_observation_seq_by_robot.get(robot_id, -1)
+        if observation_seq >= 0 and observation_seq == previous_seq:
+            self.external_observation_duplicate_dropped += 1
+            self.get_logger().warn(
+                'OBSERVATION_DUPLICATE_DROPPED | '
+                f'robot_id={robot_id} boot_id={boot_id or "unknown"} '
+                f'sequence={observation_seq}',
+                throttle_duration_sec=2.0,
+            )
+            return
+        if observation_seq >= 0 and observation_seq < previous_seq:
+            self.external_observation_out_of_order_dropped += 1
+            self.get_logger().warn(
+                'OBSERVATION_OUT_OF_ORDER_DROPPED | '
+                f'robot_id={robot_id} boot_id={boot_id or "unknown"} '
+                f'sequence={observation_seq} latest={previous_seq}',
+                throttle_duration_sec=2.0,
+            )
+            return
         max_count = max(1, int(self.external_detection_max_count))
         if len(raw_dets) > max_count:
             self.get_logger().warn(
@@ -1774,6 +1830,16 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         )
         yolo_latency_ms = self.payload_float(payload, 'latency_ms', -1.0)
         http_roundtrip_ms = self.payload_float(payload, 'http_roundtrip_ms', -1.0)
+        capture_pose = self.parse_payload_capture_pose(payload)
+        if capture_pose is None:
+            self.external_observation_missing_pose_dropped += 1
+            self.get_logger().warn(
+                'OBSERVATION_MISSING_POSE_DROPPED | '
+                f'robot_id={robot_id} boot_id={boot_id or "unknown"} '
+                f'sequence={observation_seq} capture_source={capture_source}',
+                throttle_duration_sec=2.0,
+            )
+            return
         with self.detection_lock:
             self.yolo_frame_count += 1
             self.yolo_det_count += len(detections)
@@ -1781,9 +1847,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             self.latest_detection_seq += 1
             self.last_yolo_ros_sec = self.get_clock().now().nanoseconds * 1e-9
             self.latest_detection_capture_sec = capture_sec if capture_sec > 0.0 else None
-            self.latest_detection_pose = self.lookup_pose_at(capture_sec)
-            if self.latest_detection_pose is None:
-                self.latest_detection_pose = self.get_robot_pose()
+            self.latest_detection_pose = capture_pose
             if capture_sec > 0.0:
                 self.latest_detection_delay_ms = max(
                     0.0, (self.last_yolo_ros_sec - capture_sec) * 1000.0
@@ -1793,9 +1857,31 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             self.latest_detection_image_delay_ms = image_delay_ms
             self.latest_detection_yolo_latency_ms = yolo_latency_ms
             self.latest_detection_http_roundtrip_ms = http_roundtrip_ms
-            self.latest_detection_capture_source = capture_source
+            self.latest_detection_capture_source = f'{capture_source}:{robot_id}'
+            if observation_seq >= 0:
+                self.external_observation_seq_by_robot[robot_id] = observation_seq
         self.last_image_shape = f'{image_w}x{image_h} flask_json'
         self.last_image_encoding = 'external_json'
+
+    def parse_payload_capture_pose(self, payload):
+        pose = payload.get('capture_pose')
+        if isinstance(pose, dict):
+            try:
+                return (
+                    float(pose['x']),
+                    float(pose['y']),
+                    float(pose.get('yaw', 0.0)),
+                )
+            except (KeyError, TypeError, ValueError):
+                return None
+        try:
+            return (
+                float(payload['capture_pose_x']),
+                float(payload['capture_pose_y']),
+                float(payload.get('capture_pose_yaw', 0.0)),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
 
     def maybe_make_fake_detection(self):
         if not self.enable_fake_detection:
