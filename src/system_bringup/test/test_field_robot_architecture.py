@@ -29,10 +29,13 @@ def test_system_launch_routes_field_observations_to_robot_topics():
 
     assert "field_observation_topic = f'/field/{scout_robot_name}/risk_observation'" in source
     assert "'output_topic': field_observation_topic" in source
-    assert "'active_max_upload_mbps': '0.5' if follower_camera_mode else '3.0'" in source
-    assert "'width': '320' if follower_camera_mode else '640'" in source
+    assert "'active_max_upload_mbps': '2.5'" in source
+    assert "'standby_max_upload_mbps': '0.8'" in source
+    assert "'width': '640'" in source
+    assert "'height': '480'" in source
     assert "'pose_topic': (" in source
-    assert "'active_roles': 'ACTIVE_SCOUT,SCOUT,FOLLOWER,RECOVERING'" in source
+    assert "'active_roles': 'ACTIVE_SCOUT,SCOUT,RECOVERING'" in source
+    assert "'standby_roles': 'FOLLOWER,IDLE,TAKEOVER_PENDING'" in source
     assert "'observation_topics': [" in source
     assert "f'/field/{active_scout_robot_name.perform(context)}/risk_observation'" in source
     assert "f'/field/{follower_robot_name.perform(context)}/risk_observation'" in source

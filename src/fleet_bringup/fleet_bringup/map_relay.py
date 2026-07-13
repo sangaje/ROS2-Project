@@ -49,6 +49,8 @@ class MapRelay(Node):
         self.declare_parameter('primary_scout_id', 'scout22')
         self.declare_parameter('follower_scout_id', 'follower21')
         self.declare_parameter('follower_input_topic', '')
+        self.declare_parameter('robot_role', '')
+        self.declare_parameter('local_map_outbound', False)
 
         self.input_topic = str(self.get_parameter('input_topic').value)
         self.output_topic = str(self.get_parameter('output_topic').value)
@@ -79,6 +81,10 @@ class MapRelay(Node):
         self.follower_input_topic = str(
             self.get_parameter('follower_input_topic').value
         ).strip()
+        self.robot_role = str(self.get_parameter('robot_role').value).strip()
+        self.local_map_outbound = bool(
+            self.get_parameter('local_map_outbound').value
+        )
         self.active_scout_id = self.primary_scout_id
 
         pub_qos = QoSProfile(
@@ -110,6 +116,7 @@ class MapRelay(Node):
         self._last_published_signature = None
         self._last_publish_mono_sec = 0.0
         self._pending_rate_limited = False
+        self._last_status_log_sec = 0.0
 
         self._pub = self.create_publisher(
             OccupancyGrid, self.output_topic, pub_qos
@@ -273,6 +280,7 @@ class MapRelay(Node):
             return
 
         now = self._now_sec()
+        self._log_map_status(now)
         external = self._external_publisher_count()
 
         if external > 0:
@@ -380,6 +388,22 @@ class MapRelay(Node):
             throttle_duration_sec=10.0,
         )
         return True
+
+    def _log_map_status(self, now_sec: float) -> None:
+        if now_sec - self._last_status_log_sec < 10.0:
+            return
+        self._last_status_log_sec = now_sec
+        shared_input = self.input_topic in ('/shared_map_in', '/map_bridge')
+        shared_rx = bool(self._latest_bridged is not None and shared_input)
+        self.get_logger().info(
+            'FOLLOWER_MAP_STATUS | '
+            f'role={self.robot_role or "unknown"} '
+            f'shared_map_rx={str(shared_rx).lower()} '
+            'shared_map_outbound=false '
+            f'local_slam_map_rx={str(self._latest_follower is not None).lower()} '
+            f'local_map_outbound={str(self.local_map_outbound).lower()} '
+            f'input_topic={self.input_topic} output_topic={self.output_topic}'
+        )
 
 
 def main():

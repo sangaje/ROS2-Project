@@ -210,6 +210,7 @@ def test_new_bridged_maps_are_republished_immediately_while_relaying():
     node = make_node()
     try:
         published = []
+        node.min_publish_period_sec = 0.0
         node._pub.publish = lambda msg: published.append(msg)
         now = [0.0]
         node._now_sec = lambda: now[0]
@@ -254,6 +255,7 @@ def test_relay_publishes_when_map_payload_changes():
     node = make_node()
     try:
         published = []
+        node.min_publish_period_sec = 0.0
         node._pub.publish = lambda msg: published.append(msg)
         now = [0.0]
         node._now_sec = lambda: now[0]
@@ -281,6 +283,7 @@ def test_relay_selects_follower_map_after_active_scout_takeover():
         node.follower_input_topic = '/follower21/map_bridge'
         node.follower_scout_id = 'follower21'
         published = []
+        node.min_publish_period_sec = 0.0
         node._pub.publish = lambda msg: published.append(msg)
         node.relay_without_primary = True
         node._relaying = True
@@ -316,6 +319,7 @@ def test_relay_does_not_republish_its_own_stale_output_over_fresh_bridge():
     node = make_node()
     try:
         published = []
+        node.min_publish_period_sec = 0.0
 
         def publish(msg):
             published.append(msg)

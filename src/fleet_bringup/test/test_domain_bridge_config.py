@@ -1,6 +1,7 @@
 import yaml
 
 from fleet_bringup.domain_bridge_config import (
+    validate_no_bridge_feedback_cycles,
     validate_no_duplicate_bridge_routes,
     write_leader_to_pc_bridge_config,
     write_field_robot_candidate_bridge_configs,
@@ -37,7 +38,10 @@ def test_real_bridge_directions_and_control_qos(tmp_path):
     assert main['topics']['/fleet/start_motion_detail']['qos']['durability'] == (
         'transient_local'
     )
-    assert '/system/ready' not in main['topics']
+    assert main['topics']['/system/ready']['type'] == 'std_msgs/msg/Bool'
+    assert main['topics']['/system/ready']['qos']['durability'] == (
+        'transient_local'
+    )
     assert '/fleet/dashboard_ui_ready' not in main['topics']
     assert main['topics']['/fleet/robot_poses']['type'] == (
         'geometry_msgs/msg/PoseArray'
@@ -70,9 +74,9 @@ def test_real_bridge_directions_and_control_qos(tmp_path):
     assert '/field/follower25/risk_observation' in follower['topics']
     assert '/clock' not in main['topics']
     assert '/cmd_vel' not in follower['topics']
-    assert main['topics']['/scout22/rl_confidence_map']['remap'] == (
-        '/rl_confidence_seed'
-    )
+    assert main['topics']['/map']['remap'] == '/shared_map_in'
+    assert '/scout22/rl_confidence_map' not in main['topics']
+    assert '/rl_confidence_seed' not in main['topics']
 
 
 def test_simulation_bridge_adds_only_simulation_transport_topics(tmp_path):
@@ -127,7 +131,7 @@ def test_member_bridge_keeps_risk_topics_off_the_default_pose_status_path(tmp_pa
     assert main['topics']['/fleet/start_motion']['qos']['durability'] == (
         'transient_local'
     )
-    assert '/system/ready' not in main['topics']
+    assert main['topics']['/system/ready']['type'] == 'std_msgs/msg/Bool'
     assert '/system/readiness' not in main['topics']
     assert main['topics']['/fleet/robot_poses']['type'] == (
         'geometry_msgs/msg/PoseArray'
@@ -182,13 +186,54 @@ def test_follower_bridge_can_forward_owned_map_to_main(tmp_path):
     follower = yaml.safe_load(follower_path.read_text())
 
     assert (follower['from_domain'], follower['to_domain']) == (21, 20)
-    assert follower['topics']['/map']['type'] == 'nav_msgs/msg/OccupancyGrid'
-    assert follower['topics']['/map']['remap'] == '/field/follower21/map'
-    assert follower['topics']['/map']['qos']['reliability'] == 'reliable'
-    assert follower['topics']['/map']['qos']['durability'] == 'transient_local'
-    assert follower['topics']['/rl_confidence_map']['remap'] == (
-        '/follower21/rl_confidence_map'
-    )
+    assert follower['topics']['/local_slam_map']['type'] == 'nav_msgs/msg/OccupancyGrid'
+    assert follower['topics']['/local_slam_map']['remap'] == '/field/follower21/map'
+    assert follower['topics']['/local_slam_map']['qos']['reliability'] == 'reliable'
+    assert follower['topics']['/local_slam_map']['qos']['durability'] == 'transient_local'
+    assert '/map' not in follower['topics']
+    assert '/rl_confidence_map' not in follower['topics']
+
+
+def test_bridge_cycle_validator_rejects_map_echo_loop():
+    main_config = {
+        'name': 'main_to_follower',
+        'from_domain': 20,
+        'to_domain': 21,
+        'topics': {
+            '/map': {
+                'type': 'nav_msgs/msg/OccupancyGrid',
+                'remap': '/shared_map_in',
+            },
+        },
+    }
+    follower_config = {
+        'name': 'follower_to_main',
+        'from_domain': 21,
+        'to_domain': 20,
+        'topics': {
+            '/map': {
+                'type': 'nav_msgs/msg/OccupancyGrid',
+                'remap': '/field/follower21/map',
+            },
+            '/field/follower21/map': {
+                'type': 'nav_msgs/msg/OccupancyGrid',
+                'remap': '/map',
+            },
+        },
+    }
+
+    try:
+        validate_no_bridge_feedback_cycles(
+            [main_config, follower_config],
+            relay_edges=[
+                ((21, '/shared_map_in'), (21, '/map'), 'map_relay'),
+                ((20, '/field/follower21/map'), (20, '/map'), 'active_map_mux'),
+            ],
+        )
+    except ValueError as exc:
+        assert 'feedback cycle' in str(exc)
+    else:
+        raise AssertionError('expected map feedback cycle rejection')
 
 
 def test_risk_to_leader_bridge_is_one_way_map_source(tmp_path):
@@ -245,7 +290,7 @@ def test_leader_to_pc_bridge_is_visualization_only(tmp_path):
     )
     assert '/fleet/readiness_detail' in config['topics']
     assert '/fleet/start_motion_detail' in config['topics']
-    assert '/system/ready' not in config['topics']
+    assert config['topics']['/system/ready']['type'] == 'std_msgs/msg/Bool'
     assert '/fleet_debug_markers' in config['topics']
     assert '/risk/risk_map' in config['topics']
     assert '/tf' not in config['topics']

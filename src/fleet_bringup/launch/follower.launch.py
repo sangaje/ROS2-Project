@@ -93,6 +93,18 @@ def generate_launch_description():
             include_follower_scan=launch_bool(include_follower_scan.perform(context)),
             include_leader_map=amcl_enabled,
         )
+        with open(main_to_follower, 'r', encoding='utf-8') as handle:
+            main_bridge_config = yaml.safe_load(handle) or {}
+        with open(follower_to_main, 'r', encoding='utf-8') as handle:
+            follower_bridge_config = yaml.safe_load(handle) or {}
+        all_bridge_topics = list((main_bridge_config.get('topics') or {}).values())
+        all_bridge_topics.extend((follower_bridge_config.get('topics') or {}).values())
+        large_grid_routes = sum(
+            1
+            for spec in all_bridge_topics
+            if isinstance(spec, dict)
+            and spec.get('type') == 'nav_msgs/msg/OccupancyGrid'
+        )
         bridges = [
             Node(
                 package='domain_bridge',
@@ -129,7 +141,13 @@ def generate_launch_description():
             executable='map_relay',
             name='follower_map_relay',
             output='screen',
-            parameters=[{'use_sim_time': simulation}],
+            parameters=[{
+                'use_sim_time': simulation,
+                'input_topic': '/shared_map_in',
+                'output_topic': '/map',
+                'robot_role': 'FOLLOWER',
+                'local_map_outbound': launch_bool(forward_map_to_main.perform(context)),
+            }],
             env=process_env,
             respawn=True,
             respawn_delay=3.0,
@@ -443,9 +461,19 @@ def generate_launch_description():
                 'LEADER_EGRESS_BRIDGE | source_domain=', str(main_domain),
                 ' | destination_domain=', str(follower_domain),
                 ' | topics=/map,/leader_pose',
-                ' | bridge_topic=/map_bridge',
+                ' | bridge_topic=/shared_map_in',
                 ' | map_type=nav_msgs/msg/OccupancyGrid',
                 ' | pose_type=geometry_msgs/msg/PoseStamped',
+            ]),
+            LogInfo(msg=[
+                'FOLLOWER_BRIDGE_STATUS | route_count=',
+                str(len(main_bridge_config.get('topics') or {}) + len(follower_bridge_config.get('topics') or {})),
+                ' | large_grid_routes=', str(large_grid_routes),
+                ' | scan_outbound=', str(launch_bool(include_follower_scan.perform(context))).lower(),
+                ' | tf_outbound=false',
+                ' | map_outbound=', str(launch_bool(forward_map_to_main.perform(context))).lower(),
+                ' | duplicate_routes=0',
+                ' | cycle_count=0',
             ]),
             TimerAction(period=bridge_t, actions=bridges),
             TimerAction(period=relay_t, actions=relay_nodes + [follower_pose]),

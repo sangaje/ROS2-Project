@@ -1249,25 +1249,24 @@ def generate_launch_description():
                 sender_share, 'launch', 'opencv_camera_to_flask_yolo.launch.py'
             )
             role_gating_on = launch_bool(enable_scout_failover.perform(context))
-            follower_camera_mode = fleet_role_value == 'follower'
             actions.append(IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(sender_launch_path),
                 launch_arguments={
                     'device': camera_sender_device.perform(context),
                     'server_url': flask_server_url.perform(context),
                     'output_topic': field_observation_topic,
-                    'width': '320' if follower_camera_mode else '640',
-                    'height': '180' if follower_camera_mode else '360',
-                    'send_width': '320' if follower_camera_mode else '640',
-                    'send_height': '180' if follower_camera_mode else '360',
-                    'camera_fps': '2.0' if follower_camera_mode else '8.0',
-                    'max_rate_hz': '1.0' if follower_camera_mode else '8.0',
-                    'active_max_rate_hz': '1.0' if follower_camera_mode else '8.0',
-                    'standby_max_rate_hz': '0.5' if follower_camera_mode else '0.75',
-                    'active_max_upload_mbps': '0.5' if follower_camera_mode else '3.0',
-                    'standby_max_upload_mbps': '0.25' if follower_camera_mode else '0.5',
+                    'width': '640',
+                    'height': '480',
+                    'send_width': '640',
+                    'send_height': '480',
+                    'camera_fps': '5.0',
+                    'max_rate_hz': '5.0',
+                    'active_max_rate_hz': '5.0',
+                    'standby_max_rate_hz': '1.0',
+                    'active_max_upload_mbps': '2.5',
+                    'standby_max_upload_mbps': '0.8',
                     'http_worker_count': '1',
-                    'jpeg_quality': '52',
+                    'jpeg_quality': '65',
                     'timeout_sec': '1.0',
                     'connect_timeout_sec': '0.3',
                     'read_timeout_sec': '1.8',
@@ -1291,8 +1290,9 @@ def generate_launch_description():
                         if (not role_gating_on or fleet_role_value in ('member', 'follower'))
                         else 'false'
                     ),
-                    'active_roles': 'ACTIVE_SCOUT,SCOUT,FOLLOWER,RECOVERING',
-                    'publish_roles': 'ACTIVE_SCOUT,SCOUT,RECOVERING',
+                    'active_roles': 'ACTIVE_SCOUT,SCOUT,RECOVERING',
+                    'standby_roles': 'FOLLOWER,IDLE,TAKEOVER_PENDING',
+                    'publish_roles': 'ACTIVE_SCOUT,SCOUT,FOLLOWER,RECOVERING',
                 }.items(),
             ))
 

@@ -98,9 +98,13 @@ def test_system_launch_uses_two_stream_dashboard_video_defaults():
     assert "default_value='52'" in text
     assert "'debug_width'," in text
     assert "'debug_height'," in text
-    assert "'max_rate_hz': '1.0' if follower_camera_mode else '8.0'" in text
-    assert "'active_max_rate_hz': '1.0' if follower_camera_mode else '8.0'" in text
-    assert "'jpeg_quality': '52'" in text
+    assert "'width': '640'" in text
+    assert "'height': '480'" in text
+    assert "'max_rate_hz': '5.0'" in text
+    assert "'active_max_rate_hz': '5.0'" in text
+    assert "'standby_max_rate_hz': '1.0'" in text
+    assert "'standby_max_upload_mbps': '0.8'" in text
+    assert "'jpeg_quality': '65'" in text
 
 
 def test_leader_can_own_risk_map_from_scout_sources():
@@ -136,6 +140,7 @@ def test_follower_map_forwarding_is_explicit_for_takeover_commit():
     assert "fleet_role_value == 'follower'" in text
     assert "fleet_launch_args['forward_map_to_main']" in text
     assert "forward_field_map_to_main.perform(context)" in text
+    assert "'standby_roles': 'FOLLOWER,IDLE,TAKEOVER_PENDING'" in text
     assert "f'/field/{follower_robot_name.perform(context)}/map'" in text
     assert "'active_scout_id_topic': active_scout_id_topic" in leader_launch
     assert "'follower_input_topic': follower_map_bridge_topic" in leader_launch

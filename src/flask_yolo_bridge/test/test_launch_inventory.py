@@ -40,14 +40,20 @@ def test_camera_sender_has_role_based_rates_and_publish_gate():
     assert 'letterbox_full_frame' in node
     assert 'cv2.copyMakeBorder' in node
     assert 'camera_resize_ms_p50=' in node
+    assert 'CAMERA_NETWORK_STATUS |' in node
     assert 'publish_roles' in node
+    assert 'standby_roles' in node
     assert 'def _current_upload_rate_hz' in node
     assert 'def _current_role_allows_publish' in node
     assert "DeclareLaunchArgument('width', default_value='640')" in launch
+    assert "DeclareLaunchArgument('height', default_value='480')" in launch
     assert "DeclareLaunchArgument('send_width', default_value='640')" in launch
-    assert "DeclareLaunchArgument('active_max_rate_hz', default_value='8.0')" in launch
-    assert "DeclareLaunchArgument('jpeg_quality', default_value='52')" in launch
+    assert "DeclareLaunchArgument('send_height', default_value='480')" in launch
+    assert "DeclareLaunchArgument('active_max_rate_hz', default_value='5.0')" in launch
+    assert "DeclareLaunchArgument('standby_max_rate_hz', default_value='1.0')" in launch
+    assert "DeclareLaunchArgument('jpeg_quality', default_value='65')" in launch
     assert "DeclareLaunchArgument('letterbox_color', default_value='0')" in launch
+    assert "'standby_roles': LaunchConfiguration('standby_roles')" in launch
     assert "'publish_roles': LaunchConfiguration('publish_roles')" in launch
     assert "'active_max_upload_mbps': LaunchConfiguration('active_max_upload_mbps')" in launch
 

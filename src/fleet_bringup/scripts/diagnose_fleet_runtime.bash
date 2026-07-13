@@ -112,7 +112,7 @@ show_domain "${main_domain}" "MAIN/LEADER" \
   /fleet/follow_enabled /fleet/follow_command /fleet/coordination_status \
   /fleet/robot_poses /fleet/collision_warning /fleet/hazard_pose /cmd_vel
 show_domain "${follower_domain}" "FOLLOWER" \
-  /scan /scan_nav /odom /map /map_bridge /amcl_pose /tf /leader_pose /leader_plan \
+  /scan /scan_nav /odom /map /shared_map_in /amcl_pose /tf /leader_pose /leader_plan \
   /burger_pose /plan /burger_scan_relay /fleet/follow_enabled \
   /fleet/follow_command /fleet/coordination_status /fleet/robot_poses \
   /fleet/collision_warning /fleet/hazard_pose /cmd_vel
@@ -127,5 +127,5 @@ show_tf "${main_domain}" map burger/base_footprint
 echo
 echo "Expected:"
 echo "- Main domain must have /map and TF map -> base_footprint after leader.launch.py starts."
-echo "- Follower domain must have /map from /map_bridge and TF map -> base_footprint after follower.launch.py starts."
+echo "- Follower domain must have /shared_map_in from leader /map, local /map from follower_map_relay, and TF map -> base_footprint after follower.launch.py starts."
 echo "- Only follower.launch.py should start domain_bridge in normal real runs."
