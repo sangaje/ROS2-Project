@@ -106,6 +106,10 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         self.pose_history_duration_sec = float(
             self.declare_parameter('pose_history_duration_sec', 8.0).value
         )
+        self.pose_history_max_samples = max(
+            2,
+            int(self.declare_parameter('pose_history_max_samples', 240).value),
+        )
         self.max_pose_interpolation_error_sec = float(
             self.declare_parameter('max_pose_interpolation_error_sec', 0.35).value
         )
@@ -169,7 +173,7 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
                 depth=1,
             )
             self.create_subscription(String, self.role_topic, self.on_role, role_qos)
-        self.pose_history = deque()
+        self.pose_history = deque(maxlen=self.pose_history_max_samples)
         self.pose_lock = threading.Lock()
         self.create_subscription(PoseStamped, self.pose_topic, self.on_pose, 10)
         self.http = requests.Session()

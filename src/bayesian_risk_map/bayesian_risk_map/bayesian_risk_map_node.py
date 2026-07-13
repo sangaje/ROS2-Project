@@ -1,5 +1,6 @@
 
 import json
+import hashlib
 import math
 import os
 import threading
@@ -569,6 +570,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.last_region_debug_wall_sec = 0.0
         self.last_diagnostic_publish_ros_ns = 0
         self.last_risk_publish_ros_ns = 0
+        self._published_layer_signatures: Dict[str, Tuple] = {}
 
         self.latest_detections: List[Detection2D] = []
         self.latest_detection_seq = 0
@@ -3530,6 +3532,78 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         msg.data = np.rint(np.clip(arr, 0.0, 1.0) * 100.0).astype(np.int8).flatten().tolist()
         return msg
 
+    def _grid_geometry_signature(self):
+        info = self.latest_map_msg.info
+        origin = info.origin
+        return (
+            self.map_frame,
+            int(info.width),
+            int(info.height),
+            round(float(info.resolution), 9),
+            round(float(origin.position.x), 6),
+            round(float(origin.position.y), 6),
+            round(float(origin.position.z), 6),
+            round(float(origin.orientation.x), 6),
+            round(float(origin.orientation.y), 6),
+            round(float(origin.orientation.z), 6),
+            round(float(origin.orientation.w), 6),
+        )
+
+    def _layer_signature(self, data: np.ndarray):
+        contiguous = np.ascontiguousarray(data)
+        digest = hashlib.blake2b(contiguous.view(np.uint8), digest_size=16).hexdigest()
+        return (
+            self._grid_geometry_signature(),
+            tuple(int(v) for v in contiguous.shape),
+            str(contiguous.dtype),
+            digest,
+        )
+
+    def _make_occgrid_from_int8(self, data: np.ndarray, stamp):
+        msg = OccupancyGrid()
+        msg.header.frame_id = self.map_frame
+        msg.header.stamp = stamp
+        msg.info = self.latest_map_msg.info
+        msg.data = np.ascontiguousarray(data, dtype=np.int8).ravel().tolist()
+        return msg
+
+    def _publish_array_layer(self, key: str, publisher, arr, stamp) -> bool:
+        if publisher is None:
+            return False
+        if arr is None:
+            if self.occ_grid is None:
+                return False
+            arr = np.zeros_like(self.occ_grid, dtype=np.float32)
+        data = np.rint(np.clip(arr, 0.0, 1.0) * 100.0).astype(np.int8, copy=False)
+        signature = self._layer_signature(data)
+        if self._published_layer_signatures.get(key) == signature:
+            return False
+        publisher.publish(self._make_occgrid_from_int8(data, stamp))
+        self._published_layer_signatures[key] = signature
+        return True
+
+    def _publish_region_id_layer(self, key: str, publisher, stamp) -> bool:
+        if publisher is None:
+            return False
+        if self.region_id_map is None:
+            if self.occ_grid is None:
+                return False
+            data = np.zeros_like(self.occ_grid, dtype=np.int8)
+        else:
+            rid = self.region_id_map
+            data16 = np.zeros(rid.shape, dtype=np.int16)
+            data16[rid == -1] = -1
+            data16[rid == -2] = 0
+            pos = rid > 0
+            data16[pos] = ((rid[pos] * 17) % 97) + 3
+            data = np.clip(data16, -1, 100).astype(np.int8)
+        signature = self._layer_signature(data)
+        if self._published_layer_signatures.get(key) == signature:
+            return False
+        publisher.publish(self._make_occgrid_from_int8(data, stamp))
+        self._published_layer_signatures[key] = signature
+        return True
+
     def region_id_to_occgrid(self, stamp):
         msg = OccupancyGrid()
         msg.header.frame_id = self.map_frame
@@ -3564,15 +3638,21 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             if self.risk_publish_rate_hz > 0.0 else 0
         )
         if risk_period_ns <= 0 or now_ros_ns - self.last_risk_publish_ros_ns >= risk_period_ns:
-            self.pub_risk.publish(self.array_to_occgrid(self.risk_map, stamp))
-            self.pub_bearing_consensus.publish(
-                self.array_to_occgrid(self.bearing_consensus_map, stamp)
+            self._publish_array_layer('risk', self.pub_risk, self.risk_map, stamp)
+            self._publish_array_layer(
+                'bearing_consensus',
+                self.pub_bearing_consensus,
+                self.bearing_consensus_map,
+                stamp,
             )
             if self.enable_person_probability_map and self.person_probability_map is not None:
                 # Publish the absolute Bayesian confidence, not a per-frame normalized
                 # image. Otherwise a decaying peak would misleadingly remain at 100.
-                self.pub_person_probability.publish(
-                    self.array_to_occgrid(self.person_probability_map, stamp)
+                self._publish_array_layer(
+                    'person_probability',
+                    self.pub_person_probability,
+                    self.person_probability_map,
+                    stamp,
                 )
             self.last_risk_publish_ros_ns = now_ros_ns
         diagnostic_period_ns = (
@@ -3590,16 +3670,16 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         if not self.publish_diagnostic_maps:
             return
 
-        self.pub_detection_candidate.publish(self.array_to_occgrid(self.detection_candidate_map, stamp))
-        self.pub_positive_memory.publish(self.array_to_occgrid(self.positive_memory_map, stamp))
-        self.pub_visibility.publish(self.array_to_occgrid(self.visibility_map, stamp))
-        self.pub_observed_empty.publish(self.array_to_occgrid(self.observed_empty_map, stamp))
-        self.pub_room_probability.publish(self.array_to_occgrid(self.room_probability_map, stamp))
-        self.pub_visual_seen.publish(self.array_to_occgrid(self.visual_seen_map, stamp))
-        self.pub_region_id.publish(self.region_id_to_occgrid(stamp))
-        self.pub_region_priority.publish(self.array_to_occgrid(self.region_priority_map, stamp))
-        self.pub_region_checked.publish(self.array_to_occgrid(self.region_checked_map, stamp))
-        self.pub_combined_priority.publish(self.array_to_occgrid(self.combined_priority_map(), stamp))
+        self._publish_array_layer('detection_candidate', self.pub_detection_candidate, self.detection_candidate_map, stamp)
+        self._publish_array_layer('positive_memory', self.pub_positive_memory, self.positive_memory_map, stamp)
+        self._publish_array_layer('visibility', self.pub_visibility, self.visibility_map, stamp)
+        self._publish_array_layer('observed_empty', self.pub_observed_empty, self.observed_empty_map, stamp)
+        self._publish_array_layer('room_probability', self.pub_room_probability, self.room_probability_map, stamp)
+        self._publish_array_layer('visual_seen', self.pub_visual_seen, self.visual_seen_map, stamp)
+        self._publish_region_id_layer('region_id', self.pub_region_id, stamp)
+        self._publish_array_layer('region_priority', self.pub_region_priority, self.region_priority_map, stamp)
+        self._publish_array_layer('region_checked', self.pub_region_checked, self.region_checked_map, stamp)
+        self._publish_array_layer('combined_priority', self.pub_combined_priority, self.combined_priority_map(), stamp)
 
     def publish_markers(self, robot_pose):
         stamp = self.get_clock().now().to_msg()

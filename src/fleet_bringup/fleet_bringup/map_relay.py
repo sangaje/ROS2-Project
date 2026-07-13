@@ -27,6 +27,7 @@ keeps serving its last output instead of republishing, so the two sources
 never publish to /map at the same time.
 """
 import rclpy
+import hashlib
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from nav_msgs.msg import OccupancyGrid
@@ -97,20 +98,12 @@ class MapRelay(Node):
         self._primary_present_since = None
         self._first_bridged_logged = False
         self._first_output_logged = False
+        self._last_published_signature = None
 
         self._pub = self.create_publisher(
             OccupancyGrid, self.output_topic, pub_qos
         )
-        volatile_pub_qos = QoSProfile(
-            depth=1,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.VOLATILE,
-            history=HistoryPolicy.KEEP_LAST,
-        )
-        self._volatile_pub = self.create_publisher(
-            OccupancyGrid, self.output_topic, volatile_pub_qos
-        )
-        self._own_output_publishers = 2
+        self._own_output_publishers = 1
         self._sub = self.create_subscription(
             OccupancyGrid, self.input_topic, self._on_bridged_map, bridge_sub_qos
         )
@@ -217,6 +210,31 @@ class MapRelay(Node):
             and len(msg.data) == width * height
         )
 
+    @staticmethod
+    def _map_signature(msg: OccupancyGrid):
+        info = msg.info
+        origin = info.origin
+        data_hash = hashlib.blake2b(
+            bytes((int(value) + 1) & 0xFF for value in msg.data),
+            digest_size=16,
+        ).hexdigest()
+        return (
+            msg.header.frame_id,
+            int(msg.header.stamp.sec),
+            int(msg.header.stamp.nanosec),
+            int(info.width),
+            int(info.height),
+            round(float(info.resolution), 9),
+            round(float(origin.position.x), 6),
+            round(float(origin.position.y), 6),
+            round(float(origin.position.z), 6),
+            round(float(origin.orientation.x), 6),
+            round(float(origin.orientation.y), 6),
+            round(float(origin.orientation.z), 6),
+            round(float(origin.orientation.w), 6),
+            data_hash,
+        )
+
     def _now_sec(self) -> float:
         return self.get_clock().now().nanoseconds * 1.0e-9
 
@@ -320,13 +338,20 @@ class MapRelay(Node):
         return self._latest_bridged
 
     def _publish(self, source: OccupancyGrid):
+        signature = self._map_signature(source)
+        if signature == self._last_published_signature:
+            self.get_logger().debug(
+                'MAP_RELAY_DUPLICATE_SKIPPED | unchanged map sample'
+            )
+            return False
         self._pub.publish(source)
-        self._volatile_pub.publish(source)
+        self._last_published_signature = signature
         self.get_logger().info(
             f'Map relayed: {source.info.width}x{source.info.height} @ '
             f'{source.info.resolution:.3f}m/cell',
             throttle_duration_sec=10.0,
         )
+        return True
 
 
 def main():

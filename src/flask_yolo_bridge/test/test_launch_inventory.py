@@ -36,3 +36,14 @@ def test_camera_sender_has_role_based_rates_and_publish_gate():
     assert 'def _current_upload_rate_hz' in node
     assert 'def _current_role_allows_publish' in node
     assert "'publish_roles': LaunchConfiguration('publish_roles')" in launch
+
+
+def test_camera_sender_pose_history_is_bounded():
+    node = (
+        Path(__file__).parents[1]
+        / 'flask_yolo_bridge'
+        / 'opencv_camera_to_flask_yolo.py'
+    ).read_text(encoding='utf-8')
+
+    assert 'pose_history_max_samples' in node
+    assert 'self.pose_history = deque(maxlen=self.pose_history_max_samples)' in node
