@@ -113,14 +113,14 @@ ibvs:
   derivative_reset_gap_sec: 0.5
 
 yolo:
-  # model/target_v3_640.engine 표적용 고속 기본값. 별도 학습 가중치는 런치의
+  # model/target_v3.engine 표적용 고속 기본값. 별도 학습 가중치는 런치의
   # yolo_node_model_path로 명시적으로 지정한다.
-  model_path: model/target_v3_640.engine
+  model_path: model/target_v3.engine
   device: 0                 # Jetson CUDA device. cpu로 강제하려면 "cpu"
   half: true                # CUDA에서 FP16 사용
   target_class: 0           # target_v3 클래스 0 = 표적 (실기 테스트로 확인됨)
   conf_threshold: 0.5        # 0.0~1.0. 낮을수록 더 많이 검출 (오검출 늘어남)
-  imgsz: 640                 # target_v3_640.engine 고정 입력 해상도와 반드시 일치
+  imgsz: 640                 # target_v3.engine 고정 입력 해상도와 반드시 일치
 
 # ===========================================================
 # 격발 & 상태 머신

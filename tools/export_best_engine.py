@@ -3,7 +3,7 @@
 
 Run this on the Jetson, not on a plain PC:
 
-  python3 tools/export_best_engine.py --pt model/target_v3.pt --engine model/target_v3_640.engine --imgsz 640
+  python3 tools/export_best_engine.py --pt model/target_v3.pt --engine model/target_v3.engine --imgsz 640
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from pathlib import Path
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument('--pt', default='model/target_v3.pt')
-    parser.add_argument('--engine', default='model/target_v3_640.engine')
+    parser.add_argument('--engine', default='model/target_v3.engine')
     parser.add_argument('--imgsz', type=int, default=640)
     parser.add_argument('--device', default='0')
     parser.add_argument('--half', action=argparse.BooleanOptionalAction, default=True)

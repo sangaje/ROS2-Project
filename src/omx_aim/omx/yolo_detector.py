@@ -69,7 +69,7 @@ def _validate_runtime_model_path(model_path: str) -> None:
     if suffix == ".pt":
         raise ValueError(
             f"PyTorch YOLO checkpoints are not allowed at runtime: {model_path}. "
-            "Export and launch with model/target_v3_640.engine instead."
+            "Export and launch with model/target_v3.engine instead."
         )
     if suffix not in (".engine", ".plan"):
         raise ValueError(

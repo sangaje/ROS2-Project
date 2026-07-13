@@ -1312,7 +1312,7 @@ def generate_launch_description():
                 'needs an interactive terminal.'
             ),
         ),
-        DeclareLaunchArgument('risk_model_path', default_value='model/target_v3_640.engine'),
+        DeclareLaunchArgument('risk_model_path', default_value='model/target_v3.engine'),
         DeclareLaunchArgument(
             'risk_target_class',
             default_value='0',
@@ -1734,10 +1734,10 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'yolo_server_model_path',
-            default_value='model/target_v3_640.engine',
+            default_value='model/target_v3.engine',
             description=(
                 'Leader role only: YOLO TensorRT engine for '
-                'flask_yolo_server. Create model/target_v3_640.engine on the '
+                'flask_yolo_server. Create model/target_v3.engine on the '
                 'Jetson before launching.'
             ),
         ),
