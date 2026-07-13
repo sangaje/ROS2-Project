@@ -219,6 +219,14 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.external_detection_max_count = int(
             self.declare_parameter('external_detection_max_count', 64).value
         )
+        self.external_accept_any_detection = self.declare_bool_parameter(
+            'external_accept_any_detection',
+            True,
+        )
+        self.external_pose_fallback_to_current = self.declare_bool_parameter(
+            'external_pose_fallback_to_current',
+            True,
+        )
         self.opencv_camera_device = self.declare_parameter('opencv_camera_device', '/dev/video0').value
         self.opencv_camera_width = int(self.declare_parameter('opencv_camera_width', 640).value)
         self.opencv_camera_height = int(self.declare_parameter('opencv_camera_height', 480).value)
@@ -1949,12 +1957,15 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                 pipeline['class_match_count'] += 1
             if label_ok:
                 pipeline['label_match_count'] += 1
-            is_target = class_ok or label_ok
+            is_target = class_ok or label_ok or self.external_accept_any_detection
             if not is_target:
                 pipeline['rejected_class'] += 1
                 if label:
                     pipeline['rejected_label'] += 1
                 continue
+            if self.external_accept_any_detection and not (class_ok or label_ok):
+                pipeline['class_match_count'] += 1
+                pipeline['label_match_count'] += 1
             if conf < self.conf_threshold:
                 pipeline['rejected_confidence'] += 1
                 continue
@@ -2032,7 +2043,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         )
         yolo_latency_ms = self.payload_float(payload, 'latency_ms', -1.0)
         http_roundtrip_ms = self.payload_float(payload, 'http_roundtrip_ms', -1.0)
-        capture_pose = self.parse_payload_capture_pose(payload)
+        capture_pose = self._external_capture_pose_or_fallback(payload)
         if capture_pose is None:
             self.external_observation_missing_pose_dropped += 1
             pipeline['rejected_pose'] = len(detections)
@@ -2152,6 +2163,31 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             )
         except (KeyError, TypeError, ValueError):
             return None
+
+    def _external_capture_pose_or_fallback(self, payload):
+        pose = self.parse_payload_capture_pose(payload)
+        pose_time_error_ms = self.payload_float(payload, 'pose_time_error_ms', -1.0)
+        bridge_default_pose = False
+        if pose is not None:
+            bridge_default_pose = (
+                abs(float(pose[0])) < 1.0e-6
+                and abs(float(pose[1])) < 1.0e-6
+                and pose_time_error_ms < 0.0
+            )
+        if pose is not None and not bridge_default_pose:
+            return pose
+        if not self.external_pose_fallback_to_current:
+            return pose
+        fallback = self.get_robot_pose()
+        if fallback is None:
+            return pose
+        self.get_logger().warning(
+            'RISK_EXTERNAL_POSE_FALLBACK | '
+            f'parsed_pose={pose} bridge_default_pose={bridge_default_pose} '
+            'using=current_pose',
+            throttle_duration_sec=2.0,
+        )
+        return fallback
 
     def maybe_make_fake_detection(self):
         if not self.enable_fake_detection:

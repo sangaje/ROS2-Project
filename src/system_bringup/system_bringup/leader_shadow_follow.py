@@ -262,12 +262,10 @@ class LeaderShadowFollow(Node):
 
         self.cancel_pub = self.create_publisher(Bool, self.leader_cancel_topic, latched_qos)
         self.nav_client = ActionClient(self, NavigateToPose, self.navigate_action)
-        self.cmd_pub = None
-        if self.direct_shadow_cmd_vel:
-            if self.use_stamped_cmd_vel:
-                self.cmd_pub = self.create_publisher(TwistStamped, self.cmd_vel_topic, 10)
-            else:
-                self.cmd_pub = self.create_publisher(Twist, self.cmd_vel_topic, 10)
+        if self.use_stamped_cmd_vel:
+            self.cmd_pub = self.create_publisher(TwistStamped, self.cmd_vel_topic, 10)
+        else:
+            self.cmd_pub = self.create_publisher(Twist, self.cmd_vel_topic, 10)
         self.state_pub = self.create_publisher(String, '/leader_shadow/state', latched_qos)
         self.goal_debug_pub = self.create_publisher(PoseStamped, '/leader_shadow/goal', 10)
         self.scan_state_pub = self.create_publisher(String, '/leader_scan/state', latched_qos)
@@ -614,8 +612,7 @@ class LeaderShadowFollow(Node):
         self._publish_remembered_target(reason)
         self._publish_state(reason)
         self._log_follow_debug(reason)
-        if self.direct_shadow_cmd_vel:
-            self._publish_twist(0.0, 0.0)
+        self._publish_twist(0.0, 0.0)
         self.get_logger().warning(
             'LEADER_OMX_TARGET_HOLD | '
             f'reason={reason} detected={self.target_detected} '
@@ -1020,8 +1017,7 @@ class LeaderShadowFollow(Node):
                 f'[LEADER_SHADOW] TARGET_HARD_STOP_CANCEL | reason={reason}'
             )
         self._stop_direct_cmd(reason)
-        if self.direct_shadow_cmd_vel:
-            self._publish_twist(0.0, 0.0)
+        self._publish_twist(0.0, 0.0)
 
     def _active_scout_pose(self) -> Tuple[Optional[PoseStamped], float]:
         if self.active_scout_id == self.follower_robot_name:
