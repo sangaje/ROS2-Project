@@ -99,13 +99,13 @@ controller_server:
       debug_trajectory_details: true
       min_vel_x: -0.08
       min_vel_y: 0.0
-      max_vel_x: 0.20
+      max_vel_x: 0.28
       max_vel_y: 0.0
       # Keep rotation below the range where the loaded chassis arcs wide and
       # diverges from the differential-drive model.
-      max_vel_theta: 0.75
+      max_vel_theta: 0.95
       min_speed_xy: 0.0
-      max_speed_xy: 0.20
+      max_speed_xy: 0.28
       min_speed_theta: 0.0
       acc_lim_x: 0.70
       acc_lim_y: 0.0
@@ -172,7 +172,7 @@ behavior_server:
     transform_tolerance: 0.5
     transform_timeout: 0.1
     simulate_ahead_time: 2.0
-    max_rotational_vel: 0.75
+    max_rotational_vel: 0.95
     min_rotational_vel: 0.12
     rotational_acc_lim: 1.40
     enable_stamped_cmd_vel: true
