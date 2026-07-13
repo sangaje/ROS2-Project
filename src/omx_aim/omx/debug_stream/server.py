@@ -48,12 +48,29 @@ class DebugStream:
         self._started = False
         self._app = None
         self._thread = None
+        self._jpeg_condition = threading.Condition()
+        self._jpeg_bytes: bytes | None = None
+        self._jpeg_seq = 0
+        self._jpeg_source_seq = -1
+        self._jpeg_encode_ms = 0.0
+        self._jpeg_size_kb = 0.0
 
     # ----- public API -----
 
     def update(self, frame) -> None:
         """메인 loop 에서 호출. annotated frame 푸시."""
         self.bus.update_frame(frame)
+        _, seq = self.bus.get_frame()
+        if seq != self._jpeg_source_seq:
+            ok, encoded = self._encode_frame(frame)
+            if ok:
+                payload = encoded.tobytes()
+                with self._jpeg_condition:
+                    self._jpeg_bytes = payload
+                    self._jpeg_seq += 1
+                    self._jpeg_source_seq = seq
+                    self._jpeg_size_kb = len(payload) / 1024.0
+                    self._jpeg_condition.notify_all()
 
     def update_state(self, snapshot: dict) -> None:
         """메인 loop 에서 호출. 상태 dict 푸시 (SSE 로 전송됨)."""
@@ -102,14 +119,15 @@ class DebugStream:
         from flask import Response
 
         frame, _ = self.bus.get_frame()
-        if frame is None:
+        jpeg, seq = self._latest_jpeg()
+        if frame is None or jpeg is None:
             return Response('waiting for OMX frame\n', status=503, mimetype='text/plain')
-        ok, encoded = self._encode_frame(frame)
-        if not ok:
-            return Response('OMX JPEG encode failed\n', status=500, mimetype='text/plain')
         return Response(
-            encoded.tobytes(), mimetype='image/jpeg',
-            headers={'Cache-Control': 'no-store, no-cache, max-age=0'},
+            jpeg, mimetype='image/jpeg',
+            headers={
+                'Cache-Control': 'no-store, no-cache, max-age=0',
+                'X-Frame-Version': str(seq),
+            },
         )
 
     def _events_view(self):
@@ -136,39 +154,52 @@ class DebugStream:
         browser ``<img>`` elements look permanently black.  Keep the stream
         alive with a clear diagnostic frame until the detector reconnects.
         """
-        interval = 1.0 / self.fps
-        params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
         last_seq = -1
+        next_emit = 0.0
 
         while True:
-            time.sleep(interval)
-            frame, seq = self.bus.get_frame()
-            if frame is None:
-                frame = np.zeros((360, 640, 3), dtype=np.uint8)
-                cv2.putText(
-                    frame, 'WAITING FOR OMX CAMERA', (78, 160),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 190, 255), 2,
-                )
-                cv2.putText(
-                    frame, 'camera reconnecting / yolo starting', (115, 205),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1,
-                )
-                # Emit the diagnostic periodically even though its source
-                # frame sequence has not changed.
-                last_seq = seq
+            now = time.monotonic()
+            if now < next_emit:
+                time.sleep(next_emit - now)
+            jpeg, seq = self._wait_for_jpeg(last_seq)
+            if jpeg is None:
+                jpeg = self._waiting_jpeg()
             elif seq == last_seq:
                 continue
             else:
                 last_seq = seq
-
-            ok, buf = self._encode_frame(frame, params=params)
-            if not ok:
-                continue
+            next_emit = time.monotonic() + (1.0 / self.fps)
 
             yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
-                   + buf.tobytes() + b'\r\n')
+                   + jpeg + b'\r\n')
+
+    def _latest_jpeg(self) -> tuple[bytes | None, int]:
+        with self._jpeg_condition:
+            return self._jpeg_bytes, self._jpeg_seq
+
+    def _wait_for_jpeg(self, previous_seq: int) -> tuple[bytes | None, int]:
+        with self._jpeg_condition:
+            self._jpeg_condition.wait_for(
+                lambda: self._jpeg_seq != previous_seq and self._jpeg_bytes is not None,
+                timeout=max(0.1, 1.0 / self.fps),
+            )
+            return self._jpeg_bytes, self._jpeg_seq
+
+    def _waiting_jpeg(self) -> bytes:
+        frame = np.zeros((360, 640, 3), dtype=np.uint8)
+        cv2.putText(
+            frame, 'WAITING FOR OMX CAMERA', (78, 160),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 190, 255), 2,
+        )
+        cv2.putText(
+            frame, 'camera reconnecting / yolo starting', (115, 205),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1,
+        )
+        ok, buf = self._encode_frame(frame)
+        return buf.tobytes() if ok else b''
 
     def _encode_frame(self, frame, *, params=None):
+        started = time.perf_counter()
         if (
             self.width > 0
             and self.height > 0
@@ -176,13 +207,49 @@ class DebugStream:
             and len(frame.shape) >= 2
             and (frame.shape[1] != self.width or frame.shape[0] != self.height)
         ):
-            frame = cv2.resize(
+            frame = self._resize_full_frame(frame)
+        params = params or [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
+        ok, encoded = cv2.imencode('.jpg', frame, params)
+        self._jpeg_encode_ms = (time.perf_counter() - started) * 1000.0
+        return ok, encoded
+
+    def _resize_full_frame(self, frame):
+        source_h, source_w = frame.shape[:2]
+        if source_w <= 0 or source_h <= 0 or self.width <= 0 or self.height <= 0:
+            return frame
+        source_ratio = source_w / float(source_h)
+        target_ratio = self.width / float(self.height)
+        if abs(source_ratio - target_ratio) <= 1.0e-3:
+            return cv2.resize(
                 frame,
                 (self.width, self.height),
-                interpolation=cv2.INTER_AREA,
+                interpolation=(
+                    cv2.INTER_AREA
+                    if self.width < source_w or self.height < source_h
+                    else cv2.INTER_LINEAR
+                ),
             )
-        params = params or [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
-        return cv2.imencode('.jpg', frame, params)
+        scale = min(self.width / float(source_w), self.height / float(source_h))
+        content_w = max(1, int(round(source_w * scale)))
+        content_h = max(1, int(round(source_h * scale)))
+        resized = cv2.resize(
+            frame,
+            (content_w, content_h),
+            interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR,
+        )
+        pad_x = max(0, (self.width - content_w) // 2)
+        pad_y = max(0, (self.height - content_h) // 2)
+        right = max(0, self.width - content_w - pad_x)
+        bottom = max(0, self.height - content_h - pad_y)
+        return cv2.copyMakeBorder(
+            resized,
+            pad_y,
+            bottom,
+            pad_x,
+            right,
+            cv2.BORDER_CONSTANT,
+            value=(0, 0, 0),
+        )
 
     def _sse_gen(self):
         """SSE: state 변경 시에만 push. 최대 5Hz."""

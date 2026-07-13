@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import statistics
 import threading
@@ -73,6 +74,9 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         )
         self.http_worker_count = int(self.declare_parameter('http_worker_count', 1).value)
         self.jpeg_quality = int(self.declare_parameter('jpeg_quality', 60).value)
+        self.letterbox_color = int(
+            self.declare_parameter('letterbox_color', 0).value
+        )
         self.timeout_sec = float(self.declare_parameter('timeout_sec', 1.0).value)
         self.connect_timeout_sec = float(
             self.declare_parameter('connect_timeout_sec', min(0.3, self.timeout_sec)).value
@@ -183,6 +187,15 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         self.pose_lock = threading.Lock()
         self.create_subscription(PoseStamped, self.pose_topic, self.on_pose, 10)
         self.http = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=1,
+            pool_maxsize=max(1, self.http_worker_count),
+            max_retries=0,
+            pool_block=True,
+        )
+        self.http.mount('http://', adapter)
+        self.http.mount('https://', adapter)
+        self.http.headers.update({'Connection': 'keep-alive'})
 
         self.frame_condition = threading.Condition()
         self.latest_frame = None
@@ -203,6 +216,7 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         self.missing_pose_drop_count = 0
         self.last_log_wall_sec = 0.0
         self.ok_timestamps = deque(maxlen=120)
+        self.resize_ms_samples = deque(maxlen=120)
         self.encode_ms_samples = deque(maxlen=120)
         self.rtt_ms_samples = deque(maxlen=120)
         self.capture_age_ms_samples = deque(maxlen=120)
@@ -249,6 +263,7 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             f'standby_budget={self.standby_max_upload_mbps:.2f}Mbps '
             f'http_workers={max(1, self.http_worker_count)} '
             f'jpeg_quality={self.jpeg_quality} timeout={self.timeout_sec:.2f}s '
+            f'letterbox=preserve_full_fov color={self.letterbox_color} '
             f'connect_timeout={self.connect_timeout_sec:.2f}s read_timeout={self.read_timeout_sec:.2f}s '
             f'max_http_roundtrip={self.max_http_roundtrip_sec:.2f}s '
             f'max_frame_age={self.max_frame_age_sec:.2f}s '
@@ -526,22 +541,102 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
                 self.frame_condition.wait(timeout=timeout)
         return None, 0.0, 0.0, 0, {}
 
+    def prepare_frame_for_upload(self, frame):
+        import cv2
+        import numpy as np
+
+        source_h, source_w = frame.shape[:2]
+        target_w = int(self.send_width)
+        target_h = int(self.send_height)
+        metadata = {
+            'source_width': int(source_w),
+            'source_height': int(source_h),
+            'display_width': int(source_w),
+            'display_height': int(source_h),
+            'letterbox_scale': 1.0,
+            'letterbox_pad_x': 0,
+            'letterbox_pad_y': 0,
+            'letterbox_content_width': int(source_w),
+            'letterbox_content_height': int(source_h),
+            'letterbox_mode': 'native',
+        }
+        if target_w <= 0 or target_h <= 0:
+            return frame, metadata
+        if source_w == target_w and source_h == target_h:
+            metadata.update({
+                'display_width': target_w,
+                'display_height': target_h,
+                'letterbox_mode': 'native',
+            })
+            return frame, metadata
+
+        source_ratio = source_w / max(1.0, float(source_h))
+        target_ratio = target_w / max(1.0, float(target_h))
+        if math.isclose(source_ratio, target_ratio, rel_tol=1.0e-3, abs_tol=1.0e-3):
+            interpolation = (
+                cv2.INTER_AREA
+                if target_w < source_w or target_h < source_h
+                else cv2.INTER_LINEAR
+            )
+            resized = cv2.resize(frame, (target_w, target_h), interpolation=interpolation)
+            metadata.update({
+                'display_width': target_w,
+                'display_height': target_h,
+                'letterbox_scale': target_w / max(1.0, float(source_w)),
+                'letterbox_content_width': target_w,
+                'letterbox_content_height': target_h,
+                'letterbox_mode': 'resize_full_frame',
+            })
+            return resized, metadata
+
+        scale = min(target_w / float(source_w), target_h / float(source_h))
+        content_w = max(1, int(round(source_w * scale)))
+        content_h = max(1, int(round(source_h * scale)))
+        interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+        resized = cv2.resize(frame, (content_w, content_h), interpolation=interpolation)
+        pad_x = max(0, (target_w - content_w) // 2)
+        pad_y = max(0, (target_h - content_h) // 2)
+        right = max(0, target_w - content_w - pad_x)
+        bottom = max(0, target_h - content_h - pad_y)
+        color = int(max(0, min(255, self.letterbox_color)))
+        letterboxed = cv2.copyMakeBorder(
+            resized,
+            pad_y,
+            bottom,
+            pad_x,
+            right,
+            cv2.BORDER_CONSTANT,
+            value=(color, color, color),
+        )
+        if letterboxed.shape[1] != target_w or letterboxed.shape[0] != target_h:
+            canvas = np.full((target_h, target_w, 3), color, dtype=frame.dtype)
+            canvas[pad_y:pad_y + content_h, pad_x:pad_x + content_w] = resized
+            letterboxed = canvas
+        metadata.update({
+            'display_width': target_w,
+            'display_height': target_h,
+            'letterbox_scale': float(scale),
+            'letterbox_pad_x': int(pad_x),
+            'letterbox_pad_y': int(pad_y),
+            'letterbox_content_width': int(content_w),
+            'letterbox_content_height': int(content_h),
+            'letterbox_mode': 'letterbox_full_frame',
+        })
+        return letterboxed, metadata
+
     def encode_jpeg(self, frame) -> bytes:
         import cv2
 
-        if self.send_width > 0 and self.send_height > 0:
-            h, w = frame.shape[:2]
-            if w != self.send_width or h != self.send_height:
-                frame = cv2.resize(
-                    frame,
-                    (int(self.send_width), int(self.send_height)),
-                    interpolation=cv2.INTER_AREA if self.send_width < w or self.send_height < h else cv2.INTER_LINEAR,
-                )
+        resize_start = time.monotonic()
+        frame, resize_meta = self.prepare_frame_for_upload(frame)
+        resize_ms = (time.monotonic() - resize_start) * 1000.0
         quality = max(1, min(100, int(self.jpeg_quality)))
+        encode_start = time.monotonic()
         ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
         if not ok:
             raise RuntimeError('cv2.imencode(.jpg) failed')
-        return bytes(buf), frame.shape[1], frame.shape[0]
+        encode_ms = (time.monotonic() - encode_start) * 1000.0
+        return bytes(buf), frame.shape[1], frame.shape[0], resize_ms, encode_ms, resize_meta
 
     def http_worker_loop(self):
         next_allowed = 0.0
@@ -573,6 +668,15 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         except Exception:
             pass
         self.http = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=1,
+            pool_maxsize=max(1, self.http_worker_count),
+            max_retries=0,
+            pool_block=True,
+        )
+        self.http.mount('http://', adapter)
+        self.http.mount('https://', adapter)
+        self.http.headers.update({'Connection': 'keep-alive'})
 
     def post_frame(self, frame, capture_sec: float, capture_mono_sec: float, seq: int, meta: dict):
         frame_age_before_send = time.monotonic() - capture_mono_sec if capture_mono_sec > 0.0 else 0.0
@@ -586,9 +690,8 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             self.log_periodic()
             return
 
-        encode_start = time.monotonic()
-        jpeg, w, h = self.encode_jpeg(frame)
-        encode_ms = (time.monotonic() - encode_start) * 1000.0
+        jpeg, w, h, resize_ms, encode_ms, resize_meta = self.encode_jpeg(frame)
+        self.resize_ms_samples.append(resize_ms)
         self.encode_ms_samples.append(encode_ms)
         self.jpeg_size_samples.append(float(len(jpeg)))
         if not self._consume_upload_budget(len(jpeg)):
@@ -610,6 +713,10 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             'robot_frame_age_ms_at_send': f'{frame_age_before_send * 1000.0:.3f}',
             'image_width': str(int(w)),
             'image_height': str(int(h)),
+        })
+        data.update({
+            key: f'{value:.9f}' if isinstance(value, float) else str(value)
+            for key, value in resize_meta.items()
         })
         request_start = time.monotonic()
         resp = self.http.post(
@@ -691,6 +798,8 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             payload['robot_frame_age_ms'] = total_frame_age_sec * 1000.0
             payload['http_roundtrip_ms'] = roundtrip_sec * 1000.0
             payload['camera_encode_ms'] = encode_ms
+            payload['camera_resize_ms'] = resize_ms
+            payload['letterbox'] = resize_meta
             payload['robot_frame_seq'] = int(seq)
 
             if self._current_role_allows_publish():
@@ -744,6 +853,7 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         if len(self.ok_timestamps) >= 2:
             dt = self.ok_timestamps[-1] - self.ok_timestamps[0]
             output_fps = (len(self.ok_timestamps) - 1) / dt if dt > 1e-6 else 0.0
+        resize = self._sample_summary(self.resize_ms_samples)
         encode = self._sample_summary(self.encode_ms_samples)
         rtt = self._sample_summary(self.rtt_ms_samples)
         age = self._sample_summary(self.capture_age_ms_samples)
@@ -758,6 +868,7 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             f'output_fps={output_fps:.2f} '
             f'tx_mbps={tx_mbps:.3f} jpeg_bytes_p50={jpeg[0]:.0f} '
             f'p95={jpeg[1]:.0f} max={jpeg[2]:.0f} '
+            f'camera_resize_ms_p50={resize[0]:.1f} p95={resize[1]:.1f} max={resize[2]:.1f} '
             f'camera_encode_ms_p50={encode[0]:.1f} p95={encode[1]:.1f} max={encode[2]:.1f} '
             f'network_rtt_ms_p50={rtt[0]:.1f} p95={rtt[1]:.1f} max={rtt[2]:.1f} '
             f'end_to_end_frame_age_ms_p50={age[0]:.1f} p95={age[1]:.1f} max={age[2]:.1f} '

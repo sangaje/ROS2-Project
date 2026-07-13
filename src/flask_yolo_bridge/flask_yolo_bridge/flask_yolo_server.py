@@ -104,7 +104,7 @@ DEBUG_PAGE = """<!doctype html>
     .stale .dot { background: var(--warn); }
     .dead .dot { background: var(--bad); }
     main { display: grid; grid-template-columns: minmax(0, 2fr) minmax(320px, 0.9fr); gap: 12px; padding: 12px; }
-    .video-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    .video-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }
     section, aside {
       background: rgba(21, 27, 36, 0.94);
       border: 1px solid var(--line);
@@ -147,7 +147,6 @@ DEBUG_PAGE = """<!doctype html>
   </header>
   <main>
     <div class="video-grid">
-      <section><h2>Camera input</h2><img src="/stream/raw.mjpg" alt="raw camera stream"></section>
       <section><h2>YOLO overlay</h2><img src="/stream/yolo.mjpg" alt="YOLO stream"></section>
     </div>
     <aside>
@@ -232,12 +231,9 @@ DEBUG_PAGE = """<!doctype html>
 @dataclass
 class DebugState:
     condition: threading.Condition = field(default_factory=threading.Condition)
-    raw_debug_enabled: bool = False
-    raw_jpeg: bytes | None = None
     yolo_jpeg: bytes | None = None
-    raw_version: int = 0
     yolo_version: int = 0
-    raw_frames: int = 0
+    capture_frames: int = 0
     yolo_frames: int = 0
     inference_frames: int = 0
     people: int = 0
@@ -248,7 +244,7 @@ class DebugState:
     image_width: int = 0
     image_height: int = 0
     capture_age_ms: float = -1.0
-    last_raw_wall_sec: float = 0.0
+    last_capture_wall_sec: float = 0.0
     last_yolo_wall_sec: float = 0.0
     last_inference_wall_sec: float = 0.0
     last_status: str = 'waiting for first frame'
@@ -259,7 +255,6 @@ class DebugState:
     dropped_capture_frames: int = 0
     dropped_inference_frames: int = 0
     dropped_stream_frames: int = 0
-    raw_stream_clients: int = 0
     yolo_stream_clients: int = 0
     stream_disconnects: int = 0
     metrics: dict = field(default_factory=lambda: {
@@ -277,20 +272,18 @@ class DebugState:
             'end_to_end_frame_age_ms',
         )
     })
-    raw_wall_times: deque = field(default_factory=lambda: deque(maxlen=90))
+    capture_wall_times: deque = field(default_factory=lambda: deque(maxlen=90))
     yolo_wall_times: deque = field(default_factory=lambda: deque(maxlen=90))
     inference_wall_times: deque = field(default_factory=lambda: deque(maxlen=90))
 
-    def update_raw(self, raw_jpeg, width, height, capture_age_ms):
+    def record_capture(self, width, height, capture_age_ms):
         with self.condition:
-            self.raw_jpeg = raw_jpeg if self.raw_debug_enabled else None
-            self.raw_version += 1
-            self.raw_frames += 1
+            self.capture_frames += 1
             self.image_width = width
             self.image_height = height
             self.capture_age_ms = capture_age_ms
-            self.last_raw_wall_sec = time.time()
-            self.raw_wall_times.append(self.last_raw_wall_sec)
+            self.last_capture_wall_sec = time.time()
+            self.capture_wall_times.append(self.last_capture_wall_sec)
             self.condition.notify_all()
 
     def update_yolo(
@@ -333,20 +326,14 @@ class DebugState:
         with self.condition:
             self.dropped_inference_frames += 1
 
-    def stream_opened(self, kind):
+    def stream_opened(self):
         with self.condition:
-            if kind == 'raw':
-                self.raw_stream_clients += 1
-            else:
-                self.yolo_stream_clients += 1
+            self.yolo_stream_clients += 1
 
-    def stream_closed(self, kind):
+    def stream_closed(self):
         with self.condition:
             self.stream_disconnects += 1
-            if kind == 'raw':
-                self.raw_stream_clients = max(0, self.raw_stream_clients - 1)
-            else:
-                self.yolo_stream_clients = max(0, self.yolo_stream_clients - 1)
+            self.yolo_stream_clients = max(0, self.yolo_stream_clients - 1)
 
     def set_error(self, message):
         with self.condition:
@@ -358,13 +345,13 @@ class DebugState:
     def status(self):
         with self.condition:
             now = time.time()
-            raw_age = now - self.last_raw_wall_sec if self.last_raw_wall_sec else -1.0
+            capture_age = now - self.last_capture_wall_sec if self.last_capture_wall_sec else -1.0
             yolo_age = now - self.last_yolo_wall_sec if self.last_yolo_wall_sec else -1.0
-            raw_fps = 0.0
-            if len(self.raw_wall_times) >= 2:
-                dt = self.raw_wall_times[-1] - self.raw_wall_times[0]
+            capture_fps = 0.0
+            if len(self.capture_wall_times) >= 2:
+                dt = self.capture_wall_times[-1] - self.capture_wall_times[0]
                 if dt > 1e-6:
-                    raw_fps = (len(self.raw_wall_times) - 1) / dt
+                    capture_fps = (len(self.capture_wall_times) - 1) / dt
             yolo_fps = 0.0
             if len(self.yolo_wall_times) >= 2:
                 dt = self.yolo_wall_times[-1] - self.yolo_wall_times[0]
@@ -378,14 +365,14 @@ class DebugState:
             inference_age = now - self.last_inference_wall_sec if self.last_inference_wall_sec else -1.0
             error_age = now - self.last_error_wall_sec if self.last_error_wall_sec else -1.0
             return {
-                'ok': self.raw_frames > 0,
-                'frames': self.raw_frames,
-                'raw_frames': self.raw_frames,
+                'ok': self.capture_frames > 0,
+                'frames': self.capture_frames,
+                'capture_frames': self.capture_frames,
                 'yolo_frames': self.yolo_frames,
                 'inference_frames': self.inference_frames,
                 'people': self.people,
-                'fps': raw_fps,
-                'raw_fps': raw_fps,
+                'fps': capture_fps,
+                'capture_fps': capture_fps,
                 'yolo_fps': yolo_fps,
                 'inference_fps': inference_fps,
                 'latency_ms': self.latency_ms,
@@ -395,8 +382,8 @@ class DebugState:
                 'image_width': self.image_width,
                 'image_height': self.image_height,
                 'capture_age_ms': self.capture_age_ms,
-                'frame_age_sec': raw_age,
-                'raw_frame_age_sec': raw_age,
+                'frame_age_sec': capture_age,
+                'capture_frame_age_sec': capture_age,
                 'yolo_frame_age_sec': yolo_age,
                 'inference_frame_age_sec': inference_age,
                 'last_status': self.last_status,
@@ -407,10 +394,8 @@ class DebugState:
                 'dropped_capture_frames': self.dropped_capture_frames,
                 'dropped_inference_frames': self.dropped_inference_frames,
                 'dropped_stream_frames': self.dropped_stream_frames,
-                'raw_debug_enabled': self.raw_debug_enabled,
-                'raw_stream_clients': self.raw_stream_clients,
                 'yolo_stream_clients': self.yolo_stream_clients,
-                'stream_clients': self.raw_stream_clients + self.yolo_stream_clients,
+                'stream_clients': self.yolo_stream_clients,
                 'stream_disconnects': self.stream_disconnects,
                 'metrics_5s': {
                     name: metric.summary(now=now, window_sec=5.0)
@@ -418,24 +403,20 @@ class DebugState:
                 },
             }
 
-    def latest_frame(self, kind):
+    def latest_frame(self):
         with self.condition:
-            frame = self.raw_jpeg if kind == 'raw' else self.yolo_jpeg
-            version = self.raw_version if kind == 'raw' else self.yolo_version
-            return version, frame
+            return self.yolo_version, self.yolo_jpeg
 
-    def wait_for_frame(self, kind, previous_version):
+    def wait_for_frame(self, previous_version):
         with self.condition:
             self.condition.wait_for(
                 lambda: (
-                    self.raw_version if kind == 'raw' else self.yolo_version
-                ) != previous_version
-                and (self.raw_jpeg if kind == 'raw' else self.yolo_jpeg) is not None,
+                    self.yolo_version != previous_version
+                    and self.yolo_jpeg is not None
+                ),
                 timeout=1.0,
             )
-            frame = self.raw_jpeg if kind == 'raw' else self.yolo_jpeg
-            version = self.raw_version if kind == 'raw' else self.yolo_version
-            return version, frame
+            return self.yolo_version, self.yolo_jpeg
 
 
 def _decode_image(file_storage):
@@ -485,12 +466,12 @@ def _draw_yolo_overlay(frame, detections, latency_ms):
     return output
 
 
-def _mjpeg_stream(state, kind):
+def _mjpeg_stream(state):
     version = -1
-    state.stream_opened(kind)
+    state.stream_opened()
     try:
         while True:
-            version, frame = state.wait_for_frame(kind, version)
+            version, frame = state.wait_for_frame(version)
             if frame is None:
                 continue
             yield (
@@ -501,7 +482,7 @@ def _mjpeg_stream(state, kind):
     except GeneratorExit:
         raise
     finally:
-        state.stream_closed(kind)
+        state.stream_closed()
 
 
 def _normalize_device(device):
@@ -649,7 +630,7 @@ def build_app(args):
         print(f'[flask_yolo_server] warmup failed: {exc}', flush=True)
         if model_suffix in ('.engine', '.plan'):
             raise
-    state = DebugState(raw_debug_enabled=bool(args.enable_raw_debug_stream))
+    state = DebugState()
     runtime = {'warmup_ms': warmup_ms}
 
     def runtime_status():
@@ -894,23 +875,19 @@ def build_app(args):
 
     @app.get('/stream/<kind>.mjpg')
     def stream(kind):
-        if kind not in ('raw', 'yolo'):
-            return jsonify({'ok': False, 'error': 'kind must be raw or yolo'}), 404
-        if kind == 'raw' and not state.raw_debug_enabled:
-            return jsonify({'ok': False, 'error': 'raw debug stream disabled'}), 404
+        if kind != 'yolo':
+            return jsonify({'ok': False, 'error': 'kind must be yolo'}), 404
         return Response(
-            _mjpeg_stream(state, kind),
+            _mjpeg_stream(state),
             mimetype='multipart/x-mixed-replace; boundary=frame',
             headers={'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0'},
         )
 
     @app.get('/frame/<kind>.jpg')
     def latest_frame(kind):
-        if kind not in ('raw', 'yolo'):
-            return jsonify({'ok': False, 'error': 'kind must be raw or yolo'}), 404
-        if kind == 'raw' and not state.raw_debug_enabled:
-            return jsonify({'ok': False, 'error': 'raw debug frame disabled'}), 404
-        version, frame = state.latest_frame(kind)
+        if kind != 'yolo':
+            return jsonify({'ok': False, 'error': 'kind must be yolo'}), 404
+        version, frame = state.latest_frame()
         if frame is None:
             return jsonify({'ok': False, 'error': 'waiting for first frame'}), 503
         return Response(
@@ -931,7 +908,7 @@ def build_app(args):
 
         try:
             t_decode0 = time.perf_counter()
-            original_jpeg, frame = _decode_image(request.files['image'])
+            _encoded_jpeg, frame = _decode_image(request.files['image'])
             decode_ms = (time.perf_counter() - t_decode0) * 1000.0
         except Exception as exc:
             return jsonify({'ok': False, 'error': str(exc)}), 400
@@ -941,18 +918,15 @@ def build_app(args):
         capture_wall_sec = float(request.form.get('capture_wall_sec') or 0.0)
         robot_frame_age_ms_at_send = float(request.form.get('robot_frame_age_ms_at_send') or -1.0)
         observation_meta = echo_observation_metadata(request.form)
-        raw_age_sec = _request_capture_age_sec(request)
-        capture_age_ms = max(0.0, raw_age_sec * 1000.0) if raw_age_sec >= 0.0 else -1.0
+        capture_age_sec = _request_capture_age_sec(request)
+        capture_age_ms = max(0.0, capture_age_sec * 1000.0) if capture_age_sec >= 0.0 else -1.0
 
         state.record('capture_age_ms', capture_age_ms)
         state.record('server_decode_ms', decode_ms)
 
-        # Track capture/upload health without exposing a raw stream by
-        # default.  If raw debug is explicitly enabled, the original robot
-        # JPEG is reused directly; raw streaming never decodes or re-encodes.
-        state.update_raw(original_jpeg, int(w), int(h), capture_age_ms)
+        state.record_capture(int(w), int(h), capture_age_ms)
 
-        if args.max_capture_age_sec > 0.0 and raw_age_sec > args.max_capture_age_sec:
+        if args.max_capture_age_sec > 0.0 and capture_age_sec > args.max_capture_age_sec:
             state.set_error('stale frame rejected before inference')
             return jsonify({
                 'ok': False,
@@ -998,7 +972,7 @@ def build_app(args):
                 'accepted_frame': True,
                 'queued_inference_drop_count': dropped,
                 'response_ms': response_ms,
-                'raw_frame_age_ms': capture_age_ms,
+                'capture_frame_age_ms': capture_age_ms,
             })
             return jsonify(latest)
 
@@ -1105,7 +1079,6 @@ def parse_args():
     parser.add_argument('--max-det', type=int, default=64)
     parser.add_argument('--imgsz', type=int, default=640)
     parser.add_argument('--debug-jpeg-quality', type=int, default=80)
-    parser.add_argument('--enable-raw-debug-stream', type=as_bool, default=False)
     parser.add_argument('--max-capture-age-sec', type=float, default=0.8)
     parser.add_argument('--max-queue-wait-sec', type=float, default=0.0)
     parser.add_argument(

@@ -322,13 +322,9 @@ class LeaderUnifiedDashboard(Node):
         self.omx_stream_path = str(_declare(self, 'omx_stream_path', '/stream.mjpg'))
         self.omx_state_path = str(_declare(self, 'omx_state_path', '/state.json'))
         self.yolo_server_port = int(_declare(self, 'yolo_server_port', 5005))
-        self.yolo_raw_stream_path = str(
-            _declare(self, 'yolo_raw_stream_path', '/stream/raw.mjpg')
-        )
         self.yolo_overlay_stream_path = str(
             _declare(self, 'yolo_overlay_stream_path', '/stream/yolo.mjpg')
         )
-        self.enable_raw_debug_stream = bool(_declare(self, 'enable_raw_debug_stream', False))
         self.yolo_status_path = str(_declare(self, 'yolo_status_path', '/api/status'))
         self.video_ready_topic = str(_declare(self, 'video_ready_topic', '/fleet/video_ready'))
         self.start_motion_topic = str(_declare(self, 'start_motion_topic', '/fleet/start_motion'))
@@ -374,6 +370,14 @@ class LeaderUnifiedDashboard(Node):
             'map': self._empty_grid_state(),
             'risk': self._empty_grid_state(),
         }
+        self._grid_render_condition = threading.Condition()
+        self._grid_render_stop = False
+        self._grid_render_thread = threading.Thread(
+            target=self._grid_render_loop,
+            name='dashboard_grid_png_cache_worker',
+            daemon=True,
+        )
+        self._grid_render_thread.start()
         self._robots: Dict[str, Dict[str, Any]] = {
             'leader': self._empty_robot('leader', 'leader', self.leader_pose_topic),
             self.follower_name: self._empty_robot(
@@ -468,6 +472,13 @@ class LeaderUnifiedDashboard(Node):
                 logger=self.get_logger(),
             ),
         }
+        self.get_logger().info(
+            'DASHBOARD_VIDEO_LAYOUT | '
+            'required_panels=scout_yolo,leader_omx '
+            'scout_' + 'raw_enabled=false '
+            'browser_video_count=2 '
+            'upstream_video_count=2'
+        )
 
         # /map is published by map_relay with both TRANSIENT_LOCAL and
         # VOLATILE writers.  Request VOLATILE here: it is compatible with
@@ -585,6 +596,8 @@ class LeaderUnifiedDashboard(Node):
             'png_seq': -1,
             'png': None,
             'metadata': None,
+            'render_pending_seq': -1,
+            'render_in_progress': False,
         }
 
     @staticmethod
@@ -638,10 +651,22 @@ class LeaderUnifiedDashboard(Node):
             static_folder=static_folder,
             static_url_path='/static',
         )
+        app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
+        asset_version = str(int(time.time()))
+
+        @app.after_request
+        def add_no_cache_headers(response):
+            if request.path == '/' or request.path.startswith('/static/'):
+                response.headers['Cache-Control'] = (
+                    'no-store, no-cache, must-revalidate, max-age=0'
+                )
+                response.headers['Pragma'] = 'no-cache'
+                response.headers['Expires'] = '0'
+            return response
 
         @app.get('/')
         def index():
-            return render_template('dashboard.html')
+            return render_template('dashboard.html', asset_version=asset_version)
 
         @app.get('/health')
         def health():
@@ -683,23 +708,15 @@ class LeaderUnifiedDashboard(Node):
         @app.get('/api/map.png')
         @app.get('/map.png')
         def map_png():
-            return self._grid_response(Response, 'map')
+            return self._grid_response(Response, request, 'map')
 
         @app.get('/api/risk.png')
         @app.get('/risk.png')
         def risk_png():
-            return self._grid_response(Response, 'risk')
+            return self._grid_response(Response, request, 'risk')
 
         @app.get('/api/yolo_stream/<kind>.mjpg')
         def yolo_stream(kind):
-            if kind == 'raw':
-                if not self.enable_raw_debug_stream:
-                    return jsonify({'ok': False, 'error': 'raw debug stream disabled'}), 404
-                return self._direct_mjpeg_proxy(
-                    Response,
-                    stream_with_context,
-                    f'http://127.0.0.1:{self.yolo_server_port}{self.yolo_raw_stream_path}',
-                )
             if kind not in ('yolo', 'overlay'):
                 return jsonify({'ok': False, 'error': 'kind must be yolo'}), 404
 
@@ -713,15 +730,7 @@ class LeaderUnifiedDashboard(Node):
 
         @app.get('/api/yolo_frame/<kind>.jpg')
         def yolo_frame(kind):
-            if kind == 'raw':
-                if not self.enable_raw_debug_stream:
-                    return jsonify({'ok': False, 'error': 'raw debug frame disabled'}), 404
-                return self._single_jpeg_proxy(
-                    Response,
-                    f'http://127.0.0.1:{self.yolo_server_port}/frame/raw.jpg',
-                    'Scout raw frame waiting',
-                )
-            elif kind in ('yolo', 'overlay'):
+            if kind in ('yolo', 'overlay'):
                 version, frame = self._video_streams['scout_yolo'].latest_frame()
                 if frame is None:
                     return jsonify({'ok': False, 'error': 'waiting for first yolo frame'}), 503
@@ -754,60 +763,7 @@ class LeaderUnifiedDashboard(Node):
 
         return app
 
-    def _single_jpeg_proxy(self, response_class: Any, url: str, waiting_label: str) -> Any:
-        """Serve one current frame, never a long-lived MJPEG connection.
-
-        Browser reloads repeatedly interrupted the three concurrent MJPEG
-        proxies, producing panels that appeared only after a lucky F5.  A
-        short single-image request is independent, cache-busted by the UI,
-        and cannot retain a stale stream connection.
-        """
-        try:
-            with urllib.request.urlopen(url, timeout=0.8) as upstream:
-                payload = upstream.read()
-            response = response_class(payload, mimetype='image/jpeg')
-        except Exception as exc:  # noqa: BLE001
-            self.get_logger().warning(
-                f'UNIFIED_DASHBOARD_FRAME_PROXY_WAIT | url={url} error={exc}',
-                throttle_duration_sec=5.0,
-            )
-            response = response_class(
-                _placeholder_jpeg(waiting_label), mimetype='image/jpeg'
-            )
-        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
-        return response
-
-    def _direct_mjpeg_proxy(
-        self,
-        response_class: Any,
-        stream_context: Any,
-        url: str,
-    ) -> Any:
-        """Legacy raw debug proxy, intentionally outside the default dashboard."""
-
-        def generate():
-            try:
-                with urllib.request.urlopen(url, timeout=2.0) as upstream:
-                    while True:
-                        chunk = upstream.read(8192)
-                        if not chunk:
-                            break
-                        yield chunk
-            except Exception as exc:  # noqa: BLE001
-                self.get_logger().warning(
-                    f'UNIFIED_DASHBOARD_DEBUG_RAW_PROXY_ERROR | url={url} error={exc}',
-                    throttle_duration_sec=5.0,
-                )
-
-        response = response_class(
-            stream_context(generate()),
-            mimetype='multipart/x-mixed-replace; boundary=frame',
-        )
-        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
-        response.headers['X-Accel-Buffering'] = 'no'
-        return response
-
-    def _grid_response(self, response_class: Any, kind: str) -> Any:
+    def _grid_response(self, response_class: Any, request_obj: Any, kind: str) -> Any:
         try:
             png = self.grid_png(kind)
         except Exception as exc:
@@ -815,8 +771,17 @@ class LeaderUnifiedDashboard(Node):
             return response_class(f'{kind} render error\n', status=500, mimetype='text/plain')
         if png is None:
             return response_class(f'{kind} not available\n', status=404, mimetype='text/plain')
+        with self._lock:
+            seq = int(self._grids[kind]['png_seq'])
+        etag = f'"{kind}-{seq}"'
+        if request_obj.headers.get('If-None-Match') == etag:
+            response = response_class(status=304)
+            response.headers['ETag'] = etag
+            response.headers['Cache-Control'] = 'no-cache'
+            return response
         response = response_class(png, mimetype='image/png')
-        response.headers['Cache-Control'] = 'no-store'
+        response.headers['Cache-Control'] = 'no-cache'
+        response.headers['ETag'] = etag
         return response
 
     def _run_flask(self) -> None:
@@ -843,11 +808,12 @@ class LeaderUnifiedDashboard(Node):
             state['msg'] = msg
             state['seq'] += 1
             state['received_wall_sec'] = now
-            state['png'] = None
-            state['png_seq'] = -1
             state['metadata'] = _grid_signature(msg)
+            state['render_pending_seq'] = int(state['seq'])
             topic = self.map_topic if kind == 'map' else self.risk_topic
             self._touch_topic(topic, now, 'nav_msgs/msg/OccupancyGrid')
+        with self._grid_render_condition:
+            self._grid_render_condition.notify_all()
 
     def _on_pose(self, name: str, msg: PoseStamped, source: str) -> None:
         now = time.time()
@@ -1038,7 +1004,7 @@ class LeaderUnifiedDashboard(Node):
         if self.require_scout_video_ready:
             required.append('scout_yolo')
         if self.require_omx_video_ready:
-            required.append('omx_camera')
+            required.append('leader_omx')
         with self._lock:
             manifest = dict(self._dashboard_manifest)
             manifest_wall = self._dashboard_manifest_wall_sec
@@ -1409,7 +1375,6 @@ class LeaderUnifiedDashboard(Node):
                     'port': self.yolo_server_port,
                     'overlay_stream_path': self.yolo_overlay_stream_path,
                     'overlay_proxy_path': '/api/yolo_stream/yolo.mjpg',
-                    'raw_debug_enabled': self.enable_raw_debug_stream,
                     'status_path': self.yolo_status_path,
                 },
                 'video_streams': self.video_metrics(),
@@ -1608,25 +1573,70 @@ class LeaderUnifiedDashboard(Node):
     def grid_png(self, kind: str) -> Optional[bytes]:
         with self._lock:
             state = self._grids[kind]
-            msg = state['msg']
-            seq = int(state['seq'])
-            if msg is None:
+            if state['msg'] is None:
                 return None
-            if state['png'] is not None and state['png_seq'] == seq:
-                return state['png']
-            width = int(msg.info.width)
-            height = int(msg.info.height)
-            data = list(msg.data)
+            if state['png'] is None or int(state['png_seq']) != int(state['seq']):
+                state['render_pending_seq'] = int(state['seq'])
+                with self._grid_render_condition:
+                    self._grid_render_condition.notify_all()
+            return state['png']
 
-        png = _encode_grid_png(data, width, height, kind)
-        with self._lock:
-            state = self._grids[kind]
-            if int(state['seq']) == seq:
-                state['png'] = png
-                state['png_seq'] = seq
-        return png
+    def _grid_render_loop(self) -> None:
+        while not getattr(self, '_grid_render_stop', False):
+            job = None
+            with self._lock:
+                for kind, state in self._grids.items():
+                    pending = int(state.get('render_pending_seq', -1))
+                    if (
+                        state.get('msg') is not None
+                        and pending > int(state.get('png_seq', -1))
+                        and not state.get('render_in_progress', False)
+                    ):
+                        msg = state['msg']
+                        state['render_in_progress'] = True
+                        job = (
+                            kind,
+                            pending,
+                            int(msg.info.width),
+                            int(msg.info.height),
+                            list(msg.data),
+                        )
+                        break
+            if job is None:
+                with self._grid_render_condition:
+                    self._grid_render_condition.wait(timeout=0.5)
+                continue
+            kind, seq, width, height, data = job
+            started = time.monotonic()
+            try:
+                png = _encode_grid_png(data, width, height, kind)
+                elapsed_ms = (time.monotonic() - started) * 1000.0
+                with self._lock:
+                    state = self._grids[kind]
+                    if int(state.get('seq', -1)) == seq:
+                        state['png'] = png
+                        state['png_seq'] = seq
+                        state['render_pending_seq'] = -1
+                    state['render_in_progress'] = False
+                self.get_logger().debug(
+                    'DASHBOARD_GRID_PNG_CACHE | '
+                    f'kind={kind} seq={seq} bytes={len(png)} encode_ms={elapsed_ms:.1f}'
+                )
+            except Exception as exc:  # noqa: BLE001
+                with self._lock:
+                    self._grids[kind]['render_in_progress'] = False
+                self.get_logger().warning(
+                    f'DASHBOARD_GRID_PNG_CACHE_ERROR | kind={kind} seq={seq} error={exc}',
+                    throttle_duration_sec=5.0,
+                )
 
     def destroy_node(self) -> None:
+        self._grid_render_stop = True
+        with self._grid_render_condition:
+            self._grid_render_condition.notify_all()
+        grid_thread = getattr(self, '_grid_render_thread', None)
+        if grid_thread is not None and grid_thread.is_alive():
+            grid_thread.join(timeout=1.0)
         for stream in getattr(self, '_video_streams', {}).values():
             stream.stop()
         super().destroy_node()
@@ -1675,21 +1685,6 @@ def _encode_grid_png(data: list, width: int, height: int, kind: str) -> bytes:
     ok, encoded = cv2.imencode('.png', img)
     if not ok:
         raise RuntimeError(f'failed to encode {kind} grid')
-    return encoded.tobytes()
-
-
-def _placeholder_jpeg(label: str) -> bytes:
-    import cv2
-    import numpy as np
-
-    image = np.zeros((360, 640, 3), dtype=np.uint8)
-    cv2.putText(
-        image, label[:62], (72, 185), cv2.FONT_HERSHEY_SIMPLEX,
-        0.72, (0, 190, 255), 2,
-    )
-    ok, encoded = cv2.imencode('.jpg', image)
-    if not ok:
-        raise RuntimeError('failed to create dashboard placeholder')
     return encoded.tobytes()
 
 

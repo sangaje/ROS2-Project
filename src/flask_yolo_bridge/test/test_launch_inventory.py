@@ -36,6 +36,10 @@ def test_camera_sender_has_role_based_rates_and_publish_gate():
     assert 'standby_max_upload_mbps' in node
     assert 'OPENCV_HTTP_YOLO_TX_BUDGET_DROP' in node
     assert 'tx_mbps=' in node
+    assert 'def prepare_frame_for_upload' in node
+    assert 'letterbox_full_frame' in node
+    assert 'cv2.copyMakeBorder' in node
+    assert 'camera_resize_ms_p50=' in node
     assert 'publish_roles' in node
     assert 'def _current_upload_rate_hz' in node
     assert 'def _current_role_allows_publish' in node
@@ -43,6 +47,7 @@ def test_camera_sender_has_role_based_rates_and_publish_gate():
     assert "DeclareLaunchArgument('send_width', default_value='640')" in launch
     assert "DeclareLaunchArgument('active_max_rate_hz', default_value='8.0')" in launch
     assert "DeclareLaunchArgument('jpeg_quality', default_value='52')" in launch
+    assert "DeclareLaunchArgument('letterbox_color', default_value='0')" in launch
     assert "'publish_roles': LaunchConfiguration('publish_roles')" in launch
     assert "'active_max_upload_mbps': LaunchConfiguration('active_max_upload_mbps')" in launch
 

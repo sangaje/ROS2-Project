@@ -375,7 +375,7 @@ function updateYoloPanel(y) {
   const statusText = data.last_error || data.last_status || '';
   const cards = [
     ['Server', y ? y.status : 'NO DATA', y ? y.status : 'NO DATA', y ? `${fmt(y.latency_ms, 0)} ms` : ''],
-    ['Upload FPS', fmt(data.raw_fps, 1), data.ok ? 'OK' : 'NO DATA', `${data.raw_frames ?? 0} frames`],
+    ['Upload FPS', fmt(data.capture_fps, 1), data.ok ? 'OK' : 'NO DATA', `${data.capture_frames ?? 0} frames`],
     ['Infer FPS', fmt(data.inference_fps, 1), data.inference_frames ? 'OK' : 'NO DATA', `${data.inference_frames ?? 0} ok frames`],
     ['Scout Stream', `${fmt(scoutStream.display_fps, 1)} fps`, scoutStream.upstream_connection_count === 1 ? 'OK' : 'NO DATA', `${fmt(scoutStream.upstream_mbps, 2)} Mbps / ${fmt(scoutStream.frame_age_ms, 0)} ms`],
     ['OMX Stream', `${fmt(omxStream.display_fps, 1)} fps`, omxStream.upstream_connection_count === 1 ? 'OK' : 'NO DATA', `${fmt(omxStream.upstream_mbps, 2)} Mbps / ${fmt(omxStream.frame_age_ms, 0)} ms`],
@@ -572,7 +572,7 @@ async function publishDashboardReadiness() {
     stamp: Date.now() / 1000.0,
     panels: {
       scout_yolo: imagePanelReady('scoutYoloStream'),
-      omx_camera: imagePanelReady('omxStream'),
+      leader_omx: imagePanelReady('omxStream'),
       map: gridPanelReady('map'),
       risk_map: gridPanelReady('risk'),
       fleet_state: {

@@ -15,9 +15,7 @@ def test_detect_defaults_to_async_latest_frame_pipeline():
     assert 'default=True' in source
     assert 'submit_latest' in source
     assert "'async_ack': True" in source
-    assert 'state.update_raw(original_jpeg' in source
-    assert 'raw_debug_enabled: bool = False' in source
-    assert 'raw debug stream disabled' in source
+    assert 'state.record_capture(' in source
     assert 'update_debug_overlay(frame' not in source.split('@app.post')[1]
 
 
@@ -36,7 +34,7 @@ def test_video_pipeline_reports_latency_and_drop_metrics():
         'response_ms',
         'end_to_end_frame_age_ms',
         'dropped_inference_frames',
-        'raw_stream_clients',
+        'capture_frames',
         'yolo_stream_clients',
     ):
         assert key in source

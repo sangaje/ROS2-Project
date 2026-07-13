@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Leader Unified Dashboard</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css', v=asset_version) }}">
 </head>
 <body>
   <header>
@@ -21,7 +21,7 @@
   <main>
     <div class="video-column">
       <section>
-        <h2>OMX AIM Debug Stream</h2>
+        <h2>Leader OMX/YOLO Detection</h2>
         <div class="stream-wrap"><img id="omxStream" alt="OMX MJPEG stream"></div>
       </section>
       <section>
@@ -81,6 +81,6 @@
       </section>
     </div>
   </main>
-  <script src="{{ url_for('static', filename='dashboard.js') }}"></script>
+  <script src="{{ url_for('static', filename='dashboard.js', v=asset_version) }}"></script>
 </body>
 </html>

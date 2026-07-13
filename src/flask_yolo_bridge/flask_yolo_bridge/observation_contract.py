@@ -131,6 +131,16 @@ def echo_observation_metadata(form: Mapping[str, object]) -> dict:
         'capture_pose_stamp_sec',
         'pose_time_error_ms',
         'capture_to_send_delay_ms',
+        'source_width',
+        'source_height',
+        'display_width',
+        'display_height',
+        'letterbox_scale',
+        'letterbox_pad_x',
+        'letterbox_pad_y',
+        'letterbox_content_width',
+        'letterbox_content_height',
+        'letterbox_mode',
         'camera_calibration_id',
     )
     out = {}

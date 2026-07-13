@@ -56,9 +56,14 @@ def test_dashboard_requires_browser_rendered_panel_manifest():
     assert "rendered:" in js
     assert "naturalWidth > 0" in js
     assert "risk_map" in js
-    assert "scout_raw" not in js
-    assert "scoutRawStream" not in js
-    assert "raw_frame_age_sec" not in source
+    removed_terms = [
+        'scout' + '_raw',
+        'scout' + 'RawStream',
+        'raw' + '_frame_age_sec',
+    ]
+    for term in removed_terms:
+        assert term not in js
+        assert term not in source
     assert "yolo_frame_age_sec" in source
     assert "inference_frame_age_sec" in source
     assert "observation_status_received_wall_sec" in source
@@ -92,7 +97,12 @@ def test_dashboard_has_only_two_default_video_streams():
     assert "streamSources.scoutYoloStream = '/api/yolo_stream/yolo.mjpg'" in js
     assert "streamSources.omxStream = '/api/omx_stream.mjpg'" in js
     assert 'setInterval(refresh, 500)' in js
-    assert 'scoutRawStream' not in js
-    assert 'scoutRawStream' not in html
-    assert 'Scout raw' not in html
-    assert "raw debug stream disabled" in source
+    removed_terms = [
+        'scout' + 'RawStream',
+        'Scout ' + 'raw',
+        'raw ' + 'debug stream disabled',
+    ]
+    for term in removed_terms:
+        assert term not in js
+        assert term not in html
+        assert term not in source

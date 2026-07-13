@@ -39,6 +39,23 @@ def run(cmd: list[str], timeout: float = 3.0) -> dict[str, Any]:
         }
 
 
+def detect_route_iface(host: str) -> tuple[str, dict[str, Any]]:
+    if not host:
+        return '', {}
+    route = run(['ip', 'route', 'get', host], timeout=2.0)
+    output = str(route.get('output', ''))
+    match = re.search(r'\bdev\s+(\S+)', output)
+    return (match.group(1) if match else ''), route
+
+
+def parse_time_wait(output: str) -> int | None:
+    match = re.search(r'timewait\s+(\d+)', output, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    match = re.search(r'TCP:\s+\d+\s+\([^)]*timewait\s+(\d+)', output, re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
 def parse_ip_link_mbps(output: str, interval_sec: float) -> dict[str, float | None]:
     byte_lines = []
     capture_next = False
@@ -134,6 +151,10 @@ def process_counts(process_output: str) -> dict[str, int]:
 
 
 def snapshot(args) -> dict[str, Any]:
+    iface = args.iface
+    route = {}
+    if not iface and args.ping_host:
+        iface, route = detect_route_iface(args.ping_host)
     topics = [
         '/map',
         '/risk/risk_map',
@@ -149,8 +170,15 @@ def snapshot(args) -> dict[str, Any]:
         'stage': args.stage,
         'stamp': time.time(),
         'ping': ping_summary(args.ping_host, args.ping_count) if args.ping_host else None,
+        'tailscale_ping': (
+            ping_summary(args.tailscale_ping_host, args.ping_count)
+            if args.tailscale_ping_host else None
+        ),
+        'route': route,
+        'iface': iface,
         'ss_summary': run(['ss', '-s']),
-        'ip_link_delta': ip_link_delta(args.iface, args.link_interval_sec),
+        'ss_tcp_queues': run(['ss', '-tinp'], timeout=5.0),
+        'ip_link_delta': ip_link_delta(iface, args.link_interval_sec),
         'processes': run(['bash', '-lc', "ps -eo pid,ppid,comm,pcpu,pmem,nlwp,args | grep -E 'ros2|python|domain_bridge|flask|yolo|nav2|cartographer' | grep -v grep"]),
         'ros_nodes': run(['ros2', 'node', 'list'], timeout=5.0),
         'ros_actions': run(['ros2', 'action', 'info', '/navigate_to_pose'], timeout=5.0),
@@ -159,6 +187,7 @@ def snapshot(args) -> dict[str, Any]:
     for topic in topics:
         actions['topics'][topic] = run(['ros2', 'topic', 'info', '-v', topic], timeout=5.0)
     actions['process_counts'] = process_counts(str(actions['processes'].get('output', '')))
+    actions['time_wait'] = parse_time_wait(str(actions['ss_summary'].get('output', '')))
     if args.topic_bw_sec > 0.0:
         bw_topics = [item.strip() for item in args.topic_bw_topics.split(',') if item.strip()]
         actions['topic_bw'] = [ros_topic_bw(topic, args.topic_bw_sec) for topic in bw_topics]
@@ -174,6 +203,7 @@ def flatten_row(record: dict[str, Any]) -> dict[str, Any]:
     ping = record.get('ping') or {}
     link = record.get('ip_link_delta') or {}
     counts = record.get('process_counts') or {}
+    tailscale_ping = record.get('tailscale_ping') or {}
     topic_bw = record.get('topic_bw_top') or []
     camera_mbps = sum(
         float(item.get('mbps') or 0.0)
@@ -193,6 +223,9 @@ def flatten_row(record: dict[str, Any]) -> dict[str, Any]:
         'ping_p95_ms': ping.get('p95_ms'),
         'ping_p99_ms': ping.get('p99_ms'),
         'ping_max_ms': ping.get('max_ms'),
+        'tailscale_ping_p95_ms': tailscale_ping.get('p95_ms'),
+        'iface': record.get('iface'),
+        'time_wait': record.get('time_wait'),
         'tx_mbps': link.get('tx_mbps'),
         'rx_mbps': link.get('rx_mbps'),
         'domain_bridge_processes': counts.get('domain_bridge'),
@@ -213,9 +246,12 @@ def print_health(row: dict[str, Any]) -> None:
     print(
         'NETWORK_CONTROL_HEALTH | '
         f"stage={row.get('stage')} "
+        f"iface={row.get('iface')} "
         f"ping_p95_ms={row.get('ping_p95_ms')} "
+        f"tailscale_ping_p95_ms={row.get('tailscale_ping_p95_ms')} "
         f"tx_mbps={row.get('tx_mbps')} "
         f"rx_mbps={row.get('rx_mbps')} "
+        f"time_wait={row.get('time_wait')} "
         f"camera_mbps={row.get('camera_mbps'):.3f} "
         f"map_mbps={row.get('map_mbps'):.3f} "
         f"domain_bridge_processes={row.get('domain_bridge_processes')} "
@@ -229,8 +265,9 @@ def main() -> int:
     parser.add_argument('--duration-sec', type=float, default=60.0)
     parser.add_argument('--interval-sec', type=float, default=5.0)
     parser.add_argument('--ping-host', default='')
+    parser.add_argument('--tailscale-ping-host', default='')
     parser.add_argument('--ping-count', type=int, default=20)
-    parser.add_argument('--iface', default='')
+    parser.add_argument('--iface', default='', help='NIC name. Empty means auto-detect with ip route get <ping-host>.')
     parser.add_argument('--link-interval-sec', type=float, default=1.0)
     parser.add_argument('--topic-bw-sec', type=float, default=0.0)
     parser.add_argument(

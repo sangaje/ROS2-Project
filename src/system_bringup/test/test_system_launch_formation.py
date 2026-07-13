@@ -87,7 +87,6 @@ def test_system_launch_starts_global_readiness_monitor_and_motion_gates():
     assert "'readiness_detail_topic': '/fleet/readiness_detail'" in text
     assert "'start_motion_detail_topic': '/fleet/start_motion_detail'" in text
     assert "'system_readiness_detail_topic': '/system/readiness_detail'" in text
-    assert "'enable_raw_debug_stream': False" in text
 
 
 def test_system_launch_uses_two_stream_dashboard_video_defaults():
@@ -102,7 +101,6 @@ def test_system_launch_uses_two_stream_dashboard_video_defaults():
     assert "'max_rate_hz': '1.0' if follower_camera_mode else '8.0'" in text
     assert "'active_max_rate_hz': '1.0' if follower_camera_mode else '8.0'" in text
     assert "'jpeg_quality': '52'" in text
-    assert "'--enable-raw-debug-stream', 'false'" in text
 
 
 def test_leader_can_own_risk_map_from_scout_sources():

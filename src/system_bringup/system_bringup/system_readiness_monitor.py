@@ -54,6 +54,7 @@ class SystemReadinessMonitor(Node):
         self.declare_parameter('follower_pose_topic', '/burger_pose')
         self.declare_parameter('field_robot_status_topic', '/fleet/field_robot_status')
         self.declare_parameter('leader_localization_ready_topic', '/localization_ready')
+        self.declare_parameter('allow_pose_tf_localization_evidence', True)
         self.declare_parameter('video_ready_topic', '/fleet/video_ready')
         self.declare_parameter('fleet_registry_json', '')
         self.declare_parameter('active_scout_robot_name', 'scout22')
@@ -84,6 +85,9 @@ class SystemReadinessMonitor(Node):
         self.follower_pose_topic = str(get('follower_pose_topic').value)
         self.field_status_topic = str(get('field_robot_status_topic').value)
         self.leader_localization_topic = str(get('leader_localization_ready_topic').value)
+        self.allow_pose_tf_localization_evidence = bool(
+            get('allow_pose_tf_localization_evidence').value
+        )
         self.video_ready_topic = str(get('video_ready_topic').value)
         registry = normalize_registry(str(get('fleet_registry_json').value))
         if not registry:
@@ -288,7 +292,12 @@ class SystemReadinessMonitor(Node):
         follower_pose_ok = (
             self._fresh(self.follower_pose_wall) if self.require_follower else True
         )
-        map_tf = map_ok and leader_pose_ok and self._tf_ok()
+        tf_ok = self._tf_ok()
+        map_tf = map_ok and leader_pose_ok and tf_ok
+        leader_localization = bool(
+            self.leader_localization_ready
+            or (self.allow_pose_tf_localization_evidence and map_tf)
+        )
         active_status_ready = self._field_robot_ready(self.active_scout_id)
         scout_localization = scout_pose_ok and active_status_ready if self.require_scout else True
         follower_candidates = [
@@ -329,7 +338,11 @@ class SystemReadinessMonitor(Node):
             'motion_hold': False,
             'scout_sensor': scout_pose_ok,
             'scout_localization': scout_localization,
-            'leader_localization': self.leader_localization_ready,
+            'leader_localization': leader_localization,
+            'leader_localization_signal': self.leader_localization_ready,
+            'leader_localization_derived_from_pose_tf': bool(
+                leader_localization and not self.leader_localization_ready
+            ),
             'follower_localization': follower_localization,
             'leader_nav2': leader_nav2,
             'follower_nav2': follower_nav2,
@@ -344,7 +357,7 @@ class SystemReadinessMonitor(Node):
             'map_tf': map_tf,
             'localization': (
                 scout_localization
-                and self.leader_localization_ready
+                and leader_localization
                 and follower_localization
             ),
             'nav2': leader_nav2 and follower_nav2,
