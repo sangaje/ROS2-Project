@@ -48,10 +48,43 @@ def generate_launch_description():
         is_follower = role == 'FOLLOWER'
         fleet_role = 'follower' if is_follower else 'member'
         default_exploration = True
+        if is_follower:
+            default_exploration = False
         default_follow = is_follower
         default_cartographer = not is_follower
         default_amcl = is_follower
         default_map_authority = not is_follower
+        requested_cartographer = _bool_text(
+            field_enable_cartographer.perform(context),
+            default_cartographer,
+        )
+        requested_rl = _bool_text(enable_rl.perform(context), default_exploration)
+        requested_map_authority = _bool_text(
+            map_authority_eligible.perform(context),
+            default_map_authority,
+        )
+        requested_map_forward = _bool_text(
+            forward_field_map_to_main.perform(context),
+            False,
+        )
+        if is_follower and requested_cartographer == 'true':
+            raise ValueError(
+                'initial_role=FOLLOWER cannot start Cartographer. '
+                'Follower uses shared map + AMCL until takeover is confirmed.'
+            )
+        if is_follower and requested_rl == 'true':
+            raise ValueError(
+                'initial_role=FOLLOWER cannot start the RL worker. '
+                'RL starts only after ACTIVE_SCOUT takeover authority.'
+            )
+        if is_follower and requested_map_authority == 'true':
+            raise ValueError(
+                'initial_role=FOLLOWER cannot claim map authority.'
+            )
+        if is_follower and requested_map_forward == 'true':
+            raise ValueError(
+                'initial_role=FOLLOWER cannot forward local maps to Leader.'
+            )
 
         system_launch = os.path.join(
             get_package_share_directory('system_bringup'),
@@ -69,15 +102,12 @@ def generate_launch_description():
                 field_enable_exploration.perform(context),
                 default_exploration,
             ),
-            'start_rl_worker': _bool_text(enable_rl.perform(context), True),
+            'start_rl_worker': requested_rl,
             'start_camera_sender': _bool_text(
                 enable_observation_tx.perform(context),
                 True,
             ),
-            'start_cartographer': _bool_text(
-                field_enable_cartographer.perform(context),
-                default_cartographer,
-            ),
+            'start_cartographer': requested_cartographer,
             'enable_cartographer': 'false',
             'enable_amcl': _bool_text(field_enable_amcl.perform(context), default_amcl),
             # Bayesian risk is centralized on the leader; this only controls
@@ -88,12 +118,9 @@ def generate_launch_description():
             'camera_sender_device': camera_sender_device.perform(context),
             'flask_server_url': flask_server_url.perform(context),
             'enable_scout_failover': 'true',
-            'forward_field_map_to_main': _bool_text(
-                forward_field_map_to_main.perform(context),
-                False,
-            ),
+            'forward_field_map_to_main': requested_map_forward,
         }
-        if not _bool_text(map_authority_eligible.perform(context), default_map_authority) == 'true':
+        if requested_map_authority != 'true':
             launch_args['start_cartographer'] = 'false'
         return [
             LogInfo(msg=[
@@ -102,6 +129,9 @@ def generate_launch_description():
                 ' fleet_role=', fleet_role,
                 ' domain=', domain_id.perform(context),
                 ' main_domain=', main_domain_id.perform(context),
+                ' cartographer=', launch_args['start_cartographer'],
+                ' rl=', launch_args['start_rl_worker'],
+                ' map_authority=', requested_map_authority,
             ]),
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(system_launch),
@@ -129,7 +159,7 @@ def generate_launch_description():
             ),
         ),
         DeclareLaunchArgument('enable_follow', default_value=''),
-        DeclareLaunchArgument('enable_rl', default_value='true'),
+        DeclareLaunchArgument('enable_rl', default_value=''),
         DeclareLaunchArgument('enable_observation_tx', default_value='true'),
         DeclareLaunchArgument(
             'field_enable_cartographer',

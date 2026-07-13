@@ -299,6 +299,29 @@ def test_command_watchdog_holds_and_retries_without_deactivating_active_scout():
     assert holds == ['command_timeout']
 
 
+def test_runtime_warmup_updates_observation_without_motion_activation():
+    runtime = (
+        Path(__file__).parents[1]
+        / 'system_bringup'
+        / 'scout_rl_runtime.py'
+    ).read_text(encoding='utf-8')
+    worker = (
+        Path(__file__).parents[1]
+        / 'system_bringup'
+        / 'scout_rl_policy_worker.py'
+    ).read_text(encoding='utf-8')
+
+    assert 'def warmup(self, reason: str = ' in runtime
+    assert 'self._sensor_pipeline_enabled = True' in runtime
+    assert 'if not self._sensor_pipeline_enabled:' in runtime
+    assert 'publish=self._active' in runtime
+    assert 'self._warm_observation(snapshot.scan)' in runtime
+    assert 'if state == RLWorkerState.ACTIVE and not self.start_motion' in worker
+    assert 'self.runtime.warmup(' in worker
+    assert 'SCOUT_STARTUP_PIPELINE |' in worker
+    assert 'SCOUT_OBSERVATION_PIPELINE |' in worker
+
+
 def test_deployment_runtime_has_no_process_or_nondeterministic_predict_path():
     source = Path(__file__).parents[1] / 'system_bringup' / 'scout_rl_runtime.py'
     text = source.read_text(encoding='utf-8')
@@ -531,6 +554,7 @@ def test_scout_rl_worker_logs_recoverable_runtime_gate_debug():
     assert 'policy_worker_dead' in source
     assert 'SCOUT_ODOM_DEBUG |' in source
     assert 'blocking_inputs=' in source
+    assert 'sensor_pipeline_enabled=' in source
     assert 'SCOUT_RL_RESUME_REQUEST |' in source
     assert 'self.runtime.hold(reason)' in source
     assert 'def debug_snapshot' in runtime

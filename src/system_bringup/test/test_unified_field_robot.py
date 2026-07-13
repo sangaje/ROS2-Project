@@ -475,3 +475,14 @@ def test_follower_startup_hold_has_timeout_and_follow_debug():
     assert "nav_action_ready=" in source
     assert "goal_sent=" in source
     assert "odom_motion=" in source
+
+
+def test_role_updates_are_noop_when_role_epoch_and_owner_match():
+    source = (
+        Path(__file__).parents[1]
+        / 'system_bringup'
+        / 'unified_field_robot.py'
+    ).read_text(encoding='utf-8')
+
+    assert 'self._last_role_tuple' in source
+    assert 'if next_tuple == self._last_role_tuple:' in source

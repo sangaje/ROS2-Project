@@ -16,10 +16,16 @@ def test_field_robot_launch_is_single_entrypoint_for_scout_and_follower():
     assert "'start_risk_map': 'false'" in source
     assert "'enable_yolo': 'false'" in source
     assert "'start_camera_sender': _bool_text" in source
-    assert "'forward_field_map_to_main': _bool_text" in source
+    assert "'forward_field_map_to_main': requested_map_forward" in source
     assert "field_enable_exploration" in source
     assert "field_enable_cartographer" in source
     assert "field_enable_amcl" in source
+    assert "initial_role=FOLLOWER cannot start Cartographer" in source
+    assert "initial_role=FOLLOWER cannot start the RL worker" in source
+    assert "initial_role=FOLLOWER cannot claim map authority" in source
+    assert "initial_role=FOLLOWER cannot forward local maps" in source
+    assert "default_exploration = False" in source
+    assert "DeclareLaunchArgument('enable_rl', default_value='')" in source
 
 
 def test_system_launch_routes_field_observations_to_robot_topics():
