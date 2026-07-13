@@ -20,6 +20,17 @@ const frameVersions = {
   omxStream: 0,
   scoutYoloStream: 0,
 };
+// MJPEG multipart connections can go silently idle (server stops sending
+// frames without ever closing the socket) -- the <img> tag then never
+// fires 'error', so it just freezes on the last frame forever unless the
+// user manually reloads the page. This watchdog forces a fresh connection
+// itself once a stream has gone stale, the same thing a manual refresh
+// used to be needed for.
+const lastFrameAtMs = {
+  omxStream: 0,
+  scoutYoloStream: 0,
+};
+const streamStaleTimeoutMs = 6000;
 const canvas = document.getElementById('mapCanvas');
 const ctx = canvas.getContext('2d');
 const roleColors = {leader: '#58a6ff', follower: '#63d297'};
@@ -108,11 +119,27 @@ function reconnectStream(id) {
   image.addEventListener('load', () => {
     if (image.naturalWidth > 0 && image.naturalHeight > 0) {
       frameVersions[id] = (frameVersions[id] || 0) + 1;
+      lastFrameAtMs[id] = Date.now();
     }
     streamReconnectDelayMs[id] = 500;
   });
   image.addEventListener('error', () => reconnectStream(id));
 });
+
+function checkStreamFreshness() {
+  const now = Date.now();
+  Object.keys(streamSources).forEach(id => {
+    const last = lastFrameAtMs[id] || 0;
+    if (last > 0 && now - last > streamStaleTimeoutMs) {
+      const image = document.getElementById(id);
+      const url = image && image.dataset.baseSrc;
+      if (url) setStreamSource(id, url, true);
+      // One attempt per stale window instead of every tick -- give the
+      // fresh connection a fair chance before deciding to retry again.
+      lastFrameAtMs[id] = now;
+    }
+  });
+}
 
 function updateImages(s) {
   queueGridLoad('map', s.map.seq, s.map.status);
@@ -629,3 +656,4 @@ async function refresh() {
 window.addEventListener('resize', draw);
 refresh();
 setInterval(refresh, 500);
+setInterval(checkStreamFreshness, 2000);

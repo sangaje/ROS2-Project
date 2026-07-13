@@ -87,6 +87,24 @@ def test_start_motion_has_falling_edge_grace_instead_of_instant_drop():
     assert 'now - self._motion_not_ready_since < self.motion_drop_grace_sec' in source
 
 
+def test_video_streams_self_heal_without_a_manual_page_refresh():
+    # Regression test: map/risk grids already retried on a failed image
+    # request, but the two MJPEG <img> streams (omxStream, scoutYoloStream)
+    # had no equivalent -- a stream that went silently idle (server stops
+    # sending frames without closing the connection) never fires 'error',
+    # so it just froze on the last frame until the user manually reloaded
+    # the page. A watchdog must now force a fresh connection itself.
+    js = (
+        Path(__file__).parents[1] / 'static' / 'dashboard.js'
+    ).read_text(encoding='utf-8')
+
+    assert 'lastFrameAtMs' in js
+    assert 'streamStaleTimeoutMs' in js
+    assert 'function checkStreamFreshness()' in js
+    assert 'setInterval(checkStreamFreshness, 2000)' in js
+    assert 'now - last > streamStaleTimeoutMs' in js
+
+
 def test_dashboard_requires_browser_rendered_panel_manifest():
     source = (
         Path(__file__).parents[1] / 'system_bringup' / 'leader_unified_dashboard.py'
