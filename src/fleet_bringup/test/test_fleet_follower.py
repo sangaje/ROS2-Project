@@ -90,22 +90,11 @@ def test_stale_follow_action_response_cannot_replace_latest_handle():
         destroy_node(node)
 
 
-def test_pending_follow_goal_response_timeout_allows_retry():
+def test_minimal_follower_has_no_start_motion_or_scan_slot_gates():
     node = make_node()
     try:
-        node.last_goal_outcome = 'pending'
-        node.pending_goal_response_since = 1.0
-        node.goal_response_timeout = 2.0
-        node.active_goal_handle = None
-        node.active_goal_id = 0
-        node.goal_count = 4
-        node.last_goal_xy = (1.0, 2.0)
-
-        node._recover_goal_response_timeout(3.5)
-
-        assert node.goal_count == 5
-        assert node.last_goal_outcome == 'failed'
-        assert node.last_goal_xy is None
-        assert node.pending_goal_response_since < 0.0
+        assert not hasattr(node, 'require_start_motion')
+        assert not hasattr(node, 'latest_scan')
+        assert not hasattr(node, 'formation_candidate_angles')
     finally:
         destroy_node(node)

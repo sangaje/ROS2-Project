@@ -47,8 +47,8 @@ def test_default_system_launch_routes_external_rl_directly_to_hardware_cmd_vel()
     assert "'cmd_vel_topic': DEFAULT_CMD_VEL_TOPIC" in launch
 
 
-def test_default_leader_shadow_does_not_create_hardware_cmd_publisher():
+def test_leader_shadow_can_force_zero_cmd_during_omx_hold():
     source = _read('src/system_bringup/system_bringup/leader_shadow_follow.py')
 
-    assert "self.cmd_pub = None" in source
-    assert "if self.direct_shadow_cmd_vel:" in source
+    assert "self.cmd_pub = self.create_publisher(TwistStamped, self.cmd_vel_topic, 10)" in source
+    assert "self._publish_twist(0.0, 0.0)" in source

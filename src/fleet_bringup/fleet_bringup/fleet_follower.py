@@ -1,22 +1,17 @@
 from __future__ import annotations
 
-import math
+from copy import deepcopy
 from functools import partial
+import math
 from typing import Optional, Tuple
 
 import rclpy
 from action_msgs.msg import GoalStatus
-from geometry_msgs.msg import PoseArray, PoseStamped
+from geometry_msgs.msg import PoseStamped
 from nav2_msgs.action import NavigateToPose
 from rclpy.action import ActionClient
 from rclpy.node import Node
-from rclpy.qos import (
-    DurabilityPolicy,
-    HistoryPolicy,
-    QoSProfile,
-    ReliabilityPolicy,
-)
-from sensor_msgs.msg import LaserScan
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool, String
 
 
@@ -38,12 +33,8 @@ def quaternion_from_yaw(yaw: float):
     return 0.0, 0.0, math.sin(half), math.cos(half)
 
 
-def wrap_angle(angle: float) -> float:
-    return math.atan2(math.sin(angle), math.cos(angle))
-
-
 class FleetFollower(Node):
-    """Send Nav2 goals behind the leader and obey central PAUSE/RESUME commands."""
+    """Minimal Nav2 follower: keep this robot behind /leader_pose."""
 
     def __init__(self) -> None:
         super().__init__('fleet_follower')
@@ -53,148 +44,54 @@ class FleetFollower(Node):
         self.declare_parameter('navigate_action', '/navigate_to_pose')
         self.declare_parameter('follow_command_topic', '/fleet/follow_command')
         self.declare_parameter('follow_status_topic', '/fleet/follow_enabled')
-        self.declare_parameter(
-            'collision_warning_topic', '/fleet/collision_warning'
-        )
-        self.declare_parameter('fleet_poses_topic', '/fleet/robot_poses')
-        self.declare_parameter('scan_topic', '/scan')
-        self.declare_parameter('start_motion_topic', '/fleet/start_motion')
-        self.declare_parameter('require_start_motion', True)
-        self.declare_parameter('follow_distance', 0.50)
-        self.declare_parameter('stop_distance_m', 0.35)
-        self.declare_parameter('resume_distance_m', 0.55)
-        self.declare_parameter('goal_period_sec', 0.5)
-        self.declare_parameter('goal_update_distance', 0.10)
-        self.declare_parameter('goal_refresh_sec', 3.0)
-        self.declare_parameter('action_wait_timeout_sec', 1.0)
-        self.declare_parameter('goal_response_timeout_sec', 2.0)
-        self.declare_parameter('cancel_previous_goal', False)
-        self.declare_parameter('start_following', True)
-        self.declare_parameter('use_scan_space_selection', True)
-        self.declare_parameter(
-            'formation_candidate_angles_deg',
-            [180.0, 135.0, -135.0, 90.0, -90.0, 45.0, -45.0, 0.0],
-        )
-        self.declare_parameter('scan_sector_half_width_deg', 28.0)
-        self.declare_parameter('min_slot_clearance_m', 0.45)
-        self.declare_parameter('avoidance_trigger_range_m', 0.42)
-        self.declare_parameter('avoidance_goal_distance_m', 0.55)
-        self.declare_parameter('peer_separation_weight', 0.35)
-        self.declare_parameter('slot_stickiness_bonus', 0.35)
         self.declare_parameter('localization_ready_topic', '/localization_ready')
         self.declare_parameter('require_localization_ready', False)
-        self.declare_parameter('pose_timeout_sec', 0.5)
+        self.declare_parameter('follow_distance', 0.50)
+        self.declare_parameter('stop_distance_m', 0.35)
+        self.declare_parameter('goal_period_sec', 0.5)
+        self.declare_parameter('goal_update_distance', 0.10)
+        self.declare_parameter('pose_timeout_sec', 0.8)
+        self.declare_parameter('start_following', True)
 
         parameter = self.get_parameter
-        self.leader_pose_topic = self._absolute(
-            str(parameter('leader_pose_topic').value)
-        )
-        self.follower_pose_topic = self._absolute(
-            str(parameter('follower_pose_topic').value)
-        )
-        self.navigate_action = self._absolute(
-            str(parameter('navigate_action').value)
-        )
-        self.follow_command_topic = self._absolute(
-            str(parameter('follow_command_topic').value)
-        )
-        self.follow_status_topic = self._absolute(
-            str(parameter('follow_status_topic').value)
-        )
-        self.collision_warning_topic = self._absolute(
-            str(parameter('collision_warning_topic').value)
-        )
-        self.fleet_poses_topic = self._absolute(
-            str(parameter('fleet_poses_topic').value)
-        )
-        self.scan_topic = self._absolute(str(parameter('scan_topic').value))
-        self.start_motion_topic = self._absolute(
-            str(parameter('start_motion_topic').value)
-        )
-        self.require_start_motion = bool(parameter('require_start_motion').value)
-        self.follow_distance = max(0.25, float(parameter('follow_distance').value))
-        self.stop_distance = max(0.05, float(parameter('stop_distance_m').value))
-        self.resume_distance = max(
-            self.stop_distance,
-            float(parameter('resume_distance_m').value),
-        )
-        self.goal_period = max(0.2, float(parameter('goal_period_sec').value))
-        self.goal_update_distance = max(
-            0.05, float(parameter('goal_update_distance').value)
-        )
-        self.goal_refresh = max(1.0, float(parameter('goal_refresh_sec').value))
-        self.action_wait_timeout = max(
-            0.0, float(parameter('action_wait_timeout_sec').value)
-        )
-        self.goal_response_timeout = max(
-            0.5, float(parameter('goal_response_timeout_sec').value)
-        )
-        self.cancel_previous_goal = bool(
-            parameter('cancel_previous_goal').value
-        )
-        self.follow_enabled = bool(parameter('start_following').value)
-        self.use_scan_space_selection = bool(
-            parameter('use_scan_space_selection').value
-        )
-        self.formation_candidate_angles = [
-            math.radians(float(v))
-            for v in list(parameter('formation_candidate_angles_deg').value)
-        ]
-        self.scan_sector_half_width = math.radians(
-            max(1.0, float(parameter('scan_sector_half_width_deg').value))
-        )
-        self.min_slot_clearance = max(
-            0.05, float(parameter('min_slot_clearance_m').value)
-        )
-        self.avoidance_trigger_range = max(
-            0.05, float(parameter('avoidance_trigger_range_m').value)
-        )
-        self.avoidance_goal_distance = max(
-            0.10, float(parameter('avoidance_goal_distance_m').value)
-        )
-        self.peer_separation_weight = max(
-            0.0, float(parameter('peer_separation_weight').value)
-        )
-        self.slot_stickiness_bonus = max(
-            0.0, float(parameter('slot_stickiness_bonus').value)
-        )
+        self.leader_pose_topic = self._absolute(str(parameter('leader_pose_topic').value))
+        self.follower_pose_topic = self._absolute(str(parameter('follower_pose_topic').value))
+        self.navigate_action = self._absolute(str(parameter('navigate_action').value))
+        self.follow_command_topic = self._absolute(str(parameter('follow_command_topic').value))
+        self.follow_status_topic = self._absolute(str(parameter('follow_status_topic').value))
         self.localization_ready_topic = self._absolute(
             str(parameter('localization_ready_topic').value)
         )
         self.require_localization_ready = bool(
             parameter('require_localization_ready').value
         )
+        self.follow_distance = max(0.1, float(parameter('follow_distance').value))
+        self.stop_distance = max(0.05, float(parameter('stop_distance_m').value))
+        self.goal_period = max(0.2, float(parameter('goal_period_sec').value))
+        self.goal_update_distance = max(
+            0.03, float(parameter('goal_update_distance').value)
+        )
         self.pose_timeout = max(0.1, float(parameter('pose_timeout_sec').value))
+        self.follow_enabled = bool(parameter('start_following').value)
 
         self.leader_pose: Optional[PoseStamped] = None
         self.leader_pose_wall: Optional[float] = None
         self.follower_pose: Optional[PoseStamped] = None
         self.follower_pose_wall: Optional[float] = None
+        self.localization_ready = False
+        self.goal_count = 0
         self.active_goal_handle = None
         self.active_goal_id = 0
+        self.goal_pending = False
         self.last_goal_xy: Optional[Point2] = None
         self.last_goal_time = -1.0e9
-        # 'none': never sent. 'pending': in flight. 'succeeded'/'failed':
-        # last result. Only 'failed' allows the goal_refresh_sec fallback in
-        # _should_send to re-send -- otherwise a settled, successfully
-        # reached follow goal got needlessly re-issued every few seconds.
         self.last_goal_outcome = 'none'
-        self.pending_goal_response_since = -1.0e9
-        self._current_slot_offset: Optional[float] = None
-        self._pending_slot_offset: Optional[float] = None
-        self.wait_log_time = -1.0e9
-        self.goal_count = 0
-        self.collision_warning = False
-        self.fleet_poses: Optional[PoseArray] = None
-        self.latest_scan: Optional[LaserScan] = None
-        self.localization_ready = False
-        self.start_motion = not self.require_start_motion
 
-        coordination_qos = QoSProfile(
-            history=HistoryPolicy.KEEP_LAST,
+        latched_qos = QoSProfile(
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
         )
         self.create_subscription(
             PoseStamped,
@@ -212,43 +109,18 @@ class FleetFollower(Node):
             String,
             self.follow_command_topic,
             self._command_callback,
-            coordination_qos,
-        )
-        self.create_subscription(
-            Bool,
-            self.collision_warning_topic,
-            self._warning_callback,
-            coordination_qos,
-        )
-        self.create_subscription(
-            PoseArray,
-            self.fleet_poses_topic,
-            self._fleet_poses_callback,
-            10,
-        )
-        self.create_subscription(
-            LaserScan,
-            self.scan_topic,
-            self._scan_callback,
-            10,
+            latched_qos,
         )
         self.create_subscription(
             Bool,
             self.localization_ready_topic,
             self._localization_ready_callback,
-            coordination_qos,
+            latched_qos,
         )
-        if self.require_start_motion:
-            self.create_subscription(
-                Bool,
-                self.start_motion_topic,
-                self._start_motion_callback,
-                coordination_qos,
-            )
         self.status_publisher = self.create_publisher(
             Bool,
             self.follow_status_topic,
-            coordination_qos,
+            latched_qos,
         )
         self.navigation_client = ActionClient(
             self,
@@ -257,22 +129,10 @@ class FleetFollower(Node):
         )
         self.create_timer(self.goal_period, self._tick)
         self._publish_status()
-
-        self.get_logger().info(
-            'FLEET_FOLLOWER_READY | '
-            f'leader={self.leader_pose_topic} '
-            f'follower={self.follower_pose_topic} '
-            f'action={self.navigate_action} '
-            f'scan={self.scan_topic} '
-            f'distance={self.follow_distance:.2f}m '
-            f'enabled={self.follow_enabled}'
-        )
         self.get_logger().warning(
-            'FOLLOWER_STARTUP_PROFILE | '
-            'robot=follower21 role=FOLLOWER domain=21 '
-            f'leader_pose_topic={self.leader_pose_topic} '
-            f'self_pose_topic={self.follower_pose_topic} '
-            'amcl=true nav2=true cartographer=false rl=false camera=false'
+            'FLEET_FOLLOWER_MINIMAL_READY | '
+            f'leader={self.leader_pose_topic} self={self.follower_pose_topic} '
+            f'action={self.navigate_action} distance={self.follow_distance:.2f}'
         )
 
     @staticmethod
@@ -290,67 +150,26 @@ class FleetFollower(Node):
         self.follower_pose = message
         self.follower_pose_wall = self._now()
 
+    def _localization_ready_callback(self, message: Bool) -> None:
+        self.localization_ready = bool(message.data)
+
     def _publish_status(self) -> None:
         message = Bool()
         message.data = self.follow_enabled
         self.status_publisher.publish(message)
 
-    def _warning_callback(self, message: Bool) -> None:
-        changed = message.data != self.collision_warning
-        self.collision_warning = bool(message.data)
-        if changed:
-            self.get_logger().warning(
-                'FLEET_SAFETY_WARNING | '
-                f'active={self.collision_warning} '
-                'robot_poses_order=[leader,follower]'
-            )
-
-    def _fleet_poses_callback(self, message: PoseArray) -> None:
-        self.fleet_poses = message
-
-    def _scan_callback(self, message: LaserScan) -> None:
-        self.latest_scan = message
-
-    def _localization_ready_callback(self, message: Bool) -> None:
-        self.localization_ready = bool(message.data)
-
-    def _start_motion_callback(self, message: Bool) -> None:
-        previous = self.start_motion
-        self.start_motion = bool(message.data)
-        if self.start_motion and not previous:
-            self.last_goal_xy = None
-            self.last_goal_time = -1.0e9
-            self.last_goal_outcome = 'none'
-
-    def _cancel_goal(self, reason: str) -> None:
-        handle = self.active_goal_handle
-        self.active_goal_handle = None
-        self.active_goal_id = 0
-        if handle is None:
-            return
-        try:
-            handle.cancel_goal_async()
-            self.get_logger().info(f'FOLLOW_GOAL_CANCEL_REQUESTED | reason={reason}')
-        except Exception as error:
-            self.get_logger().warning(
-                f'FOLLOW_GOAL_CANCEL_ERROR | reason={reason} error={error}'
-            )
-
     def _set_following(self, enabled: bool, command: str) -> None:
         changed = enabled != self.follow_enabled
         self.follow_enabled = enabled
         self._publish_status()
-        if not enabled:
-            self._cancel_goal(command)
         self.last_goal_xy = None
         self.last_goal_time = -1.0e9
         self.last_goal_outcome = 'none'
-        self._current_slot_offset = None
+        if not enabled:
+            self._cancel_goal(command)
         if changed:
             state = 'FOLLOWING' if enabled else 'PAUSED'
-            self.get_logger().warning(
-                f'FOLLOW_STATE | state={state} command={command}'
-            )
+            self.get_logger().warning(f'FOLLOW_STATE | state={state} command={command}')
 
     def _command_callback(self, message: String) -> None:
         command = message.data.strip().upper()
@@ -369,171 +188,27 @@ class FleetFollower(Node):
         qx, qy, qz, qw = quaternion_from_yaw(yaw)
         target = PoseStamped()
         target.header.frame_id = 'map'
-        target.header.stamp = rclpy.time.Time().to_msg()
-        target.pose.position.x = x
-        target.pose.position.y = y
+        target.header.stamp = self.get_clock().now().to_msg()
+        target.pose.position.x = float(x)
+        target.pose.position.y = float(y)
         target.pose.orientation.x = qx
         target.pose.orientation.y = qy
         target.pose.orientation.z = qz
         target.pose.orientation.w = qw
         return target
 
-    def _scan_clearance_for_world_direction(self, world_direction: float) -> float:
-        if self.latest_scan is None or self.follower_pose is None:
-            return float('inf')
-        follower_yaw = yaw_from_quaternion(self.follower_pose.pose.orientation)
-        target_bearing = wrap_angle(world_direction - follower_yaw)
-        scan = self.latest_scan
-        samples = []
-        for index, value in enumerate(scan.ranges):
-            if not math.isfinite(value):
-                value = scan.range_max
-            value = min(max(float(value), scan.range_min), scan.range_max)
-            bearing = scan.angle_min + index * scan.angle_increment
-            if abs(wrap_angle(bearing - target_bearing)) <= self.scan_sector_half_width:
-                samples.append(value)
-        if not samples:
-            return 0.0
-        samples.sort()
-        return samples[max(0, int(0.35 * (len(samples) - 1)))]
-
-    def _nearest_obstacle_world_bearing(self) -> Optional[Tuple[float, float]]:
-        if self.latest_scan is None or self.follower_pose is None:
-            return None
-        scan = self.latest_scan
-        best_range = float('inf')
-        best_bearing = 0.0
-        for index, value in enumerate(scan.ranges):
-            if not math.isfinite(value):
-                continue
-            value = float(value)
-            if value < scan.range_min or value > scan.range_max:
-                continue
-            if value < best_range:
-                best_range = value
-                best_bearing = scan.angle_min + index * scan.angle_increment
-        if not math.isfinite(best_range):
-            return None
-        follower_yaw = yaw_from_quaternion(self.follower_pose.pose.orientation)
-        return best_range, wrap_angle(follower_yaw + best_bearing)
-
-    def _avoidance_target_if_needed(self) -> Optional[PoseStamped]:
-        nearest = self._nearest_obstacle_world_bearing()
-        if nearest is None or self.follower_pose is None or self.leader_pose is None:
-            return None
-        nearest_range, obstacle_direction = nearest
-        if nearest_range > self.avoidance_trigger_range:
-            return None
-
-        left = wrap_angle(obstacle_direction + math.pi / 2.0)
-        right = wrap_angle(obstacle_direction - math.pi / 2.0)
-        left_clear = self._scan_clearance_for_world_direction(left)
-        right_clear = self._scan_clearance_for_world_direction(right)
-        escape = left if left_clear >= right_clear else right
-        follower = self.follower_pose.pose.position
-        leader = self.leader_pose.pose.position
-        yaw_to_leader = math.atan2(leader.y - follower.y, leader.x - follower.x)
-        target = self._make_goal_pose(
-            follower.x + self.avoidance_goal_distance * math.cos(escape),
-            follower.y + self.avoidance_goal_distance * math.sin(escape),
-            yaw_to_leader,
-        )
-        self.get_logger().warning(
-            'FOLLOW_AVOIDANCE_TARGET | '
-            f'obstacle_range={nearest_range:.2f} '
-            f'escape_clearance={max(left_clear, right_clear):.2f}'
-        )
-        return target
-
-    def _peer_clearance_score(self, x: float, y: float) -> float:
-        if self.fleet_poses is None:
-            return 0.0
-        best = float('inf')
-        for pose in self.fleet_poses.poses:
-            d = math.hypot(x - pose.position.x, y - pose.position.y)
-            if d > 1e-3:
-                best = min(best, d)
-        if not math.isfinite(best):
-            return 0.0
-        return min(2.0, best)
-
-    def _target_open_slot_around_leader(self) -> PoseStamped:
+    def _target_behind_leader(self) -> PoseStamped:
         assert self.leader_pose is not None
         leader = self.leader_pose.pose
         leader_yaw = yaw_from_quaternion(leader.orientation)
-        if (
-            not self.use_scan_space_selection
-            or self.latest_scan is None
-            or self.follower_pose is None
-        ):
-            self._pending_slot_offset = None
-            return self._make_goal_pose(
-                leader.position.x - self.follow_distance * math.cos(leader_yaw),
-                leader.position.y - self.follow_distance * math.sin(leader_yaw),
-                leader_yaw,
-            )
-
-        follower = self.follower_pose.pose.position
-        best_target = None
-        best_offset = None
-        best_score = -float('inf')
-        for offset in self.formation_candidate_angles:
-            slot_angle = leader_yaw + offset
-            x = leader.position.x + self.follow_distance * math.cos(slot_angle)
-            y = leader.position.y + self.follow_distance * math.sin(slot_angle)
-            direction_from_follower = math.atan2(y - follower.y, x - follower.x)
-            clearance = self._scan_clearance_for_world_direction(
-                direction_from_follower
-            )
-            if clearance < self.min_slot_clearance:
-                continue
-            travel = math.hypot(x - follower.x, y - follower.y)
-            peer_score = self._peer_clearance_score(x, y)
-            behind_bonus = 0.25 if abs(wrap_angle(offset - math.pi)) < 0.01 else 0.0
-            # Bias toward whichever slot the last goal actually sent was
-            # for, so a marginal scan-noise fluctuation between ticks can't
-            # flip the target to a different slot around the leader while
-            # it hasn't moved -- that produced a follower that never
-            # settled, constantly re-planning to a "slightly better" slot.
-            sticky = (
-                self.slot_stickiness_bonus
-                if (
-                    self._current_slot_offset is not None
-                    and abs(wrap_angle(offset - self._current_slot_offset)) < 0.01
-                )
-                else 0.0
-            )
-            score = (
-                clearance
-                + self.peer_separation_weight * peer_score
-                + behind_bonus
-                + sticky
-                - 0.20 * travel
-            )
-            if score > best_score:
-                best_score = score
-                best_target = self._make_goal_pose(x, y, leader_yaw)
-                best_offset = offset
-
-        self._pending_slot_offset = best_offset
-        if best_target is not None:
-            return best_target
-
         return self._make_goal_pose(
             leader.position.x - self.follow_distance * math.cos(leader_yaw),
             leader.position.y - self.follow_distance * math.sin(leader_yaw),
             leader_yaw,
         )
 
-    def _target_behind_leader(self) -> PoseStamped:
-        assert self.leader_pose is not None
-        avoidance = self._avoidance_target_if_needed()
-        if avoidance is not None:
-            self._pending_slot_offset = None
-            return avoidance
-        return self._target_open_slot_around_leader()
-
     def _should_send(self, target: PoseStamped) -> bool:
+        now = self._now()
         current = (target.pose.position.x, target.pose.position.y)
         if self.last_goal_xy is None:
             return True
@@ -543,62 +218,25 @@ class FleetFollower(Node):
         )
         if moved >= self.goal_update_distance:
             return True
-        # Once settled (the last goal succeeded, or is still in flight),
-        # hold still instead of re-issuing the same goal every
-        # goal_refresh_sec -- that made a follower that had already reached
-        # its slot behind the leader keep fidgeting/re-planning in place.
-        # Only a genuinely failed/rejected goal falls back to a periodic
-        # retry so a stuck follower can still recover.
         if self.last_goal_outcome == 'failed':
-            return self._now() - self.last_goal_time >= self.goal_refresh
+            return now - self.last_goal_time >= self.goal_period
         return False
-
-    def _log_wait(self, reason: str) -> None:
-        now = self._now()
-        if now - self.wait_log_time >= 5.0:
-            self.get_logger().warning(f'FOLLOW_WAIT | {reason}')
-            self.wait_log_time = now
 
     def _tick(self) -> None:
         if not self.follow_enabled:
             return
         now = self._now()
-        self._recover_goal_response_timeout(now)
-        if self.require_start_motion and not self.start_motion:
-            self._log_follow_debug('start_motion_false')
-            return
-        if self.leader_pose is None:
-            self._log_follow_debug('leader_pose_missing')
-            return
-        if self.leader_pose_wall is None or now - self.leader_pose_wall > self.pose_timeout:
-            self._log_follow_debug('leader_pose_stale')
-            return
-        if str(self.leader_pose.header.frame_id or '').strip().lstrip('/') != 'map':
-            self._log_follow_debug('leader_pose_stale')
-            return
-        if self.follower_pose is None:
-            self._log_follow_debug('self_pose_missing')
-            return
-        if self.follower_pose_wall is None or now - self.follower_pose_wall > self.pose_timeout:
-            self._log_follow_debug('self_pose_stale')
-            return
-        if str(self.follower_pose.header.frame_id or '').strip().lstrip('/') != 'map':
-            self._log_follow_debug('self_pose_stale')
-            return
-        if self.require_localization_ready and not self.localization_ready:
-            self._log_follow_debug('localization_not_ready')
-            return
-        if not self.navigation_client.server_is_ready():
-            self._log_follow_debug('nav_server_unavailable')
+        reason = self._blocking_reason(now)
+        if reason is not None:
+            self._log_follow_debug(reason)
             return
         distance_to_leader = math.hypot(
             self.leader_pose.pose.position.x - self.follower_pose.pose.position.x,
             self.leader_pose.pose.position.y - self.follower_pose.pose.position.y,
         )
-        if self.last_goal_xy is None and distance_to_leader <= self.resume_distance:
-            self._log_follow_debug('goal_not_changed', distance_to_leader=distance_to_leader)
+        if distance_to_leader <= self.stop_distance:
+            self._log_follow_debug('close_to_leader', distance_to_leader=distance_to_leader)
             return
-
         target = self._target_behind_leader()
         if not self._should_send(target):
             self._log_follow_debug(
@@ -607,32 +245,108 @@ class FleetFollower(Node):
                 target=target,
             )
             return
-        if self.cancel_previous_goal:
-            self._cancel_goal('new follow target')
+        self._send_goal(target, distance_to_leader)
 
+    def _blocking_reason(self, now: float) -> Optional[str]:
+        if self.leader_pose is None:
+            return 'leader_pose_missing'
+        if self.leader_pose_wall is None or now - self.leader_pose_wall > self.pose_timeout:
+            return 'leader_pose_stale'
+        if str(self.leader_pose.header.frame_id or '').strip().lstrip('/') != 'map':
+            return 'leader_pose_not_map'
+        if self.follower_pose is None:
+            return 'self_pose_missing'
+        if self.follower_pose_wall is None or now - self.follower_pose_wall > self.pose_timeout:
+            return 'self_pose_stale'
+        if str(self.follower_pose.header.frame_id or '').strip().lstrip('/') != 'map':
+            return 'self_pose_not_map'
+        if self.require_localization_ready and not self.localization_ready:
+            return 'localization_not_ready'
+        if not self.navigation_client.server_is_ready():
+            return 'nav_server_unavailable'
+        return None
+
+    def _send_goal(self, target: PoseStamped, distance_to_leader: float) -> None:
         goal = NavigateToPose.Goal()
-        goal.pose = target
-        self.last_goal_xy = (
-            target.pose.position.x,
-            target.pose.position.y,
-        )
-        self.last_goal_time = self._now()
-        self.last_goal_outcome = 'pending'
-        self.pending_goal_response_since = self.last_goal_time
-        self._current_slot_offset = self._pending_slot_offset
+        goal.pose = deepcopy(target)
+        goal.pose.header.frame_id = goal.pose.header.frame_id or 'map'
+        goal.pose.header.stamp = self.get_clock().now().to_msg()
         self.goal_count += 1
         goal_id = self.goal_count
+        self.goal_pending = True
+        self.last_goal_xy = (target.pose.position.x, target.pose.position.y)
+        self.last_goal_time = self._now()
+        self.last_goal_outcome = 'pending'
         future = self.navigation_client.send_goal_async(goal)
         future.add_done_callback(
             partial(self._goal_response_callback, goal_id=goal_id)
         )
         self._log_follow_debug(
-            'none',
+            'goal_sent',
             distance_to_leader=distance_to_leader,
             target=target,
-            goal_required=True,
             goal_sent=True,
         )
+        self.get_logger().warning(
+            'FOLLOW_NAV2_DIRECT_GOAL_SENT | '
+            f'action={self.navigate_action} goal_id={goal_id} '
+            f'x={target.pose.position.x:.3f} y={target.pose.position.y:.3f} '
+            f'distance_to_leader={distance_to_leader:.3f}'
+        )
+
+    def _goal_response_callback(self, future, goal_id: int) -> None:
+        if goal_id == self.goal_count:
+            self.goal_pending = False
+        try:
+            handle = future.result()
+        except Exception as error:
+            self.get_logger().error(f'FOLLOW_NAV2_DIRECT_GOAL_ERROR | {error}')
+            if goal_id == self.goal_count:
+                self.last_goal_outcome = 'failed'
+            return
+        if goal_id != self.goal_count:
+            if handle.accepted:
+                handle.cancel_goal_async()
+            return
+        if not handle.accepted:
+            self.get_logger().warning('FOLLOW_NAV2_DIRECT_GOAL_REJECTED')
+            self.last_goal_outcome = 'failed'
+            return
+        self.active_goal_handle = handle
+        self.active_goal_id = goal_id
+        handle.get_result_async().add_done_callback(
+            partial(self._goal_result_callback, goal_id=goal_id)
+        )
+        self.get_logger().warning(
+            f'FOLLOW_NAV2_DIRECT_GOAL_ACCEPTED | goal_id={goal_id}'
+        )
+
+    def _goal_result_callback(self, future, goal_id: int) -> None:
+        succeeded = False
+        try:
+            result = future.result()
+            succeeded = result.status == GoalStatus.STATUS_SUCCEEDED
+        except Exception as error:
+            self.get_logger().warning(f'FOLLOW_NAV2_DIRECT_RESULT_ERROR | {error}')
+        if goal_id == self.goal_count:
+            self.last_goal_outcome = 'succeeded' if succeeded else 'failed'
+        if goal_id == self.active_goal_id:
+            self.active_goal_handle = None
+            self.active_goal_id = 0
+
+    def _cancel_goal(self, reason: str) -> None:
+        handle = self.active_goal_handle
+        self.active_goal_handle = None
+        self.active_goal_id = 0
+        if handle is None:
+            return
+        try:
+            handle.cancel_goal_async()
+            self.get_logger().warning(f'FOLLOW_NAV2_DIRECT_CANCEL | reason={reason}')
+        except Exception as error:
+            self.get_logger().warning(
+                f'FOLLOW_NAV2_DIRECT_CANCEL_ERROR | reason={reason} error={error}'
+            )
 
     def _log_follow_debug(
         self,
@@ -640,7 +354,6 @@ class FleetFollower(Node):
         *,
         distance_to_leader: float = float('nan'),
         target: Optional[PoseStamped] = None,
-        goal_required: bool = False,
         goal_sent: bool = False,
     ) -> None:
         now = self._now()
@@ -657,77 +370,15 @@ class FleetFollower(Node):
         self.get_logger().warning(
             'FOLLOWER_FOLLOW_DEBUG | '
             'role=FOLLOWER '
-            f'start_motion={self.start_motion} '
-            f'localization_ready={self.localization_ready} '
             f'leader_pose_age_ms={leader_age_ms:.0f} '
             f'self_pose_age_ms={self_age_ms:.0f} '
             f'nav_server_ready={self.navigation_client.server_is_ready()} '
             f'distance_to_leader={distance_to_leader:.3f} '
             f'target_x={target_x:.3f} target_y={target_y:.3f} '
-            f'goal_required={goal_required} goal_sent={goal_sent} '
+            f'goal_sent={goal_sent} '
             f'goal_accepted={self.active_goal_handle is not None} '
-            'path_received=unknown controller_cmd_age_ms=-1 '
-            f'odom_motion=false blocking_reason={reason}',
+            f'blocking_reason={reason}',
             throttle_duration_sec=1.0,
-        )
-
-    def _goal_response_callback(self, future, goal_id: int) -> None:
-        if goal_id == self.goal_count:
-            self.pending_goal_response_since = -1.0e9
-        try:
-            handle = future.result()
-        except Exception as error:
-            self.get_logger().error(f'FOLLOW_GOAL_ERROR | {error}')
-            if goal_id == self.goal_count:
-                self.last_goal_outcome = 'failed'
-            return
-        if not handle.accepted:
-            self.get_logger().warning('FOLLOW_GOAL_REJECTED')
-            if goal_id == self.goal_count:
-                self.last_goal_outcome = 'failed'
-            return
-        if not self.follow_enabled or goal_id != self.goal_count:
-            handle.cancel_goal_async()
-            return
-        self.active_goal_handle = handle
-        self.active_goal_id = goal_id
-        handle.get_result_async().add_done_callback(
-            partial(self._goal_result_callback, goal_id=goal_id)
-        )
-        self.get_logger().info(
-            f'FOLLOW_GOAL_ACCEPTED | count={self.goal_count}'
-        )
-
-    def _goal_result_callback(self, future, goal_id: int) -> None:
-        succeeded = False
-        try:
-            result = future.result()
-            succeeded = result.status == GoalStatus.STATUS_SUCCEEDED
-        except Exception as error:
-            self.get_logger().warning(f'FOLLOW_GOAL_RESULT_ERROR | {error}')
-        if goal_id == self.goal_count:
-            self.last_goal_outcome = 'succeeded' if succeeded else 'failed'
-        if goal_id == self.active_goal_id:
-            self.active_goal_handle = None
-            self.active_goal_id = 0
-
-    def _recover_goal_response_timeout(self, now: float) -> None:
-        if self.last_goal_outcome != 'pending':
-            return
-        if self.active_goal_handle is not None:
-            return
-        if self.pending_goal_response_since < 0.0:
-            return
-        if now - self.pending_goal_response_since < self.goal_response_timeout:
-            return
-        self.goal_count += 1
-        self.active_goal_id = 0
-        self.active_goal_handle = None
-        self.last_goal_xy = None
-        self.last_goal_outcome = 'failed'
-        self.pending_goal_response_since = -1.0e9
-        self.get_logger().warning(
-            'FOLLOW_GOAL_RESPONSE_TIMEOUT | retry_with_latest_target=true'
         )
 
 

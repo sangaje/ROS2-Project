@@ -258,6 +258,9 @@ class UnifiedFieldRobot(Node):
         self.last_follow_goal_wall = -1.0e9
         self.pending_follow_goal_xy: Optional[tuple[float, float]] = None
         self.pending_follow_goal_wall = -1.0e9
+        self.follow_goal_pending = False
+        self.follow_goal_epoch = 0
+        self.follow_goal_handle = None
         self.first_follow_leader_xy: Optional[tuple[float, float]] = None
         self.first_follow_wall: Optional[float] = None
         self.follow_startup_released = False
@@ -569,10 +572,6 @@ class UnifiedFieldRobot(Node):
         if not self.enable_follow:
             return
         now = self._now()
-        self.nav.recover_timeouts()
-        if not self._start_motion_allowed():
-            self._log_follow_gate('start_motion_false')
-            return
         if getattr(self, 'require_system_ready', False) and not getattr(
             self, 'system_ready', True
         ):
@@ -599,63 +598,20 @@ class UnifiedFieldRobot(Node):
             self._log_follow_gate('self_pose_stale')
             return
         if self.require_localization_ready and not self.localization_ready:
-            # Without this, FOLLOWER starts sending Nav2 goals the instant
-            # it has a leader pose, before this robot's own AMCL has
-            # converged (global_localize_kickstart's spin state machine
-            # hasn't finished/published /localization_ready yet). Nav2
-            # then acts on a bad pose estimate, and the reported position
-            # "teleports" once AMCL catches up or re-converges elsewhere.
             self._log_follow_gate('localization_not_ready')
             return
         if not self.nav_client.server_is_ready():
             self._log_follow_gate('nav_server_unavailable')
             return
-        if self.nav.has_pending_goal or not self.nav.is_idle:
-            self._log_follow_gate('goal_in_progress')
-            return
         if now - self.last_follow_goal_wall < self.follow_goal_period:
             return
-        leader_distance = float('nan')
-        leader_moved = 0.0
-        startup_elapsed = 0.0
-        if not self.follow_startup_released:
-            leader_xy = (
-                self.leader_pose.pose.position.x,
-                self.leader_pose.pose.position.y,
-            )
-            self_xy = (
-                self.self_pose.pose.position.x,
-                self.self_pose.pose.position.y,
-            )
-            if self.first_follow_leader_xy is None:
-                self.first_follow_leader_xy = leader_xy
-                self.first_follow_wall = now
-            leader_moved = math.hypot(
-                leader_xy[0] - self.first_follow_leader_xy[0],
-                leader_xy[1] - self.first_follow_leader_xy[1],
-            )
-            leader_distance = math.hypot(
-                leader_xy[0] - self_xy[0],
-                leader_xy[1] - self_xy[1],
-            )
-            startup_elapsed = (
-                now - self.first_follow_wall
-                if self.first_follow_wall is not None else 0.0
-            )
-            if leader_distance <= self.follow_resume_distance:
-                self._log_follow_gate(
-                    'goal_not_changed',
-                    leader_distance=leader_distance,
-                    leader_moved=leader_moved,
-                    startup_elapsed=startup_elapsed,
-                )
-                return
-            self.follow_startup_released = True
-            self.get_logger().warning(
-                'FOLLOW_STARTUP_RELEASED | '
-                f'robot={self.robot_name} distance_to_leader={leader_distance:.3f} '
-                f'leader_moved={leader_moved:.3f} elapsed={startup_elapsed:.2f}s'
-            )
+        leader_distance = math.hypot(
+            self.leader_pose.pose.position.x - self.self_pose.pose.position.x,
+            self.leader_pose.pose.position.y - self.self_pose.pose.position.y,
+        )
+        if leader_distance <= self.follow_stop_distance:
+            self._log_follow_gate('close_to_leader', leader_distance=leader_distance)
+            return
         yaw = yaw_from_quaternion(self.leader_pose.pose.orientation)
         goal = self._copy_pose(self.leader_pose)
         goal.pose.position.x -= self.follow_distance * math.cos(yaw)
@@ -672,15 +628,13 @@ class UnifiedFieldRobot(Node):
                 )
                 return
         self._log_follow_debug(
-            'goal_required',
+            'goal_sent',
             leader_distance=leader_distance,
             goal_required=True,
-            goal_sent=False,
+            goal_sent=True,
             target_xy=xy,
         )
-        self._queue_nav_goal(goal, source='FOLLOW')
-        self.pending_follow_goal_xy = xy
-        self.pending_follow_goal_wall = now
+        self._send_follow_nav2_goal(goal, xy)
 
     def _log_follow_gate(
         self,
@@ -756,7 +710,7 @@ class UnifiedFieldRobot(Node):
         return (
             'FOLLOWER_FOLLOW_DEBUG | FOLLOW_DEBUG | '
             f'robot={self.robot_name} role={self.role.value} '
-            f'start_motion={getattr(self, "start_motion", True)} '
+            f'start_motion_ignored={getattr(self, "require_start_motion", False)} '
             f'leader_pose_rx={self.leader_pose is not None} '
             f'leader_pose_age_ms={leader_age * 1000.0:.0f} '
             f'self_pose_rx={self.self_pose is not None} '
@@ -770,10 +724,10 @@ class UnifiedFieldRobot(Node):
             f'leader_moved={leader_moved:.3f} '
             f'startup_elapsed={startup_elapsed:.2f} '
             f'goal_required={goal_required} goal_sent={goal_sent} '
-            f'goal_accepted={self.nav.active_goal_handle is not None} '
+            f'goal_accepted={self.follow_goal_handle is not None} '
             'path_received=unknown '
-            f'goal_pending={self.nav.has_pending_goal} '
-            f'active_goals={self.nav.active_goal_count} '
+            f'goal_pending={self.follow_goal_pending} '
+            f'active_goals={1 if self.follow_goal_handle is not None else 0} '
             f'controller_cmd_age_ms={cmd_age * 1000.0 if cmd_age >= 0.0 else -1.0:.0f} '
             f'odom_motion={self.movement_started} '
             f'blocking_reason={reason}'
@@ -891,10 +845,7 @@ class UnifiedFieldRobot(Node):
             return
         old = self.role
         if role != Role.FOLLOWER:
-            self.last_follow_goal_xy = None
-            self.pending_follow_goal_xy = None
-            self.first_follow_leader_xy = None
-            self.follow_startup_released = False
+            self._cancel_follow_goal(f'role_change_to_{role.value}')
         if old != role:
             self._set_authority(MotionAuthority.NONE, f'release_{old.value}')
             self._invalidate_nav_goal(
@@ -924,6 +875,113 @@ class UnifiedFieldRobot(Node):
         if not self._start_motion_allowed():
             return
         self.nav.request_goal(pose, source)
+
+    def _send_follow_nav2_goal(
+        self,
+        pose: PoseStamped,
+        xy: tuple[float, float],
+    ) -> None:
+        goal = NavigateToPose.Goal()
+        goal.pose = self._copy_pose(pose)
+        goal.pose.header.frame_id = goal.pose.header.frame_id or 'map'
+        goal.pose.header.stamp = self.get_clock().now().to_msg()
+        self.follow_goal_epoch += 1
+        goal_id = self.follow_goal_epoch
+        self.follow_goal_pending = True
+        self.pending_follow_goal_xy = xy
+        self.pending_follow_goal_wall = self._now()
+        self.last_follow_goal_xy = xy
+        self.last_follow_goal_wall = self.pending_follow_goal_wall
+        self._set_authority(MotionAuthority.NORMAL_FOLLOW, 'follow_goal_sent')
+        try:
+            future = self.nav_client.send_goal_async(goal)
+        except Exception as exc:  # noqa: BLE001
+            self.follow_goal_pending = False
+            self._set_authority(MotionAuthority.NONE, 'follow_goal_send_error')
+            self.get_logger().error(
+                f'FOLLOW_NAV2_DIRECT_SEND_ERROR | action={self.navigate_action} error={exc}'
+            )
+            return
+        future.add_done_callback(
+            lambda fut, goal_id=goal_id: self._on_follow_goal_response(fut, goal_id)
+        )
+        self.get_logger().warning(
+            'FOLLOW_NAV2_DIRECT_GOAL_SENT | '
+            f'robot={self.robot_name} action={self.navigate_action} '
+            f'goal_id={goal_id} x={xy[0]:.3f} y={xy[1]:.3f}'
+        )
+
+    def _on_follow_goal_response(self, future, goal_id: int) -> None:
+        if goal_id == self.follow_goal_epoch:
+            self.follow_goal_pending = False
+        try:
+            handle = future.result()
+        except Exception as exc:  # noqa: BLE001
+            if goal_id == self.follow_goal_epoch:
+                self._set_authority(MotionAuthority.NONE, 'follow_goal_response_error')
+                self._reset_follow_goal_memory()
+            self.get_logger().warning(
+                f'FOLLOW_NAV2_DIRECT_GOAL_ERROR | action={self.navigate_action} error={exc}'
+            )
+            return
+        if goal_id != self.follow_goal_epoch or self.role != Role.FOLLOWER:
+            if handle.accepted:
+                try:
+                    handle.cancel_goal_async()
+                except Exception as exc:  # noqa: BLE001
+                    self.get_logger().warning(
+                        f'FOLLOW_NAV2_DIRECT_STALE_CANCEL_ERROR | error={exc}'
+                    )
+            return
+        if not handle.accepted:
+            self._set_authority(MotionAuthority.NONE, 'follow_goal_rejected')
+            self._reset_follow_goal_memory()
+            self.get_logger().warning(
+                f'FOLLOW_NAV2_DIRECT_GOAL_REJECTED | action={self.navigate_action}'
+            )
+            return
+        self.follow_goal_handle = handle
+        self.get_logger().warning(
+            f'FOLLOW_NAV2_DIRECT_GOAL_ACCEPTED | robot={self.robot_name} goal_id={goal_id}'
+        )
+        handle.get_result_async().add_done_callback(
+            lambda fut, goal_id=goal_id: self._on_follow_goal_result(fut, goal_id)
+        )
+
+    def _on_follow_goal_result(self, future, goal_id: int) -> None:
+        status = None
+        error = ''
+        try:
+            result = future.result()
+            status = result.status
+        except Exception as exc:  # noqa: BLE001
+            error = str(exc)
+        if goal_id != self.follow_goal_epoch:
+            return
+        self.follow_goal_handle = None
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            self._set_authority(MotionAuthority.NONE, 'follow_goal_succeeded')
+            return
+        self._set_authority(MotionAuthority.NONE, 'follow_goal_finished')
+        self._reset_follow_goal_memory()
+        self.get_logger().warning(
+            'FOLLOW_NAV2_DIRECT_RESULT | '
+            f'robot={self.robot_name} status={status} error={error}'
+        )
+
+    def _cancel_follow_goal(self, reason: str) -> None:
+        self.follow_goal_epoch += 1
+        self.follow_goal_pending = False
+        handle = self.follow_goal_handle
+        self.follow_goal_handle = None
+        if handle is not None:
+            try:
+                handle.cancel_goal_async()
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warning(
+                    f'FOLLOW_NAV2_DIRECT_CANCEL_ERROR | reason={reason} error={exc}'
+                )
+        self._reset_follow_goal_memory()
 
     def _dispatch_pending_nav_goal(self) -> None:
         self.nav.dispatch(
@@ -1293,6 +1351,7 @@ class UnifiedFieldRobot(Node):
     def _reset_follow_goal_memory(self) -> None:
         self.last_follow_goal_xy = None
         self.pending_follow_goal_xy = None
+        self.pending_follow_goal_wall = -1.0e9
         self.first_follow_leader_xy = None
         self.first_follow_wall = None
         self.follow_startup_released = False

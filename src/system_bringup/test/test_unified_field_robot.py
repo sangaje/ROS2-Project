@@ -568,16 +568,18 @@ def test_leader_shadow_reevaluates_immediately_when_gates_open():
     assert 'self._tick()' in video_callback
 
 
-def test_follower_startup_hold_has_timeout_and_follow_debug():
+def test_follower_follow_is_minimal_direct_nav2_and_logs_debug():
     source = (
         Path(__file__).parents[1]
         / 'system_bringup'
         / 'unified_field_robot.py'
     ).read_text(encoding='utf-8')
 
-    assert "follow_startup_timeout_sec" in source
     assert "follow_resume_distance_m" in source
-    assert "leader_distance <= self.follow_resume_distance" in source
+    assert "def _send_follow_nav2_goal" in source
+    assert "FOLLOW_NAV2_DIRECT_GOAL_SENT" in source
+    assert "if self.nav.has_pending_goal or not self.nav.is_idle" not in source
+    assert "leader_distance <= self.follow_resume_distance" not in source
     assert "FOLLOWER_FOLLOW_DEBUG |" in source
     assert "nav_server_ready=" in source
     assert "goal_sent=" in source

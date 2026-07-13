@@ -585,8 +585,8 @@ def generate_launch_description():
             default_value='false',
             choices=['true', 'false'],
             description=(
-                'Start fleet_follower. Set false when system_bringup '
-                'unified_field_robot owns FOLLOWER mode.'
+                'Start the minimal fleet_follower Nav2 follower. Set false '
+                'when system_bringup unified_field_robot owns FOLLOWER mode.'
             ),
         ),
         DeclareLaunchArgument('follower_initial_x', default_value='0.0'),
