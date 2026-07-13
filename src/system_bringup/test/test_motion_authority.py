@@ -50,6 +50,7 @@ def test_leader_shadow_pauses_for_target_lock_states():
     assert "'TRACKING'" in source
     assert "'CONFIRMING'" in source
     assert "'FIRING'" in source
+    assert "'COOLDOWN'" in source
 
 
 def test_leader_shadow_hard_stops_on_best_effort_target_detection():
@@ -64,6 +65,7 @@ def test_leader_shadow_hard_stops_on_best_effort_target_detection():
     assert 'def _force_leader_stop_for_target' in source
     assert "self._pulse_cancel()" in source
     assert "self._publish_twist(0.0, 0.0)" in source
+    assert "base_motion_stopped=true omx_pd_allowed=true" in source
 
 
 def test_leader_shadow_blocks_nav2_goal_publish_during_target_hold():

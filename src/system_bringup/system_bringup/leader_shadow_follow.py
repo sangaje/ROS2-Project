@@ -579,8 +579,13 @@ class LeaderShadowFollow(Node):
 
     @staticmethod
     def _is_omx_aiming(state: str) -> bool:
-        """Target lock states that must hold leader shadow motion."""
-        return str(state).strip().upper() in ('TRACKING', 'CONFIRMING', 'FIRING')
+        """OMX may keep aiming/firing; only the robot base must stay stopped."""
+        return str(state).strip().upper() in (
+            'TRACKING',
+            'CONFIRMING',
+            'FIRING',
+            'COOLDOWN',
+        )
 
     def _target_hold_reason(self) -> Optional[str]:
         now = self._now()
@@ -602,6 +607,7 @@ class LeaderShadowFollow(Node):
         return None
 
     def _hold_for_omx_target(self, reason: str) -> None:
+        """Stop Nav2/base motion while leaving OMX PD tracking free to run."""
         self.target_hold_active = True
         self._cancel_shadow_goal(reason)
         self._stop_direct_cmd(reason)
@@ -614,6 +620,7 @@ class LeaderShadowFollow(Node):
         self._publish_twist(0.0, 0.0)
         self.get_logger().warning(
             'LEADER_OMX_TARGET_HOLD | '
+            'base_motion_stopped=true omx_pd_allowed=true '
             f'reason={reason} detected={self.target_detected} '
             f'omx_state={self.omx_state or "(empty)"} '
             f'has_memory={self.last_target_point is not None}',
@@ -1009,7 +1016,7 @@ class LeaderShadowFollow(Node):
             self.mode = LeaderMode.IDLE
 
     def _force_leader_stop_for_target(self, reason: str) -> None:
-        """Hard stop the leader while OMX owns target tracking."""
+        """Hard stop only the robot base while OMX owns target tracking."""
         now = self._now()
         if now - self.last_target_cancel_wall >= self.target_cancel_period:
             self._cancel_shadow_goal(reason)
