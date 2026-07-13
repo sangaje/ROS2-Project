@@ -554,6 +554,10 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.latest_detection_pose = None
         self.latest_detection_capture_sec = None
         self.latest_detection_delay_ms = -1.0
+        self.latest_detection_image_delay_ms = -1.0
+        self.latest_detection_yolo_latency_ms = -1.0
+        self.latest_detection_http_roundtrip_ms = -1.0
+        self.latest_detection_capture_source = 'none'
         self.detection_lock = threading.Lock()
         self.pose_lock = threading.Lock()
         self.yolo_condition = threading.Condition()
@@ -1604,6 +1608,16 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         except Exception:
             return None
 
+    @staticmethod
+    def payload_float(payload, key, default=-1.0):
+        try:
+            value = payload.get(key, default)
+            if value in (None, ''):
+                return float(default)
+            return float(value)
+        except Exception:
+            return float(default)
+
     def update_detection_capture_pose(self, header=None, capture_sec=None):
         now_ros_sec = self.get_clock().now().nanoseconds * 1e-9
         if capture_sec is None:
@@ -1659,6 +1673,10 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             self.latest_detection_seq += 1
             self.last_yolo_ros_sec = self.get_clock().now().nanoseconds * 1e-9
             self.update_detection_capture_pose(header, capture_sec)
+            self.latest_detection_image_delay_ms = self.latest_detection_delay_ms
+            self.latest_detection_yolo_latency_ms = -1.0
+            self.latest_detection_http_roundtrip_ms = -1.0
+            self.latest_detection_capture_source = 'local_camera'
 
         overlay = self.make_overlay(frame, detections)
         if overlay is None:
@@ -1734,11 +1752,28 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                 range_hat_m=float(range_hat) if range_hat is not None else self.bbox_height_to_range(bbox, image_h),
             ))
 
-        capture_sec = float(
-            payload.get('capture_ros_sec')
-            or payload.get('capture_wall_sec')
-            or 0.0
+        capture_ros_sec = self.payload_float(payload, 'capture_ros_sec', 0.0)
+        capture_wall_sec = self.payload_float(payload, 'capture_wall_sec', 0.0)
+        if capture_ros_sec > 0.0:
+            capture_sec = capture_ros_sec
+            capture_source = 'capture_ros_sec'
+        elif capture_wall_sec > 0.0:
+            capture_sec = capture_wall_sec
+            capture_source = 'capture_wall_sec'
+        else:
+            capture_sec = 0.0
+            capture_source = 'receipt'
+        image_delay_candidates = [
+            self.payload_float(payload, 'capture_age_ms', -1.0),
+            self.payload_float(payload, 'robot_frame_age_ms', -1.0),
+            self.payload_float(payload, 'robot_frame_age_ms_at_send', -1.0),
+        ]
+        image_delay_ms = max(
+            (value for value in image_delay_candidates if value >= 0.0),
+            default=-1.0,
         )
+        yolo_latency_ms = self.payload_float(payload, 'latency_ms', -1.0)
+        http_roundtrip_ms = self.payload_float(payload, 'http_roundtrip_ms', -1.0)
         with self.detection_lock:
             self.yolo_frame_count += 1
             self.yolo_det_count += len(detections)
@@ -1755,6 +1790,10 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                 )
             else:
                 self.latest_detection_delay_ms = -1.0
+            self.latest_detection_image_delay_ms = image_delay_ms
+            self.latest_detection_yolo_latency_ms = yolo_latency_ms
+            self.latest_detection_http_roundtrip_ms = http_roundtrip_ms
+            self.latest_detection_capture_source = capture_source
         self.last_image_shape = f'{image_w}x{image_h} flask_json'
         self.last_image_encoding = 'external_json'
 
@@ -1824,6 +1863,10 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             f'risk_max={float(np.max(self.risk_map)) if self.risk_map is not None else 0.0:.3f} | '
             f'last_shape={self.last_image_shape} | enc={self.last_image_encoding} | '
             f'capture_delay_ms={self.latest_detection_delay_ms:.1f} | '
+            f'image_delay_ms={self.latest_detection_image_delay_ms:.1f} | '
+            f'yolo_latency_ms={self.latest_detection_yolo_latency_ms:.1f} | '
+            f'http_roundtrip_ms={self.latest_detection_http_roundtrip_ms:.1f} | '
+            f'capture_source={self.latest_detection_capture_source} | '
             f'history_pose={self.latest_detection_pose is not None} | '
             f'bearing_obs={len(self.bearing_observations)} views={bearing_view_count} '
             f'consensus_peaks={len(self.bearing_consensus_peaks)} | '

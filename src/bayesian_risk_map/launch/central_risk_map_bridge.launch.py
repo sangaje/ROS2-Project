@@ -53,6 +53,7 @@ def generate_launch_description():
     source_domain_id = LaunchConfiguration('source_domain_id')
     risk_sink_domain_ids = LaunchConfiguration('risk_sink_domain_ids')
     bridge_rviz_topics = LaunchConfiguration('bridge_rviz_topics')
+    source_pose_topic = LaunchConfiguration('source_pose_topic')
 
     def _write_bridge_configs(context, *args, **kwargs):
         central_domain = central_domain_id.perform(context)
@@ -91,7 +92,11 @@ topics:
         if include_rviz_topics:
             source_yaml += _topic_block('/scan', 'sensor_msgs/msg/LaserScan', reliability='best_effort', depth=3)
             source_yaml += _topic_block('/odom', 'nav_msgs/msg/Odometry', depth=3)
-        source_yaml += _topic_block('/leader_pose', 'geometry_msgs/msg/PoseStamped', depth=1)
+        source_yaml += _topic_block(
+            source_pose_topic.perform(context),
+            'geometry_msgs/msg/PoseStamped',
+            depth=1,
+        )
         source_yaml += _topic_block('/risk/yolo_detections', 'std_msgs/msg/String', reliability='best_effort', depth=1)
         source_to_central = _write_runtime_yaml(
             f'risk_source_{source_domain}_to_central_{central_domain}_',
@@ -208,7 +213,8 @@ topics:
         DeclareLaunchArgument('map_topic', default_value='/map'),
         DeclareLaunchArgument('map_frame', default_value='map'),
         DeclareLaunchArgument('base_frame', default_value='base_footprint'),
-        DeclareLaunchArgument('pose_topic', default_value='/leader_pose'),
+        DeclareLaunchArgument('source_pose_topic', default_value='/member_pose'),
+        DeclareLaunchArgument('pose_topic', default_value='/member_pose'),
         DeclareLaunchArgument('pose_topic_stale_sec', default_value='2.5'),
         DeclareLaunchArgument('external_detection_topic', default_value='/risk/yolo_detections'),
         DeclareLaunchArgument('risk_publish_rate_hz', default_value='5.0'),

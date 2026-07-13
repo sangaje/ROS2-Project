@@ -402,6 +402,7 @@ def write_risk_to_leader_bridge_config(
     leader_domain: int,
     *,
     include_map: bool = True,
+    include_risk_outputs: bool = True,
     output_directory: Optional[Path] = None,
 ) -> Path:
     """Create the one-way scout/risk bridge into the leader domain.
@@ -411,7 +412,19 @@ def write_risk_to_leader_bridge_config(
     leader-SLAM compatibility mode sets this false so domain 20's local
     Cartographer remains the only /map source in that mode.
     """
-    topics = risk_topics()
+    all_risk_topics = risk_topics()
+    topics = {
+        '/risk/yolo_detections': all_risk_topics['/risk/yolo_detections'],
+        '/member_pose': topic('geometry_msgs/msg/PoseStamped'),
+    }
+    if include_risk_outputs:
+        topics.update(
+            {
+                name: spec
+                for name, spec in all_risk_topics.items()
+                if name != '/risk/yolo_detections'
+            }
+        )
     topics['/scout/signal'] = topic(
         'std_msgs/msg/String',
         profile=qos(reliability='best_effort', durability='volatile', depth=5),

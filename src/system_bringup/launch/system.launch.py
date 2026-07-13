@@ -81,6 +81,7 @@ def generate_launch_description():
     leader_auto_localize = LaunchConfiguration('leader_auto_localize')
     enable_amcl = LaunchConfiguration('enable_amcl')
     start_risk_map = LaunchConfiguration('start_risk_map')
+    start_leader_risk_map = LaunchConfiguration('start_leader_risk_map')
     start_cartographer = LaunchConfiguration('start_cartographer')
     cartographer_configuration_basename = LaunchConfiguration(
         'cartographer_configuration_basename'
@@ -293,7 +294,6 @@ def generate_launch_description():
         scout_owns_slam = (
             role_value == 'scout'
             and fleet_role_value in ('member', 'follower')
-            and launch_bool(start_risk_map.perform(context))
             and launch_bool(start_cartographer.perform(context))
             and not launch_bool(enable_amcl.perform(context))
         )
@@ -540,6 +540,9 @@ def generate_launch_description():
                         risk_domain,
                         domain,
                         include_map=not leader_owns_map,
+                        include_risk_outputs=not launch_bool(
+                            start_leader_risk_map.perform(context)
+                        ),
                     )
                     if leader_owns_map:
                         actions.append(LogInfo(msg=[
@@ -579,6 +582,65 @@ def generate_launch_description():
                         'SYSTEM_BRINGUP | risk_domain_id equals leader '
                         'domain; risk->leader bridge skipped.'
                     ]))
+
+            if launch_bool(start_leader_risk_map.perform(context)):
+                risk_share = get_package_share_directory('bayesian_risk_map')
+                risk_config = os.path.join(
+                    risk_share, 'config', 'bayesian_risk_map.yaml'
+                )
+                actions.append(TimerAction(
+                    period=2.0,
+                    actions=[Node(
+                        package='bayesian_risk_map',
+                        executable='bayesian_risk_map_node',
+                        name='leader_bayesian_risk_map_node',
+                        output='screen',
+                        parameters=[
+                            risk_config,
+                            {
+                                'use_sim_time': False,
+                                'map_topic': '/map',
+                                'map_qos_durability': 'volatile',
+                                'map_frame': 'map',
+                                'base_frame': 'base_footprint',
+                                'pose_source': 'topic',
+                                'pose_topic': scout_pose_topic.perform(context),
+                                'pose_topic_stale_sec': (
+                                    scout_pose_timeout_sec.perform(context)
+                                ),
+                                'detection_source': 'flask_topic',
+                                'external_detection_topic': (
+                                    external_detection_topic.perform(context)
+                                ),
+                                'enable_yolo': False,
+                                'publish_overlay': False,
+                                'publish_debug_image': False,
+                                'publish_debug_compressed_image': False,
+                                'publish_diagnostic_maps': False,
+                                'debug_show_opencv': False,
+                                'teleop_mode': True,
+                                'risk_publish_rate_hz': 5.0,
+                                'diagnostic_publish_rate_hz': 1.0,
+                                'region_update_period_sec': 1.5,
+                                'enable_room_probability': False,
+                                'enable_region_segmentation': False,
+                                'enable_visibility_tracking': True,
+                                'target_class': risk_target_class.perform(context),
+                                'model_path': risk_model_path.perform(context),
+                                'camera_hfov_deg': leader_scan_fov_deg.perform(context),
+                            },
+                        ],
+                        env=process_env,
+                        respawn=True,
+                        respawn_delay=3.0,
+                    )],
+                ))
+                actions.append(LogInfo(msg=[
+                    'SYSTEM_BRINGUP | leader Jetson owns Bayesian risk map; ',
+                    'source pose=', scout_pose_topic.perform(context),
+                    ' detection=', external_detection_topic.perform(context),
+                    ' map=/map',
+                ]))
 
             actions.append(TimerAction(
                 period=3.0,
@@ -927,7 +989,10 @@ def generate_launch_description():
 
         camera_sender_on = launch_bool(start_camera_sender.perform(context))
 
-        if launch_bool(start_risk_map.perform(context)):
+        if (
+            launch_bool(start_risk_map.perform(context))
+            or launch_bool(start_cartographer.perform(context))
+        ):
             risk_share = get_package_share_directory('bayesian_risk_map')
             risk_launch_path = os.path.join(
                 risk_share, 'launch', 'real_robot_risk_slam.launch.py'
@@ -982,6 +1047,7 @@ def generate_launch_description():
                     'start_cartographer': (
                         'true' if cartographer_on else 'false'
                     ),
+                    'start_risk_map': start_risk_map.perform(context),
                     'cartographer_configuration_basename': configured_lua,
                     'start_camera': risk_start_camera,
                     'start_teleop': start_teleop.perform(context),
@@ -1156,6 +1222,17 @@ def generate_launch_description():
                 'true restores Scout-owned Cartographer/risk processing; '
                 'local YOLO/camera capture remain disabled when '
                 'start_camera_sender:=true.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'start_leader_risk_map', default_value='true',
+            choices=['true', 'false'],
+            description=(
+                'Leader role only: run the Bayesian risk map on the leader '
+                'Jetson from bridged Scout /map, /member_pose and '
+                '/risk/yolo_detections. When true, the risk-domain bridge '
+                'excludes Scout-owned risk outputs so the leader has one '
+                'authoritative /risk/risk_map publisher.'
             ),
         ),
         DeclareLaunchArgument(

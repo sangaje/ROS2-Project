@@ -190,8 +190,27 @@ def test_risk_to_leader_bridge_is_one_way_map_source(tmp_path):
     assert config['topics']['/map']['qos']['reliability'] == 'reliable'
     assert config['topics']['/map']['qos']['durability'] == 'transient_local'
     assert config['topics']['/map']['qos']['history'] == 'keep_last'
+    assert config['topics']['/member_pose']['type'] == 'geometry_msgs/msg/PoseStamped'
+    assert config['topics']['/risk/yolo_detections']['type'] == 'std_msgs/msg/String'
     assert '/tf' not in config['topics']
     assert '/tf_static' not in config['topics']
+
+
+def test_risk_to_leader_bridge_can_exclude_scout_risk_outputs(tmp_path):
+    path = write_risk_to_leader_bridge_config(
+        22,
+        24,
+        include_risk_outputs=False,
+        output_directory=tmp_path,
+    )
+    config = yaml.safe_load(path.read_text())
+
+    assert '/map' in config['topics']
+    assert '/member_pose' in config['topics']
+    assert '/risk/yolo_detections' in config['topics']
+    assert '/risk/risk_map' not in config['topics']
+    assert '/risk/person_probability_map' not in config['topics']
+    assert '/risk/evidence_markers' not in config['topics']
 
 
 def test_leader_to_pc_bridge_is_visualization_only(tmp_path):
