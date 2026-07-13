@@ -434,6 +434,8 @@ class LeaderShadowFollow(Node):
             self.get_logger().warning(
                 f'[LEADER_SHADOW] LOCALIZATION_READY | topic={self.localization_ready_topic}'
             )
+            self.last_goal_wall = -1.0e9
+            self._tick()
 
     def _on_system_ready(self, msg: Bool) -> None:
         previous = self.system_ready
@@ -456,6 +458,9 @@ class LeaderShadowFollow(Node):
             self.get_logger().warning(
                 f'[LEADER_SHADOW] VIDEO_READY | ready={self.video_ready} topic={self.video_ready_topic}'
             )
+        if self.video_ready and not previous:
+            self.last_goal_wall = -1.0e9
+            self._tick()
 
     def _on_target_detected(self, msg: Bool) -> None:
         self.target_detected = bool(msg.data)

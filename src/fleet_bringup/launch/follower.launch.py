@@ -369,7 +369,7 @@ def generate_launch_description():
                     'amcl_get_state_service': '/amcl/get_state',
                     'global_frame': 'map',
                     'base_frame': 'base_footprint',
-                    'ready_topic': 'localization_ready',
+                    'ready_topic': '/localization_ready',
                     'fixed_seed_initial_pose_applied': True,
                 }],
                 env=process_env,

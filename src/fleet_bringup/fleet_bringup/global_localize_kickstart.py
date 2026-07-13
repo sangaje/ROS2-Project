@@ -97,7 +97,7 @@ class GlobalLocalizeKickstart(Node):
         self.declare_parameter('amcl_lifecycle_service', '/amcl/get_state')
         self.declare_parameter('base_frame', 'base_footprint')
         self.declare_parameter('global_frame', 'map')
-        self.declare_parameter('ready_topic', 'localization_ready')
+        self.declare_parameter('ready_topic', '/localization_ready')
 
         # A pose on the shared map is not interchangeable across robots. Keep
         # scout-pose seeding opt-in only for fixtures where the leader and

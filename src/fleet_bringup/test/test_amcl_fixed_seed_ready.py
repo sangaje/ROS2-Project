@@ -15,6 +15,7 @@ def test_fixed_seed_ready_watches_amcl_inputs_without_motion_side_effects():
     assert "self.declare_parameter('odom_topic', '/odom')" in SOURCE
     assert "self.declare_parameter('amcl_pose_topic', '/amcl_pose')" in SOURCE
     assert "self.declare_parameter('amcl_get_state_service', '/amcl/get_state')" in SOURCE
+    assert "self.declare_parameter('ready_topic', '/localization_ready')" in SOURCE
     assert "self.declare_parameter('fixed_seed_initial_pose_applied', True)" in SOURCE
     assert 'self._publish_ready(True)' in SOURCE
 
@@ -30,3 +31,17 @@ def test_fixed_seed_ready_requires_tf_and_lifecycle_active():
     assert "self.base_frame" in SOURCE
     assert "GetState" in SOURCE
     assert "lifecycle=active" in SOURCE
+    assert "LEADER_LOCALIZATION_DEBUG |" in SOURCE
+    assert "blocking_reason=" in SOURCE
+    assert "readiness_publisher_count=" in SOURCE
+
+
+def test_launch_files_pass_absolute_localization_ready_topic():
+    root = Path(__file__).parents[2]
+    for relative in (
+        'fleet_bringup/launch/leader.launch.py',
+        'fleet_bringup/launch/member.launch.py',
+        'fleet_bringup/launch/follower.launch.py',
+    ):
+        text = (root / relative).read_text(encoding='utf-8')
+        assert "'ready_topic': '/localization_ready'" in text

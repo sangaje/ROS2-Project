@@ -1481,7 +1481,55 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         x1, y1, x2, y2 = bbox
         cx = 0.5 * (x1 + x2)
         fx = (image_w / 2.0) / math.tan(math.radians(self.camera_hfov_deg) / 2.0)
-        return math.atan2(cx - image_w / 2.0, fx)
+        # Image x grows to the right, while ROS base +y and positive yaw point
+        # left. A non-mirrored forward camera therefore maps right-side pixels
+        # to a negative bearing.
+        return math.atan2(image_w / 2.0 - cx, fx)
+
+    def log_risk_projection_debug(
+        self,
+        *,
+        bbox,
+        image_w,
+        bearing_rad,
+        robot_pose,
+        range_m,
+    ) -> None:
+        try:
+            x1, _, x2, _ = bbox
+            cx = 0.5 * (float(x1) + float(x2))
+            width = max(1.0, float(image_w))
+            normalized_x = cx / width - 0.5
+            side = 'CENTER'
+            if normalized_x > 0.05:
+                side = 'RIGHT'
+            elif normalized_x < -0.05:
+                side = 'LEFT'
+            rx, ry, ryaw = robot_pose
+            global_bearing = wrap_angle(float(ryaw) + float(bearing_rad))
+            risk_x = float(rx) + float(range_m) * math.cos(global_bearing)
+            risk_y = float(ry) + float(range_m) * math.sin(global_bearing)
+            grid = self.world_to_grid(risk_x, risk_y)
+            gx, gy = grid if grid is not None else (-1, -1)
+            self.get_logger().warning(
+                'RISK_PROJECTION_DEBUG | '
+                f'image_width={int(width)} '
+                f'bbox_center_x={cx:.1f} '
+                f'image_side={side} '
+                f'normalized_x={normalized_x:.4f} '
+                f'bearing_camera_deg={math.degrees(float(bearing_rad)):.2f} '
+                'camera_mirrored=false '
+                'camera_yaw_offset_deg=0.00 '
+                f'robot_yaw_deg={math.degrees(float(ryaw)):.2f} '
+                f'global_bearing_deg={math.degrees(global_bearing):.2f} '
+                f'robot_x={float(rx):.3f} robot_y={float(ry):.3f} '
+                f'range_m={float(range_m):.3f} '
+                f'risk_world_x={risk_x:.3f} risk_world_y={risk_y:.3f} '
+                f'grid_x={gx} grid_y={gy}',
+                throttle_duration_sec=1.0,
+            )
+        except Exception:  # noqa: BLE001
+            return
 
     def bbox_height_to_range(self, bbox, image_h):
         x1, y1, x2, y2 = bbox
@@ -1924,6 +1972,14 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                 throttle_duration_sec=2.0,
             )
             return
+        for detection in detections:
+            self.log_risk_projection_debug(
+                bbox=detection.bbox,
+                image_w=image_w,
+                bearing_rad=detection.bearing_rad,
+                robot_pose=capture_pose,
+                range_m=detection.range_hat_m,
+            )
         with self.detection_lock:
             self.yolo_frame_count += 1
             self.yolo_det_count += len(detections)
@@ -2830,6 +2886,13 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             conf=clamp(confidence, 0.0, 1.0),
             bearing_rad=self.bbox_center_to_bearing(bbox, image_w),
             range_hat_m=self.bbox_height_to_range(bbox, image_h),
+        )
+        self.log_risk_projection_debug(
+            bbox=detection.bbox,
+            image_w=image_w,
+            bearing_rad=detection.bearing_rad,
+            robot_pose=leader_pose,
+            range_m=detection.range_hat_m,
         )
         return self.build_detection_candidate_map(leader_pose, [detection])
 

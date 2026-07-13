@@ -26,6 +26,8 @@ def test_dashboard_publishes_latched_video_ready_after_all_streams_arrive():
     assert "start_motion_detail_topic" in source
     assert "self.start_motion_detail_pub" in source
     assert "blocking_reasons" in source
+    assert "DASHBOARD_READINESS_DETAIL |" in source
+    assert "blocking_panels=" in source
     assert "system_readiness_detail_topic" in source
     assert "self._publish_start_motion(False" in source
     assert "DurabilityPolicy.TRANSIENT_LOCAL" in source

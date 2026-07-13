@@ -435,6 +435,28 @@ def test_nav2_shadow_goal_starts_even_when_leader_begins_next_to_scout():
     assert node.shadow_goal_active is True
 
 
+def test_leader_shadow_reevaluates_immediately_when_gates_open():
+    source = (
+        Path(__file__).parents[1]
+        / 'system_bringup'
+        / 'leader_shadow_follow.py'
+    ).read_text(encoding='utf-8')
+
+    localization_callback = source.split('def _on_localization_ready', 1)[1].split(
+        'def _on_system_ready',
+        1,
+    )[0]
+    video_callback = source.split('def _on_video_ready', 1)[1].split(
+        'def _on_target_detected',
+        1,
+    )[0]
+
+    assert 'self.last_goal_wall = -1.0e9' in localization_callback
+    assert 'self._tick()' in localization_callback
+    assert 'self.last_goal_wall = -1.0e9' in video_callback
+    assert 'self._tick()' in video_callback
+
+
 def test_follower_startup_hold_has_timeout_and_follow_debug():
     source = (
         Path(__file__).parents[1]

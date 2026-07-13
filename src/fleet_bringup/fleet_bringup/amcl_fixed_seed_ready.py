@@ -34,7 +34,7 @@ class AmclFixedSeedReady(Node):
         self.declare_parameter('global_frame', 'map')
         self.declare_parameter('odom_frame', 'odom')
         self.declare_parameter('base_frame', 'base_footprint')
-        self.declare_parameter('ready_topic', 'localization_ready')
+        self.declare_parameter('ready_topic', '/localization_ready')
         self.declare_parameter('min_known_map_cells', 100)
         self.declare_parameter('max_scan_age_sec', 1.5)
         self.declare_parameter('max_odom_age_sec', 1.5)
@@ -103,9 +103,14 @@ class AmclFixedSeedReady(Node):
         self.xy_cov = float('inf')
         self.yaw_cov = float('inf')
         self.amcl_active_cached = not self.require_amcl_active
+        self.amcl_state_label = (
+            'not_required' if not self.require_amcl_active else 'unknown'
+        )
         self.amcl_state_request_pending = False
         self.good_since_wall: Optional[float] = None
         self.done = False
+        self.last_map_wall: Optional[float] = None
+        self.map_valid = False
 
         self._publish_ready(False)
         self.create_timer(self.check_period_sec, self._tick)
@@ -121,7 +126,16 @@ class AmclFixedSeedReady(Node):
         return self.get_clock().now().nanoseconds * 1.0e-9
 
     def _on_map(self, msg: OccupancyGrid) -> None:
+        width = int(msg.info.width)
+        height = int(msg.info.height)
+        self.map_valid = (
+            width > 0
+            and height > 0
+            and float(msg.info.resolution) > 0.0
+            and len(msg.data) == width * height
+        )
         self.map_known_cells = sum(1 for cell in msg.data if cell >= 0)
+        self.last_map_wall = self._now()
 
     def _on_scan(self, msg: LaserScan) -> None:  # noqa: ARG002
         self.last_scan_wall = self._now()
@@ -151,16 +165,24 @@ class AmclFixedSeedReady(Node):
         return last_wall is not None and self._now() - last_wall <= max_age
 
     def _tf_ok(self, target: str, source: str) -> bool:
+        return self._tf_status(target, source)[0]
+
+    def _tf_status(self, target: str, source: str) -> tuple[bool, float]:
         try:
-            self.tf_buffer.lookup_transform(
+            transform = self.tf_buffer.lookup_transform(
                 target,
                 source,
                 rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=self.tf_timeout_sec),
             )
-            return True
+            stamp = transform.header.stamp
+            stamp_sec = float(stamp.sec) + float(stamp.nanosec) * 1.0e-9
+            age_ms = -1.0
+            if stamp_sec > 0.0:
+                age_ms = max(0.0, (self._now() - stamp_sec) * 1000.0)
+            return True, age_ms
         except (LookupException, ExtrapolationException, Exception):  # noqa: BLE001
-            return False
+            return False, -1.0
 
     def _age(self, last_wall: Optional[float]) -> float:
         if last_wall is None:
@@ -172,11 +194,18 @@ class AmclFixedSeedReady(Node):
         odom_fresh = self._fresh(self.last_odom_wall, self.max_odom_age_sec)
         amcl_fresh = self._fresh(self.last_amcl_wall, self.max_amcl_age_sec)
         cov_ok = self.xy_cov <= self.max_xy_cov and self.yaw_cov <= self.max_yaw_cov
-        map_odom_tf = self._tf_ok(self.global_frame, self.odom_frame)
-        odom_base_tf = self._tf_ok(self.odom_frame, self.base_frame)
+        map_odom_tf, map_odom_age_ms = self._tf_status(
+            self.global_frame,
+            self.odom_frame,
+        )
+        odom_base_tf, odom_base_age_ms = self._tf_status(
+            self.odom_frame,
+            self.base_frame,
+        )
         lifecycle_active = self._amcl_active()
         checks = {
             'initial_pose_applied': self.initial_pose_applied,
+            'map_valid': self.map_valid,
             'map_ready': self.map_known_cells >= self.min_known_map_cells,
             'scan_fresh': scan_fresh,
             'odom_fresh': odom_fresh,
@@ -186,28 +215,43 @@ class AmclFixedSeedReady(Node):
             'map_odom_tf': map_odom_tf,
             'odom_base_tf': odom_base_tf,
             'amcl_lifecycle_active': lifecycle_active,
+            '_map_odom_tf_age_ms': map_odom_age_ms,
+            '_odom_base_tf_age_ms': odom_base_age_ms,
         }
         reason = 'ready'
         for key, value in checks.items():
+            if key.startswith('_'):
+                continue
             if not value:
                 reason = key
                 break
-        return all(checks.values()), reason, checks
+        return all(value for key, value in checks.items() if not key.startswith('_')), reason, checks
 
     def _log_localization_debug(self, *, ready: bool, reason: str, checks: dict) -> None:
         self.get_logger().warning(
-            'LOCALIZATION_DEBUG | '
-            f'mode=amcl ready={ready} blocking_reason={reason} '
+            'LEADER_LOCALIZATION_DEBUG | '
+            f'mode=amcl '
+            f'map_rx={self.last_map_wall is not None} '
+            f'map_age_ms={self._age(self.last_map_wall) * 1000.0:.0f} '
+            f'map_valid={self.map_valid} '
+            f'scan_rx={self.last_scan_wall is not None} '
             f'map_known_cells={self.map_known_cells} '
             f'map_ready={checks["map_ready"]} '
             f'scan_age_ms={self._age(self.last_scan_wall) * 1000.0:.0f} '
+            f'odom_rx={self.last_odom_wall is not None} '
             f'odom_age_ms={self._age(self.last_odom_wall) * 1000.0:.0f} '
+            f'amcl_process_alive={self.amcl_state_client.service_is_ready() or self.last_amcl_wall is not None} '
+            f'amcl_lifecycle_state={self.amcl_state_label} '
+            f'amcl_pose_rx={self.last_amcl_wall is not None} '
             f'amcl_pose_age_ms={self._age(self.last_amcl_wall) * 1000.0:.0f} '
-            f'xy_cov={self.xy_cov:.4f} yaw_cov={self.yaw_cov:.4f} '
+            f'cov_xy={self.xy_cov:.4f} cov_yaw={self.yaw_cov:.4f} '
             f'covariance_ok={checks["covariance_ok"]} '
             f'map_odom_tf={checks["map_odom_tf"]} '
             f'odom_base_tf={checks["odom_base_tf"]} '
-            f'lifecycle_active={checks["amcl_lifecycle_active"]}',
+            f'tf_age_ms={max(checks["_map_odom_tf_age_ms"], checks["_odom_base_tf_age_ms"]):.0f} '
+            f'readiness_publisher_count={self.count_publishers(self.ready_topic)} '
+            f'localization_ready={ready} '
+            f'blocking_reason={reason}',
             throttle_duration_sec=2.0,
         )
 
@@ -226,8 +270,10 @@ class AmclFixedSeedReady(Node):
             response = future.result()
         except Exception:  # noqa: BLE001
             self.amcl_active_cached = False
+            self.amcl_state_label = 'service_error'
             return
         state = getattr(response.current_state, 'label', '')
+        self.amcl_state_label = str(state).lower() or 'unknown'
         self.amcl_active_cached = str(state).lower() == 'active'
 
     def _publish_ready(self, ready: bool) -> None:

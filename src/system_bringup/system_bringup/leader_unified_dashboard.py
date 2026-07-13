@@ -1199,6 +1199,26 @@ class LeaderUnifiedDashboard(Node):
                 f'scout_stream={scout_stream_ready} '
                 f'omx_frame={omx_frame_ready} omx_stream={omx_stream_ready} ui={ui_ready}'
             )
+        if not ready:
+            panel_state = detail.get('dashboard_ui', {}).get('panels', {})
+            blocking_panels = []
+            if isinstance(panel_state, dict):
+                blocking_panels = [
+                    name
+                    for name, panel in panel_state.items()
+                    if isinstance(panel, dict) and not bool(panel.get('ready'))
+                ]
+            self.get_logger().warning(
+                'DASHBOARD_READINESS_DETAIL | '
+                f'scout_yolo={scout_ready} '
+                f'leader_omx={omx_ready} '
+                f'map={panel_state.get("map", {}).get("ready") if isinstance(panel_state.get("map"), dict) else None} '
+                f'risk_map={panel_state.get("risk_map", {}).get("ready") if isinstance(panel_state.get("risk_map"), dict) else None} '
+                f'fleet_state={panel_state.get("fleet_state", {}).get("ready") if isinstance(panel_state.get("fleet_state"), dict) else None} '
+                f'browser_heartbeat={bool(ui_detail.get("session_fresh"))} '
+                f'blocking_panels={blocking_panels}',
+                throttle_duration_sec=2.0,
+            )
         if start_motion != previous_start_motion:
             reason = 'dashboard_and_system_ready' if start_motion else 'motion_barrier_not_ready'
             self._publish_start_motion(start_motion, {**detail, 'reason': reason})
