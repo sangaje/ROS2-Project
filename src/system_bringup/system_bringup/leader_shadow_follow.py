@@ -18,7 +18,7 @@ from typing import Optional, Tuple
 
 import rclpy
 from action_msgs.msg import GoalStatus
-from geometry_msgs.msg import PoseStamped, Twist, TwistStamped
+from geometry_msgs.msg import PointStamped, PoseStamped, Twist, TwistStamped
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
@@ -97,6 +97,11 @@ class LeaderShadowFollow(Node):
         self.declare_parameter('target_detected_topic', '/omx/target_detected')
         self.declare_parameter('target_detected_stop_hold_sec', 3.0)
         self.declare_parameter('target_detected_cancel_period_sec', 0.25)
+        self.declare_parameter('target_memory_hold_sec', 5.0)
+        self.declare_parameter('target_reacquire_publish_period_sec', 0.5)
+        self.declare_parameter('target_processed_topic', '/omx/target_processed')
+        self.declare_parameter('target_lost_topic', '/omx/target_lost')
+        self.declare_parameter('target_reacquire_topic', '/omx/target_in_map')
         self.declare_parameter('pause_on_raw_target_detection', True)
         self.declare_parameter('omx_state_topic', '/omx/state')
         self.declare_parameter('pause_on_omx_aiming', True)
@@ -182,6 +187,13 @@ class LeaderShadowFollow(Node):
         self.target_cancel_period = max(
             0.05, float(get('target_detected_cancel_period_sec').value)
         )
+        self.target_memory_hold = max(0.0, float(get('target_memory_hold_sec').value))
+        self.target_reacquire_period = max(
+            0.1, float(get('target_reacquire_publish_period_sec').value)
+        )
+        self.target_processed_topic = str(get('target_processed_topic').value)
+        self.target_lost_topic = str(get('target_lost_topic').value)
+        self.target_reacquire_topic = str(get('target_reacquire_topic').value)
         self.pause_on_raw_target_detection = bool(
             get('pause_on_raw_target_detection').value
         )
@@ -259,6 +271,11 @@ class LeaderShadowFollow(Node):
         self.state_pub = self.create_publisher(String, '/leader_shadow/state', latched_qos)
         self.goal_debug_pub = self.create_publisher(PoseStamped, '/leader_shadow/goal', 10)
         self.scan_state_pub = self.create_publisher(String, '/leader_scan/state', latched_qos)
+        self.target_reacquire_pub = self.create_publisher(
+            PointStamped,
+            self.target_reacquire_topic,
+            10,
+        )
 
         self.create_subscription(PoseStamped, self.leader_pose_topic, self._on_leader_pose, 10)
         self.create_subscription(PoseStamped, self.active_pose_topic, self._on_original_scout_pose, 20)
@@ -306,6 +323,18 @@ class LeaderShadowFollow(Node):
             self._on_target_detected,
             detected_qos,
         )
+        self.create_subscription(
+            PointStamped,
+            self.target_processed_topic,
+            self._on_target_point,
+            10,
+        )
+        self.create_subscription(
+            PointStamped,
+            self.target_lost_topic,
+            self._on_target_lost,
+            10,
+        )
         self.create_subscription(String, self.omx_state_topic, self._on_omx_state, 10)
         if self.scan_enabled:
             scan_qos = QoSProfile(
@@ -329,6 +358,11 @@ class LeaderShadowFollow(Node):
         self.video_ready = not self.require_video_ready
         self.target_detected = False
         self.target_detected_wall = -1.0e9
+        self.target_last_seen_wall = -1.0e9
+        self.last_target_point: Optional[PointStamped] = None
+        self.last_target_point_wall = -1.0e9
+        self.last_target_reacquire_wall = -1.0e9
+        self.target_hold_active = False
         self.last_target_cancel_wall = -1.0e9
         self.omx_state = ''
         self.leader_pose: Optional[PoseStamped] = None
@@ -525,17 +559,88 @@ class LeaderShadowFollow(Node):
     def _on_target_detected(self, msg: Bool) -> None:
         self.target_detected = bool(msg.data)
         if self.target_detected:
-            self.target_detected_wall = self._now()
+            now = self._now()
+            self.target_detected_wall = now
+            self.target_last_seen_wall = now
             if self.pause_on_raw_target_detection:
-                self._force_leader_stop_for_target('target_detected_signal')
+                self._hold_for_omx_target('target_detected_signal')
 
     def _on_omx_state(self, msg: String) -> None:
         self.omx_state = str(msg.data).strip().upper()
+        if self._is_omx_aiming(self.omx_state):
+            self.target_last_seen_wall = self._now()
+
+    def _on_target_point(self, msg: PointStamped) -> None:
+        self.last_target_point = deepcopy(msg)
+        self.last_target_point_wall = self._now()
+        self.target_last_seen_wall = self.last_target_point_wall
+
+    def _on_target_lost(self, msg: PointStamped) -> None:
+        self.last_target_point = deepcopy(msg)
+        self.last_target_point_wall = self._now()
 
     @staticmethod
     def _is_omx_aiming(state: str) -> bool:
         """Target lock states that must hold leader shadow motion."""
         return str(state).strip().upper() in ('TRACKING', 'CONFIRMING', 'FIRING')
+
+    def _target_hold_reason(self) -> Optional[str]:
+        now = self._now()
+        if self.pause_on_raw_target_detection and self.target_detected:
+            return 'target_detected'
+        if (
+            self.pause_on_raw_target_detection
+            and now - self.target_detected_wall <= self.target_stop_hold
+        ):
+            return 'target_detected_hold'
+        if self.pause_on_omx_aiming and self._is_omx_aiming(self.omx_state):
+            return f'omx_{self.omx_state.lower()}'
+        if (
+            self.last_target_point is not None
+            and self.target_memory_hold > 0.0
+            and now - max(self.last_target_point_wall, self.target_last_seen_wall)
+            <= self.target_memory_hold
+        ):
+            return 'target_reacquire_memory'
+        return None
+
+    def _hold_for_omx_target(self, reason: str) -> None:
+        self.target_hold_active = True
+        self._cancel_shadow_goal(reason)
+        self._stop_direct_cmd(reason)
+        self._set_controller_speed_limit(False)
+        self.shadow_active = False
+        self.mode = LeaderMode.IDLE
+        self._publish_remembered_target(reason)
+        self._publish_state(reason)
+        self._log_follow_debug(reason)
+        if self.direct_shadow_cmd_vel:
+            self._publish_twist(0.0, 0.0)
+        self.get_logger().warning(
+            'LEADER_OMX_TARGET_HOLD | '
+            f'reason={reason} detected={self.target_detected} '
+            f'omx_state={self.omx_state or "(empty)"} '
+            f'has_memory={self.last_target_point is not None}',
+            throttle_duration_sec=1.0,
+        )
+
+    def _publish_remembered_target(self, reason: str) -> None:
+        if self.last_target_point is None:
+            return
+        now = self._now()
+        if now - self.last_target_reacquire_wall < self.target_reacquire_period:
+            return
+        msg = deepcopy(self.last_target_point)
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = msg.header.frame_id or 'map'
+        self.target_reacquire_pub.publish(msg)
+        self.last_target_reacquire_wall = now
+        self.get_logger().warning(
+            'LEADER_OMX_REACQUIRE_TARGET | '
+            f'reason={reason} topic={self.target_reacquire_topic} '
+            f'x={msg.point.x:.3f} y={msg.point.y:.3f} z={msg.point.z:.3f}',
+            throttle_duration_sec=1.0,
+        )
 
     def _on_scan(self, msg: LaserScan) -> None:
         self.last_scan_wall = self._now()
@@ -551,6 +656,15 @@ class LeaderShadowFollow(Node):
             self._publish_state('disabled')
             self._log_follow_debug('disabled')
             return
+        target_reason = self._target_hold_reason()
+        if target_reason is not None:
+            self._hold_for_omx_target(target_reason)
+            return
+        if self.target_hold_active:
+            self.target_hold_active = False
+            self.last_goal = None
+            self.last_goal_wall = -1.0e9
+            self.get_logger().warning('LEADER_OMX_TARGET_RELEASE | nav2_resume=true')
         risk_goal = self._build_risk_goal()
         if risk_goal is not None:
             self.mode = LeaderMode.SHADOW_FOLLOW
@@ -715,6 +829,21 @@ class LeaderShadowFollow(Node):
             self.shadow_goal_active = False
             self.get_logger().warning(
                 f'LEADER_NAV2_DIRECT_GOAL_ERROR | action={self.navigate_action} error={exc}'
+            )
+            return
+        if self._target_hold_reason() is not None:
+            if handle.accepted:
+                try:
+                    handle.cancel_goal_async()
+                except Exception as exc:  # noqa: BLE001
+                    self.get_logger().warning(
+                        f'LEADER_NAV2_DIRECT_CANCEL_ERROR | reason=target_hold_response error={exc}'
+                    )
+            self.shadow_goal_active = False
+            self.nav_goal_handle = None
+            self.get_logger().warning(
+                'LEADER_NAV2_DIRECT_GOAL_CANCELLED | '
+                f'reason=target_hold_response action={self.navigate_action}'
             )
             return
         if not handle.accepted:
@@ -883,7 +1012,7 @@ class LeaderShadowFollow(Node):
         """Hard stop the leader while OMX owns target tracking."""
         now = self._now()
         if now - self.last_target_cancel_wall >= self.target_cancel_period:
-            self._pulse_cancel()
+            self._cancel_shadow_goal(reason)
             self.last_target_cancel_wall = now
             self.shadow_goal_active = False
             self.last_goal = None
@@ -1235,6 +1364,8 @@ class LeaderShadowFollow(Node):
             'failover_state': self.failover_state,
             'shadow_active': self.shadow_active,
             'omx_state': self.omx_state,
+            'target_detected': bool(self.target_detected),
+            'target_hold_active': bool(self.target_hold_active),
             'scan_fov_deg': self.scan_fov_deg,
             'scan_heading_reference': 'leader_current_heading',
         }
@@ -1252,6 +1383,13 @@ class LeaderShadowFollow(Node):
                 'x': round(float(self.last_risk_target[0]), 3),
                 'y': round(float(self.last_risk_target[1]), 3),
                 'value': int(self.last_risk_value),
+            }
+        if self.last_target_point is not None:
+            data['remembered_target'] = {
+                'x': round(float(self.last_target_point.point.x), 3),
+                'y': round(float(self.last_target_point.point.y), 3),
+                'z': round(float(self.last_target_point.point.z), 3),
+                'age_ms': int(self._age_ms(self.last_target_point_wall)),
             }
         data['target_mode'] = getattr(self, 'last_target_mode', 'none')
         data['target_behind_scout'] = bool(

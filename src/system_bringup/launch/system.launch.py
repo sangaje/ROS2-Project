@@ -982,6 +982,11 @@ def generate_launch_description():
                             'localization_ready_topic': '/localization_ready',
                             'require_video_ready': False,
                             'video_ready_topic': '/fleet/video_ready',
+                            'target_memory_hold_sec': 5.0,
+                            'target_reacquire_publish_period_sec': 0.5,
+                            'target_processed_topic': '/omx/target_processed',
+                            'target_lost_topic': '/omx/target_lost',
+                            'target_reacquire_topic': '/omx/target_in_map',
                             'require_system_ready': False,
                             'system_ready_topic': '/system/ready',
                             'scout_pose_timeout_sec': float(
