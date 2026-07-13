@@ -962,6 +962,7 @@ def generate_launch_description():
                             'active_scout_pose_topic': scout_pose_topic.perform(context),
                             'follower_scout_pose_topic': '/burger_pose',
                             'leader_goal_topic': '/fleet/leader_coord_goal',
+                            'navigate_action': '/navigate_to_pose',
                             'leader_cancel_topic': '/fleet/leader_nav_cancel',
                             'cmd_vel_topic': leader_cmd_vel_topic,
                             'use_stamped_cmd_vel': True,

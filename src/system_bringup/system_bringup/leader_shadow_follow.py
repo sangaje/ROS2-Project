@@ -10,16 +10,20 @@ leader Nav2 goals.
 
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import math
 from enum import Enum
 from typing import Optional, Tuple
 
 import rclpy
+from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseStamped, Twist, TwistStamped
+from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
 from rcl_interfaces.srv import SetParameters
+from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import LaserScan
@@ -63,6 +67,7 @@ class LeaderShadowFollow(Node):
         self.declare_parameter('active_scout_pose_topic', '/member_pose')
         self.declare_parameter('follower_scout_pose_topic', '/burger_pose')
         self.declare_parameter('leader_goal_topic', '/fleet/leader_coord_goal')
+        self.declare_parameter('navigate_action', '/navigate_to_pose')
         self.declare_parameter('leader_cancel_topic', '/fleet/leader_nav_cancel')
         self.declare_parameter('cmd_vel_topic', '/cmd_vel')
         self.declare_parameter('use_stamped_cmd_vel', True)
@@ -138,6 +143,7 @@ class LeaderShadowFollow(Node):
         self.active_pose_topic = str(get('active_scout_pose_topic').value)
         self.follower_pose_topic = str(get('follower_scout_pose_topic').value)
         self.leader_goal_topic = str(get('leader_goal_topic').value)
+        self.navigate_action = str(get('navigate_action').value).strip() or '/navigate_to_pose'
         self.leader_cancel_topic = str(get('leader_cancel_topic').value)
         self.cmd_vel_topic = str(get('cmd_vel_topic').value)
         self.use_stamped_cmd_vel = bool(get('use_stamped_cmd_vel').value)
@@ -242,8 +248,8 @@ class LeaderShadowFollow(Node):
             history=HistoryPolicy.KEEP_LAST,
         )
 
-        self.goal_pub = self.create_publisher(PoseStamped, self.leader_goal_topic, 10)
         self.cancel_pub = self.create_publisher(Bool, self.leader_cancel_topic, latched_qos)
+        self.nav_client = ActionClient(self, NavigateToPose, self.navigate_action)
         self.cmd_pub = None
         if self.direct_shadow_cmd_vel:
             if self.use_stamped_cmd_vel:
@@ -360,6 +366,9 @@ class LeaderShadowFollow(Node):
         self.last_goal: Optional[PoseStamped] = None
         self.shadow_goal_active = False
         self.direct_cmd_active = False
+        self.nav_goal_pending = False
+        self.nav_goal_handle = None
+        self.nav_goal_reason = ''
         self.last_goal_wall = -1.0e9
         self.last_nominal_target: Optional[Point2] = None
         self.last_target_mode = 'none'
@@ -378,6 +387,7 @@ class LeaderShadowFollow(Node):
             f'follower_scout={self.follower_robot_name}:{self.follower_pose_topic} '
             f'distance={self.follow_distance:.2f}m fov={self.scan_fov_deg:.1f}deg '
             f'backend={self.follow_backend} direct_cmd={self.direct_shadow_cmd_vel}:{self.cmd_vel_topic} '
+            f'navigate_action={self.navigate_action} '
             f'cmd_scale=lin{self.cmd_linear_scale:.2f}/ang{self.cmd_angular_scale:.2f} '
             f'cmd_cap=lin{self.cmd_max_linear_vel:.2f}/ang{self.cmd_max_angular_vel:.2f} '
             f'controller_service={self.controller_set_parameters_service} '
@@ -654,18 +664,92 @@ class LeaderShadowFollow(Node):
             self._publish_state('goal_rate_limited', goal=goal, distance_to_scout=distance_to_scout)
             self._log_follow_debug('goal_rate_limited', goal=goal, distance_to_scout=distance_to_scout)
             return
-        self.goal_pub.publish(goal)
+        if not self.nav_client.server_is_ready():
+            self._publish_state('nav2_action_wait', goal=goal, distance_to_scout=distance_to_scout)
+            self._log_follow_debug('nav2_action_wait', goal=goal, distance_to_scout=distance_to_scout)
+            self.get_logger().warning(
+                'LEADER_NAV2_DIRECT_WAIT | '
+                f'action={self.navigate_action} reason={reason} '
+                f'x={goal.pose.position.x:.3f} y={goal.pose.position.y:.3f}',
+                throttle_duration_sec=1.0,
+            )
+            return
+        action_goal = NavigateToPose.Goal()
+        action_goal.pose = deepcopy(goal)
+        action_goal.pose.header.frame_id = action_goal.pose.header.frame_id or 'map'
+        action_goal.pose.header.stamp = self.get_clock().now().to_msg()
+        try:
+            future = self.nav_client.send_goal_async(action_goal)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(
+                f'LEADER_NAV2_DIRECT_SEND_ERROR | action={self.navigate_action} error={exc}'
+            )
+            return
+        self.nav_goal_pending = True
+        self.nav_goal_reason = reason
         self.goal_debug_pub.publish(goal)
         self.last_goal = goal
         self.shadow_goal_active = True
         self.last_goal_wall = self._now()
         self._publish_state(reason, goal=goal, distance_to_scout=distance_to_scout)
         self._log_follow_debug(reason, goal=goal, distance_to_scout=distance_to_scout)
+        future.add_done_callback(
+            lambda fut, goal=deepcopy(goal), reason=reason: self._on_nav_goal_response(
+                fut,
+                goal,
+                reason,
+            )
+        )
         self.get_logger().warning(
-            '[LEADER_SHADOW] NAV2_GOAL_SENT | '
-            f'reason={reason} x={goal.pose.position.x:.3f} '
-            f'y={goal.pose.position.y:.3f} catchup={catchup} '
+            'LEADER_NAV2_DIRECT_GOAL_SENT | '
+            f'action={self.navigate_action} reason={reason} '
+            f'x={goal.pose.position.x:.3f} y={goal.pose.position.y:.3f} catchup={catchup} '
             f'risk_value={self.last_risk_value}'
+        )
+
+    def _on_nav_goal_response(self, future, goal: PoseStamped, reason: str) -> None:
+        self.nav_goal_pending = False
+        try:
+            handle = future.result()
+        except Exception as exc:  # noqa: BLE001
+            self.shadow_goal_active = False
+            self.get_logger().warning(
+                f'LEADER_NAV2_DIRECT_GOAL_ERROR | action={self.navigate_action} error={exc}'
+            )
+            return
+        if not handle.accepted:
+            self.shadow_goal_active = False
+            self.nav_goal_handle = None
+            self.get_logger().warning(
+                'LEADER_NAV2_DIRECT_GOAL_REJECTED | '
+                f'action={self.navigate_action} reason={reason} '
+                f'x={goal.pose.position.x:.3f} y={goal.pose.position.y:.3f}'
+            )
+            return
+        self.nav_goal_handle = handle
+        self.get_logger().warning(
+            'LEADER_NAV2_DIRECT_GOAL_ACCEPTED | '
+            f'action={self.navigate_action} reason={reason} '
+            f'x={goal.pose.position.x:.3f} y={goal.pose.position.y:.3f}'
+        )
+        handle.get_result_async().add_done_callback(
+            lambda fut, reason=reason: self._on_nav_goal_result(fut, reason)
+        )
+
+    def _on_nav_goal_result(self, future, reason: str) -> None:
+        self.nav_goal_handle = None
+        self.shadow_goal_active = False
+        try:
+            result = future.result()
+            status = int(getattr(result, 'status', GoalStatus.STATUS_UNKNOWN))
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warning(
+                f'LEADER_NAV2_DIRECT_RESULT_ERROR | action={self.navigate_action} error={exc}'
+            )
+            return
+        self.get_logger().warning(
+            'LEADER_NAV2_DIRECT_RESULT | '
+            f'action={self.navigate_action} reason={reason} status={status}'
         )
 
     def _build_risk_goal(self) -> Optional[PoseStamped]:
@@ -1119,13 +1203,22 @@ class LeaderShadowFollow(Node):
 
     def _cancel_shadow_goal(self, reason: str) -> None:
         """Cancel the previous shadow goal once when shadow loses authority."""
-        if not self.shadow_goal_active:
+        if not self.shadow_goal_active and self.nav_goal_handle is None and not self.nav_goal_pending:
             return
         self._pulse_cancel()
+        if self.nav_goal_handle is not None:
+            try:
+                self.nav_goal_handle.cancel_goal_async()
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warning(
+                    f'LEADER_NAV2_DIRECT_CANCEL_ERROR | reason={reason} error={exc}'
+                )
+        self.nav_goal_handle = None
+        self.nav_goal_pending = False
         self.shadow_goal_active = False
         self.last_goal = None
         self.get_logger().warning(
-            f'[LEADER_SHADOW] GOAL_CANCELLED | reason={reason}'
+            f'LEADER_NAV2_DIRECT_GOAL_CANCELLED | reason={reason}'
         )
 
     def _publish_state(
