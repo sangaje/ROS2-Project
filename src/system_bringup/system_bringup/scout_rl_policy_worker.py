@@ -424,6 +424,10 @@ class ScoutRLPolicyWorker(Node):
             return False
         if self.require_failover_activation and self.role_epoch < self.failover_epoch:
             return False
+        if self.direct_rl_start:
+            if self.require_system_ready and not self.system_ready:
+                return False
+            return True
         if self.require_failover_activation and not gate.recovery_complete:
             return False
         if self.require_localization_ready and not gate.localization_ready:
@@ -432,13 +436,31 @@ class ScoutRLPolicyWorker(Node):
             return False
         return True
 
+    def _direct_rl_gate_state(self, gate: GateInputs) -> tuple[RLWorkerState, str]:
+        """Minimal ACTIVE_SCOUT gate; runtime handles model/sensor waiting."""
+        role_active = self.desired_role.strip().upper() == 'ACTIVE_SCOUT'
+        if not role_active:
+            return RLWorkerState.STANDBY, 'role_not_active_scout'
+        if self.require_failover_activation and self.role_epoch < self.failover_epoch:
+            return RLWorkerState.STANDBY, 'stale_epoch'
+        if self.require_failover_activation and not gate.active_scout_matches:
+            return RLWorkerState.STANDBY, 'active_scout_id_mismatch'
+        if self.require_system_ready and not self.system_ready:
+            return RLWorkerState.WAIT_MOTION_RELEASE, 'system_not_ready'
+        if not self._local_motion_release():
+            return RLWorkerState.WAIT_MOTION_RELEASE, 'start_motion_false'
+        return RLWorkerState.ACTIVE, 'direct_rl_role_ready'
+
     def _evaluate_gate(self) -> None:
         if not hasattr(self, 'runtime'):
             return
         gate = self._build_gate_inputs()
         if self._warmup_allowed(gate):
             self.runtime.warmup('active_scout_startup')
-        state, reason = evaluate_activation_gate(gate)
+        if self.direct_rl_start:
+            state, reason = self._direct_rl_gate_state(gate)
+        else:
+            state, reason = evaluate_activation_gate(gate)
         if state == RLWorkerState.ACTIVE and not self._local_motion_release():
             state = RLWorkerState.WAIT_MOTION_RELEASE
             reason = 'startup_not_released' if not self.startup_released else 'start_motion_false'
@@ -709,16 +731,17 @@ class ScoutRLPolicyWorker(Node):
             'SCOUT_STARTUP_BOTTLENECK | '
             f'stage={worst_stage} delay_ms={worst_delay} cause={blocking_reason}'
         )
+        runtime = self.runtime.debug_snapshot()
         self.get_logger().warning(
             'SCOUT_OBSERVATION_MINIMAL_DEBUG | '
-            f'map_tick_count={payload["map_tick_count"]} '
-            f'snapshot_update_count={payload["snapshot_update_count"]} '
-            f'snapshot_age_ms={payload["snapshot_age_ms"]} '
-            f'scan_generation={payload["scan_generation"]} '
-            f'odom_generation={payload["odom_generation"]} '
-            f'map_generation={payload["map_generation"]} '
-            f'tf_ready={payload["tf_ready"]} '
-            f'observation_ready={payload["observation_ready"]} '
+            f'map_tick_count={runtime.get("map_tick_count", 0)} '
+            f'snapshot_update_count={runtime.get("snapshot_update_count", 0)} '
+            f'snapshot_age_ms={float(runtime.get("map_snapshot_age_ms", -1.0)):.0f} '
+            f'scan_generation={runtime.get("scan_generation", 0)} '
+            f'odom_generation={runtime.get("odom_callback_count", 0)} '
+            f'map_generation={runtime.get("map_generation", 0)} '
+            f'tf_ready={runtime.get("tf_ready", False)} '
+            f'observation_ready={runtime.get("observation_ready", False)} '
             f'blocking_reason={blocking_reason}',
             throttle_duration_sec=1.0,
         )
@@ -745,6 +768,8 @@ class ScoutRLPolicyWorker(Node):
             return 'localization_not_ready'
         if state == RLWorkerState.WAIT_MOTION_RELEASE:
             return 'cmd_vel_authority_lost'
+        if not bool(runtime.get('ready', False)):
+            return 'model_not_ready'
         if state == RLWorkerState.WAIT_SENSOR_READY:
             scan_age = float(runtime.get('scan_age_ms', -1.0))
             odom_age = float(runtime.get('odom_age_ms', -1.0))
@@ -957,8 +982,14 @@ class ScoutRLPolicyWorker(Node):
             self.get_logger().warning(
                 'RL_ACTIVATION_GATE | '
                 f'robot={self.robot_name} role={self.desired_role} '
-                f'epoch={self.role_epoch} model=true scan=true map=true tf=true '
-                f'nav_idle={self.nav_goal_inactive} system=true start_motion=true'
+                f'epoch={self.role_epoch} reason={reason} '
+                f'direct_rl_start={self.direct_rl_start} '
+                f'model_ready={self.runtime.ready} '
+                f'sensor_ready={self.runtime.sensor_ready()} '
+                f'observation_ready={self.runtime.observation_ready()} '
+                f'nav_idle={self.nav_goal_inactive} '
+                f'system_ready={self.system_ready} '
+                f'start_motion={self._local_motion_release()}'
             )
         elif state == RLWorkerState.STANDBY:
             self.get_logger().warning(
