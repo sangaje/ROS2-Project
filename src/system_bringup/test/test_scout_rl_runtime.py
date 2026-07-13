@@ -662,3 +662,4 @@ def test_scout_rl_worker_logs_recoverable_runtime_gate_debug():
     assert 'SCOUT_MODEL_LOAD_START |' in runtime
     assert 'SCOUT_MODEL_LOAD_PENDING |' in runtime
     assert 'model_loading_elapsed_ms=' in source
+    assert 'SCOUT_CONFIDENCE_DEFERRED_FOR_MODEL_LOAD |' in runtime

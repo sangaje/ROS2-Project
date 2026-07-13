@@ -312,6 +312,7 @@ class ActiveScoutRLRuntime:
         self._first_action_debug_logged = False
         self.model = None
         self.counters = RuntimeCounters()
+        self._start_model_loader(model_loader)
         self._sensor_group = ReentrantCallbackGroup()
         self._map_group = MutuallyExclusiveCallbackGroup()
         self._confidence_group = MutuallyExclusiveCallbackGroup()
@@ -440,7 +441,6 @@ class ActiveScoutRLRuntime:
             self._model_state_tick,
             callback_group=self._sensor_group,
         )
-        self._start_model_loader(model_loader)
 
     def _event_ms(self) -> int:
         start = float(getattr(self, '_process_start_mono', time.monotonic()))
@@ -1203,6 +1203,13 @@ class ActiveScoutRLRuntime:
         observation snapshot the RL policy reads every cycle.
         """
         if not self._sensor_pipeline_enabled:
+            return
+        if self._model_loading:
+            self.node.get_logger().warning(
+                'SCOUT_CONFIDENCE_DEFERRED_FOR_MODEL_LOAD | '
+                f'model_loading_elapsed_ms={int((time.monotonic() - self._model_load_started_mono) * 1000.0)}',
+                throttle_duration_sec=2.0,
+            )
             return
         snapshot = self._sensor_snapshot()
         now = time.monotonic()
