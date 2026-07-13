@@ -94,7 +94,7 @@ ibvs:
   sign_vs_x: -1             # 카메라 마운팅에 따른 부호
   sign_vs_y: -1
   deadband_x:  0.03        # 화면 폭의 3%
-  deadband_y:  0.09         # ← 신규 (위아래 3배 여유)
+  deadband_y:  0.03        # x축과 동일 (정사각형 데드밴드)
   # 조준 기준점을 화면 정중앙보다 아래로 둔다.
   # 0.14는 720p 기준 약 50px 아래.
   aim_target_offset_y_norm: 0.14
