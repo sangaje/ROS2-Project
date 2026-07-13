@@ -461,4 +461,16 @@ def test_runtime_publishes_the_exact_policy_lidar_debug_topic():
     )
 
     assert "'/rl_policy_scan_60'" in source
+
+
+def test_runtime_accepts_takeover_confidence_seed_without_rl_package_changes():
+    source = (Path(__file__).parents[1] / 'system_bringup' / 'scout_rl_runtime.py').read_text(
+        encoding='utf-8'
+    )
+
+    assert "'/rl_confidence_seed'" in source
+    assert 'def _on_confidence_seed' in source
+    assert 'def _merge_confidence_seed_locked' in source
+    assert 'np.maximum(target, merged, out=target)' in source
+    assert 'SCOUT_RL_CONFIDENCE_SEED_APPLIED' in source
     assert 'def _publish_policy_scan_from_raw' in source

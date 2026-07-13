@@ -139,6 +139,10 @@ def generate_launch_description():
     amcl_scan_topic = LaunchConfiguration('amcl_scan_topic')
     costmap_scan_topic = LaunchConfiguration('costmap_scan_topic')
     hardware_param_file = LaunchConfiguration('hardware_param_file')
+    active_scout_id_topic = LaunchConfiguration('active_scout_id_topic')
+    active_scout_robot_name = LaunchConfiguration('active_scout_robot_name')
+    follower_robot_name = LaunchConfiguration('follower_robot_name')
+    follower_map_bridge_topic = LaunchConfiguration('follower_map_bridge_topic')
     initial_x = LaunchConfiguration('leader_initial_x')
     initial_y = LaunchConfiguration('leader_initial_y')
     initial_yaw = LaunchConfiguration('leader_initial_yaw')
@@ -232,6 +236,10 @@ def generate_launch_description():
                     'check_period_sec': 0.2,
                     'takeover_grace_sec': 0.0,
                     'relay_without_primary': True,
+                    'active_scout_id_topic': active_scout_id_topic,
+                    'primary_scout_id': active_scout_robot_name,
+                    'follower_scout_id': follower_robot_name,
+                    'follower_input_topic': follower_map_bridge_topic,
                 }],
                 env=process_env,
                 respawn=True,
@@ -777,6 +785,26 @@ def generate_launch_description():
                 'Optional TurtleBot3 hardware params. Empty uses the '
                 'tracked Waffle kinematics profile.'
             ),
+        ),
+        DeclareLaunchArgument(
+            'active_scout_id_topic',
+            default_value='/failover/active_scout_id',
+            description='Latched active scout id used to select the shared map source.',
+        ),
+        DeclareLaunchArgument(
+            'active_scout_robot_name',
+            default_value='scout22',
+            description='Initial active scout id that owns /map_bridge.',
+        ),
+        DeclareLaunchArgument(
+            'follower_robot_name',
+            default_value='follower21',
+            description='Follower id that may take over as ACTIVE_SCOUT.',
+        ),
+        DeclareLaunchArgument(
+            'follower_map_bridge_topic',
+            default_value='/follower21/map_bridge',
+            description='Leader-domain follower SLAM map input selected after takeover.',
         ),
         DeclareLaunchArgument('leader_initial_x', default_value='0.0'),
         DeclareLaunchArgument('leader_initial_y', default_value='0.0'),

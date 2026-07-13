@@ -72,6 +72,9 @@ def test_real_bridge_directions_and_control_qos(tmp_path):
     )
     assert '/clock' not in main['topics']
     assert '/cmd_vel' not in follower['topics']
+    assert main['topics']['/scout22/rl_confidence_map']['remap'] == (
+        '/rl_confidence_seed'
+    )
 
 
 def test_simulation_bridge_adds_only_simulation_transport_topics(tmp_path):
@@ -179,9 +182,12 @@ def test_follower_bridge_can_forward_owned_map_to_main(tmp_path):
 
     assert (follower['from_domain'], follower['to_domain']) == (21, 20)
     assert follower['topics']['/map']['type'] == 'nav_msgs/msg/OccupancyGrid'
-    assert follower['topics']['/map']['remap'] == '/map_bridge'
+    assert follower['topics']['/map']['remap'] == '/follower21/map_bridge'
     assert follower['topics']['/map']['qos']['reliability'] == 'reliable'
     assert follower['topics']['/map']['qos']['durability'] == 'transient_local'
+    assert follower['topics']['/rl_confidence_map']['remap'] == (
+        '/follower21/rl_confidence_map'
+    )
 
 
 def test_risk_to_leader_bridge_is_one_way_map_source(tmp_path):
@@ -194,6 +200,9 @@ def test_risk_to_leader_bridge_is_one_way_map_source(tmp_path):
 
     assert (config['from_domain'], config['to_domain']) == (22, 24)
     assert config['topics']['/map']['remap'] == '/map_bridge'
+    assert config['topics']['/rl_confidence_map']['remap'] == (
+        '/scout22/rl_confidence_map'
+    )
     assert config['topics']['/map']['qos']['reliability'] == 'reliable'
     assert config['topics']['/map']['qos']['durability'] == 'transient_local'
     assert config['topics']['/map']['qos']['history'] == 'keep_last'

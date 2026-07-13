@@ -322,6 +322,16 @@ def generate_launch_description():
                 leader_auto_localize.perform(context)
             )
             fleet_launch_args['hardware_param_file'] = leader_hardware_file
+            fleet_launch_args['active_scout_id_topic'] = '/failover/active_scout_id'
+            fleet_launch_args['active_scout_robot_name'] = (
+                active_scout_robot_name.perform(context)
+            )
+            fleet_launch_args['follower_robot_name'] = (
+                follower_robot_name.perform(context)
+            )
+            fleet_launch_args['follower_map_bridge_topic'] = (
+                f'/{follower_robot_name.perform(context)}/map_bridge'
+            )
         if fleet_role_value in ('follower', 'member'):
             fleet_launch_args['auto_localize'] = (
                 auto_localize.perform(context)
@@ -347,7 +357,13 @@ def generate_launch_description():
                 # 22->20 map/risk path.  Keeping this member bridge pose and
                 # status-only avoids two domain_bridge processes publishing
                 # the same map/risk samples into domain 20.
-                'false'
+                'true'
+                if (
+                    fleet_role_value == 'follower'
+                    and launch_bool(start_cartographer.perform(context))
+                    and not launch_bool(enable_amcl.perform(context))
+                )
+                else 'false'
             )
         if fleet_role_value in ('leader', 'member'):
             nav2_value = start_nav2.perform(context)

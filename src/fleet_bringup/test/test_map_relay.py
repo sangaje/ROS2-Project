@@ -1,5 +1,6 @@
 import rclpy
 from nav_msgs.msg import OccupancyGrid
+from std_msgs.msg import String
 
 from fleet_bringup.map_relay import MapRelay
 
@@ -254,6 +255,35 @@ def test_relay_republishes_cached_map_while_active_for_volatile_subscribers():
         node._check_primary()
         assert len(published) == 2
         assert published[-1].info.width == 10
+    finally:
+        destroy_node(node)
+
+
+def test_relay_selects_follower_map_after_active_scout_takeover():
+    node = make_node()
+    try:
+        node.follower_input_topic = '/follower21/map_bridge'
+        node.follower_scout_id = 'follower21'
+        published = []
+        node._pub.publish = lambda msg: published.append(msg)
+        node._volatile_pub.publish = lambda msg: None
+        node.relay_without_primary = True
+        node._relaying = True
+
+        node._on_bridged_map(grid(22))
+        assert published[-1].info.width == 22
+
+        follower = String()
+        follower.data = 'follower21'
+        node._on_follower_map(grid(21))
+        node._on_active_scout_id(follower)
+
+        assert node._selected_input_topic() == '/follower21/map_bridge'
+        assert published[-1].info.width == 21
+
+        # Late scout22 maps must not overwrite the selected follower map.
+        node._on_bridged_map(grid(23))
+        assert published[-1].info.width == 21
     finally:
         destroy_node(node)
 

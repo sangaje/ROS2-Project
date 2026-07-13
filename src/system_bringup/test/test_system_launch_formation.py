@@ -80,3 +80,16 @@ def test_scout_can_run_cartographer_without_local_risk_map():
 
     assert 'or launch_bool(start_cartographer.perform(context))' in text
     assert "'start_risk_map': start_risk_map.perform(context)" in text
+
+
+def test_follower_takeover_forwards_map_on_hidden_active_scout_bridge():
+    text = SYSTEM_LAUNCH.read_text(encoding='utf-8')
+    leader_launch = (
+        Path(__file__).parents[2] / 'fleet_bringup' / 'launch' / 'leader.launch.py'
+    ).read_text(encoding='utf-8')
+
+    assert "fleet_role_value == 'follower'" in text
+    assert "fleet_launch_args['forward_map_to_main']" in text
+    assert "f'/{follower_robot_name.perform(context)}/map_bridge'" in text
+    assert "'active_scout_id_topic': active_scout_id_topic" in leader_launch
+    assert "'follower_input_topic': follower_map_bridge_topic" in leader_launch

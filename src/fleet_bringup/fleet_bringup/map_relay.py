@@ -30,6 +30,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from nav_msgs.msg import OccupancyGrid
+from std_msgs.msg import String
 
 
 class MapRelay(Node):
@@ -41,6 +42,10 @@ class MapRelay(Node):
         self.declare_parameter('takeover_grace_sec', 2.0)
         self.declare_parameter('standby_confirm_sec', 2.0)
         self.declare_parameter('relay_without_primary', False)
+        self.declare_parameter('active_scout_id_topic', '')
+        self.declare_parameter('primary_scout_id', 'scout22')
+        self.declare_parameter('follower_scout_id', 'follower21')
+        self.declare_parameter('follower_input_topic', '')
 
         self.input_topic = str(self.get_parameter('input_topic').value)
         self.output_topic = str(self.get_parameter('output_topic').value)
@@ -56,6 +61,15 @@ class MapRelay(Node):
         self.relay_without_primary = bool(
             self.get_parameter('relay_without_primary').value
         )
+        self.active_scout_id_topic = str(
+            self.get_parameter('active_scout_id_topic').value
+        ).strip()
+        self.primary_scout_id = str(self.get_parameter('primary_scout_id').value).strip()
+        self.follower_scout_id = str(self.get_parameter('follower_scout_id').value).strip()
+        self.follower_input_topic = str(
+            self.get_parameter('follower_input_topic').value
+        ).strip()
+        self.active_scout_id = self.primary_scout_id
 
         pub_qos = QoSProfile(
             depth=1,
@@ -76,6 +90,7 @@ class MapRelay(Node):
             history=HistoryPolicy.KEEP_LAST,
         )
         self._latest_bridged = None
+        self._latest_follower = None
         self._last_seen_output = None
         self._relaying = False
         self._primary_missing_since = None
@@ -99,6 +114,22 @@ class MapRelay(Node):
         self._sub = self.create_subscription(
             OccupancyGrid, self.input_topic, self._on_bridged_map, bridge_sub_qos
         )
+        self._follower_sub = None
+        if self.follower_input_topic:
+            self._follower_sub = self.create_subscription(
+                OccupancyGrid,
+                self.follower_input_topic,
+                self._on_follower_map,
+                bridge_sub_qos,
+            )
+        self._active_scout_sub = None
+        if self.active_scout_id_topic:
+            self._active_scout_sub = self.create_subscription(
+                String,
+                self.active_scout_id_topic,
+                self._on_active_scout_id,
+                pub_qos,
+            )
         # Also watch the output topic itself so a takeover can continue from
         # whatever the primary (e.g. Cartographer) last published there,
         # instead of always jumping straight to the bridged leader map.
@@ -112,7 +143,9 @@ class MapRelay(Node):
             f'map relay standing by: {self.input_topic} (transient_local) -> '
             f'{self.output_topic} (transient_local), only if no other '
             f'publisher is active on {self.output_topic}; '
-            f'relay_without_primary={self.relay_without_primary}'
+            f'relay_without_primary={self.relay_without_primary} '
+            f'active_scout_topic={self.active_scout_id_topic or "(disabled)"} '
+            f'follower_input={self.follower_input_topic or "(disabled)"}'
         )
 
     def _on_bridged_map(self, msg: OccupancyGrid):
@@ -131,8 +164,33 @@ class MapRelay(Node):
                 f'height={msg.info.height} resolution={msg.info.resolution:.3f}'
             )
         self._latest_bridged = msg
-        if self._relaying:
+        if self._relaying and self._selected_map_source() is msg:
             self._publish(msg)
+
+    def _on_follower_map(self, msg: OccupancyGrid):
+        if not self._is_valid_map(msg):
+            self.get_logger().warning(
+                'MAP_RELAY_INVALID_FOLLOWER_MAP | ignoring invalid '
+                f'{self.follower_input_topic} sample',
+                throttle_duration_sec=5.0,
+            )
+            return
+        self._latest_follower = msg
+        if self._relaying and self._selected_map_source() is msg:
+            self._publish(msg)
+
+    def _on_active_scout_id(self, msg: String):
+        scout_id = str(msg.data).strip()
+        if not scout_id or scout_id == self.active_scout_id:
+            return
+        self.active_scout_id = scout_id
+        self.get_logger().warning(
+            'MAP_RELAY_ACTIVE_SCOUT_CHANGED | '
+            f'active_scout={self.active_scout_id} '
+            f'selected_input={self._selected_input_topic()}'
+        )
+        if self._relaying:
+            self._publish_latest()
 
     def _on_output_seen(self, msg: OccupancyGrid):
         if self._relaying:
@@ -234,10 +292,9 @@ class MapRelay(Node):
         # Prefer continuing from whatever the primary itself last
         # published (e.g. Cartographer's own last map before it died);
         # only fall back to the bridged leader map if we never saw one.
-        source = (
-            self._latest_bridged
-            if self.relay_without_primary
-            else self._last_seen_output or self._latest_bridged
+        selected = self._selected_map_source()
+        source = selected if self.relay_without_primary else (
+            self._last_seen_output or selected
         )
         if source is None:
             self.get_logger().warning(
@@ -247,6 +304,20 @@ class MapRelay(Node):
             )
             return
         self._publish(source)
+
+    def _selected_input_topic(self) -> str:
+        if (
+            self.follower_input_topic
+            and self.follower_scout_id
+            and self.active_scout_id == self.follower_scout_id
+        ):
+            return self.follower_input_topic
+        return self.input_topic
+
+    def _selected_map_source(self):
+        if self._selected_input_topic() == self.follower_input_topic:
+            return self._latest_follower or self._latest_bridged
+        return self._latest_bridged
 
     def _publish(self, source: OccupancyGrid):
         self._pub.publish(source)

@@ -236,6 +236,8 @@ class ActiveScoutRLRuntime:
         self._map: Optional[OccupancyGrid] = None
         self._map_received_at = 0.0
         self._map_generation = 0
+        self._pending_confidence_seed: Optional[OccupancyGrid] = None
+        self._confidence_seed_applied = False
         self._map_snapshot: Optional[MapSnapshot] = None
         self._history_vector: deque[np.ndarray] = deque(maxlen=self.config.history_len)
         self._history_map: deque[np.ndarray] = deque(maxlen=self.config.history_len)
@@ -331,6 +333,19 @@ class ActiveScoutRLRuntime:
         )
         self.map_sub = self.node.create_subscription(
             OccupancyGrid, self.config.map_topic, self._on_map, map_qos,
+            callback_group=self._sensor_group,
+        )
+        seed_qos = QoSProfile(
+            depth=1,
+            history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.confidence_seed_sub = self.node.create_subscription(
+            OccupancyGrid,
+            '/rl_confidence_seed',
+            self._on_confidence_seed,
+            seed_qos,
             callback_group=self._sensor_group,
         )
         self.map_timer = self.node.create_timer(
@@ -518,6 +533,94 @@ class ActiveScoutRLRuntime:
             self._map_generation += 1
             self.counters.map_callback_count += 1
 
+    def _on_confidence_seed(self, message: OccupancyGrid) -> None:
+        if not self._valid_grid(message):
+            return
+        with self._map_state_lock:
+            if self._confidence_seed_applied:
+                return
+            self._pending_confidence_seed = message
+        self.node.get_logger().warning(
+            'SCOUT_RL_CONFIDENCE_SEED_RX | '
+            f'frame={message.header.frame_id or "map"} '
+            f'size={message.info.width}x{message.info.height} '
+            f'resolution={message.info.resolution:.3f}'
+        )
+
+    @staticmethod
+    def _valid_grid(message: OccupancyGrid) -> bool:
+        width = int(message.info.width)
+        height = int(message.info.height)
+        return (
+            width > 0
+            and height > 0
+            and float(message.info.resolution) > 0.0
+            and len(message.data) == width * height
+        )
+
+    def _merge_confidence_seed_locked(self) -> None:
+        seed = self._pending_confidence_seed
+        if seed is None or self._confidence_seed_applied:
+            return
+        grid = self.exploration_map
+        target = getattr(grid, 'confidence_grid', None)
+        if not isinstance(target, np.ndarray) or target.size == 0:
+            return
+        if not self._valid_grid(seed):
+            self._pending_confidence_seed = None
+            return
+        source_frame = str(seed.header.frame_id or self.config.map_frame).lstrip('/')
+        target_frame = str(getattr(grid, 'frame_id', self.config.map_frame)).lstrip('/')
+        if source_frame != target_frame:
+            self.node.get_logger().warning(
+                'SCOUT_RL_CONFIDENCE_SEED_SKIPPED | '
+                f'frame_mismatch seed={source_frame} target={target_frame}'
+            )
+            self._pending_confidence_seed = None
+            return
+
+        src_w = int(seed.info.width)
+        src_h = int(seed.info.height)
+        src_res = float(seed.info.resolution)
+        src_ox = float(seed.info.origin.position.x)
+        src_oy = float(seed.info.origin.position.y)
+        dst_h, dst_w = target.shape
+        dst_res = float(getattr(grid, 'resolution', self.config.map_resolution_m))
+        dst_ox = float(getattr(grid, 'origin_x', 0.0))
+        dst_oy = float(getattr(grid, 'origin_y', 0.0))
+
+        src = np.asarray(seed.data, dtype=np.float32).reshape((src_h, src_w))
+        src = np.clip(src, 0.0, 100.0)
+        yy, xx = np.indices((dst_h, dst_w), dtype=np.float32)
+        world_x = dst_ox + (xx + 0.5) * dst_res
+        world_y = dst_oy + (yy + 0.5) * dst_res
+        src_x = np.floor((world_x - src_ox) / src_res).astype(np.int32)
+        src_y = np.floor((world_y - src_oy) / src_res).astype(np.int32)
+        valid = (
+            (src_x >= 0)
+            & (src_x < src_w)
+            & (src_y >= 0)
+            & (src_y < src_h)
+        )
+        if not np.any(valid):
+            self.node.get_logger().warning(
+                'SCOUT_RL_CONFIDENCE_SEED_SKIPPED | no_overlap'
+            )
+            self._pending_confidence_seed = None
+            return
+        before = int(np.count_nonzero(target >= grid.min_known_confidence))
+        merged = np.zeros_like(target, dtype=np.float32)
+        merged[valid] = src[src_y[valid], src_x[valid]]
+        np.maximum(target, merged, out=target)
+        after = int(np.count_nonzero(target >= grid.min_known_confidence))
+        self._confidence_seed_applied = True
+        self._pending_confidence_seed = None
+        grid.publish()
+        self.node.get_logger().warning(
+            'SCOUT_RL_CONFIDENCE_SEED_APPLIED | '
+            f'before={before} after={after} added={max(after - before, 0)}'
+        )
+
     def _sensor_snapshot(self) -> SensorSnapshot:
         with self._lock:
             return SensorSnapshot(
@@ -614,6 +717,7 @@ class ActiveScoutRLRuntime:
                     sensor_xy=sensor_xy,
                     sensor_yaw=sensor_yaw,
                 )
+                self._merge_confidence_seed_locked()
                 self._map_snapshot = MapSnapshot(
                     stats=stats,
                     robot_xy=robot_xy,

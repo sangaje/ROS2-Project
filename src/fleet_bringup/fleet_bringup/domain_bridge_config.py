@@ -191,6 +191,11 @@ def write_fleet_bridge_configs(
             'std_msgs/msg/Bool',
             profile=qos(durability='transient_local', depth=1),
         ),
+        '/scout22/rl_confidence_map': topic(
+            'nav_msgs/msg/OccupancyGrid',
+            remap='/rl_confidence_seed',
+            profile=qos(durability='transient_local', depth=1),
+        ),
         '/fleet/hazard_pose': topic(
             'geometry_msgs/msg/PoseStamped',
             profile=qos(depth=5),
@@ -250,8 +255,13 @@ def write_fleet_bridge_configs(
     if forward_map_to_main:
         follower_topics['/map'] = topic(
             'nav_msgs/msg/OccupancyGrid',
-            remap='/map_bridge',
+            remap=f'/follower{int(follower_domain)}/map_bridge',
             profile=map_qos(depth=5),
+        )
+        follower_topics['/rl_confidence_map'] = topic(
+            'nav_msgs/msg/OccupancyGrid',
+            remap=f'/follower{int(follower_domain)}/rl_confidence_map',
+            profile=qos(durability='transient_local', depth=1),
         )
     if simulation:
         follower_topics['/cmd_vel'] = topic(
@@ -380,6 +390,11 @@ def write_member_bridge_configs(
             remap='/map_bridge',
             profile=map_qos(depth=5),
         )
+        member_topics['/rl_confidence_map'] = topic(
+            'nav_msgs/msg/OccupancyGrid',
+            remap='/scout22/rl_confidence_map',
+            profile=qos(durability='transient_local', depth=1),
+        )
 
     main_to_member = _write_runtime_config(
         f'main_{main_domain}_to_member_{member_domain}_',
@@ -442,6 +457,11 @@ def write_risk_to_leader_bridge_config(
             'nav_msgs/msg/OccupancyGrid',
             remap='/map_bridge',
             profile=map_qos(depth=5),
+        )
+        topics['/rl_confidence_map'] = topic(
+            'nav_msgs/msg/OccupancyGrid',
+            remap='/scout22/rl_confidence_map',
+            profile=qos(durability='transient_local', depth=1),
         )
     return _write_runtime_config(
         f'risk_{risk_domain}_to_leader_{leader_domain}_',
