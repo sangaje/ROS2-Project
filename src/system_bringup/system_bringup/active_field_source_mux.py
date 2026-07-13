@@ -63,7 +63,12 @@ class ActiveFieldSourceMux(Node):
         self.epoch = 0
 
         latched = _latched_qos()
-        best_effort = QoSProfile(depth=10)
+        # QoSProfile defaults reliability to RELIABLE when not given
+        # explicitly -- this was silently requesting RELIABLE despite the
+        # name, incompatible with the domain_bridge's actual BEST_EFFORT
+        # republish of /scout/signal and /field/<robot>/risk_observation
+        # (both bridged verbatim from the scout's best-effort publishers).
+        best_effort = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         map_qos = _latched_qos(depth=1)
         self.map_pub = self.create_publisher(OccupancyGrid, '/active_scout/map', map_qos)
         self.pose_pub = self.create_publisher(PoseStamped, '/active_scout/pose', best_effort)
@@ -93,6 +98,12 @@ class ActiveFieldSourceMux(Node):
                 lambda msg, robot=robot: self._on_heartbeat(robot, msg),
                 best_effort,
             )
+            self.create_subscription(
+                String,
+                f'/field/{robot}/risk_observation',
+                lambda msg, robot=robot: self._on_risk(robot, msg),
+                best_effort,
+            )
 
         if self.robot_names:
             self.create_subscription(
@@ -111,12 +122,6 @@ class ActiveFieldSourceMux(Node):
                 String,
                 '/scout/signal',
                 lambda msg: self._on_heartbeat(self.active_scout_id, msg),
-                best_effort,
-            )
-            self.create_subscription(
-                String,
-                f'/field/{robot}/risk_observation',
-                lambda msg, robot=robot: self._on_risk(robot, msg),
                 best_effort,
             )
 
