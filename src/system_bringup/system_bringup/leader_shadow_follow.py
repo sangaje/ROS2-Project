@@ -355,8 +355,8 @@ class LeaderShadowFollow(Node):
 
     @staticmethod
     def _is_omx_aiming(state: str) -> bool:
-        """Only confirmed aiming/firing may preempt leader shadow motion."""
-        return str(state).strip().upper() in ('CONFIRMING', 'FIRING')
+        """Target lock states that must hold leader shadow motion."""
+        return str(state).strip().upper() in ('TRACKING', 'CONFIRMING', 'FIRING')
 
     def _on_scan(self, msg: LaserScan) -> None:
         self.last_scan_wall = self._now()

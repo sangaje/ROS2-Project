@@ -139,7 +139,7 @@ fire:
   cooldown_sec: 3.0
   # 표적이 잠깐 사라져도 바로 scan_sweep 로 복귀하지 않고, 현재 조준 자세를
   # 유지하며 재검출을 기다린다.
-  lost_timeout_sec: 4.0
+  lost_timeout_sec: 3.0
 
   # 탐지 즉시 격발 경로는 사용하지 않는다. 표적이 보이면 TRACKING 으로 들어가
   # IBVS 로 조준하고, deadband 안에서 hold_time_sec 동안 유지된 뒤
@@ -149,7 +149,9 @@ fire:
 # ===========================================================
 autotrack:
   # IDLE 상태에서 카메라가 표적 검출 시 자율 추적 시작?
-  # true: 별도 무장 없이 부팅 즉시 armed 상태로 시작 (탐지 즉시 격발).
+  # true: 별도 무장 없이 부팅 즉시 armed 상태로 시작.
+  # 탐지 시 바로 TRACKING/PD 조준에 들어가며, 격발 경로는
+  # CONFIRMING/FIRING 상태에서만 열린다.
   # /omx/arm_enable 로 언제든 false 로 다시 잠글 수 있음.
   default_armed: true
   
@@ -166,11 +168,8 @@ patrol:
   target_scan_timeout_sec: 5.0
   boundary_scan_timeout_sec: 0.35
   boundary_aim_settle_sec: 0.05
-  # scan_sweep 는 매 half_period(=period_sec/2) 마다 목표 각도를 반대쪽
-  # 끝으로 그냥 뒤집는다 -- 서보가 실제로 그 끝까지 물리적으로 다 이동하기
-  # 전에 목표가 또 뒤집히면 중간에 방향이 꺾여서 절대 끝까지 못 간다.
-  # period_sec 를 넉넉하게 잡아야 좌우 끝까지 실제로 도달한다(실기에서
-  # 여전히 안 끝까지 가면 더 늘릴 것).
+  # scan_sweep 는 continuous triangle-wave 목표를 써서 좌우로 천천히 훑는다.
+  # period_sec 를 늘리면 더 느리게 왕복한다.
   scan_sweep_half_angle_deg: 60.0
   scan_sweep_period_sec: 5.0
   max_queue_size: 20

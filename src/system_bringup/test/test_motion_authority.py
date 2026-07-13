@@ -40,8 +40,8 @@ def test_backend_activation_requires_active_role_localization_and_nav_release():
     ) == (False, 'nav_goal_active')
 
 
-def test_leader_shadow_only_pauses_for_confirmed_omx_aiming_states():
+def test_leader_shadow_pauses_for_target_lock_states():
+    assert LeaderShadowFollow._is_omx_aiming('TRACKING')
     assert LeaderShadowFollow._is_omx_aiming('CONFIRMING')
     assert LeaderShadowFollow._is_omx_aiming('firing')
-    assert not LeaderShadowFollow._is_omx_aiming('TRACKING')
     assert not LeaderShadowFollow._is_omx_aiming('SCANNING')

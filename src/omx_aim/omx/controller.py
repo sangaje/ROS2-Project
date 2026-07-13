@@ -148,6 +148,12 @@ class OmxController:
             self._scan_sweep_start_t = now
             self._scan_sweep_center_yaw = self.yaw
             self._scan_sweep_center_pitch = self.pitch
+            self._log(
+                "OMX_SCAN_SWEEP_START | "
+                f"center_yaw={math.degrees(self._scan_sweep_center_yaw):+.1f}deg "
+                f"half_angle={math.degrees(half_angle):.1f}deg "
+                f"period={period_sec:.2f}s"
+            )
 
         elapsed = max(0.0, now - self._scan_sweep_start_t)
         phase = (elapsed % period_sec) / period_sec  # 0..1, 한 바퀴(왕복) 주기

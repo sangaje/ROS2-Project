@@ -485,6 +485,8 @@ class StateMachine:
             self.nav_waypoints = []
             self.nav_final_view_pose = None
             self.pending_cancel_for_preempt = self._is_waffle_navigating()
+            action['cancel_navigation'] = True
+            action['cancel_reason'] = 'target_detected_track'
             self.confirm_progress = 0.0
             self.lost_start_t = 0.0
             action['action'] = 'track'
@@ -708,6 +710,11 @@ class StateMachine:
         elif self.armed and detected:
             self._log("Autonomous detection -> TRACKING")
             self.current_focus = None  # autotrack 은 focus 없음
+            action['cancel_navigation'] = True
+            action['cancel_reason'] = 'target_detected_idle'
+            if error_norm is not None:
+                action['action'] = 'track'
+                action['error'] = error_norm
             self.transition(State.TRACKING)
 
         else:
@@ -715,6 +722,9 @@ class StateMachine:
                 action['patrol_complete'] = True
                 self.patrol_complete_sent = True
                 self._log("정찰 완료 - main_queue 비었음")
+            if self.armed:
+                action['action'] = 'scan_sweep'
+                action['scan_sweep'] = True
 
     # ----- 핸들러: WAITING_NAV -----
 
