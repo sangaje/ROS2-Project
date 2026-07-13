@@ -27,6 +27,23 @@ def test_invalid_camera_frames_do_not_short_circuit_omx_navigation_loop():
     assert 'self.publish_vision_safe_fire_lock()' in source
 
 
+def test_fire_disable_is_latched_and_not_republished_every_frame():
+    package_root = Path(__file__).parents[1]
+    node_source = (package_root / 'omx_aim' / 'yolo_node.py').read_text(
+        encoding='utf-8'
+    )
+    fire_source = (package_root / 'omx_aim' / 'fire_node.py').read_text(
+        encoding='utf-8'
+    )
+
+    assert 'TRANSIENT_LOCAL' in node_source
+    assert 'self._last_fire_disable_pub' in node_source
+    assert 'def _publish_fire_disable(' in node_source
+    assert node_source.count('self.pub_fire_disable.publish') == 1
+    assert 'TRANSIENT_LOCAL' in fire_source
+    assert 'if previous == msg.data:' in fire_source
+
+
 def test_omx_launch_supports_video_only_dry_run_during_motor_faults():
     package_root = Path(__file__).parents[1]
     launch_source = (package_root / 'launch' / 'jetson.launch.py').read_text(
@@ -40,3 +57,18 @@ def test_omx_launch_supports_video_only_dry_run_during_motor_faults():
     assert "yolo_args.append('--dry-run')" in launch_source
     assert "'omx_dry_run', default_value='false'" in launch_source
     assert 'OMX_CONTROL_DISCONNECT_ERROR' in node_source
+    assert 'OMX_CONTROL_RUNTIME_FALLBACK_VIDEO_ONLY' in node_source
+    assert "self._controller_call('go_home', self.ctrl.go_home)" in node_source
+    assert "'scan_sweep'," in node_source
+    assert 'self.ctrl.scan_sweep,' in node_source
+
+
+def test_camera_read_exceptions_do_not_kill_omx_loop():
+    node_source = (
+        Path(__file__).parents[1] / 'omx_aim' / 'yolo_node.py'
+    ).read_text(encoding='utf-8')
+
+    assert 'OMX_CAMERA_READ_ERROR' in node_source
+    assert "vision_reason = f'camera_read_failed:{type(exc).__name__}'" in node_source
+    assert 'self.detector.release()' in node_source
+    assert "self.detector._set_camera_health(False, 'read_exception')" in node_source

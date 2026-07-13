@@ -220,9 +220,7 @@ class OmxYoloNode(Node):
                 'OMX_CONTROL_FALLBACK_VIDEO_ONLY | '
                 f'controller_error={type(exc).__name__}: {exc}'
             )
-            self.ctrl = OmxController(self.cfg, dry_run=True,
-                                      logger=self.get_logger())
-            self.ctrl.connect()
+            self._replace_controller_with_video_only(yaw=0.0, pitch=0.0)
             self.ctrl.go_home()
 
         self.paused = False
@@ -253,7 +251,15 @@ class OmxYoloNode(Node):
         self.pub_error = self.create_publisher(Point, '/omx/error_norm', 10)
         self.pub_joint = self.create_publisher(JointState, '/omx/joint_state', 10)
         self.pub_fire = self.create_publisher(Empty, '/omx/fire', 10)
-        self.pub_fire_disable = self.create_publisher(Bool, '/omx/fire_disable', 10)
+        fire_disable_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+        self.pub_fire_disable = self.create_publisher(
+            Bool, '/omx/fire_disable', fire_disable_qos
+        )
         self.pub_processed = self.create_publisher(PointStamped, '/omx/target_processed', 10)
         self.pub_target_lost = self.create_publisher(PointStamped, '/omx/target_lost', 10)
         self.pub_target_blocked = self.create_publisher(PointStamped, '/omx/target_blocked', 10)
@@ -346,6 +352,7 @@ class OmxYoloNode(Node):
         self._last_fire_enable_t = 0.0
         self._fire_enable_detection_active = False
         self._fire_enable_republish_sec = 1.0
+        self._last_fire_disable_pub: Optional[bool] = None
         self._detection_nav_stop_active = False
         self._detection_streak = 0
         self._last_detection_cancel_t = -1.0e9
@@ -369,6 +376,46 @@ class OmxYoloNode(Node):
             f"topic={self.localization_ready_topic}"
         )
         self.get_logger().info("=== Node ready (H4) ===")
+        self._publish_fire_disable(True, 'startup', force=True)
+
+    def _replace_controller_with_video_only(
+        self,
+        *,
+        yaw: Optional[float] = None,
+        pitch: Optional[float] = None,
+    ) -> None:
+        self.ctrl = OmxController(self.cfg, dry_run=True,
+                                  logger=self.get_logger())
+        self.ctrl.connect()
+        if yaw is not None:
+            self.ctrl.yaw = float(yaw)
+        if pitch is not None:
+            self.ctrl.pitch = float(pitch)
+        self.ctrl.reset_scan_sweep()
+
+    def _controller_call(self, command: str, fn, *args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            old_ctrl = getattr(self, 'ctrl', None)
+            yaw = float(getattr(old_ctrl, 'yaw', 0.0))
+            pitch = float(getattr(old_ctrl, 'pitch', 0.0))
+            self.get_logger().error(
+                'OMX_CONTROL_RUNTIME_FALLBACK_VIDEO_ONLY | '
+                f'command={command} '
+                f'controller_error={type(exc).__name__}: {exc}'
+            )
+            try:
+                if old_ctrl is not None:
+                    old_ctrl.disconnect()
+            except Exception as disconnect_exc:  # noqa: BLE001
+                self.get_logger().warning(
+                    'OMX_CONTROL_RUNTIME_DISCONNECT_ERROR | '
+                    f'controller_error={type(disconnect_exc).__name__}: '
+                    f'{disconnect_exc}'
+                )
+            self._replace_controller_with_video_only(yaw=yaw, pitch=pitch)
+            return None
 
     # ----- Costmap -----
 
@@ -1032,7 +1079,7 @@ class OmxYoloNode(Node):
     def on_control_mode(self, msg):
         if msg.data == "idle":
             self.sm.on_abort()
-            self.ctrl.go_home()
+            self._controller_call('go_home', self.ctrl.go_home)
 
     def on_target_in_map(self, msg: PointStamped):
         coord = (msg.point.x, msg.point.y, msg.point.z)
@@ -1052,7 +1099,7 @@ class OmxYoloNode(Node):
 
     def on_abort(self, msg):
         self.sm.on_abort()
-        self.ctrl.go_home()
+        self._controller_call('go_home', self.ctrl.go_home)
 
     def on_nav_result(self, msg: String):
         """H2: waffle_node 가 발행한 Nav2 액션 결과."""
@@ -1200,9 +1247,7 @@ class OmxYoloNode(Node):
 
     def publish_vision_safe_fire_lock(self) -> None:
         """A missing/invalid frame must never leave the fire path enabled."""
-        msg = Bool()
-        msg.data = True
-        self.pub_fire_disable.publish(msg)
+        self._publish_fire_disable(True, 'vision_not_valid')
         self._fire_enable_detection_active = False
 
     def publish_error(self, ex, ey):
@@ -1237,6 +1282,26 @@ class OmxYoloNode(Node):
     def publish_fire(self):
         self.pub_fire.publish(Empty())
 
+    def _publish_fire_disable(
+        self,
+        disabled: bool,
+        reason: str,
+        *,
+        force: bool = False,
+    ) -> bool:
+        disabled = bool(disabled)
+        if not force and self._last_fire_disable_pub is disabled:
+            return False
+        msg = Bool()
+        msg.data = disabled
+        self.pub_fire_disable.publish(msg)
+        self._last_fire_disable_pub = disabled
+        state = 'disabled' if disabled else 'armed'
+        self.get_logger().info(
+            f'[fire_enable] state={state} reason={reason}'
+        )
+        return True
+
     def publish_fire_enable_for_aim_state(self, action: dict, now: float):
         """Clear fire_node safety only after the target is actually aimed.
 
@@ -1255,11 +1320,7 @@ class OmxYoloNode(Node):
 
         if not should_enable:
             if self._fire_enable_detection_active:
-                msg = Bool()
-                msg.data = True
-                self.pub_fire_disable.publish(msg)
-                self.get_logger().info(
-                    "[fire_enable] 조준/격발 창 종료 -> /omx/fire_disable=true")
+                self._publish_fire_disable(True, 'aim_window_closed')
             self._fire_enable_detection_active = False
             return
 
@@ -1270,13 +1331,9 @@ class OmxYoloNode(Node):
         if not should_publish:
             return
 
-        msg = Bool()
-        msg.data = False
-        self.pub_fire_disable.publish(msg)
+        self._publish_fire_disable(False, 'aim_confirmed')
         self._last_fire_enable_t = now
         self._fire_enable_detection_active = True
-        self.get_logger().info(
-            "[fire_enable] 조준 확인 중 -> /omx/fire_disable=false 발행")
 
     def maybe_stop_nav_on_detection(
         self,
@@ -1574,12 +1631,25 @@ class OmxYoloNode(Node):
     # ----- Main loop -----
 
     def loop(self):
-        frame = self.detector.read_frame()
         now = time.time()
+        vision_reason = ''
+        try:
+            frame = self.detector.read_frame()
+        except Exception as exc:  # noqa: BLE001
+            frame = None
+            vision_reason = f'camera_read_failed:{type(exc).__name__}'
+            self.get_logger().error(
+                f'OMX_CAMERA_READ_ERROR | reason={vision_reason}: {exc}',
+                throttle_duration_sec=2.0,
+            )
+            try:
+                self.detector.release()
+                self.detector._set_camera_health(False, 'read_exception')
+            except Exception:
+                pass
         frame_valid = frame is not None
         inference_ran = False
         detected, error_norm, bbox, conf = False, None, None, None
-        vision_reason = ''
         if frame_valid and self.sm.state != State.COOLDOWN:
             try:
                 detected, error_norm, bbox, conf = self.detector.detect(frame)
@@ -1590,7 +1660,7 @@ class OmxYoloNode(Node):
                     f'OMX_VISION_UNAVAILABLE | reason={vision_reason}: {exc}',
                     throttle_duration_sec=2.0,
                 )
-        elif not frame_valid:
+        elif not frame_valid and not vision_reason:
             vision_reason = str(
                 getattr(self.detector, 'camera_failure_reason', 'camera_unavailable')
             )
@@ -1623,15 +1693,21 @@ class OmxYoloNode(Node):
                         f"TF 변환 실패, focus 종료: {coord_map}")
                     self.sm._on_focus_done()
                 else:
-                    self.ctrl.aim_at_coord(*coord_arm)
+                    self._controller_call(
+                        'aim_at_coord', self.ctrl.aim_at_coord, *coord_arm
+                    )
                     self.get_logger().info(
                         f"AIM: map{coord_map} -> arm{coord_arm}")
 
             elif action['action'] == 'track':
-                self.ctrl.step_ibvs(*action['error'])
+                self._controller_call(
+                    'step_ibvs', self.ctrl.step_ibvs, *action['error']
+                )
 
             elif action['action'] == 'scan_sweep':
-                self.ctrl.scan_sweep(
+                self._controller_call(
+                    'scan_sweep',
+                    self.ctrl.scan_sweep,
                     now,
                     self.cfg.patrol.scan_sweep_half_angle_deg,
                     self.cfg.patrol.scan_sweep_period_sec,
@@ -1641,21 +1717,23 @@ class OmxYoloNode(Node):
                 processed_map = (self.sm.current_focus.coord_map
                                  if self.sm.current_focus else None)
                 self.publish_fire()
-                self.ctrl.fire()
+                self._controller_call('fire', self.ctrl.fire)
                 self.publish_processed(processed_map)
 
             elif action['action'] == 'target_lost':
                 self.publish_target_lost(action.get('lost_coord_map'))
 
             elif action['action'] == 'home':
-                self.ctrl.go_home()
+                self._controller_call('go_home', self.ctrl.go_home)
 
             elif action['action'] == 'nav_goal':
                 # H2 신규
                 vp = action['nav_goal_xyyaw']
                 if vp is not None:
                     self.publish_nav_goal(vp)
-                self.ctrl.scan_sweep(
+                self._controller_call(
+                    'scan_sweep',
+                    self.ctrl.scan_sweep,
                     now,
                     self.cfg.patrol.scan_sweep_half_angle_deg,
                     self.cfg.patrol.scan_sweep_period_sec,
@@ -1888,7 +1966,7 @@ class OmxYoloNode(Node):
         elif key == ord('h'):
             self.get_logger().info("Home + 모든 큐 비움 (수동)")
             self.sm.on_abort()
-            self.ctrl.go_home()
+            self._controller_call('go_home', self.ctrl.go_home)
 
     def destroy_node(self):
         if hasattr(self, 'detector'):

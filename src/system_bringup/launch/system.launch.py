@@ -746,7 +746,7 @@ def generate_launch_description():
                 ))
             if launch_bool(enable_leader_shadow_follow.perform(context)):
                 actions.append(TimerAction(
-                    period=9.0,
+                    period=3.0,
                     actions=[Node(
                         package='system_bringup',
                         executable='leader_shadow_follow',
@@ -774,7 +774,7 @@ def generate_launch_description():
                             'scout_pose_timeout_sec': float(
                                 scout_pose_timeout_sec.perform(context)
                             ),
-                            'startup_grace_sec': 8.0,
+                            'startup_grace_sec': 2.0,
                             'leader_shadow_follow_distance_m': float(
                                 leader_shadow_follow_distance_m.perform(context)
                             ),
@@ -1405,7 +1405,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'leader_shadow_direct_cmd_vel',
-            default_value='true',
+            default_value='false',
             choices=['true', 'false'],
             description=(
                 'Leader role only: use continuous /cmd_vel for normal '
@@ -1414,22 +1414,22 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'leader_shadow_follow_distance_m',
-            default_value='2.8',
+            default_value='1.2',
             description='Leader shadow target distance behind active scout movement direction.',
         ),
         DeclareLaunchArgument(
             'leader_shadow_stop_distance_m',
-            default_value='2.2',
+            default_value='0.8',
             description='Leader stops shadow goal updates when closer than this to the active scout.',
         ),
         DeclareLaunchArgument(
             'leader_shadow_resume_distance_m',
-            default_value='3.0',
+            default_value='1.3',
             description='Leader resumes shadow follow when scout distance reaches this hysteresis threshold.',
         ),
         DeclareLaunchArgument(
             'leader_shadow_far_distance_m',
-            default_value='4.5',
+            default_value='2.4',
             description='Distance where shadow follow permits catch-up speed limits.',
         ),
         DeclareLaunchArgument(

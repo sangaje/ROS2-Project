@@ -66,7 +66,7 @@ class LeaderShadowFollow(Node):
         self.declare_parameter('leader_cancel_topic', '/fleet/leader_nav_cancel')
         self.declare_parameter('cmd_vel_topic', '/cmd_vel')
         self.declare_parameter('use_stamped_cmd_vel', True)
-        self.declare_parameter('direct_shadow_cmd_vel', True)
+        self.declare_parameter('direct_shadow_cmd_vel', False)
         self.declare_parameter(
             'controller_set_parameters_service',
             '/controller_server/set_parameters',
@@ -86,10 +86,10 @@ class LeaderShadowFollow(Node):
         self.declare_parameter('scout_pose_timeout_sec', 2.5)
         self.declare_parameter('startup_grace_sec', 8.0)
 
-        self.declare_parameter('leader_shadow_follow_distance_m', 2.8)
-        self.declare_parameter('leader_shadow_stop_distance_m', 2.2)
-        self.declare_parameter('leader_shadow_resume_distance_m', 3.0)
-        self.declare_parameter('leader_shadow_far_distance_m', 4.5)
+        self.declare_parameter('leader_shadow_follow_distance_m', 1.2)
+        self.declare_parameter('leader_shadow_stop_distance_m', 0.8)
+        self.declare_parameter('leader_shadow_resume_distance_m', 1.3)
+        self.declare_parameter('leader_shadow_far_distance_m', 2.4)
         self.declare_parameter('leader_shadow_max_linear_vel', 0.14)
         self.declare_parameter('leader_shadow_catchup_max_linear_vel', 0.14)
         self.declare_parameter('leader_shadow_max_angular_vel', 0.35)
@@ -423,33 +423,32 @@ class LeaderShadowFollow(Node):
             self._publish_state(f'scout_pose_stale_{scout_age:.2f}s')
             return
 
-        distance_to_scout = self._distance_pose(self.leader_pose, scout_pose)
-        if self.shadow_active:
-            if distance_to_scout <= self.stop_distance:
-                self.shadow_active = False
-        elif distance_to_scout >= self.resume_distance:
-            self.shadow_active = True
-
-        if not self.shadow_active:
-            self._cancel_shadow_goal('inside_standoff_hysteresis')
-            self._stop_direct_cmd('inside_standoff_hysteresis')
-            self.mode = LeaderMode.IDLE
-            self._set_controller_speed_limit(False)
-            self._publish_state('inside_standoff_hysteresis')
-            return
-
         self.mode = (
             LeaderMode.SHADOW_NEW_SCOUT
             if self.active_scout_id != self.original_scout_id
             else LeaderMode.SHADOW_FOLLOW
         )
-        catchup = distance_to_scout >= self.far_distance
+        distance_to_scout = self._distance_pose(self.leader_pose, scout_pose)
         goal = self._build_shadow_goal(scout_pose)
         if goal is None:
             self._cancel_shadow_goal('no_feasible_shadow_target')
             self._stop_direct_cmd('no_feasible_shadow_target')
             self._publish_state('no_feasible_shadow_target')
             return
+        distance_to_shadow_goal = self._distance_pose(self.leader_pose, goal)
+        self.shadow_active = distance_to_shadow_goal > self.cmd_goal_tolerance
+        if not self.shadow_active:
+            self._cancel_shadow_goal('at_shadow_target')
+            self._stop_direct_cmd('at_shadow_target')
+            self.mode = LeaderMode.IDLE
+            self._set_controller_speed_limit(False)
+            self._publish_state(
+                'at_shadow_target',
+                goal=goal,
+                distance_to_scout=distance_to_scout,
+            )
+            return
+        catchup = distance_to_scout >= self.far_distance
         if self.direct_shadow_cmd_vel:
             self._cancel_shadow_goal('direct_shadow_cmd_vel')
             if not self.direct_cmd_active:

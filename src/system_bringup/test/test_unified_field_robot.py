@@ -4,7 +4,7 @@ from builtin_interfaces.msg import Time
 from geometry_msgs.msg import PoseStamped, TwistStamped
 from std_msgs.msg import Bool, String
 
-from system_bringup.leader_shadow_follow import LeaderShadowFollow
+from system_bringup.leader_shadow_follow import LeaderMode, LeaderShadowFollow
 from system_bringup.nav_goal_manager import NavGoalManager
 from system_bringup.unified_field_robot import (
     MotionAuthority,
@@ -72,6 +72,11 @@ class _ActionClient:
         future = _Future()
         self.sent.append((goal, future))
         return future
+
+
+class _ServiceClient:
+    def service_is_ready(self):
+        return False
 
 
 class _Runtime:
@@ -357,3 +362,71 @@ def test_direct_shadow_cmd_compensates_loaded_leader_speed():
     assert command.twist.linear.x == 0.75
     assert command.twist.angular.z == 0.0
     assert node.direct_cmd_active is True
+
+
+def test_nav2_shadow_goal_starts_even_when_leader_begins_next_to_scout():
+    node = LeaderShadowFollow.__new__(LeaderShadowFollow)
+    logger = _Logger()
+    node.get_logger = lambda: logger
+    node.get_clock = lambda: _Clock()
+    node._now = lambda: 10.0
+    node.enabled = True
+    node.start_wall = 0.0
+    node.startup_grace = 0.0
+    node.require_localization_ready = False
+    node.localization_ready = True
+    node.pause_on_omx_aiming = False
+    node.pause_on_raw_target_detection = False
+    node.failover_state = 'NORMAL_OPERATION'
+    node.active_scout_id = 'scout22'
+    node.original_scout_id = 'scout22'
+    node.follower_robot_name = 'follower21'
+    node.leader_pose = _pose(0.0, 0.0)
+    node.original_scout_pose = _pose(0.10, 0.0)
+    node.original_scout_wall = 10.0
+    node.follower_scout_pose = None
+    node.follower_scout_wall = -1.0e9
+    node.scout_pose_timeout = 5.0
+    node.mode = LeaderMode.IDLE
+    node.omx_state = ''
+    node.direct_shadow_cmd_vel = False
+    node.shadow_active = True
+    node.shadow_goal_active = False
+    node.direct_cmd_active = False
+    node.map_msg = None
+    node.heading = 0.0
+    node.previous_scout_sample = None
+    node.last_goal = None
+    node.last_goal_wall = -1.0e9
+    node.last_nominal_target = None
+    node.goal_period = 0.0
+    node.goal_min_change = 0.05
+    node.follow_distance = 1.2
+    node.cmd_goal_tolerance = 0.16
+    node.far_distance = 4.5
+    node.shadow_linear_vel = 0.14
+    node.catchup_linear_vel = 0.14
+    node.shadow_angular_vel = 0.35
+    node.restore_linear_vel = 0.14
+    node.restore_angular_vel = 0.35
+    node.map_clearance = 0.22
+    node.search_radius = 1.2
+    node.search_step = 0.15
+    node.occupied_threshold = 50
+    node.allow_unknown = False
+    node.scan_fov_deg = 60.0
+    node.speed_limit_pending = False
+    node.speed_profile = None
+    node.controller_client = _ServiceClient()
+    node.goal_pub = _Publisher()
+    node.goal_debug_pub = _Publisher()
+    node.cancel_pub = _Publisher()
+    node.cmd_pub = _Publisher()
+    node.state_pub = _Publisher()
+
+    node._tick()
+
+    assert len(node.goal_pub.messages) == 1
+    goal = node.goal_pub.messages[0]
+    assert -1.3 < goal.pose.position.x < -0.9
+    assert node.shadow_goal_active is True
