@@ -1,6 +1,7 @@
 import pytest
 
 from launch import LaunchContext
+from launch.actions import SetEnvironmentVariable
 
 from fleet_bringup import launch_utils
 
@@ -15,7 +16,7 @@ def _shell(monkeypatch, domain_id='22', cyclonedds_uri=None):
         monkeypatch.setenv('CYCLONEDDS_URI', cyclonedds_uri)
 
 
-def test_clean_process_environment_preserves_shell_dds_values(monkeypatch):
+def test_clean_process_environment_preserves_unreadable_shell_dds_values(monkeypatch):
     uri = 'file:///operator/cyclonedds.xml'
     _shell(monkeypatch, cyclonedds_uri=uri)
 
@@ -26,18 +27,48 @@ def test_clean_process_environment_preserves_shell_dds_values(monkeypatch):
     assert env['CYCLONEDDS_URI'] == uri
 
 
-def test_dds_launch_environment_validates_without_set_environment_actions(monkeypatch):
-    _shell(monkeypatch, cyclonedds_uri='file:///operator/cyclonedds.xml')
+def test_clean_process_environment_widens_small_cyclone_participant_range(monkeypatch, tmp_path):
+    source = tmp_path / 'cyclonedds.xml'
+    source.write_text(
+        '''<?xml version="1.0"?>
+<CycloneDDS xmlns="https://cdds.io/config">
+  <Domain id="any"><Discovery>
+    <ParticipantIndex>auto</ParticipantIndex>
+    <MaxAutoParticipantIndex>30</MaxAutoParticipantIndex>
+    <Peers><Peer address="10.0.0.2"/></Peers>
+  </Discovery></Domain>
+</CycloneDDS>''',
+        encoding='utf-8',
+    )
+    _shell(monkeypatch, cyclonedds_uri=f'file://{source}')
+
+    env = launch_utils.clean_process_environment('22')
+    derived = launch_utils._cyclonedds_uri_to_path(env['CYCLONEDDS_URI'])
+
+    assert derived is not None and derived.is_file()
+    text = derived.read_text(encoding='utf-8')
+    assert '<MaxAutoParticipantIndex>240</MaxAutoParticipantIndex>' in text
+    assert '<Peer address="10.0.0.2"' in text
+    assert source.read_text(encoding='utf-8').count('>30<') == 1
+
+
+def test_dds_launch_environment_sets_derived_participant_config(monkeypatch, tmp_path):
+    source = tmp_path / 'cyclonedds.xml'
+    source.write_text(
+        '''<CycloneDDS xmlns="https://cdds.io/config"><Domain id="any">
+<Discovery><ParticipantIndex>auto</ParticipantIndex>
+<MaxAutoParticipantIndex>30</MaxAutoParticipantIndex></Discovery>
+</Domain></CycloneDDS>''',
+        encoding='utf-8',
+    )
+    _shell(monkeypatch, cyclonedds_uri=f'file://{source}')
     action = launch_utils.dds_launch_environment('22')[0]
     context = LaunchContext()
-    before = {
-        'ROS_DOMAIN_ID': context.environment.get('ROS_DOMAIN_ID'),
-        'CYCLONEDDS_URI': context.environment.get('CYCLONEDDS_URI'),
-    }
 
-    assert action.execute(context) == []
-    assert context.environment.get('ROS_DOMAIN_ID') == before['ROS_DOMAIN_ID']
-    assert context.environment.get('CYCLONEDDS_URI') == before['CYCLONEDDS_URI']
+    actions = action.execute(context)
+
+    assert len(actions) == 1
+    assert isinstance(actions[0], SetEnvironmentVariable)
 
 
 def test_dds_launch_environment_rejects_shell_domain_mismatch(monkeypatch):
