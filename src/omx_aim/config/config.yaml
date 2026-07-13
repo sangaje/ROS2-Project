@@ -95,9 +95,9 @@ ibvs:
   sign_vs_y: -1
   deadband_x:  0.03        # 화면 폭의 3%
   deadband_y:  0.09         # ← 신규 (위아래 3배 여유)
-  # 조준 기준점을 화면 정중앙보다 살짝 아래로 둔다.
-  # 0.08은 720p 기준 약 29px 아래.
-  aim_target_offset_y_norm: 0.08
+  # 조준 기준점을 화면 정중앙보다 아래로 둔다.
+  # 0.14는 720p 기준 약 50px 아래.
+  aim_target_offset_y_norm: 0.14
   control_hz:  25.0         # 제어 주기
   # ----- 움직이는 표적 추적 (Phase B) -----
   # 0 = 순수 P (정적 표적, 기존 동작과 동일)

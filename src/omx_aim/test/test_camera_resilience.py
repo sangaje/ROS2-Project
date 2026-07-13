@@ -53,7 +53,7 @@ def test_aim_reference_can_be_lowered_below_image_center():
         encoding='utf-8'
     )
 
-    assert 'aim_target_offset_y_norm: 0.08' in config_source
+    assert 'aim_target_offset_y_norm: 0.14' in config_source
     assert 'def aim_reference_pixel' in detector_source
     assert "getattr(self.cfg.ibvs, 'aim_target_offset_y_norm'" in detector_source
     assert 'self.detector.aim_reference_pixel(w, h)' in node_source

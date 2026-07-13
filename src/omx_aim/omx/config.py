@@ -61,9 +61,9 @@ class IbvsConfig:
     deadband_y: float
     control_hz: float
     # Positive values move the visual-servo reference point downward from the
-    # image center, in normalized half-height units. 0.08 is about 29 px on
+    # image center, in normalized half-height units. 0.14 is about 50 px on
     # a 720p frame.
-    aim_target_offset_y_norm: float = 0.08
+    aim_target_offset_y_norm: float = 0.14
     camera_device: str = ''
     camera_backend: str = 'v4l2'
     camera_reconnect_period_sec: float = 1.0
