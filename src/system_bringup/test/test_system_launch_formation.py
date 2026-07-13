@@ -37,8 +37,8 @@ def test_system_launch_uses_fixed_seed_localization_and_faster_nav2_leader_defau
     assert "'leader_shadow_far_distance_m',\n            default_value='0.80'" in text
     assert "'leader_shadow_goal_update_period_sec',\n            default_value='0.5'" in text
     assert "'leader_shadow_goal_min_change_m',\n            default_value='0.12'" in text
-    assert "'follow_goal_update_distance_m': 0.30" in text
-    assert "'follow_startup_leader_motion_m': 0.30" in text
+    assert "'follow_goal_update_distance_m': 0.10" in text
+    assert "'follow_startup_leader_motion_m': 0.0" in text
 
 
 def test_scout_member_pose_is_stabilized_when_cartographer_corrects_while_stopped():

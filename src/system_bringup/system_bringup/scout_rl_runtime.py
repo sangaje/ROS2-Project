@@ -72,6 +72,7 @@ class RuntimeCounters:
     map_callback_count: int = 0
     map_tick_count: int = 0
     map_tick_failure_count: int = 0
+    snapshot_update_count: int = 0
     pose_success_count: int = 0
     confidence_update_attempt_count: int = 0
     confidence_update_success_count: int = 0
@@ -573,11 +574,14 @@ class ActiveScoutRLRuntime:
             'map_tick_count': self.counters.map_tick_count,
             'map_update_attempt_count': self.counters.confidence_update_attempt_count,
             'map_update_success_count': self.counters.confidence_update_success_count,
+            'snapshot_update_count': self.counters.snapshot_update_count,
             'map_snapshot_exists': map_snapshot is not None,
             'map_snapshot_age_ms': (
                 (now - map_snapshot.updated_at) * 1000.0
                 if map_snapshot is not None else -1.0
             ),
+            'scan_generation': snapshot.scan_generation,
+            'map_generation': snapshot.map_generation,
             'history_length': len(self._history_vector),
             'tf_ready': self.tf_ready(),
             'policy_worker_alive': self._model_loading or self.ready,
@@ -923,7 +927,7 @@ class ActiveScoutRLRuntime:
         if not blocking:
             if map_snapshot is None:
                 blocking.append('observation_map_update_missing')
-            elif now - map_snapshot.updated_at > self.config.max_scan_age_sec:
+            elif now - map_snapshot.updated_at > self.config.max_observation_snapshot_age_sec:
                 blocking.append('observation_stale')
         return blocking
 
@@ -1038,6 +1042,7 @@ class ActiveScoutRLRuntime:
                     map_generation=snapshot.map_generation,
                     updated_at=now,
                 )
+                self.counters.snapshot_update_count += 1
             if not self._active:
                 self._warm_observation(snapshot.scan)
             self._log_heartbeat()
@@ -1371,7 +1376,11 @@ class ActiveScoutRLRuntime:
         scan_age = (now - snapshot.scan_received_at) * 1000.0 if snapshot.scan else -1.0
         odom_age = (now - snapshot.odom_received_at) * 1000.0 if snapshot.odom else -1.0
         map_age = (now - snapshot.map_received_at) * 1000.0 if snapshot.slam_map else -1.0
-        obs_ok = bool(map_snapshot is not None and now - map_snapshot.updated_at <= self.config.max_scan_age_sec)
+        obs_ok = bool(
+            map_snapshot is not None
+            and now - map_snapshot.updated_at
+            <= self.config.max_observation_snapshot_age_sec
+        )
         counters = self.counters
         self.node.get_logger().info(
             'RL_RUNTIME_HEARTBEAT | '

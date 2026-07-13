@@ -331,6 +331,13 @@ class LeaderUnifiedDashboard(Node):
         self.start_motion_detail_topic = str(
             _declare(self, 'start_motion_detail_topic', '/fleet/start_motion_detail')
         )
+        self.scout_motion_ready_detail_topic = str(
+            _declare(
+                self,
+                'scout_motion_ready_detail_topic',
+                '/fleet/scout_motion_ready_detail',
+            )
+        )
         self.readiness_detail_topic = str(
             _declare(self, 'readiness_detail_topic', '/fleet/readiness_detail')
         )
@@ -436,6 +443,8 @@ class LeaderUnifiedDashboard(Node):
         self._start_motion = False
         self._system_ready = False
         self._system_readiness_detail: Dict[str, Any] = {}
+        self._scout_motion_ready_detail: Dict[str, Any] = {}
+        self._scout_motion_ready_detail_wall_sec: Optional[float] = None
         self._video_ready_detail: Dict[str, Any] = {
             'ready': False,
             'start_motion': False,
@@ -573,6 +582,12 @@ class LeaderUnifiedDashboard(Node):
             String,
             self.system_readiness_detail_topic,
             self._on_system_readiness_detail,
+            video_ready_qos,
+        )
+        self.create_subscription(
+            String,
+            self.scout_motion_ready_detail_topic,
+            self._on_scout_motion_ready_detail,
             video_ready_qos,
         )
         self.video_ready_pub = self.create_publisher(
@@ -978,6 +993,24 @@ class LeaderUnifiedDashboard(Node):
                     'type': 'std_msgs/msg/String',
                 }
 
+    def _on_scout_motion_ready_detail(self, msg: String) -> None:
+        try:
+            payload = json.loads(msg.data)
+        except (json.JSONDecodeError, TypeError):
+            payload = {'raw': msg.data}
+        if not isinstance(payload, dict):
+            return
+        now = time.time()
+        with self._lock:
+            self._scout_motion_ready_detail = payload
+            self._scout_motion_ready_detail_wall_sec = now
+            self._topic_state[self.scout_motion_ready_detail_topic] = {
+                'value': payload,
+                'received_wall_sec': now,
+                'type': 'std_msgs/msg/String',
+            }
+        self._evaluate_motion_release(now, dashboard_ready=self._video_ready)
+
     def _publish_readiness_detail(self, detail: Dict[str, Any]) -> None:
         msg = String(data=json.dumps(detail, sort_keys=True))
         self.readiness_detail_pub.publish(msg)
@@ -1079,6 +1112,97 @@ class LeaderUnifiedDashboard(Node):
             'stable_required_sec': self.dashboard_stable_duration_sec,
         }
         return bool(all_ready and stable), detail
+
+    def _scout_motion_release_snapshot(self, now: float) -> tuple[bool, Dict[str, Any]]:
+        with self._lock:
+            detail = dict(self._scout_motion_ready_detail)
+            received = self._scout_motion_ready_detail_wall_sec
+        fresh = (
+            isinstance(received, (int, float))
+            and now - float(received) <= 2.0
+        )
+        release_ready = bool(fresh and detail.get('ready'))
+        blocking = str(detail.get('blocking_reason') or '').strip()
+        if not fresh:
+            blocking = 'scout_motion_ready_detail_stale'
+        elif not blocking:
+            blocking = 'none' if release_ready else 'scout_motion_not_ready'
+        detail['detail_fresh'] = fresh
+        detail['release_ready'] = release_ready
+        detail['blocking_reason'] = blocking
+        detail['received_age_ms'] = (
+            int((now - float(received)) * 1000.0)
+            if isinstance(received, (int, float)) else -1
+        )
+        return release_ready, detail
+
+    def _evaluate_motion_release(
+        self,
+        now: float,
+        *,
+        dashboard_ready: bool,
+        base_detail: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        release_ready, scout_detail = self._scout_motion_release_snapshot(now)
+        with self._lock:
+            previous_start_motion = self._start_motion
+            start_motion = bool(previous_start_motion or release_ready)
+            if start_motion:
+                self._startup_motion_released = True
+            phase = (
+                'RUNNING'
+                if start_motion else (
+                    'RUNTIME_STOPPED'
+                    if self._startup_motion_released
+                    else 'STARTUP_NOT_RELEASED'
+                )
+            )
+            self._start_motion = start_motion
+        blocking_reason = (
+            'none' if start_motion else scout_detail.get('blocking_reason', 'unknown')
+        )
+        stable_elapsed_ms = int(scout_detail.get('stable_elapsed_ms', 0) or 0)
+        release_detail = {
+            'reason': (
+                'minimum_scout_runtime_ready'
+                if start_motion else 'minimum_scout_runtime_not_ready'
+            ),
+            'phase': phase,
+            'start_motion': start_motion,
+            'scout_motion_ready': release_ready,
+            'scout_motion_ready_detail': scout_detail,
+            'stable_elapsed_ms': stable_elapsed_ms,
+            'blocking_reason': blocking_reason,
+            'dashboard_ready': bool(dashboard_ready),
+            'system_ready': self._system_ready,
+        }
+        if base_detail is not None:
+            base_detail.update(release_detail)
+        self.get_logger().warning(
+            'MOTION_RELEASE_DEBUG | '
+            f'state={scout_detail.get("state", phase)} '
+            f'start_motion={start_motion} '
+            f'scan_ready={scout_detail.get("scan_ready")} '
+            f'odom_ready={scout_detail.get("odom_ready")} '
+            f'map_ready={scout_detail.get("map_ready")} '
+            f'tf_ready={scout_detail.get("tf_ready")} '
+            f'model_ready={scout_detail.get("model_ready")} '
+            f'observation_ready={scout_detail.get("observation_ready")} '
+            f'dashboard_ready={bool(dashboard_ready)} '
+            f'leader_ready={self._system_readiness_detail.get("leader_localization")} '
+            f'follower_ready={self._system_readiness_detail.get("follower_localization")} '
+            f'stable_elapsed_ms={stable_elapsed_ms} '
+            f'blocking_reason={blocking_reason}',
+            throttle_duration_sec=1.0,
+        )
+        if start_motion and not previous_start_motion:
+            self._publish_start_motion(start_motion, release_detail)
+            self.get_logger().warning(
+                'MOTION_RELEASED | '
+                'reason=minimum_scout_runtime_ready '
+                f'stable_elapsed_ms={stable_elapsed_ms}'
+            )
+        return start_motion
 
     def _evaluate_video_ready(self) -> None:
         yolo = self.yolo_status()
@@ -1198,42 +1322,10 @@ class LeaderUnifiedDashboard(Node):
         }
         with self._lock:
             previous = self._video_ready
-            previous_start_motion = self._start_motion
             self._video_ready = ready
-            system_ready = system_ready_snapshot
-            raw_motion_ok = bool(ready and system_ready)
-            if raw_motion_ok:
-                self._motion_not_ready_since = None
-                start_motion = True
-            elif previous_start_motion:
-                if self._motion_not_ready_since is None:
-                    self._motion_not_ready_since = now
-                if now - self._motion_not_ready_since < self.motion_drop_grace_sec:
-                    # Transient blip while already running -- ride it out
-                    # instead of stopping the robot on a single bad poll.
-                    start_motion = True
-                else:
-                    start_motion = False
-            else:
-                # Never actually released yet: no grace period at startup,
-                # readiness must be genuinely satisfied first.
-                start_motion = False
-            if start_motion:
-                self._startup_motion_released = True
-            phase = (
-                'RUNNING'
-                if start_motion else (
-                    'RUNTIME_STOPPED'
-                    if self._startup_motion_released
-                    else 'STARTUP_NOT_RELEASED'
-                )
-            )
-            self._start_motion = start_motion
             published_count = int(self._video_ready_detail.get('published_count', 0))
             detail['published_count'] = published_count
-            detail['start_motion'] = start_motion
-            detail['phase'] = phase
-            detail['system_ready'] = system_ready
+            detail['system_ready'] = system_ready_snapshot
             detail['system_ready_topic'] = self.system_ready_topic
             detail['start_motion_topic'] = self.start_motion_topic
             detail['authoritative_publisher'] = (
@@ -1242,6 +1334,12 @@ class LeaderUnifiedDashboard(Node):
             detail['publisher_count'] = self.count_publishers(self.start_motion_topic)
             self._video_ready_detail = detail
             self._dashboard_ui_ready = ui_ready
+        start_motion = self._evaluate_motion_release(
+            now,
+            dashboard_ready=ready,
+            base_detail=detail,
+        )
+        phase = str(detail.get('phase', 'RUNNING' if start_motion else 'STARTUP_NOT_RELEASED'))
         self._publish_readiness_detail(detail)
         panel_state = detail.get('dashboard_ui', {}).get('panels', {})
         blocking_panels = []
@@ -1288,15 +1386,6 @@ class LeaderUnifiedDashboard(Node):
                 f'blocking_panels={blocking_panels}',
                 throttle_duration_sec=2.0,
             )
-        if start_motion != previous_start_motion:
-            reason = 'dashboard_and_system_ready' if start_motion else 'motion_barrier_not_ready'
-            self._publish_start_motion(start_motion, {**detail, 'reason': reason})
-            self.get_logger().warning(
-                'FLEET_START_MOTION | '
-                f'ready={start_motion} video_ready={ready} system_ready={system_ready} '
-                f'ui={ui_ready} backend={backend_ready}'
-            )
-
     def _on_nav_path(self, name: str, msg: NavPath) -> None:
         now = time.time()
         with self._lock:

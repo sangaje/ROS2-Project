@@ -594,10 +594,8 @@ def test_observation_snapshot_and_confidence_periods_are_bounded_and_derived():
 
     # Deliberately not tied to max_scan_age_sec: this is the freshness bound
     # for the derived MapSnapshot, not for raw scan/odom/map messages.
-    # Floor raised from 0.6s->1.5s after real-hardware SCOUT_MAP_TICK_TIMING
-    # telemetry showed the heavy confidence tick's own update() cost (an
-    # external, unmodifiable turtlebot3_rl_training call) spiking past 1s.
-    assert config.max_observation_snapshot_age_sec >= 1.5
+    # Startup release uses a separate 1.0s MapSnapshot freshness contract.
+    assert config.max_observation_snapshot_age_sec == 1.0
     assert config.max_observation_snapshot_age_sec <= fast_tick_period_sec * 20.0
     assert config.confidence_update_period_sec >= 1.5
     # The heavy confidence/publish pipeline must run at a bounded, slower

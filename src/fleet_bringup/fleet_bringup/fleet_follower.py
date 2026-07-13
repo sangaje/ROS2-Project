@@ -58,9 +58,13 @@ class FleetFollower(Node):
         )
         self.declare_parameter('fleet_poses_topic', '/fleet/robot_poses')
         self.declare_parameter('scan_topic', '/scan')
-        self.declare_parameter('follow_distance', 0.70)
-        self.declare_parameter('goal_period_sec', 1.0)
-        self.declare_parameter('goal_update_distance', 0.20)
+        self.declare_parameter('start_motion_topic', '/fleet/start_motion')
+        self.declare_parameter('require_start_motion', True)
+        self.declare_parameter('follow_distance', 0.50)
+        self.declare_parameter('stop_distance_m', 0.35)
+        self.declare_parameter('resume_distance_m', 0.55)
+        self.declare_parameter('goal_period_sec', 0.5)
+        self.declare_parameter('goal_update_distance', 0.10)
         self.declare_parameter('goal_refresh_sec', 3.0)
         self.declare_parameter('action_wait_timeout_sec', 1.0)
         self.declare_parameter('cancel_previous_goal', False)
@@ -78,6 +82,7 @@ class FleetFollower(Node):
         self.declare_parameter('slot_stickiness_bonus', 0.35)
         self.declare_parameter('localization_ready_topic', '/localization_ready')
         self.declare_parameter('require_localization_ready', False)
+        self.declare_parameter('pose_timeout_sec', 0.5)
 
         parameter = self.get_parameter
         self.leader_pose_topic = self._absolute(
@@ -102,7 +107,16 @@ class FleetFollower(Node):
             str(parameter('fleet_poses_topic').value)
         )
         self.scan_topic = self._absolute(str(parameter('scan_topic').value))
+        self.start_motion_topic = self._absolute(
+            str(parameter('start_motion_topic').value)
+        )
+        self.require_start_motion = bool(parameter('require_start_motion').value)
         self.follow_distance = max(0.25, float(parameter('follow_distance').value))
+        self.stop_distance = max(0.05, float(parameter('stop_distance_m').value))
+        self.resume_distance = max(
+            self.stop_distance,
+            float(parameter('resume_distance_m').value),
+        )
         self.goal_period = max(0.2, float(parameter('goal_period_sec').value))
         self.goal_update_distance = max(
             0.05, float(parameter('goal_update_distance').value)
@@ -146,9 +160,12 @@ class FleetFollower(Node):
         self.require_localization_ready = bool(
             parameter('require_localization_ready').value
         )
+        self.pose_timeout = max(0.1, float(parameter('pose_timeout_sec').value))
 
         self.leader_pose: Optional[PoseStamped] = None
+        self.leader_pose_wall: Optional[float] = None
         self.follower_pose: Optional[PoseStamped] = None
+        self.follower_pose_wall: Optional[float] = None
         self.active_goal_handle = None
         self.active_goal_id = 0
         self.last_goal_xy: Optional[Point2] = None
@@ -166,6 +183,7 @@ class FleetFollower(Node):
         self.fleet_poses: Optional[PoseArray] = None
         self.latest_scan: Optional[LaserScan] = None
         self.localization_ready = False
+        self.start_motion = not self.require_start_motion
 
         coordination_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -215,6 +233,13 @@ class FleetFollower(Node):
             self._localization_ready_callback,
             coordination_qos,
         )
+        if self.require_start_motion:
+            self.create_subscription(
+                Bool,
+                self.start_motion_topic,
+                self._start_motion_callback,
+                coordination_qos,
+            )
         self.status_publisher = self.create_publisher(
             Bool,
             self.follow_status_topic,
@@ -237,6 +262,13 @@ class FleetFollower(Node):
             f'distance={self.follow_distance:.2f}m '
             f'enabled={self.follow_enabled}'
         )
+        self.get_logger().warning(
+            'FOLLOWER_STARTUP_PROFILE | '
+            'robot=follower21 role=FOLLOWER domain=21 '
+            f'leader_pose_topic={self.leader_pose_topic} '
+            f'self_pose_topic={self.follower_pose_topic} '
+            'amcl=true nav2=true cartographer=false rl=false camera=false'
+        )
 
     @staticmethod
     def _absolute(topic: str) -> str:
@@ -247,9 +279,11 @@ class FleetFollower(Node):
 
     def _leader_pose_callback(self, message: PoseStamped) -> None:
         self.leader_pose = message
+        self.leader_pose_wall = self._now()
 
     def _follower_pose_callback(self, message: PoseStamped) -> None:
         self.follower_pose = message
+        self.follower_pose_wall = self._now()
 
     def _publish_status(self) -> None:
         message = Bool()
@@ -274,6 +308,14 @@ class FleetFollower(Node):
 
     def _localization_ready_callback(self, message: Bool) -> None:
         self.localization_ready = bool(message.data)
+
+    def _start_motion_callback(self, message: Bool) -> None:
+        previous = self.start_motion
+        self.start_motion = bool(message.data)
+        if self.start_motion and not previous:
+            self.last_goal_xy = None
+            self.last_goal_time = -1.0e9
+            self.last_goal_outcome = 'none'
 
     def _cancel_goal(self, reason: str) -> None:
         handle = self.active_goal_handle
@@ -515,23 +557,51 @@ class FleetFollower(Node):
     def _tick(self) -> None:
         if not self.follow_enabled:
             return
+        now = self._now()
+        if self.require_start_motion and not self.start_motion:
+            self._log_follow_debug('start_motion_false')
+            return
         if self.leader_pose is None:
-            self._log_wait(f'no {self.leader_pose_topic}')
+            self._log_follow_debug('leader_pose_missing')
+            return
+        if self.leader_pose_wall is None or now - self.leader_pose_wall > self.pose_timeout:
+            self._log_follow_debug('leader_pose_stale')
+            return
+        if str(self.leader_pose.header.frame_id or '').strip().lstrip('/') != 'map':
+            self._log_follow_debug('leader_pose_stale')
             return
         if self.follower_pose is None:
-            self._log_wait('follower localization is not ready')
+            self._log_follow_debug('self_pose_missing')
+            return
+        if self.follower_pose_wall is None or now - self.follower_pose_wall > self.pose_timeout:
+            self._log_follow_debug('self_pose_stale')
+            return
+        if str(self.follower_pose.header.frame_id or '').strip().lstrip('/') != 'map':
+            self._log_follow_debug('self_pose_stale')
             return
         if self.require_localization_ready and not self.localization_ready:
-            self._log_wait('waiting for the localization spin to finish')
+            self._log_follow_debug('localization_not_ready')
             return
         if not self.navigation_client.wait_for_server(
             timeout_sec=self.action_wait_timeout
         ):
-            self._log_wait(f'action server is not ready: {self.navigate_action}')
+            self._log_follow_debug('nav_server_unavailable')
+            return
+        distance_to_leader = math.hypot(
+            self.leader_pose.pose.position.x - self.follower_pose.pose.position.x,
+            self.leader_pose.pose.position.y - self.follower_pose.pose.position.y,
+        )
+        if self.last_goal_xy is None and distance_to_leader <= self.resume_distance:
+            self._log_follow_debug('goal_not_changed', distance_to_leader=distance_to_leader)
             return
 
         target = self._target_behind_leader()
         if not self._should_send(target):
+            self._log_follow_debug(
+                'goal_not_changed',
+                distance_to_leader=distance_to_leader,
+                target=target,
+            )
             return
         if self.cancel_previous_goal:
             self._cancel_goal('new follow target')
@@ -550,6 +620,50 @@ class FleetFollower(Node):
         future = self.navigation_client.send_goal_async(goal)
         future.add_done_callback(
             partial(self._goal_response_callback, goal_id=goal_id)
+        )
+        self._log_follow_debug(
+            'none',
+            distance_to_leader=distance_to_leader,
+            target=target,
+            goal_required=True,
+            goal_sent=True,
+        )
+
+    def _log_follow_debug(
+        self,
+        reason: str,
+        *,
+        distance_to_leader: float = float('nan'),
+        target: Optional[PoseStamped] = None,
+        goal_required: bool = False,
+        goal_sent: bool = False,
+    ) -> None:
+        now = self._now()
+        leader_age_ms = (
+            -1.0 if self.leader_pose_wall is None
+            else max(0.0, (now - self.leader_pose_wall) * 1000.0)
+        )
+        self_age_ms = (
+            -1.0 if self.follower_pose_wall is None
+            else max(0.0, (now - self.follower_pose_wall) * 1000.0)
+        )
+        target_x = float('nan') if target is None else target.pose.position.x
+        target_y = float('nan') if target is None else target.pose.position.y
+        self.get_logger().warning(
+            'FOLLOWER_FOLLOW_DEBUG | '
+            'role=FOLLOWER '
+            f'start_motion={self.start_motion} '
+            f'localization_ready={self.localization_ready} '
+            f'leader_pose_age_ms={leader_age_ms:.0f} '
+            f'self_pose_age_ms={self_age_ms:.0f} '
+            f'nav_server_ready={self.navigation_client.server_is_ready()} '
+            f'distance_to_leader={distance_to_leader:.3f} '
+            f'target_x={target_x:.3f} target_y={target_y:.3f} '
+            f'goal_required={goal_required} goal_sent={goal_sent} '
+            f'goal_accepted={self.active_goal_handle is not None} '
+            'path_received=unknown controller_cmd_age_ms=-1 '
+            f'odom_motion=false blocking_reason={reason}',
+            throttle_duration_sec=1.0,
         )
 
     def _goal_response_callback(self, future, goal_id: int) -> None:

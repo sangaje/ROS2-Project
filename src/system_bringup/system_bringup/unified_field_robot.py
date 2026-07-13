@@ -86,9 +86,11 @@ class UnifiedFieldRobot(Node):
         self.declare_parameter('use_stamped_cmd_vel', True)
         self.declare_parameter('amcl_pose_topic', '/amcl_pose')
         self.declare_parameter('odom_topic', '/odom')
-        self.declare_parameter('follow_distance_m', 0.70)
-        self.declare_parameter('follow_goal_period_sec', 1.0)
-        self.declare_parameter('follow_goal_update_distance_m', 0.30)
+        self.declare_parameter('follow_distance_m', 0.50)
+        self.declare_parameter('follow_stop_distance_m', 0.35)
+        self.declare_parameter('follow_resume_distance_m', 0.55)
+        self.declare_parameter('follow_goal_period_sec', 0.5)
+        self.declare_parameter('follow_goal_update_distance_m', 0.10)
         self.declare_parameter('follow_startup_leader_motion_m', 0.30)
         self.declare_parameter('follow_startup_close_distance_m', 0.35)
         self.declare_parameter('follow_startup_timeout_sec', 4.0)
@@ -146,6 +148,11 @@ class UnifiedFieldRobot(Node):
         self.amcl_pose_topic = str(get('amcl_pose_topic').value)
         self.odom_topic = str(get('odom_topic').value)
         self.follow_distance = max(0.1, float(get('follow_distance_m').value))
+        self.follow_stop_distance = max(0.05, float(get('follow_stop_distance_m').value))
+        self.follow_resume_distance = max(
+            self.follow_stop_distance,
+            float(get('follow_resume_distance_m').value),
+        )
         self.follow_goal_period = max(0.2, float(get('follow_goal_period_sec').value))
         self.follow_update_distance = max(0.05, float(get('follow_goal_update_distance_m').value))
         self.follow_startup_leader_motion = max(
@@ -354,6 +361,25 @@ class UnifiedFieldRobot(Node):
             f'receive_age_ms={receive_age_ms:.0f}',
             throttle_duration_sec=3.0,
         )
+        leader_age_ms = (
+            -1.0 if self.leader_pose_wall is None
+            else max(0.0, (self._now() - self.leader_pose_wall) * 1000.0)
+        )
+        self_age_ms = (
+            -1.0 if self.self_pose_wall is None
+            else max(0.0, (self._now() - self.self_pose_wall) * 1000.0)
+        )
+        self.get_logger().warning(
+            'FOLLOWER_POSE_INPUT | '
+            f'leader_pose_rx={self.leader_pose is not None} '
+            f'leader_pose_age_ms={leader_age_ms:.0f} '
+            f'leader_pose_frame={self.leader_pose.header.frame_id if self.leader_pose else ""} '
+            f'self_pose_rx={self.self_pose is not None} '
+            f'self_pose_age_ms={self_age_ms:.0f} '
+            f'self_pose_frame={self.self_pose.header.frame_id if self.self_pose else ""} '
+            'blocking_reason=none',
+            throttle_duration_sec=1.0,
+        )
 
     def _on_localization_ready(self, msg: Bool) -> None:
         previous = self.localization_ready
@@ -542,6 +568,7 @@ class UnifiedFieldRobot(Node):
     def _tick_follow(self) -> None:
         if not self.enable_follow:
             return
+        now = self._now()
         if not self._start_motion_allowed():
             self._log_follow_gate('start_motion_false')
             return
@@ -553,11 +580,22 @@ class UnifiedFieldRobot(Node):
         if self.leader_pose is None:
             self._log_follow_gate('leader_pose_missing')
             return
+        if self.leader_pose_wall is None or now - self.leader_pose_wall > self.self_pose_timeout:
+            self._log_follow_gate('leader_pose_stale')
+            return
+        leader_frame = str(self.leader_pose.header.frame_id or '').strip().lstrip('/')
+        if leader_frame != 'map':
+            self._log_follow_gate('leader_pose_stale')
+            return
         if self.self_pose is None or self.self_pose_wall is None:
             self._log_follow_gate('self_pose_missing')
             return
-        if self._now() - self.self_pose_wall > self.self_pose_timeout:
-            self._log_follow_gate('self_pose_missing')
+        if now - self.self_pose_wall > self.self_pose_timeout:
+            self._log_follow_gate('self_pose_stale')
+            return
+        self_frame = str(self.self_pose.header.frame_id or '').strip().lstrip('/')
+        if self_frame != 'map':
+            self._log_follow_gate('self_pose_stale')
             return
         if self.require_localization_ready and not self.localization_ready:
             # Without this, FOLLOWER starts sending Nav2 goals the instant
@@ -572,9 +610,8 @@ class UnifiedFieldRobot(Node):
             self._log_follow_gate('nav_server_unavailable')
             return
         if self.nav.has_pending_goal or not self.nav.is_idle:
-            self._log_follow_gate('command_authority_conflict')
+            self._log_follow_gate('goal_in_progress')
             return
-        now = self._now()
         if now - self.last_follow_goal_wall < self.follow_goal_period:
             return
         leader_distance = float('nan')
@@ -604,13 +641,9 @@ class UnifiedFieldRobot(Node):
                 now - self.first_follow_wall
                 if self.first_follow_wall is not None else 0.0
             )
-            if (
-                leader_distance <= self.follow_startup_close_distance
-                and leader_moved < self.follow_startup_leader_motion
-                and startup_elapsed < self.follow_startup_timeout
-            ):
+            if leader_distance <= self.follow_resume_distance:
                 self._log_follow_gate(
-                    'startup_formation_hold',
+                    'goal_not_changed',
                     leader_distance=leader_distance,
                     leader_moved=leader_moved,
                     startup_elapsed=startup_elapsed,
@@ -629,12 +662,20 @@ class UnifiedFieldRobot(Node):
         xy = (goal.pose.position.x, goal.pose.position.y)
         if self.last_follow_goal_xy is not None:
             if math.hypot(xy[0] - self.last_follow_goal_xy[0], xy[1] - self.last_follow_goal_xy[1]) < self.follow_update_distance:
+                self._log_follow_debug(
+                    'goal_not_changed',
+                    leader_distance=leader_distance,
+                    goal_required=False,
+                    goal_sent=False,
+                    target_xy=xy,
+                )
                 return
         self._log_follow_debug(
             'goal_required',
             leader_distance=leader_distance,
             goal_required=True,
             goal_sent=False,
+            target_xy=xy,
         )
         self._queue_nav_goal(goal, source='FOLLOW')
         self.pending_follow_goal_xy = xy
@@ -667,6 +708,7 @@ class UnifiedFieldRobot(Node):
         leader_distance: float = float('nan'),
         goal_required: bool,
         goal_sent: bool,
+        target_xy: Optional[tuple[float, float]] = None,
     ) -> None:
         self.get_logger().warning(
             self._follow_debug_text(
@@ -674,6 +716,7 @@ class UnifiedFieldRobot(Node):
                 leader_distance=leader_distance,
                 goal_required=goal_required,
                 goal_sent=goal_sent,
+                target_xy=target_xy,
             ),
             throttle_duration_sec=1.0,
         )
@@ -687,6 +730,7 @@ class UnifiedFieldRobot(Node):
         startup_elapsed: float = float('nan'),
         goal_required: bool,
         goal_sent: bool,
+        target_xy: Optional[tuple[float, float]] = None,
     ) -> str:
         leader_age = (
             -1.0 if self.leader_pose is None
@@ -704,23 +748,32 @@ class UnifiedFieldRobot(Node):
         cmd_age = -1.0
         if getattr(self, 'movement_started', False):
             cmd_age = 0.0
+        target_x = float('nan')
+        target_y = float('nan')
+        if target_xy is not None:
+            target_x, target_y = target_xy
         return (
-            'FOLLOW_DEBUG | '
+            'FOLLOWER_FOLLOW_DEBUG | FOLLOW_DEBUG | '
             f'robot={self.robot_name} role={self.role.value} '
+            f'start_motion={getattr(self, "start_motion", True)} '
             f'leader_pose_rx={self.leader_pose is not None} '
-            f'leader_pose_age={leader_age:.2f} '
+            f'leader_pose_age_ms={leader_age * 1000.0:.0f} '
             f'self_pose_rx={self.self_pose is not None} '
-            f'self_pose_age={self_age:.2f} '
+            f'self_pose_age_ms={self_age * 1000.0:.0f} '
             f'localization_ready={self.localization_ready} '
             f'system_ready={getattr(self, "system_ready", True)} '
-            f'nav_action_ready={self.nav_client.server_is_ready()} '
+            f'nav_server_ready={self.nav_client.server_is_ready()} '
             f'distance_to_leader={leader_distance:.3f} '
+            f'target_x={target_x:.3f} '
+            f'target_y={target_y:.3f} '
             f'leader_moved={leader_moved:.3f} '
             f'startup_elapsed={startup_elapsed:.2f} '
             f'goal_required={goal_required} goal_sent={goal_sent} '
+            f'goal_accepted={self.nav.active_goal_handle is not None} '
+            'path_received=unknown '
             f'goal_pending={self.nav.has_pending_goal} '
             f'active_goals={self.nav.active_goal_count} '
-            f'controller_cmd_age={cmd_age:.2f} '
+            f'controller_cmd_age_ms={cmd_age * 1000.0 if cmd_age >= 0.0 else -1.0:.0f} '
             f'odom_motion={self.movement_started} '
             f'blocking_reason={reason}'
         )
@@ -906,6 +959,10 @@ class UnifiedFieldRobot(Node):
             self.pending_follow_goal_xy = None
 
     def _on_nav_result(self, source: str, status, error: str) -> None:
+        if source == 'FOLLOW':
+            if status != GoalStatus.STATUS_SUCCEEDED:
+                self._reset_follow_goal_memory()
+            return
         if source != 'RECOVERY' or self.role != Role.RECOVERY_NAVIGATING:
             return
         if status == GoalStatus.STATUS_SUCCEEDED:
@@ -926,6 +983,12 @@ class UnifiedFieldRobot(Node):
         self.nav.invalidate(reason, clear_pending=clear_pending)
 
     def _handle_nav_failure(self, source: str, reason: str) -> None:
+        if source == 'FOLLOW':
+            self._reset_follow_goal_memory()
+            self.get_logger().warning(
+                f'FOLLOW_GOAL_RETRY_READY | reason={reason}'
+            )
+            return
         if source != 'RECOVERY' or self.role != Role.RECOVERY_NAVIGATING:
             return
         if self.recovery_nav_failures >= self.max_recovery_nav_retries:

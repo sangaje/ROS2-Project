@@ -470,9 +470,10 @@ def test_follower_startup_hold_has_timeout_and_follow_debug():
     ).read_text(encoding='utf-8')
 
     assert "follow_startup_timeout_sec" in source
-    assert "startup_elapsed < self.follow_startup_timeout" in source
-    assert "FOLLOW_DEBUG |" in source
-    assert "nav_action_ready=" in source
+    assert "follow_resume_distance_m" in source
+    assert "leader_distance <= self.follow_resume_distance" in source
+    assert "FOLLOWER_FOLLOW_DEBUG |" in source
+    assert "nav_server_ready=" in source
     assert "goal_sent=" in source
     assert "odom_motion=" in source
 

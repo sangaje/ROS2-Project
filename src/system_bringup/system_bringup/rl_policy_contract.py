@@ -230,18 +230,10 @@ def active_scout_config(
         max_tf_age_sec=float(runtime['max_tf_age_sec']),
         max_inference_sec=float(runtime['max_inference_sec']),
         command_timeout_sec=float(runtime['command_timeout_sec']),
-        # Fast observation tick runs at control_dt_sec / map_substeps_per_action
-        # (10 Hz at the frozen v132 values). Real-hardware SCOUT_MAP_TICK_TIMING
-        # telemetry showed the heavy confidence_tick's own exploration_map.
-        # update() call (an external, unmodifiable turtlebot3_rl_training cost)
-        # taking up to ~1.1s on a Pi, and the fast tick's lock wait spiking to
-        # ~750ms while that's in flight -- both well past the original 0.6s
-        # guess. Floored higher to tolerate that measured worst case with
-        # margin, without tying this to max_scan_age_sec.
-        max_observation_snapshot_age_sec=max(
-            1.5,
-            (float(runtime['control_dt_sec']) / int(runtime['map_substeps_per_action'])) * 15.0,
-        ),
+        # Fast observation tick runs independently of the heavy confidence
+        # publish path. Treat the policy-facing MapSnapshot as its own
+        # freshness contract instead of hiding stalls behind scan timeout.
+        max_observation_snapshot_age_sec=1.0,
         # Heavy confidence-grid update + external map publish: slowed down
         # from ~2 Hz so it has real idle time between runs instead of racing
         # back-to-back (its own cost can exceed 1s), which is what was

@@ -418,6 +418,13 @@ def generate_launch_description():
             parameters=[{
                 'use_sim_time': simulation,
                 'follow_distance': float(follow_distance.perform(context)),
+                'stop_distance_m': 0.35,
+                'resume_distance_m': 0.55,
+                'goal_period_sec': 0.5,
+                'goal_update_distance': 0.10,
+                'pose_timeout_sec': 0.5,
+                'require_start_motion': True,
+                'start_motion_topic': '/fleet/start_motion',
                 'start_following': True,
                 'require_localization_ready': require_ready_for_follow,
             }],
@@ -457,6 +464,13 @@ def generate_launch_description():
             behavior_nodes.append(follower)
 
         actions.extend([
+            LogInfo(msg=[
+                'FOLLOWER_STARTUP_PROFILE | robot=follower21 role=FOLLOWER ',
+                'domain=', str(follower_domain),
+                ' leader_pose_topic=/leader_pose self_pose_topic=/burger_pose ',
+                'amcl=', str(amcl_enabled).lower(),
+                ' nav2=true cartographer=false rl=false camera=false',
+            ]),
             LogInfo(msg=[
                 'LEADER_EGRESS_BRIDGE | source_domain=', str(main_domain),
                 ' | destination_domain=', str(follower_domain),
@@ -563,7 +577,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'follow_distance',
-            default_value='0.70',
+            default_value='0.50',
             description='Desired distance behind the leader in metres.',
         ),
         DeclareLaunchArgument(

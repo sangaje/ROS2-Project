@@ -44,7 +44,7 @@ def destroy_node(node: FleetFollower) -> None:
         rclpy.shutdown()
 
 
-def test_default_target_is_seventy_centimetres_behind_leader():
+def test_default_target_is_fifty_centimetres_behind_leader():
     node = make_node()
     try:
         leader = PoseStamped()
@@ -55,7 +55,7 @@ def test_default_target_is_seventy_centimetres_behind_leader():
         node._leader_pose_callback(leader)
 
         target = node._target_behind_leader()
-        assert abs(target.pose.position.x - 0.30) < 1.0e-6
+        assert abs(target.pose.position.x - 0.50) < 1.0e-6
         assert abs(target.pose.position.y - 2.0) < 1.0e-6
     finally:
         destroy_node(node)

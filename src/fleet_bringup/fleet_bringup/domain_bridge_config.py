@@ -419,6 +419,10 @@ def write_fleet_bridge_configs(
             'std_msgs/msg/String',
             profile=qos(durability='transient_local', depth=1),
         ),
+        '/fleet/scout_motion_ready_detail': topic(
+            'std_msgs/msg/String',
+            profile=qos(durability='transient_local', depth=1),
+        ),
         f'/field/follower{int(follower_domain)}/risk_observation': topic(
             'std_msgs/msg/String',
             profile=qos(reliability='best_effort', durability='volatile', depth=5),
@@ -569,6 +573,10 @@ def write_member_bridge_configs(
             profile=qos(durability='transient_local', depth=1),
         ),
         '/fleet/field_robot_status': topic(
+            'std_msgs/msg/String',
+            profile=qos(durability='transient_local', depth=1),
+        ),
+        '/fleet/scout_motion_ready_detail': topic(
             'std_msgs/msg/String',
             profile=qos(durability='transient_local', depth=1),
         ),

@@ -46,6 +46,9 @@ class ScoutRLPolicyWorker(Node):
         self.declare_parameter('system_ready_topic', '/system/ready')
         self.declare_parameter('require_start_motion', True)
         self.declare_parameter('start_motion_topic', '/fleet/start_motion')
+        self.declare_parameter('motion_readiness_detail_topic', '/fleet/scout_motion_ready_detail')
+        self.declare_parameter('motion_release_stable_sec', 1.0)
+        self.declare_parameter('startup_sensor_max_age_sec', 0.5)
         # Backward-compatible names accepted by old launch files. They no
         # longer control the final motion barrier.
         self.declare_parameter('require_video_ready', True)
@@ -72,6 +75,15 @@ class ScoutRLPolicyWorker(Node):
         requested_start_motion = bool(get('require_start_motion').value)
         self.require_start_motion = True
         self.start_motion_topic = str(get('start_motion_topic').value).strip()
+        self.motion_readiness_detail_topic = str(
+            get('motion_readiness_detail_topic').value
+        ).strip() or '/fleet/scout_motion_ready_detail'
+        self.motion_release_stable_sec = max(
+            0.1, float(get('motion_release_stable_sec').value)
+        )
+        self.startup_sensor_max_age_sec = max(
+            0.05, float(get('startup_sensor_max_age_sec').value)
+        )
         legacy_topic = str(get('video_ready_topic').value).strip()
         if not self.start_motion_topic:
             self.start_motion_topic = legacy_topic or '/fleet/start_motion'
@@ -105,6 +117,7 @@ class ScoutRLPolicyWorker(Node):
         self.last_debug_wall = -1.0e9
         self.last_odom_debug_wall = -1.0e9
         self.startup_released = False
+        self._motion_ready_since: Optional[float] = None
         self._last_role_update_tuple = (
             self.desired_role,
             self.role_epoch,
@@ -133,6 +146,9 @@ class ScoutRLPolicyWorker(Node):
             self.create_subscription(Bool, self.system_ready_topic, self._on_system_ready, latched_qos)
         self.create_subscription(Bool, self.start_motion_topic, self._on_start_motion, latched_qos)
         self.create_subscription(String, self.field_robot_status_topic, self._on_field_status, 10)
+        self.motion_readiness_pub = self.create_publisher(
+            String, self.motion_readiness_detail_topic, latched_qos
+        )
 
         self.runtime = ActiveScoutRLRuntime(
             self,
@@ -161,6 +177,9 @@ class ScoutRLPolicyWorker(Node):
             f'require_failover_activation={self.require_failover_activation} '
             f'require_system_ready={self.require_system_ready}:{self.system_ready_topic} '
             f'require_start_motion={self.require_start_motion}:{self.start_motion_topic} '
+            f'motion_readiness_detail_topic={self.motion_readiness_detail_topic} '
+            f'motion_release_stable_sec={self.motion_release_stable_sec:.2f} '
+            f'startup_sensor_max_age_sec={self.startup_sensor_max_age_sec:.2f} '
             f'requested_start_motion_gate={requested_start_motion} '
             f'odom_topic={self.odom_topic} max_odom_age_sec={self.max_odom_age_sec:.2f}'
         )
@@ -416,6 +435,131 @@ class ScoutRLPolicyWorker(Node):
             self.runtime.deactivate(reason)
             self._publish_zero()
         self._log_rl_debug(gate, state, reason)
+        self._publish_motion_readiness(gate, state, reason)
+
+    def _publish_motion_readiness(
+        self,
+        gate: GateInputs,
+        state: RLWorkerState,
+        reason: str,
+    ) -> None:
+        now = self._now()
+        runtime = self.runtime.debug_snapshot()
+        max_age_ms = self.startup_sensor_max_age_sec * 1000.0
+        scan_age_ms = float(runtime.get('scan_age_ms', -1.0))
+        odom_age_ms = float(runtime.get('odom_age_ms', -1.0))
+        map_age_ms = float(runtime.get('map_age_ms', -1.0))
+        role_active = self.desired_role.strip().upper() == 'ACTIVE_SCOUT'
+        lease_valid = bool(
+            gate.active_scout_matches
+            and gate.role_epoch >= gate.failover_epoch
+        )
+        motion_authority_available = bool(
+            gate.nav_goal_inactive
+            and self.motion_authority in ('', 'NONE', 'ACTIVE_SCOUT_RL')
+        )
+        conditions = {
+            'role_active': role_active,
+            'lease_valid': lease_valid,
+            'model_ready': bool(self.runtime.ready),
+            'scan_ready': 0.0 <= scan_age_ms < max_age_ms,
+            'odom_ready': 0.0 <= odom_age_ms < max_age_ms,
+            'map_ready': map_age_ms >= 0.0,
+            'tf_ready': bool(runtime.get('tf_ready', False)),
+            'observation_ready': bool(runtime.get('observation_ready', False)),
+        }
+        minimum_ready = bool(
+            all(conditions.values())
+            and motion_authority_available
+        )
+        if minimum_ready:
+            if self._motion_ready_since is None:
+                self._motion_ready_since = now
+            stable_elapsed_ms = (now - self._motion_ready_since) * 1000.0
+        else:
+            self._motion_ready_since = None
+            stable_elapsed_ms = 0.0
+        release_ready = bool(
+            minimum_ready
+            and stable_elapsed_ms >= self.motion_release_stable_sec * 1000.0
+        )
+        blocking_reason = 'none'
+        for key, ok in conditions.items():
+            if not ok:
+                blocking_reason = key.replace('_ready', '_stale')
+                if key == 'role_active':
+                    blocking_reason = 'role_inactive'
+                elif key == 'lease_valid':
+                    blocking_reason = 'lease_expired'
+                elif key == 'model_ready':
+                    blocking_reason = 'model_not_ready'
+                elif key == 'map_ready':
+                    blocking_reason = 'map_missing'
+                elif key == 'tf_ready':
+                    blocking_reason = 'tf_unavailable'
+                break
+        if blocking_reason == 'none' and not motion_authority_available:
+            blocking_reason = 'motion_authority_unavailable'
+        release_state = (
+            'RELEASED'
+            if self.start_motion else (
+                'STABLE_CHECK' if minimum_ready else 'WAITING'
+            )
+        )
+        payload = {
+            'robot': self.robot_name,
+            'ready': release_ready,
+            'conditions_ready': minimum_ready,
+            'state': release_state,
+            'role': self.desired_role,
+            'active_scout_id': self.active_scout_id,
+            'epoch': self.role_epoch,
+            'failover_epoch': self.failover_epoch,
+            'lease_valid': lease_valid,
+            'motion_authority_available': motion_authority_available,
+            'motion_authority': self.motion_authority,
+            'stable_elapsed_ms': int(stable_elapsed_ms),
+            'stable_required_ms': int(self.motion_release_stable_sec * 1000.0),
+            'blocking_reason': blocking_reason,
+            'gate_state': state.value,
+            'gate_reason': reason,
+            'scan_age_ms': int(scan_age_ms),
+            'odom_age_ms': int(odom_age_ms),
+            'map_age_ms': int(map_age_ms),
+            'map_tick_count': int(runtime.get('map_tick_count', 0) or 0),
+            'snapshot_update_count': int(
+                runtime.get('snapshot_update_count', 0) or 0
+            ),
+            'snapshot_age_ms': int(float(runtime.get('map_snapshot_age_ms', -1.0))),
+            'scan_generation': int(runtime.get('scan_generation', 0) or 0),
+            'odom_generation': int(runtime.get('odom_callback_count', 0) or 0),
+            'map_generation': int(runtime.get('map_generation', 0) or 0),
+            **conditions,
+        }
+        self.motion_readiness_pub.publish(
+            String(data=json.dumps(payload, sort_keys=True))
+        )
+        ready_count = sum(1 for ok in conditions.values() if ok)
+        self.get_logger().warning(
+            'MOTION_RELEASE_PROGRESS | '
+            f'ready_conditions={ready_count}/{len(conditions)} '
+            f'stable_elapsed_ms={int(stable_elapsed_ms)} '
+            f'blocking_reason={blocking_reason}',
+            throttle_duration_sec=1.0,
+        )
+        self.get_logger().warning(
+            'SCOUT_OBSERVATION_MINIMAL_DEBUG | '
+            f'map_tick_count={payload["map_tick_count"]} '
+            f'snapshot_update_count={payload["snapshot_update_count"]} '
+            f'snapshot_age_ms={payload["snapshot_age_ms"]} '
+            f'scan_generation={payload["scan_generation"]} '
+            f'odom_generation={payload["odom_generation"]} '
+            f'map_generation={payload["map_generation"]} '
+            f'tf_ready={payload["tf_ready"]} '
+            f'observation_ready={payload["observation_ready"]} '
+            f'blocking_reason={blocking_reason}',
+            throttle_duration_sec=1.0,
+        )
 
     def _debug_blocking_reason(
         self,

@@ -69,22 +69,21 @@ def test_system_launch_exposes_omx_and_scout_video_ready_requirements():
     ) in text
 
 
-def test_start_motion_has_falling_edge_grace_instead_of_instant_drop():
-    # Regression test for the observed "works, then doesn't, then works
-    # again" oscillation: start_motion used to be recomputed from scratch
-    # every 1 Hz poll with zero hysteresis, so a single missed check (one
-    # late YOLO frame, one browser heartbeat gap) instantly cut motion
-    # authority and stopped the robot, then it recovered a few polls later.
+def test_start_motion_is_one_shot_scout_runtime_release():
+    # Dashboard/browser/video readiness is diagnostic only. Startup motion is
+    # released once from the Scout runtime's minimum safety detail and is not
+    # pulled low by later dashboard/video misses.
     source = (
         Path(__file__).parents[1] / 'system_bringup' / 'leader_unified_dashboard.py'
     ).read_text(encoding='utf-8')
 
-    assert 'motion_drop_grace_sec' in source
-    assert '_motion_not_ready_since' in source
-    assert 'raw_motion_ok = bool(ready and system_ready)' in source
-    assert 'if raw_motion_ok:' in source
-    assert 'elif previous_start_motion:' in source
-    assert 'now - self._motion_not_ready_since < self.motion_drop_grace_sec' in source
+    assert 'scout_motion_ready_detail_topic' in source
+    assert 'def _evaluate_motion_release' in source
+    assert 'previous_start_motion or release_ready' in source
+    assert 'MOTION_RELEASE_DEBUG |' in source
+    assert 'MOTION_RELEASED |' in source
+    assert 'reason=minimum_scout_runtime_ready' in source
+    assert 'raw_motion_ok = bool(ready and system_ready)' not in source
 
 
 def test_video_streams_self_heal_without_a_manual_page_refresh():
@@ -120,7 +119,8 @@ def test_dashboard_requires_browser_rendered_panel_manifest():
     assert "_dashboard_ui_panels_ready" in source
     assert "rendered" in source
     assert "backend_ready and ui_ready" in source
-    assert "ready and system_ready" in source
+    assert "dashboard_ready=ready" in source
+    assert "previous_start_motion or release_ready" in source
     assert "publishDashboardReadiness" in js
     assert "rendered:" in js
     assert "naturalWidth > 0" in js
