@@ -22,7 +22,8 @@ def generate_launch_description():
         DeclareLaunchArgument('iou', default_value='0.45'),
         DeclareLaunchArgument('max_det', default_value='64'),
         DeclareLaunchArgument('imgsz', default_value='640'),
-        DeclareLaunchArgument('debug_jpeg_quality', default_value='75'),
+        DeclareLaunchArgument('debug_jpeg_quality', default_value='52'),
+        DeclareLaunchArgument('enable_raw_debug_stream', default_value='false'),
         DeclareLaunchArgument('max_capture_age_sec', default_value='1.5'),
         DeclareLaunchArgument('max_queue_wait_sec', default_value='0.05'),
         ExecuteProcess(
@@ -40,6 +41,7 @@ def generate_launch_description():
                 '--max-det', LaunchConfiguration('max_det'),
                 '--imgsz', LaunchConfiguration('imgsz'),
                 '--debug-jpeg-quality', LaunchConfiguration('debug_jpeg_quality'),
+                '--enable-raw-debug-stream', LaunchConfiguration('enable_raw_debug_stream'),
                 '--max-capture-age-sec', LaunchConfiguration('max_capture_age_sec'),
                 '--max-queue-wait-sec', LaunchConfiguration('max_queue_wait_sec'),
             ],

@@ -232,6 +232,7 @@ DEBUG_PAGE = """<!doctype html>
 @dataclass
 class DebugState:
     condition: threading.Condition = field(default_factory=threading.Condition)
+    raw_debug_enabled: bool = False
     raw_jpeg: bytes | None = None
     yolo_jpeg: bytes | None = None
     raw_version: int = 0
@@ -282,7 +283,7 @@ class DebugState:
 
     def update_raw(self, raw_jpeg, width, height, capture_age_ms):
         with self.condition:
-            self.raw_jpeg = raw_jpeg
+            self.raw_jpeg = raw_jpeg if self.raw_debug_enabled else None
             self.raw_version += 1
             self.raw_frames += 1
             self.image_width = width
@@ -406,6 +407,7 @@ class DebugState:
                 'dropped_capture_frames': self.dropped_capture_frames,
                 'dropped_inference_frames': self.dropped_inference_frames,
                 'dropped_stream_frames': self.dropped_stream_frames,
+                'raw_debug_enabled': self.raw_debug_enabled,
                 'raw_stream_clients': self.raw_stream_clients,
                 'yolo_stream_clients': self.yolo_stream_clients,
                 'stream_clients': self.raw_stream_clients + self.yolo_stream_clients,
@@ -647,7 +649,7 @@ def build_app(args):
         print(f'[flask_yolo_server] warmup failed: {exc}', flush=True)
         if model_suffix in ('.engine', '.plan'):
             raise
-    state = DebugState()
+    state = DebugState(raw_debug_enabled=bool(args.enable_raw_debug_stream))
     runtime = {'warmup_ms': warmup_ms}
 
     def runtime_status():
@@ -894,6 +896,8 @@ def build_app(args):
     def stream(kind):
         if kind not in ('raw', 'yolo'):
             return jsonify({'ok': False, 'error': 'kind must be raw or yolo'}), 404
+        if kind == 'raw' and not state.raw_debug_enabled:
+            return jsonify({'ok': False, 'error': 'raw debug stream disabled'}), 404
         return Response(
             _mjpeg_stream(state, kind),
             mimetype='multipart/x-mixed-replace; boundary=frame',
@@ -904,6 +908,8 @@ def build_app(args):
     def latest_frame(kind):
         if kind not in ('raw', 'yolo'):
             return jsonify({'ok': False, 'error': 'kind must be raw or yolo'}), 404
+        if kind == 'raw' and not state.raw_debug_enabled:
+            return jsonify({'ok': False, 'error': 'raw debug frame disabled'}), 404
         version, frame = state.latest_frame(kind)
         if frame is None:
             return jsonify({'ok': False, 'error': 'waiting for first frame'}), 503
@@ -941,8 +947,9 @@ def build_app(args):
         state.record('capture_age_ms', capture_age_ms)
         state.record('server_decode_ms', decode_ms)
 
-        # Keep the raw debug camera view live.  The original robot JPEG is
-        # reused directly; raw streaming never decodes or re-encodes it.
+        # Track capture/upload health without exposing a raw stream by
+        # default.  If raw debug is explicitly enabled, the original robot
+        # JPEG is reused directly; raw streaming never decodes or re-encodes.
         state.update_raw(original_jpeg, int(w), int(h), capture_age_ms)
 
         if args.max_capture_age_sec > 0.0 and raw_age_sec > args.max_capture_age_sec:
@@ -1098,6 +1105,7 @@ def parse_args():
     parser.add_argument('--max-det', type=int, default=64)
     parser.add_argument('--imgsz', type=int, default=640)
     parser.add_argument('--debug-jpeg-quality', type=int, default=80)
+    parser.add_argument('--enable-raw-debug-stream', type=as_bool, default=False)
     parser.add_argument('--max-capture-age-sec', type=float, default=0.8)
     parser.add_argument('--max-queue-wait-sec', type=float, default=0.0)
     parser.add_argument(

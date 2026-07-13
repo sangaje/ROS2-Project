@@ -14,10 +14,10 @@ const gridLoad = {
   risk: {loading: false, requestedSeq: -1, pendingSeq: -1, latestSeq: -1, lastRequestMs: 0, minIntervalMs: 1000},
 };
 let streamSources = {};
-const framePollTimers = {};
+const streamReconnectTimers = {};
+const streamReconnectDelayMs = {};
 const frameVersions = {
   omxStream: 0,
-  scoutRawStream: 0,
   scoutYoloStream: 0,
 };
 const canvas = document.getElementById('mapCanvas');
@@ -76,17 +76,12 @@ function setStreamSource(id, url, force = false) {
   const img = document.getElementById(id);
   if (!force && img.dataset.baseSrc === url) return;
   img.dataset.baseSrc = url;
-  img.src = `${url}${url.includes('?') ? '&' : '?'}t=${Date.now()}`;
+  img.src = `${url}${url.includes('?') ? '&' : '?'}session=${dashboardSessionId}&t=${Date.now()}`;
 }
 
 function configureStream(s) {
-  // Use latest-JPEG polling, not long-lived MJPEG proxy connections.  This
-  // makes each panel independent and stable across browser reloads.
-  streamSources.omxStream = '/api/omx_frame.jpg';
-
-  const yolo = s.yolo_server || {};
-  streamSources.scoutRawStream = '/api/yolo_frame/raw.jpg';
-  streamSources.scoutYoloStream = '/api/yolo_frame/yolo.jpg';
+  streamSources.omxStream = '/api/omx_stream.mjpg';
+  streamSources.scoutYoloStream = '/api/yolo_stream/yolo.mjpg';
   refreshStreams(false);
 }
 
@@ -97,31 +92,27 @@ function refreshStreams(force = true) {
 }
 
 function reconnectStream(id) {
-  scheduleFramePoll(id, 750);
+  window.clearTimeout(streamReconnectTimers[id]);
+  const previous = streamReconnectDelayMs[id] || 500;
+  const delay = Math.min(8000, previous);
+  streamReconnectDelayMs[id] = Math.min(8000, Math.max(500, previous * 1.7));
+  streamReconnectTimers[id] = window.setTimeout(() => {
+    const image = document.getElementById(id);
+    const url = image.dataset.baseSrc;
+    if (url) setStreamSource(id, url, true);
+  }, delay);
 }
 
-['omxStream', 'scoutRawStream', 'scoutYoloStream'].forEach(id => {
+['omxStream', 'scoutYoloStream'].forEach(id => {
   const image = document.getElementById(id);
-  // Poll only after the previous JPEG has completed.  A fixed interval can
-  // repeatedly cancel a slower first request and recreate the F5-dependent
-  // black panels that this dashboard is meant to avoid.
   image.addEventListener('load', () => {
     if (image.naturalWidth > 0 && image.naturalHeight > 0) {
       frameVersions[id] = (frameVersions[id] || 0) + 1;
     }
-    scheduleFramePoll(id, 220);
+    streamReconnectDelayMs[id] = 500;
   });
   image.addEventListener('error', () => reconnectStream(id));
 });
-
-function scheduleFramePoll(id, delayMs) {
-  window.clearTimeout(framePollTimers[id]);
-  framePollTimers[id] = window.setTimeout(() => {
-    const image = document.getElementById(id);
-    const url = image.dataset.baseSrc;
-    if (url) setStreamSource(id, url, true);
-  }, delayMs);
-}
 
 function updateImages(s) {
   queueGridLoad('map', s.map.seq, s.map.status);
@@ -376,16 +367,21 @@ function updateOmxPanel(s) {
 
 function updateYoloPanel(y) {
   const data = y && y.data ? y.data : {};
+  const streams = latest && latest.video_streams ? latest.video_streams : {};
+  const scoutStream = streams.scout_yolo || {};
+  const omxStream = streams.omx || {};
   const detections = Array.isArray(data.detections) ? data.detections : [];
   const target = data.all_classes ? 'all' : data.target_class ?? '--';
   const statusText = data.last_error || data.last_status || '';
   const cards = [
     ['Server', y ? y.status : 'NO DATA', y ? y.status : 'NO DATA', y ? `${fmt(y.latency_ms, 0)} ms` : ''],
-    ['Raw FPS', fmt(data.raw_fps, 1), data.ok ? 'OK' : 'NO DATA', `${data.raw_frames ?? 0} frames`],
+    ['Upload FPS', fmt(data.raw_fps, 1), data.ok ? 'OK' : 'NO DATA', `${data.raw_frames ?? 0} frames`],
     ['Infer FPS', fmt(data.inference_fps, 1), data.inference_frames ? 'OK' : 'NO DATA', `${data.inference_frames ?? 0} ok frames`],
+    ['Scout Stream', `${fmt(scoutStream.display_fps, 1)} fps`, scoutStream.upstream_connection_count === 1 ? 'OK' : 'NO DATA', `${fmt(scoutStream.upstream_mbps, 2)} Mbps / ${fmt(scoutStream.frame_age_ms, 0)} ms`],
+    ['OMX Stream', `${fmt(omxStream.display_fps, 1)} fps`, omxStream.upstream_connection_count === 1 ? 'OK' : 'NO DATA', `${fmt(omxStream.upstream_mbps, 2)} Mbps / ${fmt(omxStream.frame_age_ms, 0)} ms`],
     ['Targets', data.people ?? '--', data.people > 0 ? 'OK' : 'NO DATA', `${detections.length} detections`],
     ['Latency', `${fmt(data.latency_ms, 1)} ms`, data.inference_frames ? 'OK' : 'NO DATA', `pred ${fmt(data.predict_ms, 1)} ms`],
-    ['Frame Age', `${fmt(data.raw_frame_age_sec, 2)} s`, data.raw_frame_age_sec < 2 ? 'OK' : 'STALE', `${data.image_width || '--'}x${data.image_height || '--'}`],
+    ['Frame Age', `${fmt(data.yolo_frame_age_sec, 2)} s`, data.yolo_frame_age_sec < 2 ? 'OK' : 'STALE', `${data.image_width || '--'}x${data.image_height || '--'}`],
     ['Runtime', data.backend || data.device || '--', data.device === 'cpu' ? 'STALE' : 'OK', `${data.device || '--'} / conf ${fmt(data.conf, 2)} / cls ${target}`],
     ['YOLO State', statusText || '--', data.last_error ? 'STALE' : data.inference_frames ? 'OK' : 'NO DATA', data.model_path || ''],
   ];
@@ -575,7 +571,6 @@ async function publishDashboardReadiness() {
     session_id: dashboardSessionId,
     stamp: Date.now() / 1000.0,
     panels: {
-      scout_raw: imagePanelReady('scoutRawStream'),
       scout_yolo: imagePanelReady('scoutYoloStream'),
       omx_camera: imagePanelReady('omxStream'),
       map: gridPanelReady('map'),

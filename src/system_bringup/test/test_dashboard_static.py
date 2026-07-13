@@ -29,9 +29,10 @@ def test_dashboard_publishes_latched_video_ready_after_all_streams_arrive():
     assert "system_readiness_detail_topic" in source
     assert "self._publish_start_motion(False" in source
     assert "DurabilityPolicy.TRANSIENT_LOCAL" in source
-    assert "raw_frames" in source
     assert "yolo_frames" in source
     assert "inference_frames" in source
+    assert "scout_stream_ready" in source
+    assert "omx_stream_ready" in source
     assert "video_ready_max_age_sec" in source
 
 
@@ -55,7 +56,9 @@ def test_dashboard_requires_browser_rendered_panel_manifest():
     assert "rendered:" in js
     assert "naturalWidth > 0" in js
     assert "risk_map" in js
-    assert "raw_frame_age_sec" in source
+    assert "scout_raw" not in js
+    assert "scoutRawStream" not in js
+    assert "raw_frame_age_sec" not in source
     assert "yolo_frame_age_sec" in source
     assert "inference_frame_age_sec" in source
     assert "observation_status_received_wall_sec" in source
@@ -70,3 +73,26 @@ def test_dashboard_subscribes_to_omx_target_detected_with_best_effort_qos():
 
     assert "self.create_subscription(Bool, '/omx/target_detected'" in source
     assert "'std_msgs/msg/Bool'), latest_best_effort_qos)" in source
+
+
+def test_dashboard_has_only_two_default_video_streams():
+    source = (
+        Path(__file__).parents[1] / 'system_bringup' / 'leader_unified_dashboard.py'
+    ).read_text(encoding='utf-8')
+    js = (
+        Path(__file__).parents[1] / 'static' / 'dashboard.js'
+    ).read_text(encoding='utf-8')
+    html = (
+        Path(__file__).parents[1] / 'templates' / 'dashboard.html'
+    ).read_text(encoding='utf-8')
+
+    assert 'CachedMjpegStream' in source
+    assert "'scout_yolo': CachedMjpegStream" in source
+    assert "'omx': CachedMjpegStream" in source
+    assert "streamSources.scoutYoloStream = '/api/yolo_stream/yolo.mjpg'" in js
+    assert "streamSources.omxStream = '/api/omx_stream.mjpg'" in js
+    assert 'setInterval(refresh, 500)' in js
+    assert 'scoutRawStream' not in js
+    assert 'scoutRawStream' not in html
+    assert 'Scout raw' not in html
+    assert "raw debug stream disabled" in source

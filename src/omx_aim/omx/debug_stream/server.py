@@ -31,10 +31,19 @@ from .state_bus import StateBus
 
 
 class DebugStream:
-    def __init__(self, port: int = 8080, fps: int = 15, quality: int = 70):
+    def __init__(
+        self,
+        port: int = 8080,
+        fps: int = 10,
+        quality: int = 52,
+        width: int = 640,
+        height: int = 360,
+    ):
         self.port = port
         self.fps = max(1, fps)
         self.quality = max(10, min(95, quality))
+        self.width = max(0, int(width))
+        self.height = max(0, int(height))
         self.bus = StateBus()
         self._started = False
         self._app = None
@@ -95,9 +104,7 @@ class DebugStream:
         frame, _ = self.bus.get_frame()
         if frame is None:
             return Response('waiting for OMX frame\n', status=503, mimetype='text/plain')
-        ok, encoded = cv2.imencode(
-            '.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
-        )
+        ok, encoded = self._encode_frame(frame)
         if not ok:
             return Response('OMX JPEG encode failed\n', status=500, mimetype='text/plain')
         return Response(
@@ -154,12 +161,28 @@ class DebugStream:
             else:
                 last_seq = seq
 
-            ok, buf = cv2.imencode('.jpg', frame, params)
+            ok, buf = self._encode_frame(frame, params=params)
             if not ok:
                 continue
 
             yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
                    + buf.tobytes() + b'\r\n')
+
+    def _encode_frame(self, frame, *, params=None):
+        if (
+            self.width > 0
+            and self.height > 0
+            and frame is not None
+            and len(frame.shape) >= 2
+            and (frame.shape[1] != self.width or frame.shape[0] != self.height)
+        ):
+            frame = cv2.resize(
+                frame,
+                (self.width, self.height),
+                interpolation=cv2.INTER_AREA,
+            )
+        params = params or [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
+        return cv2.imencode('.jpg', frame, params)
 
     def _sse_gen(self):
         """SSE: state 변경 시에만 push. 최대 5Hz."""

@@ -10,8 +10,9 @@ import time
 import json
 import urllib.error
 import urllib.request
+from collections import deque
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import rclpy
 from ament_index_python.packages import get_package_share_directory
@@ -83,6 +84,207 @@ def _metadata_match(a: Optional[Dict[str, Any]], b: Optional[Dict[str, Any]]) ->
     return True
 
 
+class CachedMjpegStream:
+    """One upstream MJPEG reader, many dashboard browser clients.
+
+    The dashboard used to proxy upstream streams per browser connection and
+    later polled latest JPEG endpoints.  Both modes create avoidable socket
+    churn.  This cache keeps one persistent upstream reader per video source,
+    stores the latest encoded JPEG bytes, and fans those bytes out to all
+    browser clients without re-encoding.
+    """
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        url: Callable[[], str],
+        logger: Any,
+        reconnect_min_sec: float = 0.5,
+        reconnect_max_sec: float = 8.0,
+    ) -> None:
+        self.name = name
+        self._url = url
+        self._logger = logger
+        self._reconnect_min_sec = max(0.1, float(reconnect_min_sec))
+        self._reconnect_max_sec = max(self._reconnect_min_sec, float(reconnect_max_sec))
+        self._condition = threading.Condition()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f'dashboard_cached_mjpeg_{name}',
+            daemon=True,
+        )
+        self._started = False
+        self._stop = False
+        self._jpeg: Optional[bytes] = None
+        self._version = 0
+        self._last_frame_wall = 0.0
+        self._last_error = ''
+        self._upstream_connected = False
+        self._client_count = 0
+        self._client_disconnects = 0
+        self._upstream_connect_count = 0
+        self._drop_count = 0
+        self._frame_times: deque[float] = deque(maxlen=180)
+        self._display_times: deque[float] = deque(maxlen=300)
+        self._upstream_bytes: deque[tuple[float, int]] = deque(maxlen=300)
+        self._display_bytes: deque[tuple[float, int]] = deque(maxlen=600)
+
+    def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop = True
+        with self._condition:
+            self._condition.notify_all()
+
+    def latest_frame(self) -> tuple[int, Optional[bytes]]:
+        self.start()
+        with self._condition:
+            return self._version, self._jpeg
+
+    def metrics(self) -> Dict[str, Any]:
+        now = time.time()
+        with self._condition:
+            jpeg_size = len(self._jpeg) if self._jpeg is not None else 0
+            frame_age_ms = (
+                (now - self._last_frame_wall) * 1000.0
+                if self._last_frame_wall > 0.0 else -1.0
+            )
+            return {
+                'name': self.name,
+                'version': int(self._version),
+                'capture_fps': self._rate(self._frame_times),
+                'encode_fps': 0.0,
+                'display_fps': self._rate(self._display_times),
+                'jpeg_size_kb': jpeg_size / 1024.0,
+                'bitrate_mbps': self._mbps(self._display_bytes, now),
+                'upstream_mbps': self._mbps(self._upstream_bytes, now),
+                'encode_ms': 0.0,
+                'frame_age_ms': frame_age_ms,
+                'client_count': int(self._client_count),
+                'upstream_connection_count': 1 if self._upstream_connected else 0,
+                'upstream_connect_count_total': int(self._upstream_connect_count),
+                'drop_count': int(self._drop_count),
+                'last_error': self._last_error,
+            }
+
+    def generator(self):
+        self.start()
+        boundary = b'--frame\r\nContent-Type: image/jpeg\r\nCache-Control: no-cache\r\n\r\n'
+        version = -1
+        with self._condition:
+            self._client_count += 1
+        try:
+            while not self._stop:
+                with self._condition:
+                    self._condition.wait_for(
+                        lambda: self._stop or (
+                            self._jpeg is not None and self._version != version
+                        ),
+                        timeout=2.0,
+                    )
+                    if self._stop:
+                        break
+                    if self._jpeg is None or self._version == version:
+                        continue
+                    frame = self._jpeg
+                    version = self._version
+                    self._display_times.append(time.time())
+                    self._display_bytes.append((time.time(), len(frame)))
+                yield boundary + frame + b'\r\n'
+        finally:
+            with self._condition:
+                self._client_count = max(0, self._client_count - 1)
+                self._client_disconnects += 1
+
+    def _run(self) -> None:
+        backoff = self._reconnect_min_sec
+        while not self._stop:
+            url = self._url()
+            try:
+                self._read_upstream(url)
+                backoff = self._reconnect_min_sec
+            except Exception as exc:  # noqa: BLE001
+                with self._condition:
+                    self._upstream_connected = False
+                    self._last_error = f'{type(exc).__name__}: {exc}'
+                    self._condition.notify_all()
+                self._logger.warning(
+                    'DASHBOARD_VIDEO_UPSTREAM_RECONNECT | '
+                    f'name={self.name} url={url} error={exc}',
+                    throttle_duration_sec=5.0,
+                )
+                time.sleep(backoff)
+                backoff = min(self._reconnect_max_sec, backoff * 1.7)
+
+    def _read_upstream(self, url: str) -> None:
+        with urllib.request.urlopen(url, timeout=3.0) as upstream:
+            with self._condition:
+                self._upstream_connected = True
+                self._upstream_connect_count += 1
+                self._last_error = ''
+                self._condition.notify_all()
+            buffer = b''
+            while not self._stop:
+                chunk = upstream.read(8192)
+                if not chunk:
+                    raise RuntimeError('upstream closed')
+                buffer += chunk
+                frames, buffer = self._extract_jpegs(buffer)
+                for frame in frames:
+                    self._update_frame(frame)
+                if len(buffer) > 2 * 1024 * 1024:
+                    self._drop_count += 1
+                    buffer = buffer[-256 * 1024:]
+
+    def _update_frame(self, frame: bytes) -> None:
+        now = time.time()
+        with self._condition:
+            if self._jpeg is not None:
+                self._drop_count += 1
+            self._jpeg = frame
+            self._version += 1
+            self._last_frame_wall = now
+            self._frame_times.append(now)
+            self._upstream_bytes.append((now, len(frame)))
+            self._condition.notify_all()
+
+    @staticmethod
+    def _extract_jpegs(buffer: bytes) -> tuple[list[bytes], bytes]:
+        frames: list[bytes] = []
+        cursor = 0
+        while True:
+            start = buffer.find(b'\xff\xd8', cursor)
+            if start < 0:
+                return frames, buffer[-2:]
+            end = buffer.find(b'\xff\xd9', start + 2)
+            if end < 0:
+                return frames, buffer[start:]
+            end += 2
+            frames.append(buffer[start:end])
+            cursor = end
+
+    @staticmethod
+    def _rate(samples: deque[float]) -> float:
+        if len(samples) < 2:
+            return 0.0
+        span = max(1.0e-6, samples[-1] - samples[0])
+        return (len(samples) - 1) / span
+
+    @staticmethod
+    def _mbps(samples: deque[tuple[float, int]], now: float) -> float:
+        cutoff = now - 5.0
+        recent = [item for item in samples if item[0] >= cutoff]
+        if not recent:
+            return 0.0
+        span = max(1.0, now - recent[0][0])
+        return sum(item[1] for item in recent) * 8.0 / (span * 1_000_000.0)
+
+
 class LeaderUnifiedDashboard(Node):
     def __init__(self) -> None:
         super().__init__('leader_unified_dashboard')
@@ -126,6 +328,7 @@ class LeaderUnifiedDashboard(Node):
         self.yolo_overlay_stream_path = str(
             _declare(self, 'yolo_overlay_stream_path', '/stream/yolo.mjpg')
         )
+        self.enable_raw_debug_stream = bool(_declare(self, 'enable_raw_debug_stream', False))
         self.yolo_status_path = str(_declare(self, 'yolo_status_path', '/api/status'))
         self.video_ready_topic = str(_declare(self, 'video_ready_topic', '/fleet/video_ready'))
         self.start_motion_topic = str(_declare(self, 'start_motion_topic', '/fleet/start_motion'))
@@ -222,7 +425,6 @@ class LeaderUnifiedDashboard(Node):
         self._video_ready_detail: Dict[str, Any] = {
             'ready': False,
             'start_motion': False,
-            'scout_raw_ready': False,
             'scout_yolo_ready': False,
             'scout_inference_ready': False,
             'omx_frame_ready': False,
@@ -252,6 +454,18 @@ class LeaderUnifiedDashboard(Node):
             'nav_cancel': self._empty_event('/omx/nav_cancel', 'std_msgs/msg/Empty'),
             'patrol_complete': self._empty_event(
                 '/omx/patrol_complete', 'std_msgs/msg/Empty'
+            ),
+        }
+        self._video_streams = {
+            'scout_yolo': CachedMjpegStream(
+                name='scout_yolo',
+                url=lambda: f'http://127.0.0.1:{self.yolo_server_port}{self.yolo_overlay_stream_path}',
+                logger=self.get_logger(),
+            ),
+            'omx': CachedMjpegStream(
+                name='omx',
+                url=lambda: f'http://127.0.0.1:{self.omx_debug_port}{self.omx_stream_path}',
+                logger=self.get_logger(),
             ),
         }
 
@@ -460,6 +674,12 @@ class LeaderUnifiedDashboard(Node):
             response.headers['Cache-Control'] = 'no-store'
             return response
 
+        @app.get('/api/video_metrics')
+        def video_metrics():
+            response = jsonify(self.video_metrics())
+            response.headers['Cache-Control'] = 'no-store'
+            return response
+
         @app.get('/api/map.png')
         @app.get('/map.png')
         def map_png():
@@ -473,34 +693,18 @@ class LeaderUnifiedDashboard(Node):
         @app.get('/api/yolo_stream/<kind>.mjpg')
         def yolo_stream(kind):
             if kind == 'raw':
-                path = self.yolo_raw_stream_path
-            elif kind in ('yolo', 'overlay'):
-                path = self.yolo_overlay_stream_path
-            else:
-                return jsonify({'ok': False, 'error': 'kind must be raw or yolo'}), 404
-
-            url = f'http://127.0.0.1:{self.yolo_server_port}{path}'
-
-            def generate():
-                try:
-                    with urllib.request.urlopen(url, timeout=2.0) as upstream:
-                        while True:
-                            # MJPEG frames are commonly smaller than 64 KiB.
-                            # Waiting for a whole 64 KiB block kept the browser
-                            # panel black despite a healthy upstream stream.
-                            chunk = upstream.read(8192)
-                            if not chunk:
-                                break
-                            yield chunk
-                except Exception as exc:  # noqa: BLE001
-                    self.get_logger().warn(
-                        'UNIFIED_DASHBOARD_YOLO_STREAM_PROXY_ERROR | '
-                        f'kind={kind} url={url} error={exc}',
-                        throttle_duration_sec=5.0,
-                    )
+                if not self.enable_raw_debug_stream:
+                    return jsonify({'ok': False, 'error': 'raw debug stream disabled'}), 404
+                return self._direct_mjpeg_proxy(
+                    Response,
+                    stream_with_context,
+                    f'http://127.0.0.1:{self.yolo_server_port}{self.yolo_raw_stream_path}',
+                )
+            if kind not in ('yolo', 'overlay'):
+                return jsonify({'ok': False, 'error': 'kind must be yolo'}), 404
 
             response = Response(
-                stream_with_context(generate()),
+                stream_with_context(self._video_streams['scout_yolo'].generator()),
                 mimetype='multipart/x-mixed-replace; boundary=frame',
             )
             response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
@@ -510,84 +714,38 @@ class LeaderUnifiedDashboard(Node):
         @app.get('/api/yolo_frame/<kind>.jpg')
         def yolo_frame(kind):
             if kind == 'raw':
-                path = '/frame/raw.jpg'
+                if not self.enable_raw_debug_stream:
+                    return jsonify({'ok': False, 'error': 'raw debug frame disabled'}), 404
+                return self._single_jpeg_proxy(
+                    Response,
+                    f'http://127.0.0.1:{self.yolo_server_port}/frame/raw.jpg',
+                    'Scout raw frame waiting',
+                )
             elif kind in ('yolo', 'overlay'):
-                path = '/frame/yolo.jpg'
+                version, frame = self._video_streams['scout_yolo'].latest_frame()
+                if frame is None:
+                    return jsonify({'ok': False, 'error': 'waiting for first yolo frame'}), 503
+                response = Response(frame, mimetype='image/jpeg')
+                response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+                response.headers['X-Frame-Version'] = str(version)
+                return response
             else:
-                return jsonify({'ok': False, 'error': 'kind must be raw or yolo'}), 404
-            return self._single_jpeg_proxy(
-                Response,
-                f'http://127.0.0.1:{self.yolo_server_port}{path}',
-                f'Scout {kind} frame waiting',
-            )
+                return jsonify({'ok': False, 'error': 'kind must be yolo'}), 404
 
         @app.get('/api/omx_frame.jpg')
         def omx_frame():
-            return self._single_jpeg_proxy(
-                Response,
-                f'http://127.0.0.1:{self.omx_debug_port}/frame.jpg',
-                'OMX frame waiting',
-            )
+            version, frame = self._video_streams['omx'].latest_frame()
+            if frame is None:
+                return jsonify({'ok': False, 'error': 'waiting for first OMX frame'}), 503
+            response = Response(frame, mimetype='image/jpeg')
+            response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+            response.headers['X-Frame-Version'] = str(version)
+            return response
 
         @app.get('/api/omx_stream.mjpg')
         def omx_stream():
-            """Proxy the local OMX debug stream through the dashboard port.
-
-            The dashboard is normally opened from another machine.  Pointing
-            the browser directly at ``<leader-ip>:8080`` made the video panel
-            depend on that extra port being reachable from the client, even
-            though the dashboard itself on 8091 was reachable.  Keep the
-            upstream strictly local and expose it through the already-open
-            dashboard HTTP endpoint instead.
-            """
-            url = f'http://127.0.0.1:{self.omx_debug_port}{self.omx_stream_path}'
-
-            def placeholder_frame(message: str) -> bytes:
-                import cv2
-                import numpy as np
-
-                image = np.zeros((360, 640, 3), dtype=np.uint8)
-                cv2.putText(
-                    image, 'OMX VIDEO WAITING', (155, 160),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 190, 255), 2,
-                )
-                cv2.putText(
-                    image, message[:72], (48, 205),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (220, 220, 220), 1,
-                )
-                ok, encoded = cv2.imencode('.jpg', image)
-                if not ok:
-                    return b''
-                return (
-                    b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
-                    + encoded.tobytes() + b'\r\n'
-                )
-
-            def generate():
-                # Keep this response alive while OMX is still loading or
-                # restarting.  A normal proxy emitted no bytes in that state,
-                # leaving a browser image permanently black until a reload.
-                while True:
-                    try:
-                        with urllib.request.urlopen(url, timeout=1.0) as upstream:
-                            while True:
-                                chunk = upstream.read(8192)
-                                if not chunk:
-                                    break
-                                yield chunk
-                    except Exception as exc:  # noqa: BLE001
-                        self.get_logger().warning(
-                            'UNIFIED_DASHBOARD_OMX_STREAM_PROXY_ERROR | '
-                            f'url={url} error={exc}',
-                            throttle_duration_sec=5.0,
-                        )
-                        frame = placeholder_frame(f'upstream reconnecting: {type(exc).__name__}')
-                        if frame:
-                            yield frame
-                        time.sleep(1.0)
-
             response = Response(
-                stream_with_context(generate()),
+                stream_with_context(self._video_streams['omx'].generator()),
                 mimetype='multipart/x-mixed-replace; boundary=frame',
             )
             response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
@@ -617,6 +775,36 @@ class LeaderUnifiedDashboard(Node):
                 _placeholder_jpeg(waiting_label), mimetype='image/jpeg'
             )
         response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+        return response
+
+    def _direct_mjpeg_proxy(
+        self,
+        response_class: Any,
+        stream_context: Any,
+        url: str,
+    ) -> Any:
+        """Legacy raw debug proxy, intentionally outside the default dashboard."""
+
+        def generate():
+            try:
+                with urllib.request.urlopen(url, timeout=2.0) as upstream:
+                    while True:
+                        chunk = upstream.read(8192)
+                        if not chunk:
+                            break
+                        yield chunk
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warning(
+                    f'UNIFIED_DASHBOARD_DEBUG_RAW_PROXY_ERROR | url={url} error={exc}',
+                    throttle_duration_sec=5.0,
+                )
+
+        response = response_class(
+            stream_context(generate()),
+            mimetype='multipart/x-mixed-replace; boundary=frame',
+        )
+        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+        response.headers['X-Accel-Buffering'] = 'no'
         return response
 
     def _grid_response(self, response_class: Any, kind: str) -> Any:
@@ -848,7 +1036,7 @@ class LeaderUnifiedDashboard(Node):
     def _dashboard_ui_panels_ready(self, now: float) -> tuple[bool, Dict[str, Any]]:
         required = ['map', 'risk_map', 'fleet_state']
         if self.require_scout_video_ready:
-            required.extend(['scout_raw', 'scout_yolo'])
+            required.append('scout_yolo')
         if self.require_omx_video_ready:
             required.append('omx_camera')
         with self._lock:
@@ -909,13 +1097,8 @@ class LeaderUnifiedDashboard(Node):
         data = yolo.get('data') if isinstance(yolo, dict) else None
         if not isinstance(data, dict):
             data = {}
-        raw_age = float(data.get('raw_frame_age_sec', -1.0) or -1.0)
         yolo_age = float(data.get('yolo_frame_age_sec', -1.0) or -1.0)
         inference_age = float(data.get('inference_frame_age_sec', -1.0) or -1.0)
-        scout_raw_ready = (
-            int(data.get('raw_frames', 0) or 0) > 0
-            and 0.0 <= raw_age <= self.video_ready_max_age_sec
-        )
         scout_yolo_ready = (
             int(data.get('yolo_frames', 0) or 0) > 0
             and 0.0 <= yolo_age <= self.video_ready_max_age_sec
@@ -947,11 +1130,22 @@ class LeaderUnifiedDashboard(Node):
             omx_frame_ready = True
         if self.require_omx_video_ready and not omx_frame_ready:
             omx_frame_ready = camera_ready and bool(observation) and observation_fresh
+        stream_metrics = self.video_metrics()
+        scout_stream = stream_metrics.get('scout_yolo', {})
+        omx_stream = stream_metrics.get('omx', {})
+        scout_stream_ready = (
+            scout_stream.get('upstream_connection_count') == 1
+            and 0.0 <= float(scout_stream.get('frame_age_ms', -1.0)) <= self.video_ready_max_age_sec * 1000.0
+        )
+        omx_stream_ready = (
+            omx_stream.get('upstream_connection_count') == 1
+            and 0.0 <= float(omx_stream.get('frame_age_ms', -1.0)) <= self.video_ready_max_age_sec * 1000.0
+        )
         scout_ready = (
-            scout_raw_ready and scout_yolo_ready and scout_inference_ready
+            scout_yolo_ready and scout_inference_ready and scout_stream_ready
             if self.require_scout_video_ready else True
         )
-        omx_ready = omx_frame_ready if self.require_omx_video_ready else True
+        omx_ready = (omx_frame_ready and omx_stream_ready) if self.require_omx_video_ready else True
         backend_ready = bool(scout_ready and omx_ready)
         ui_ready, ui_detail = self._dashboard_ui_panels_ready(now)
         ready = bool(backend_ready and ui_ready)
@@ -1001,14 +1195,15 @@ class LeaderUnifiedDashboard(Node):
             'topic': self.video_ready_topic,
             'scout_required': self.require_scout_video_ready,
             'omx_required': self.require_omx_video_ready,
-            'scout_raw_ready': scout_raw_ready,
             'scout_yolo_ready': scout_yolo_ready,
             'scout_inference_ready': scout_inference_ready,
+            'scout_stream_ready': scout_stream_ready,
             'omx_frame_ready': omx_frame_ready,
-            'raw_frame_age_sec': raw_age,
+            'omx_stream_ready': omx_stream_ready,
             'yolo_frame_age_sec': yolo_age,
             'inference_frame_age_sec': inference_age,
             'omx_observation_fresh': observation_fresh,
+            'video_streams': stream_metrics,
             'video_ready_max_age_sec': self.video_ready_max_age_sec,
             'yolo_status': yolo.get('status'),
             'yolo_error': yolo.get('error'),
@@ -1033,10 +1228,10 @@ class LeaderUnifiedDashboard(Node):
             self._publish_video_ready(ready, 'all_video_ready' if ready else 'video_not_ready')
             self.get_logger().warning(
                 'FLEET_VIDEO_READY | '
-                f'ready={ready} scout_raw={scout_raw_ready} '
-                f'scout_yolo={scout_yolo_ready} '
+                f'ready={ready} scout_yolo={scout_yolo_ready} '
                 f'scout_inference={scout_inference_ready} '
-                f'omx_frame={omx_frame_ready} ui={ui_ready}'
+                f'scout_stream={scout_stream_ready} '
+                f'omx_frame={omx_frame_ready} omx_stream={omx_stream_ready} ui={ui_ready}'
             )
         if start_motion != previous_start_motion:
             reason = 'dashboard_and_system_ready' if start_motion else 'motion_barrier_not_ready'
@@ -1212,12 +1407,12 @@ class LeaderUnifiedDashboard(Node):
                 },
                 'yolo_server': {
                     'port': self.yolo_server_port,
-                    'raw_stream_path': self.yolo_raw_stream_path,
                     'overlay_stream_path': self.yolo_overlay_stream_path,
-                    'raw_proxy_path': '/api/yolo_stream/raw.mjpg',
                     'overlay_proxy_path': '/api/yolo_stream/yolo.mjpg',
+                    'raw_debug_enabled': self.enable_raw_debug_stream,
                     'status_path': self.yolo_status_path,
                 },
+                'video_streams': self.video_metrics(),
                 'omx': dict(self._omx_state),
                 'events': self._events_summary(now),
                 'map': self._grid_summary('map', now, self.map_stale_timeout_sec),
@@ -1245,6 +1440,12 @@ class LeaderUnifiedDashboard(Node):
                 ],
                 'topics': self._topics_summary(now),
             }
+
+    def video_metrics(self) -> Dict[str, Any]:
+        return {
+            name: stream.metrics()
+            for name, stream in self._video_streams.items()
+        }
 
     def yolo_status(self) -> Dict[str, Any]:
         url = f'http://127.0.0.1:{self.yolo_server_port}{self.yolo_status_path}'
@@ -1424,6 +1625,11 @@ class LeaderUnifiedDashboard(Node):
                 state['png'] = png
                 state['png_seq'] = seq
         return png
+
+    def destroy_node(self) -> None:
+        for stream in getattr(self, '_video_streams', {}).values():
+            stream.stop()
+        super().destroy_node()
 
 
 def _encode_grid_png(data: list, width: int, height: int, kind: str) -> bytes:

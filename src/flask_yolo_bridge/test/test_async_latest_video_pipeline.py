@@ -16,6 +16,8 @@ def test_detect_defaults_to_async_latest_frame_pipeline():
     assert 'submit_latest' in source
     assert "'async_ack': True" in source
     assert 'state.update_raw(original_jpeg' in source
+    assert 'raw_debug_enabled: bool = False' in source
+    assert 'raw debug stream disabled' in source
     assert 'update_debug_overlay(frame' not in source.split('@app.post')[1]
 
 

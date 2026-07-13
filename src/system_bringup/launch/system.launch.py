@@ -217,6 +217,10 @@ def generate_launch_description():
     patrol_max_candidate_cells = LaunchConfiguration('patrol_max_candidate_cells')
     debug_stream = LaunchConfiguration('debug_stream')
     debug_port = LaunchConfiguration('debug_port')
+    debug_fps = LaunchConfiguration('debug_fps')
+    debug_quality = LaunchConfiguration('debug_quality')
+    debug_width = LaunchConfiguration('debug_width')
+    debug_height = LaunchConfiguration('debug_height')
     unified_dashboard = LaunchConfiguration('unified_dashboard')
     dashboard_host = LaunchConfiguration('dashboard_host')
     dashboard_port = LaunchConfiguration('dashboard_port')
@@ -823,7 +827,8 @@ def generate_launch_description():
                         '--iou', '0.45',
                         '--max-det', '64',
                         '--imgsz', '640',
-                        '--debug-jpeg-quality', '65',
+                        '--debug-jpeg-quality', '52',
+                        '--enable-raw-debug-stream', 'false',
                         '--max-capture-age-sec', '1.5',
                         '--max-queue-wait-sec', '0.05',
                         '--async-latest', 'true',
@@ -902,6 +907,10 @@ def generate_launch_description():
                         ),
                         'debug_stream': debug_stream.perform(context),
                         'debug_port': debug_port.perform(context),
+                        'debug_fps': debug_fps.perform(context),
+                        'debug_quality': debug_quality.perform(context),
+                        'debug_width': debug_width.perform(context),
+                        'debug_height': debug_height.perform(context),
                     }.items(),
                 ))
             if launch_bool(enable_leader_shadow_follow.perform(context)):
@@ -1023,7 +1032,6 @@ def generate_launch_description():
                         'omx_stream_path': '/stream.mjpg',
                         'omx_state_path': '/state.json',
                         'yolo_server_port': int(yolo_server_port.perform(context)),
-                        'yolo_raw_stream_path': '/stream/raw.mjpg',
                         'yolo_overlay_stream_path': '/stream/yolo.mjpg',
                         'yolo_status_path': '/api/status',
                         'map_topic': '/map',
@@ -1051,6 +1059,7 @@ def generate_launch_description():
                         'system_ready_topic': '/system/ready',
                         'system_readiness_detail_topic': '/system/readiness_detail',
                         'video_ready_max_age_sec': 3.0,
+                        'enable_raw_debug_stream': False,
                     }],
                     env=process_env,
                     respawn=True,
@@ -1254,13 +1263,13 @@ def generate_launch_description():
                     'send_width': '320' if follower_camera_mode else '640',
                     'send_height': '180' if follower_camera_mode else '360',
                     'camera_fps': '2.0' if follower_camera_mode else '8.0',
-                    'max_rate_hz': '1.0' if follower_camera_mode else '6.0',
-                    'active_max_rate_hz': '1.0' if follower_camera_mode else '6.0',
+                    'max_rate_hz': '1.0' if follower_camera_mode else '8.0',
+                    'active_max_rate_hz': '1.0' if follower_camera_mode else '8.0',
                     'standby_max_rate_hz': '0.5' if follower_camera_mode else '0.75',
-                    'active_max_upload_mbps': '0.5' if follower_camera_mode else '2.5',
+                    'active_max_upload_mbps': '0.5' if follower_camera_mode else '3.0',
                     'standby_max_upload_mbps': '0.25' if follower_camera_mode else '0.5',
                     'http_worker_count': '1',
-                    'jpeg_quality': '55' if follower_camera_mode else '58',
+                    'jpeg_quality': '52',
                     'timeout_sec': '1.0',
                     'connect_timeout_sec': '0.3',
                     'read_timeout_sec': '1.8',
@@ -2015,6 +2024,26 @@ def generate_launch_description():
             'debug_port',
             default_value='8080',
             description='Leader role only: OMX MJPEG debug stream port.',
+        ),
+        DeclareLaunchArgument(
+            'debug_fps',
+            default_value='10',
+            description='Leader role only: OMX dashboard stream FPS.',
+        ),
+        DeclareLaunchArgument(
+            'debug_quality',
+            default_value='52',
+            description='Leader role only: OMX dashboard JPEG quality.',
+        ),
+        DeclareLaunchArgument(
+            'debug_width',
+            default_value='640',
+            description='Leader role only: OMX dashboard stream width.',
+        ),
+        DeclareLaunchArgument(
+            'debug_height',
+            default_value='360',
+            description='Leader role only: OMX dashboard stream height.',
         ),
         DeclareLaunchArgument(
             'unified_dashboard',

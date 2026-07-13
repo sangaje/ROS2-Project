@@ -64,6 +64,10 @@ def launch_setup(context, *args, **kwargs):
         LaunchConfiguration('start_patrol_planner').perform(context)
     )
     debug_port = LaunchConfiguration('debug_port').perform(context)
+    debug_fps = LaunchConfiguration('debug_fps').perform(context)
+    debug_quality = LaunchConfiguration('debug_quality').perform(context)
+    debug_width = LaunchConfiguration('debug_width').perform(context)
+    debug_height = LaunchConfiguration('debug_height').perform(context)
     yolo_node_delay = float(
         LaunchConfiguration('yolo_node_delay_sec').perform(context)
     )
@@ -89,7 +93,14 @@ def launch_setup(context, *args, **kwargs):
         # TensorRT inference, and MJPEG dashboard path.
         yolo_args.append('--dry-run')
     if debug_stream:
-        yolo_args += ['--debug-stream', '--debug-port', debug_port]
+        yolo_args += [
+            '--debug-stream',
+            '--debug-port', debug_port,
+            '--debug-fps', debug_fps,
+            '--debug-quality', debug_quality,
+            '--debug-width', debug_width,
+            '--debug-height', debug_height,
+        ]
 
     actions = []
 
@@ -343,6 +354,18 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'debug_port', default_value='8080',
             description='디버그 스트림 포트'),
+        DeclareLaunchArgument(
+            'debug_fps', default_value='10',
+            description='디버그 스트림 FPS 제한'),
+        DeclareLaunchArgument(
+            'debug_quality', default_value='52',
+            description='디버그 스트림 JPEG quality'),
+        DeclareLaunchArgument(
+            'debug_width', default_value='640',
+            description='디버그 스트림 출력 width'),
+        DeclareLaunchArgument(
+            'debug_height', default_value='360',
+            description='디버그 스트림 출력 height'),
         DeclareLaunchArgument(
             'fire_start_disabled', default_value='true',
             choices=['true', 'false'],

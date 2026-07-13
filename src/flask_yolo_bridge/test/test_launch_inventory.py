@@ -39,6 +39,10 @@ def test_camera_sender_has_role_based_rates_and_publish_gate():
     assert 'publish_roles' in node
     assert 'def _current_upload_rate_hz' in node
     assert 'def _current_role_allows_publish' in node
+    assert "DeclareLaunchArgument('width', default_value='640')" in launch
+    assert "DeclareLaunchArgument('send_width', default_value='640')" in launch
+    assert "DeclareLaunchArgument('active_max_rate_hz', default_value='8.0')" in launch
+    assert "DeclareLaunchArgument('jpeg_quality', default_value='52')" in launch
     assert "'publish_roles': LaunchConfiguration('publish_roles')" in launch
     assert "'active_max_upload_mbps': LaunchConfiguration('active_max_upload_mbps')" in launch
 

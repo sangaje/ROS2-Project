@@ -116,8 +116,10 @@ class OmxYoloNode(Node):
     def __init__(self, dry_run: bool = False, no_display: bool = False,
                 debug_stream: bool = False,
                 debug_port: int = 8080,
-                debug_fps: int = 15,
-                debug_quality: int = 70):
+                debug_fps: int = 10,
+                debug_quality: int = 52,
+                debug_width: int = 640,
+                debug_height: int = 360):
         super().__init__('omx_yolo_node')
 
         self.cfg = load_config()
@@ -355,11 +357,16 @@ class OmxYoloNode(Node):
         if debug_stream:
             from omx.debug_stream import DebugStream
             self.debug_stream = DebugStream(
-                port=debug_port, fps=debug_fps, quality=debug_quality)
+                port=debug_port,
+                fps=debug_fps,
+                quality=debug_quality,
+                width=debug_width,
+                height=debug_height,
+            )
             self.debug_stream.start()
             self.get_logger().info(
                 f"Debug stream ON: http://0.0.0.0:{debug_port}/ "
-                f"(fps={debug_fps}, q={debug_quality})")
+                f"(fps={debug_fps}, q={debug_quality}, size={debug_width}x{debug_height})")
         self.timer = self.create_timer(self.control_period, self.loop)
         self.status_timer = self.create_timer(1.0, self.publish_periodic)
 
@@ -2230,10 +2237,14 @@ def main(args=None):
                         help="Flask MJPEG 디버그 스트림 (http://host:port/)")
     parser.add_argument("--debug-port", type=int, default=8080,
                         help="--debug-stream 포트 (기본 8080)")
-    parser.add_argument("--debug-fps", type=int, default=15,
-                        help="--debug-stream FPS 제한 (기본 15)")
-    parser.add_argument("--debug-quality", type=int, default=70,
-                        help="--debug-stream JPEG quality 10~95 (기본 70)")
+    parser.add_argument("--debug-fps", type=int, default=10,
+                        help="--debug-stream FPS 제한 (기본 10)")
+    parser.add_argument("--debug-quality", type=int, default=52,
+                        help="--debug-stream JPEG quality 10~95 (기본 52)")
+    parser.add_argument("--debug-width", type=int, default=640,
+                        help="--debug-stream output width (기본 640)")
+    parser.add_argument("--debug-height", type=int, default=360,
+                        help="--debug-stream output height (기본 360)")
     cli_args, ros_args = parser.parse_known_args()
 
     rclpy.init(args=ros_args)
@@ -2244,7 +2255,9 @@ def main(args=None):
                    debug_stream=cli_args.debug_stream,
                    debug_port=cli_args.debug_port,
                    debug_fps=cli_args.debug_fps,
-                   debug_quality=cli_args.debug_quality)
+                   debug_quality=cli_args.debug_quality,
+                   debug_width=cli_args.debug_width,
+                   debug_height=cli_args.debug_height)
         try:
             rclpy.spin(node)
         finally:
