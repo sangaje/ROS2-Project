@@ -122,6 +122,7 @@ class OmxYoloNode(Node):
 
         self.cfg = load_config()
         self.dry_run = dry_run
+        self._control_video_only = bool(dry_run)
         self.no_display = no_display
         self.get_logger().info(f"Config loaded. port={self.cfg.motor.port}")
 
@@ -399,6 +400,7 @@ class OmxYoloNode(Node):
     ) -> None:
         self.ctrl = OmxController(self.cfg, dry_run=True,
                                   logger=self.get_logger())
+        self._control_video_only = True
         self.ctrl.connect()
         if yaw is not None:
             self.ctrl.yaw = float(yaw)
@@ -1355,6 +1357,8 @@ class OmxYoloNode(Node):
     def publish_periodic(self):
         msg = String()
         prefix = "dry_run_" if self.dry_run else ""
+        if getattr(self, '_control_video_only', False) and not self.dry_run:
+            prefix = "video_only_"
         if self.paused:
             prefix = "paused_"
         msg.data = f"{prefix}{self.sm.state.value}"
@@ -1410,6 +1414,10 @@ class OmxYoloNode(Node):
             'image_width': int(getattr(self.detector, 'frame_width', 0)),
             'image_height': int(getattr(self.detector, 'frame_height', 0)),
             'source': str(getattr(self.detector, 'camera_source', 'unknown')),
+            'aim_reference_offset_y_norm': float(
+                getattr(self.cfg.ibvs, 'aim_target_offset_y_norm', 0.0)
+            ),
+            'control_video_only': bool(getattr(self, '_control_video_only', False)),
         }
         if inference_ran and detected and bbox is not None:
             payload['bbox_xyxy'] = [float(value) for value in bbox]
@@ -1995,7 +2003,7 @@ class OmxYoloNode(Node):
 
     def visualize(self, frame, detected, error_norm, bbox, conf, action):
         h, w = frame.shape[:2]
-        cx, cy = w / 2.0, h / 2.0
+        cx, cy = self.detector.aim_reference_pixel(w, h)
         deadband_x = self.cfg.ibvs.deadband_x
         deadband_y = self.cfg.ibvs.deadband_y
 

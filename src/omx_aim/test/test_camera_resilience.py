@@ -41,6 +41,35 @@ def test_invalid_camera_frames_do_not_short_circuit_omx_navigation_loop():
     assert 'self.publish_vision_safe_fire_lock()' in source
 
 
+def test_aim_reference_can_be_lowered_below_image_center():
+    package_root = Path(__file__).parents[1]
+    config_source = (package_root / 'config' / 'config.yaml').read_text(
+        encoding='utf-8'
+    )
+    detector_source = (package_root / 'omx' / 'yolo_detector.py').read_text(
+        encoding='utf-8'
+    )
+    node_source = (package_root / 'omx_aim' / 'yolo_node.py').read_text(
+        encoding='utf-8'
+    )
+
+    assert 'aim_target_offset_y_norm: 0.08' in config_source
+    assert 'def aim_reference_pixel' in detector_source
+    assert "getattr(self.cfg.ibvs, 'aim_target_offset_y_norm'" in detector_source
+    assert 'self.detector.aim_reference_pixel(w, h)' in node_source
+
+
+def test_runtime_motor_fallback_is_visible_in_status_and_observation():
+    node_source = (
+        Path(__file__).parents[1] / 'omx_aim' / 'yolo_node.py'
+    ).read_text(encoding='utf-8')
+
+    assert 'self._control_video_only = bool(dry_run)' in node_source
+    assert 'self._control_video_only = True' in node_source
+    assert 'prefix = "video_only_"' in node_source
+    assert "'control_video_only': bool" in node_source
+
+
 def test_fire_disable_is_latched_and_not_republished_every_frame():
     package_root = Path(__file__).parents[1]
     node_source = (package_root / 'omx_aim' / 'yolo_node.py').read_text(

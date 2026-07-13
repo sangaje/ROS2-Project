@@ -176,6 +176,17 @@ class YoloDetector:
                   f"클래스 {self.target_class} ({self.class_name}), "
                   f"device={self.device}, half={self.use_half}")
 
+    def aim_reference_pixel(self, width: int, height: int) -> tuple[float, float]:
+        """Return the visual-servo reference pixel used for error_norm."""
+        cx = float(width) / 2.0
+        cy = float(height) / 2.0
+        offset_y = float(getattr(self.cfg.ibvs, 'aim_target_offset_y_norm', 0.0))
+        # Offset is normalized by image half-height so it shares the same
+        # units as error_norm.y. Positive means lower on the screen.
+        cy += offset_y * (float(height) / 2.0)
+        cy = max(0.0, min(float(height) - 1.0, cy))
+        return cx, cy
+
     def _log(self, msg):
         if self.logger:
             self.logger.info(msg)
@@ -410,7 +421,9 @@ class YoloDetector:
             ey > 0: 객체가 아래쪽
         """
         h, w = frame.shape[:2]
-        cx, cy = w / 2.0, h / 2.0
+        cx, cy = self.aim_reference_pixel(w, h)
+        norm_x = max(1.0, w / 2.0)
+        norm_y = max(1.0, h / 2.0)
 
         results = self.model.predict(
             frame, imgsz=self.cfg.yolo.imgsz,
@@ -433,8 +446,8 @@ class YoloDetector:
 
         obj_x = (x1 + x2) / 2.0
         obj_y = (y1 + y2) / 2.0
-        ex = (obj_x - cx) / cx
-        ey = (obj_y - cy) / cy
+        ex = (obj_x - cx) / norm_x
+        ey = (obj_y - cy) / norm_y
 
         return True, (ex, ey), (x1, y1, x2, y2), conf
 
