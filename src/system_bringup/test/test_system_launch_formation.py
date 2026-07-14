@@ -64,6 +64,20 @@ def test_system_launch_uses_external_worker_without_in_process_runtime():
     assert "'require_video_ready': 'false'" in text
     assert "'video_ready_topic': '/fleet/start_motion'" in text
     assert "'require_system_ready': 'false'" in text
+    assert "or fleet_role_value == 'follower'" in text
+
+
+def test_follower_takeover_starts_slam_risk_after_active_scout_role():
+    text = SYSTEM_LAUNCH.read_text(encoding='utf-8')
+    setup = (
+        Path(__file__).parents[1] / 'setup.py'
+    ).read_text(encoding='utf-8')
+
+    assert "executable='takeover_stack_manager'" in text
+    assert "'start_cartographer': True" in text
+    assert "'start_risk_map': True" in text
+    assert "'pre_shutdown_lifecycle_nodes': ['/amcl']" in text
+    assert "'takeover_stack_manager = system_bringup.takeover_stack_manager:main'" in setup
 
 
 def test_system_launch_uses_local_motion_release_without_start_motion_gate():
@@ -137,17 +151,19 @@ def test_scout_can_run_cartographer_without_local_risk_map():
     assert "fleet_role_value == 'member'" in text
 
 
-def test_follower_startup_forces_slam_and_rl_off():
+def test_follower_startup_keeps_slam_off_but_allows_role_gated_rl():
     text = SYSTEM_LAUNCH.read_text(encoding='utf-8')
 
     assert 'follower_initial_role = (' in text
     assert 'cartographer_requested = False' in text
     assert 'risk_map_requested = False' in text
     assert "'true' if follower_initial_role else enable_amcl.perform(context)" in text
-    assert "local_exploration = (\n                False\n                if follower_initial_role" in text
+    assert "local_exploration = launch_bool(enable_exploration.perform(context))" in text
     assert "'false'\n                if follower_initial_role\n                else forward_field_map_to_main.perform(context)" in text
     assert 'FOLLOWER_CAPABILITY_STATUS | robot=' in text
-    assert 'cartographer_enabled=false rl_enabled=false' in text
+    assert 'cartographer_enabled=false rl_initial_active=false' in text
+    assert 'takeover_rl_standby=' in text
+    assert "initial_role_active': (\n                                'true' if fleet_role_value == 'member' else 'false'" in text
 
 
 def test_follower_map_forwarding_is_explicit_for_takeover_commit():

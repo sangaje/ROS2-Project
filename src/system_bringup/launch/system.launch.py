@@ -449,7 +449,10 @@ def generate_launch_description():
                 ' role=FOLLOWER active_scout_id=',
                 active_scout_robot_name.perform(context),
                 ' follow_enabled=true amcl_enabled=true nav2_enabled=true ',
-                'cartographer_enabled=false rl_enabled=false ',
+                'cartographer_enabled=false rl_initial_active=false ',
+                'takeover_rl_standby=',
+                str(launch_bool(enable_exploration.perform(context))).lower(),
+                ' ',
                 'confidence_enabled=false map_authority=false ',
                 'local_map_outbound=false blocking_reason=normal_follower',
             ]))
@@ -470,22 +473,16 @@ def generate_launch_description():
             if role_value == 'scout' and fleet_role_value == 'follower'
             else active_scout_robot_name.perform(context)
         )
+        field_observation_topic = f'/field/{scout_robot_name}/risk_observation'
 
         if (
             role_value == 'scout'
             and (
                 fleet_role_value == 'member'
-                or (
-                    launch_bool(enable_scout_failover.perform(context))
-                    and not follower_initial_role
-                )
+                or fleet_role_value == 'follower'
             )
         ):
-            local_exploration = (
-                False
-                if follower_initial_role
-                else launch_bool(enable_exploration.perform(context))
-            )
+            local_exploration = launch_bool(enable_exploration.perform(context))
             if local_exploration and rl_backend_value == 'external_worker':
                 actions.append(LogInfo(msg=[
                     'SYSTEM_BRINGUP | ACTIVE_SCOUT RL backend=external_worker; '
@@ -602,6 +599,34 @@ def generate_launch_description():
                             'use_stamped_cmd_vel': 'true',
                             'enable_velocity_safety_filter': 'true',
                         }.items(),
+                ))
+            if follower_initial_role and launch_bool(enable_scout_failover.perform(context)):
+                actions.append(Node(
+                    package='system_bringup',
+                    executable='takeover_stack_manager',
+                    name='takeover_stack_manager',
+                    output='screen',
+                    parameters=[{
+                        'robot_name': local_robot_name,
+                        'role_topic': DEFAULT_ROLE_TOPIC_TEMPLATE.format(
+                            robot_name=local_robot_name
+                        ),
+                        'enabled': True,
+                        'start_cartographer': True,
+                        'start_risk_map': True,
+                        'cartographer_configuration_basename': (
+                            'turtlebot3_lds_2d_risk_safe_no_odom.lua'
+                        ),
+                        'detection_source': 'flask_topic',
+                        'external_detection_topic': field_observation_topic,
+                        'enable_yolo': False,
+                        'start_camera': False,
+                        'start_rviz': False,
+                        'pre_shutdown_lifecycle_nodes': ['/amcl'],
+                    }],
+                    env=process_env,
+                    respawn=True,
+                    respawn_delay=3.0,
                 ))
 
         if role_value == 'leader':
@@ -1189,7 +1214,6 @@ def generate_launch_description():
             return actions
 
         camera_sender_on = launch_bool(start_camera_sender.perform(context))
-        field_observation_topic = f'/field/{scout_robot_name}/risk_observation'
 
         if risk_map_requested or cartographer_requested:
             risk_share = get_package_share_directory('bayesian_risk_map')

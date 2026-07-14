@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Unified Field Robot entry point for scout22 and follower21.
+"""Unified robot entry point for leader, scout22 and follower21.
 
-Scout and Follower are the same robot stack.  The initial role and runtime
-enable flags choose whether the robot starts as ACTIVE_SCOUT or FOLLOWER.
+ACTIVE_SCOUT and FOLLOWER are both scout-capable field robots.  The follower
+starts as a leader-following robot, then takes over the scout mission after the
+active scout is confirmed dead.
 """
 
 import os
@@ -26,8 +27,14 @@ def generate_launch_description():
     domain_id = LaunchConfiguration('domain_id')
     main_domain_id = LaunchConfiguration('main_domain_id')
     initial_role = LaunchConfiguration('initial_role')
+    active_scout_robot_name = LaunchConfiguration('active_scout_robot_name')
+    follower_robot_name = LaunchConfiguration('follower_robot_name')
+    risk_domain_id = LaunchConfiguration('risk_domain_id')
+    member_domain_id = LaunchConfiguration('member_domain_id')
+    follower_domain_id = LaunchConfiguration('follower_domain_id')
+    require_follower_pose = LaunchConfiguration('require_follower_pose')
+    leader_enable_cartographer = LaunchConfiguration('leader_enable_cartographer')
     field_enable_exploration = LaunchConfiguration('field_enable_exploration')
-    enable_follow = LaunchConfiguration('enable_follow')
     enable_rl = LaunchConfiguration('enable_rl')
     enable_observation_tx = LaunchConfiguration('enable_observation_tx')
     field_enable_cartographer = LaunchConfiguration('field_enable_cartographer')
@@ -40,16 +47,50 @@ def generate_launch_description():
     def make_stack(context):
         name = robot_name.perform(context).strip()
         role = initial_role.perform(context).strip().upper()
-        if role not in ('ACTIVE_SCOUT', 'FOLLOWER'):
+        if role not in ('LEADER', 'ACTIVE_SCOUT', 'FOLLOWER'):
             raise ValueError(
-                'initial_role must be ACTIVE_SCOUT or FOLLOWER, '
+                'initial_role must be LEADER, ACTIVE_SCOUT or FOLLOWER, '
                 f'got {role!r}'
             )
+        is_leader = role == 'LEADER'
         is_follower = role == 'FOLLOWER'
+
+        system_launch = os.path.join(
+            get_package_share_directory('system_bringup'),
+            'launch',
+            'system.launch.py',
+        )
+        if is_leader:
+            launch_args = {
+                'role': 'leader',
+                'fleet_role': 'leader',
+                'domain_id': domain_id.perform(context),
+                'main_domain_id': main_domain_id.perform(context),
+                'risk_domain_id': risk_domain_id.perform(context),
+                'member_domain_id': member_domain_id.perform(context),
+                'follower_domain_id': follower_domain_id.perform(context),
+                'active_scout_robot_name': active_scout_robot_name.perform(context),
+                'follower_robot_name': follower_robot_name.perform(context),
+                'enable_cartographer': leader_enable_cartographer.perform(context),
+                'require_follower_pose': require_follower_pose.perform(context),
+                'enable_scout_failover': 'true',
+            }
+            return [
+                LogInfo(msg=[
+                    'FIELD_ROBOT_LAUNCH | robot=leader role=LEADER',
+                    ' domain=', domain_id.perform(context),
+                    ' main_domain=', main_domain_id.perform(context),
+                    ' active_scout=', active_scout_robot_name.perform(context),
+                    ' follower_scout=', follower_robot_name.perform(context),
+                ]),
+                IncludeLaunchDescription(
+                    PythonLaunchDescriptionSource(system_launch),
+                    launch_arguments=launch_args.items(),
+                ),
+            ]
+
         fleet_role = 'follower' if is_follower else 'member'
         default_exploration = True
-        if is_follower:
-            default_exploration = False
         default_follow = is_follower
         default_cartographer = not is_follower
         default_amcl = is_follower
@@ -72,32 +113,27 @@ def generate_launch_description():
                 'initial_role=FOLLOWER cannot start Cartographer. '
                 'Follower uses shared map + AMCL until takeover is confirmed.'
             )
-        if is_follower and requested_rl == 'true':
-            raise ValueError(
-                'initial_role=FOLLOWER cannot start the RL worker. '
-                'RL starts only after ACTIVE_SCOUT takeover authority.'
-            )
         if is_follower and requested_map_authority == 'true':
             raise ValueError(
-                'initial_role=FOLLOWER cannot claim map authority.'
+                'initial_role=FOLLOWER cannot claim map authority at startup. '
+                'Takeover SLAM starts only after ACTIVE_SCOUT authority.'
             )
         if is_follower and requested_map_forward == 'true':
             raise ValueError(
                 'initial_role=FOLLOWER cannot forward local maps to Leader.'
             )
 
-        system_launch = os.path.join(
-            get_package_share_directory('system_bringup'),
-            'launch',
-            'system.launch.py',
-        )
         launch_args = {
             'role': 'scout',
             'fleet_role': fleet_role,
             'domain_id': domain_id.perform(context),
             'main_domain_id': main_domain_id.perform(context),
-            'active_scout_robot_name': name if not is_follower else 'scout22',
-            'follower_robot_name': name if is_follower else 'follower21',
+            'active_scout_robot_name': (
+                name if not is_follower else active_scout_robot_name.perform(context)
+            ),
+            'follower_robot_name': (
+                name if is_follower else follower_robot_name.perform(context)
+            ),
             'enable_exploration': _bool_text(
                 field_enable_exploration.perform(context),
                 default_exploration,
@@ -127,6 +163,10 @@ def generate_launch_description():
                 'FIELD_ROBOT_LAUNCH | robot=', name,
                 ' role=', role,
                 ' fleet_role=', fleet_role,
+                ' scout_capable=true',
+                ' normal_duty=',
+                'leader_follow' if is_follower else 'active_scout',
+                ' takeover_duty=active_scout',
                 ' domain=', domain_id.perform(context),
                 ' main_domain=', main_domain_id.perform(context),
                 ' cartographer=', launch_args['start_cartographer'],
@@ -149,7 +189,22 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'initial_role',
             default_value='ACTIVE_SCOUT',
-            choices=['ACTIVE_SCOUT', 'FOLLOWER'],
+            choices=['LEADER', 'ACTIVE_SCOUT', 'FOLLOWER'],
+        ),
+        DeclareLaunchArgument('active_scout_robot_name', default_value='scout22'),
+        DeclareLaunchArgument('follower_robot_name', default_value='follower21'),
+        DeclareLaunchArgument('risk_domain_id', default_value='22'),
+        DeclareLaunchArgument('member_domain_id', default_value='22'),
+        DeclareLaunchArgument('follower_domain_id', default_value='21'),
+        DeclareLaunchArgument(
+            'require_follower_pose',
+            default_value='false',
+            choices=['true', 'false'],
+        ),
+        DeclareLaunchArgument(
+            'leader_enable_cartographer',
+            default_value='false',
+            choices=['true', 'false'],
         ),
         DeclareLaunchArgument(
             'field_enable_exploration',
@@ -158,7 +213,6 @@ def generate_launch_description():
                 'Field robot wrapper override. Empty chooses from initial_role.'
             ),
         ),
-        DeclareLaunchArgument('enable_follow', default_value=''),
         DeclareLaunchArgument('enable_rl', default_value=''),
         DeclareLaunchArgument('enable_observation_tx', default_value='true'),
         DeclareLaunchArgument(

@@ -4,15 +4,21 @@ from pathlib import Path
 ROOT = Path(__file__).parents[3]
 
 
-def test_field_robot_launch_is_single_entrypoint_for_scout_and_follower():
+def test_field_robot_launch_is_single_entrypoint_for_leader_scout_and_follower():
     source = (
         ROOT / 'src' / 'system_bringup' / 'launch' / 'field_robot.launch.py'
     ).read_text(encoding='utf-8')
 
     assert "initial_role" in source
+    assert "LEADER" in source
     assert "ACTIVE_SCOUT" in source
     assert "FOLLOWER" in source
+    assert "'role': 'leader'" in source
     assert "'fleet_role': fleet_role" in source
+    assert "scout_capable=true" in source
+    assert "normal_duty=" in source
+    assert "takeover_duty=active_scout" in source
+    assert "leader_follow" in source
     assert "'start_risk_map': 'false'" in source
     assert "'enable_yolo': 'false'" in source
     assert "'start_camera_sender': _bool_text" in source
@@ -21,11 +27,11 @@ def test_field_robot_launch_is_single_entrypoint_for_scout_and_follower():
     assert "field_enable_cartographer" in source
     assert "field_enable_amcl" in source
     assert "initial_role=FOLLOWER cannot start Cartographer" in source
-    assert "initial_role=FOLLOWER cannot start the RL worker" in source
-    assert "initial_role=FOLLOWER cannot claim map authority" in source
+    assert "initial_role=FOLLOWER cannot claim map authority at startup" in source
     assert "initial_role=FOLLOWER cannot forward local maps" in source
-    assert "default_exploration = False" in source
+    assert "default_exploration = True" in source
     assert "DeclareLaunchArgument('enable_rl', default_value='')" in source
+    assert "DeclareLaunchArgument('enable_follow'" not in source
 
 
 def test_system_launch_routes_field_observations_to_robot_topics():
