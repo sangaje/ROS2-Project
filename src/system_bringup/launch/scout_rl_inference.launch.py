@@ -6,12 +6,16 @@ backend.  It remains directly runnable for diagnostics.
 """
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, LogInfo
+from launch.actions import DeclareLaunchArgument, LogInfo, OpaqueFunction
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
-from fleet_bringup.launch_utils import dds_launch_environment
+from fleet_bringup.launch_utils import (
+    clean_process_environment,
+    dds_launch_environment,
+    with_virtualenv_site_packages,
+)
 from system_bringup.launch_defaults import (
     DEFAULT_ACTIVE_SCOUT,
     DEFAULT_CMD_VEL_TOPIC,
@@ -36,6 +40,8 @@ def generate_launch_description():
     video_ready_topic = LaunchConfiguration('video_ready_topic')
     require_start_motion = LaunchConfiguration('require_start_motion')
     start_motion_topic = LaunchConfiguration('start_motion_topic')
+    direct_rl_start = LaunchConfiguration('direct_rl_start')
+    load_model_on_start = LaunchConfiguration('load_model_on_start')
     cmd_vel_topic = LaunchConfiguration('cmd_vel_topic')
     use_stamped_cmd_vel = LaunchConfiguration('use_stamped_cmd_vel')
     odom_topic = LaunchConfiguration('odom_topic')
@@ -43,6 +49,85 @@ def generate_launch_description():
     enable_velocity_safety_filter = LaunchConfiguration(
         'enable_velocity_safety_filter'
     )
+
+    def launch_worker(context):
+        process_env = with_virtualenv_site_packages(
+            clean_process_environment(domain_id.perform(context))
+        )
+        return [
+            LogInfo(msg=[
+                'SCOUT_RL_INFERENCE | model=',
+                'sac_turtlebot3_burger_emergency.zip vector_dim=63 domain=',
+                domain_id.perform(context),
+            ]),
+            Node(
+                package='system_bringup',
+                executable='scout_rl_policy_worker',
+                name='scout_rl_policy_worker',
+                output='screen',
+                parameters=[{
+                    'robot_name': robot_name,
+                    'role_topic': role_topic,
+                    'initial_role_active': ParameterValue(
+                        initial_role_active,
+                        value_type=bool,
+                    ),
+                    'failover_state_topic': failover_state_topic,
+                    'active_scout_id_topic': active_scout_id_topic,
+                    'scout_epoch_topic': scout_epoch_topic,
+                    'localization_ready_topic': localization_ready_topic,
+                    'field_robot_status_topic': field_robot_status_topic,
+                    'require_failover_activation': ParameterValue(
+                        require_failover_activation,
+                        value_type=bool,
+                    ),
+                    'require_localization_ready': ParameterValue(
+                        require_localization_ready,
+                        value_type=bool,
+                    ),
+                    'require_system_ready': ParameterValue(
+                        require_system_ready,
+                        value_type=bool,
+                    ),
+                    'system_ready_topic': system_ready_topic,
+                    'require_video_ready': ParameterValue(
+                        require_video_ready,
+                        value_type=bool,
+                    ),
+                    'video_ready_topic': video_ready_topic,
+                    'require_start_motion': ParameterValue(
+                        require_start_motion,
+                        value_type=bool,
+                    ),
+                    'start_motion_topic': start_motion_topic,
+                    'direct_rl_start': ParameterValue(
+                        direct_rl_start,
+                        value_type=bool,
+                    ),
+                    'load_model_on_start': ParameterValue(
+                        load_model_on_start,
+                        value_type=bool,
+                    ),
+                    'cmd_vel_topic': cmd_vel_topic,
+                    'odom_topic': odom_topic,
+                    'max_odom_age_sec': ParameterValue(
+                        max_odom_age_sec,
+                        value_type=float,
+                    ),
+                    'use_stamped_cmd_vel': ParameterValue(
+                        use_stamped_cmd_vel,
+                        value_type=bool,
+                    ),
+                    'enable_velocity_safety_filter': ParameterValue(
+                        enable_velocity_safety_filter,
+                        value_type=bool,
+                    ),
+                }],
+                env=process_env,
+                respawn=True,
+                respawn_delay=3.0,
+            ),
+        ]
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -148,6 +233,18 @@ def generate_launch_description():
             description='Velocity topic owned by this inference process.',
         ),
         DeclareLaunchArgument(
+            'direct_rl_start',
+            default_value='true',
+            choices=['true', 'false'],
+            description='Start ACTIVE_SCOUT output directly, before role-topic activation.',
+        ),
+        DeclareLaunchArgument(
+            'load_model_on_start',
+            default_value='true',
+            choices=['true', 'false'],
+            description='Load the SAC checkpoint immediately instead of waiting for ACTIVE_SCOUT.',
+        ),
+        DeclareLaunchArgument(
             'odom_topic',
             default_value='/odom',
             description='Scout-local odometry topic used by RL readiness; never bridged cross-domain.',
@@ -170,68 +267,5 @@ def generate_launch_description():
             description='Apply the runtime backup/slowdown safety projection.',
         ),
         *dds_launch_environment(domain_id),
-        LogInfo(msg=[
-            'SCOUT_RL_INFERENCE | model=',
-            'sac_turtlebot3_burger_emergency.zip vector_dim=63 domain=',
-            domain_id,
-        ]),
-        Node(
-            package='system_bringup',
-            executable='scout_rl_policy_worker',
-            name='scout_rl_policy_worker',
-            output='screen',
-            parameters=[{
-                'robot_name': robot_name,
-                'role_topic': role_topic,
-                'initial_role_active': ParameterValue(
-                    initial_role_active,
-                    value_type=bool,
-                ),
-                'failover_state_topic': failover_state_topic,
-                'active_scout_id_topic': active_scout_id_topic,
-                'scout_epoch_topic': scout_epoch_topic,
-                'localization_ready_topic': localization_ready_topic,
-                'field_robot_status_topic': field_robot_status_topic,
-                'require_failover_activation': ParameterValue(
-                    require_failover_activation,
-                    value_type=bool,
-                ),
-                'require_localization_ready': ParameterValue(
-                    require_localization_ready,
-                    value_type=bool,
-                ),
-                'require_system_ready': ParameterValue(
-                    require_system_ready,
-                    value_type=bool,
-                ),
-                'system_ready_topic': system_ready_topic,
-                'require_video_ready': ParameterValue(
-                    require_video_ready,
-                    value_type=bool,
-                ),
-                'video_ready_topic': video_ready_topic,
-                'require_start_motion': ParameterValue(
-                    require_start_motion,
-                    value_type=bool,
-                ),
-                'start_motion_topic': start_motion_topic,
-                'direct_rl_start': True,
-                'cmd_vel_topic': cmd_vel_topic,
-                'odom_topic': odom_topic,
-                'max_odom_age_sec': ParameterValue(
-                    max_odom_age_sec,
-                    value_type=float,
-                ),
-                'use_stamped_cmd_vel': ParameterValue(
-                    use_stamped_cmd_vel,
-                    value_type=bool,
-                ),
-                'enable_velocity_safety_filter': ParameterValue(
-                    enable_velocity_safety_filter,
-                    value_type=bool,
-                ),
-            }],
-            respawn=True,
-            respawn_delay=3.0,
-        ),
+        OpaqueFunction(function=launch_worker),
     ])

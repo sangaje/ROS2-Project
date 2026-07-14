@@ -600,6 +600,12 @@ def generate_launch_description():
                             'start_motion_topic': '/fleet/start_motion',
                             'require_system_ready': 'false',
                             'system_ready_topic': '/system/ready',
+                            'direct_rl_start': (
+                                'true' if fleet_role_value == 'member' else 'false'
+                            ),
+                            'load_model_on_start': (
+                                'true' if fleet_role_value == 'member' else 'false'
+                            ),
                             'cmd_vel_topic': DEFAULT_CMD_VEL_TOPIC,
                             'odom_topic': '/odom',
                             'max_odom_age_sec': '2.0',

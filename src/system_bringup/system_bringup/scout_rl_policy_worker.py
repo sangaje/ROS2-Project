@@ -56,6 +56,7 @@ class ScoutRLPolicyWorker(Node):
         self.confidence_map_topic = str(get('confidence_map_topic').value).strip()
         self.use_stamped = bool(get('use_stamped_cmd_vel').value)
         self.direct_rl_start = bool(get('direct_rl_start').value)
+        self.load_model_on_start = bool(get('load_model_on_start').value)
         self.require_system_ready = bool(get('require_system_ready').value)
         self.system_ready_topic = str(get('system_ready_topic').value).strip()
         self.emergency_stop_distance_m = max(
@@ -75,7 +76,8 @@ class ScoutRLPolicyWorker(Node):
 
         self.model = None
         self.model_error = ''
-        self.model_loading = True
+        self.model_loading = False
+        self.model_loader_started = False
         self.model_load_started = time.monotonic()
         self.role_active = bool(get('initial_role_active').value) or self.direct_rl_start
         self.system_ready = not self.require_system_ready
@@ -115,20 +117,38 @@ class ScoutRLPolicyWorker(Node):
             self._on_scan,
             qos_profile_sensor_data,
         )
-        map_qos = QoSProfile(
+        volatile_map_qos = QoSProfile(
             depth=1,
             history=HistoryPolicy.KEEP_LAST,
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.VOLATILE,
         )
-        self.create_subscription(OccupancyGrid, self.map_topic, self._on_map, map_qos)
+        latched_map_qos = QoSProfile(
+            depth=1,
+            history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.create_subscription(
+            OccupancyGrid,
+            self.map_topic,
+            self._on_map,
+            volatile_map_qos,
+        )
+        self.create_subscription(
+            OccupancyGrid,
+            self.map_topic,
+            self._on_map,
+            latched_map_qos,
+        )
         if self.require_system_ready:
             self.create_subscription(Bool, self.system_ready_topic, self._on_system_ready, latched_qos)
 
         self.create_timer(self.config.control_dt_sec, self._policy_tick)
         self.create_timer(1.0, self._status_tick)
         self.create_timer(1.0, self._publish_confidence_map)
-        self._start_model_loader()
+        if self.load_model_on_start or self.role_active:
+            self._ensure_model_loader_started('startup')
 
         self.get_logger().warning(
             'SCOUT_RL_MINIMAL_WORKER_READY | '
@@ -138,6 +158,7 @@ class ScoutRLPolicyWorker(Node):
             f'map_topic={self.map_topic} confidence_topic={self.confidence_map_topic} '
             f'checkpoint={self.config.checkpoint} '
             f'direct_rl_start={self.direct_rl_start} '
+            f'load_model_on_start={self.load_model_on_start} '
             f'emergency_stop_distance_m={self.emergency_stop_distance_m:.2f}'
         )
 
@@ -157,6 +178,7 @@ class ScoutRLPolicyWorker(Node):
         self.declare_parameter('require_start_motion', False)
         self.declare_parameter('start_motion_topic', '/fleet/start_motion')
         self.declare_parameter('direct_rl_start', True)
+        self.declare_parameter('load_model_on_start', True)
         self.declare_parameter('motion_readiness_detail_topic', '/fleet/scout_motion_ready_detail')
         self.declare_parameter('motion_release_stable_sec', 0.0)
         self.declare_parameter('startup_sensor_max_age_sec', 2.0)
@@ -171,10 +193,18 @@ class ScoutRLPolicyWorker(Node):
         self.declare_parameter('max_odom_age_sec', 2.0)
         self.declare_parameter('emergency_stop_distance_m', 0.20)
 
-    def _start_model_loader(self) -> None:
+    def _ensure_model_loader_started(self, reason: str) -> None:
+        if self.model is not None or self.model_loading or self.model_loader_started:
+            return
+        self.model_loader_started = True
+        self.model_loading = True
+        self.model_load_started = time.monotonic()
+        self._start_model_loader(reason)
+
+    def _start_model_loader(self, reason: str) -> None:
         def load() -> None:
             self.get_logger().warning(
-                f'SCOUT_MODEL_LOAD_START | model_path={self.config.checkpoint}'
+                f'SCOUT_MODEL_LOAD_START | reason={reason} model_path={self.config.checkpoint}'
             )
             try:
                 model = load_deployment_model()
@@ -210,6 +240,8 @@ class ScoutRLPolicyWorker(Node):
             self.get_logger().warning(
                 f'SCOUT_RL_ROLE | role={role} active={self.role_active}'
             )
+            if self.role_active:
+                self._ensure_model_loader_started('active_scout_role')
             if not self.role_active:
                 self._publish_zero()
 
@@ -232,6 +264,8 @@ class ScoutRLPolicyWorker(Node):
         self.latest_confidence_grid = self._confidence_from_map(msg)
 
     def _policy_tick(self) -> None:
+        if self.role_active:
+            self._ensure_model_loader_started('policy_tick_active')
         if not self._motion_allowed():
             self._wait_log(self._blocking_reason())
             self._publish_zero()
@@ -291,6 +325,8 @@ class ScoutRLPolicyWorker(Node):
     def _blocking_reason(self) -> str:
         if not self.role_active:
             return 'role_not_active_scout'
+        if not self.model_loader_started:
+            return 'model_not_started'
         if self.model_loading:
             return 'model_loading'
         if self.model is None:

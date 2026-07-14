@@ -172,6 +172,26 @@ def test_follower_startup_keeps_slam_off_but_allows_role_gated_rl():
     assert "'require_bootstrap_complete': False" in text
     assert "'require_localization_ready': (\n                            False if follower_initial_role else not scout_owns_slam" in text
     assert "initial_role_active': (\n                                'true' if fleet_role_value == 'member' else 'false'" in text
+    assert "'direct_rl_start': (\n                                'true' if fleet_role_value == 'member' else 'false'" in text
+    assert "'load_model_on_start': (\n                                'true' if fleet_role_value == 'member' else 'false'" in text
+
+
+def test_scout_rl_worker_uses_launch_env_and_lazy_follower_model_load():
+    launch = (
+        Path(__file__).parents[1] / 'launch' / 'scout_rl_inference.launch.py'
+    ).read_text(encoding='utf-8')
+    worker = (
+        Path(__file__).parents[1] / 'system_bringup' / 'scout_rl_policy_worker.py'
+    ).read_text(encoding='utf-8')
+
+    assert 'with_virtualenv_site_packages' in launch
+    assert 'clean_process_environment(domain_id.perform(context))' in launch
+    assert 'env=process_env' in launch
+    assert "'load_model_on_start'" in launch
+    assert "self.declare_parameter('load_model_on_start', True)" in worker
+    assert "if self.load_model_on_start or self.role_active:" in worker
+    assert "self._ensure_model_loader_started('active_scout_role')" in worker
+    assert 'durability=DurabilityPolicy.TRANSIENT_LOCAL' in worker
 
 
 def test_follower_map_forwarding_is_explicit_for_takeover_commit():
