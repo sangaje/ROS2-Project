@@ -1,6 +1,7 @@
 import pytest
 
 from launch import LaunchContext
+from launch.actions import SetEnvironmentVariable
 
 from fleet_bringup import launch_utils
 
@@ -26,7 +27,7 @@ def test_clean_process_environment_preserves_unreadable_shell_dds_values(monkeyp
     assert env['CYCLONEDDS_URI'] == uri
 
 
-def test_clean_process_environment_preserves_readable_shell_cyclonedds_uri(monkeypatch, tmp_path):
+def test_clean_process_environment_widens_small_cyclone_participant_range(monkeypatch, tmp_path):
     source = tmp_path / 'cyclonedds.xml'
     source.write_text(
         '''<?xml version="1.0"?>
@@ -42,12 +43,16 @@ def test_clean_process_environment_preserves_readable_shell_cyclonedds_uri(monke
     _shell(monkeypatch, cyclonedds_uri=f'file://{source}')
 
     env = launch_utils.clean_process_environment('22')
+    derived = launch_utils._cyclonedds_uri_to_path(env['CYCLONEDDS_URI'])
 
-    assert env['CYCLONEDDS_URI'] == f'file://{source}'
+    assert derived is not None and derived.is_file()
+    text = derived.read_text(encoding='utf-8')
+    assert '<MaxAutoParticipantIndex>240</MaxAutoParticipantIndex>' in text
+    assert '<Peer address="10.0.0.2"' in text
     assert source.read_text(encoding='utf-8').count('>30<') == 1
 
 
-def test_dds_launch_environment_does_not_override_cyclonedds_uri(monkeypatch, tmp_path):
+def test_dds_launch_environment_sets_derived_participant_config(monkeypatch, tmp_path):
     source = tmp_path / 'cyclonedds.xml'
     source.write_text(
         '''<CycloneDDS xmlns="https://cdds.io/config"><Domain id="any">
@@ -62,7 +67,8 @@ def test_dds_launch_environment_does_not_override_cyclonedds_uri(monkeypatch, tm
 
     actions = action.execute(context)
 
-    assert actions == []
+    assert len(actions) == 1
+    assert isinstance(actions[0], SetEnvironmentVariable)
 
 
 def test_dds_launch_environment_rejects_shell_domain_mismatch(monkeypatch):

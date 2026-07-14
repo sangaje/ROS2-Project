@@ -26,11 +26,6 @@ def map_qos(depth: int = 1) -> Dict:
     return qos(reliability='reliable', durability='transient_local', depth=depth)
 
 
-def live_map_qos(depth: int = 1) -> Dict:
-    """Match live Cartographer map publishers that may offer volatile durability."""
-    return qos(reliability='reliable', durability='volatile', depth=depth)
-
-
 def topic(message_type: str, *, remap: Optional[str] = None, profile=None) -> Dict:
     config = {
         'type': message_type,
@@ -673,7 +668,7 @@ def write_risk_to_leader_bridge_config(
         topics[source] = topic(
             'nav_msgs/msg/OccupancyGrid',
             remap=f'/field/scout{int(risk_domain)}/map',
-            profile=live_map_qos(),
+            profile=map_qos(),
         )
     if include_rl_confidence_map:
         topics['/rl_confidence_map'] = topic(

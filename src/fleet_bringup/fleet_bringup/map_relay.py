@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Receives /map_bridge from domain_bridge with a live-map-compatible
+Receives /map_bridge from domain_bridge with a transient-local
 subscription and republishes it on /map (transient_local). By default it
 stands by until no other /map publisher is alive. In external-map mode it
 relays each bridged update directly and avoids periodic full-map
@@ -96,7 +96,7 @@ class MapRelay(Node):
         bridge_sub_qos = QoSProfile(
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.VOLATILE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
         )
         output_sub_qos = QoSProfile(
@@ -151,7 +151,7 @@ class MapRelay(Node):
             self.check_period, self._check_primary
         )
         self.get_logger().info(
-            f'map relay standing by: {self.input_topic} (volatile) -> '
+            f'map relay standing by: {self.input_topic} (transient_local) -> '
             f'{self.output_topic} (transient_local), only if no other '
             f'publisher is active on {self.output_topic}; '
             f'relay_without_primary={self.relay_without_primary} '

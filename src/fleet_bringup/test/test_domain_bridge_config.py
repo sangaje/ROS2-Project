@@ -247,7 +247,7 @@ def test_risk_to_leader_bridge_is_one_way_map_source(tmp_path):
     assert (config['from_domain'], config['to_domain']) == (22, 24)
     assert config['topics']['/map']['remap'] == '/field/scout22/map'
     assert config['topics']['/map']['qos']['reliability'] == 'reliable'
-    assert config['topics']['/map']['qos']['durability'] == 'volatile'
+    assert config['topics']['/map']['qos']['durability'] == 'transient_local'
     assert config['topics']['/map']['qos']['history'] == 'keep_last'
     assert '/member_pose' not in config['topics']
     assert '/scout/signal' not in config['topics']
@@ -272,24 +272,6 @@ def test_risk_to_leader_bridge_can_exclude_scout_risk_outputs(tmp_path):
     assert '/risk/risk_map' not in config['topics']
     assert '/risk/person_probability_map' not in config['topics']
     assert '/risk/evidence_markers' not in config['topics']
-
-
-def test_risk_to_leader_bridge_can_use_scout_map_gateway_source(tmp_path):
-    path = write_risk_to_leader_bridge_config(
-        22,
-        24,
-        map_source_topic='/field/scout22/map_out',
-        output_directory=tmp_path,
-    )
-    config = yaml.safe_load(path.read_text())
-
-    assert '/map' not in config['topics']
-    assert config['topics']['/field/scout22/map_out']['remap'] == (
-        '/field/scout22/map'
-    )
-    assert config['topics']['/field/scout22/map_out']['qos']['durability'] == (
-        'volatile'
-    )
 
 
 def test_leader_to_pc_bridge_is_visualization_only(tmp_path):

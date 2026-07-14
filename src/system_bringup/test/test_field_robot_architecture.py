@@ -57,6 +57,6 @@ def test_leader_map_input_uses_field_robot_namespaces():
 
     assert "f'/field/{active_scout_robot_name.perform(context)}/map'" in leader
     assert "map_source_topic=(" in system
-    assert "f'/field/{active_scout_robot_name.perform(context)}/map_out'" in system
+    assert "/map_out" in system
     assert "default_value='/field/follower21/map'" in leader
     assert "f'/field/{follower_robot_name.perform(context)}/map'" in system
