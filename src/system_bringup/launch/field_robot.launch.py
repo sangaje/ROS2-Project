@@ -26,6 +26,7 @@ def generate_launch_description():
     robot_name = LaunchConfiguration('robot_name')
     domain_id = LaunchConfiguration('domain_id')
     main_domain_id = LaunchConfiguration('main_domain_id')
+    role_alias = LaunchConfiguration('role')
     initial_role = LaunchConfiguration('initial_role')
     active_scout_robot_name = LaunchConfiguration('active_scout_robot_name')
     follower_robot_name = LaunchConfiguration('follower_robot_name')
@@ -43,10 +44,28 @@ def generate_launch_description():
     field_forward_map_to_main = LaunchConfiguration('field_forward_map_to_main')
     camera_sender_device = LaunchConfiguration('camera_sender_device')
     flask_server_url = LaunchConfiguration('flask_server_url')
+    unified_dashboard = LaunchConfiguration('unified_dashboard')
+    dashboard_host = LaunchConfiguration('dashboard_host')
+    dashboard_port = LaunchConfiguration('dashboard_port')
 
     def make_stack(context):
         name = robot_name.perform(context).strip()
-        role = initial_role.perform(context).strip().upper()
+        alias = role_alias.perform(context).strip().lower()
+        if alias:
+            role_map = {
+                'leader': 'LEADER',
+                'scout': 'ACTIVE_SCOUT',
+                'active_scout': 'ACTIVE_SCOUT',
+                'follower': 'FOLLOWER',
+            }
+            if alias not in role_map:
+                raise ValueError(
+                    'role must be leader, scout, active_scout or follower, '
+                    f'got {alias!r}'
+                )
+            role = role_map[alias]
+        else:
+            role = initial_role.perform(context).strip().upper()
         if role not in ('LEADER', 'ACTIVE_SCOUT', 'FOLLOWER'):
             raise ValueError(
                 'initial_role must be LEADER, ACTIVE_SCOUT or FOLLOWER, '
@@ -74,6 +93,9 @@ def generate_launch_description():
                 'enable_cartographer': leader_enable_cartographer.perform(context),
                 'require_follower_pose': require_follower_pose.perform(context),
                 'enable_scout_failover': 'true',
+                'unified_dashboard': unified_dashboard.perform(context),
+                'dashboard_host': dashboard_host.perform(context),
+                'dashboard_port': dashboard_port.perform(context),
             }
             return [
                 LogInfo(msg=[
@@ -180,6 +202,14 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('robot_name', default_value='scout22'),
         DeclareLaunchArgument(
+            'role',
+            default_value='',
+            description=(
+                'Convenience alias: leader, scout/active_scout or follower. '
+                'When set, this overrides initial_role.'
+            ),
+        ),
+        DeclareLaunchArgument(
             'domain_id',
             default_value=EnvironmentVariable('ROS_DOMAIN_ID'),
         ),
@@ -239,5 +269,21 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument('camera_sender_device', default_value='/dev/video1'),
         DeclareLaunchArgument('flask_server_url', default_value='http://orin-jetson:5005/detect'),
+        DeclareLaunchArgument(
+            'unified_dashboard',
+            default_value='true',
+            choices=['true', 'false'],
+            description='Leader role only: run the integrated dashboard.',
+        ),
+        DeclareLaunchArgument(
+            'dashboard_host',
+            default_value='0.0.0.0',
+            description='Leader role only: dashboard bind address.',
+        ),
+        DeclareLaunchArgument(
+            'dashboard_port',
+            default_value='8091',
+            description='Leader role only: dashboard HTTP port.',
+        ),
         OpaqueFunction(function=make_stack),
     ])

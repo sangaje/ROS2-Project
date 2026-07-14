@@ -10,6 +10,10 @@ def test_field_robot_launch_is_single_entrypoint_for_leader_scout_and_follower()
     ).read_text(encoding='utf-8')
 
     assert "initial_role" in source
+    assert "LaunchConfiguration('role')" in source
+    assert "'leader': 'LEADER'" in source
+    assert "'scout': 'ACTIVE_SCOUT'" in source
+    assert "'follower': 'FOLLOWER'" in source
     assert "LEADER" in source
     assert "ACTIVE_SCOUT" in source
     assert "FOLLOWER" in source
@@ -36,6 +40,11 @@ def test_field_robot_launch_is_single_entrypoint_for_leader_scout_and_follower()
     assert "default_exploration = True" in source
     assert "DeclareLaunchArgument('enable_rl', default_value='')" in source
     assert "DeclareLaunchArgument('enable_follow'" not in source
+    assert "'unified_dashboard': unified_dashboard.perform(context)" in source
+    assert "'dashboard_host': dashboard_host.perform(context)" in source
+    assert "'dashboard_port': dashboard_port.perform(context)" in source
+    assert "DeclareLaunchArgument(\n            'unified_dashboard'" in source
+    assert "DeclareLaunchArgument(\n            'dashboard_port'" in source
 
 
 def test_system_launch_routes_field_observations_to_robot_topics():
