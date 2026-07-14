@@ -112,6 +112,9 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         self.current_role = self.initial_role
         self.current_role_epoch = 0
         self.role_topic = str(self.declare_parameter('role_topic', '').value).strip()
+        self.active_scout_id_topic = str(
+            self.declare_parameter('active_scout_id_topic', '/failover/active_scout_id').value
+        ).strip()
         self.pose_topic = str(
             self.declare_parameter('pose_topic', '/member_pose').value
         ).strip()
@@ -182,6 +185,11 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
         # outside active_roles) never opens the camera, never uploads a
         # frame, and never publishes a risk observation -- not even at a
         # throttled "standby" rate.
+        self.role_topic_camera_enabled = initial_active
+        self.role_topic_publish_enabled = (
+            initial_active and self.initial_role in self.publish_roles
+        )
+        self.active_scout_id_enabled = None
         self.camera_process_enabled = initial_active
         self.camera_upload_enabled = initial_active
         self.risk_observation_publish_enabled = (
@@ -226,6 +234,13 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
                 depth=1,
             )
             self.create_subscription(String, self.role_topic, self.on_role, role_qos)
+            if self.active_scout_id_topic:
+                self.create_subscription(
+                    String,
+                    self.active_scout_id_topic,
+                    self.on_active_scout_id,
+                    role_qos,
+                )
         self.pose_history = deque(maxlen=self.pose_history_max_samples)
         self.pose_lock = threading.Lock()
         self.create_subscription(PoseStamped, self.pose_topic, self.on_pose, 10)
@@ -312,6 +327,7 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             f'max_http_roundtrip={self.max_http_roundtrip_sec:.2f}s '
             f'max_frame_age={self.max_frame_age_sec:.2f}s '
             f'role_gating={self.enable_role_gating} role_topic={self.role_topic or "none"} '
+            f'active_scout_id_topic={self.active_scout_id_topic or "none"} '
             f'pose_topic={self.pose_topic} require_capture_pose={self.require_capture_pose} '
             f'robot_id={self.robot_name or "unknown"} boot_id={self.boot_id} '
             f'camera_process_enabled={self.camera_process_enabled} '
@@ -323,24 +339,14 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
             f'latest_frame_only=true ros_image_publish=false'
         )
 
-    def on_role(self, msg: String):
-        raw = msg.data.strip()
-        role = raw
-        if raw.startswith('{'):
-            role, epoch = parse_role_payload(raw, self.current_role)
-            self.current_role = role
-            self.current_role_epoch = epoch
+    def _apply_role_gate(self, source: str, value: str):
+        if self.active_scout_id_enabled is None:
+            camera_process_enabled = self.role_topic_camera_enabled
+            risk_observation_publish_enabled = self.role_topic_publish_enabled
         else:
-            self.current_role = raw.strip().upper()
-        role_name = role.strip().upper()
-        # Only active_roles (ACTIVE_SCOUT/SCOUT/RECOVERING by default) may
-        # open the camera, upload to the YOLO server, or publish a risk
-        # observation. FOLLOWER/IDLE/TAKEOVER_PENDING/RECOVERY_NAVIGATING
-        # get none of the three, even at a throttled rate -- a follower has
-        # no scout authority until it actually takes over.
-        camera_process_enabled = role_name in self.active_roles
+            camera_process_enabled = bool(self.active_scout_id_enabled)
+            risk_observation_publish_enabled = bool(self.active_scout_id_enabled)
         camera_upload_enabled = camera_process_enabled
-        risk_observation_publish_enabled = role_name in self.publish_roles
         changed = (
             camera_process_enabled != self.camera_process_enabled
             or camera_upload_enabled != self.camera_upload_enabled
@@ -364,12 +370,41 @@ class OpenCVCameraToFlaskYolo(FlexibleParameterNodeMixin, Node):
                 self.frame_condition.notify_all()
         self.get_logger().warning(
             'OPENCV_CAMERA_ROLE_GATE | '
-            f'role={role} '
+            f'source={source} value={value} role={self.current_role} '
             f'camera_process_enabled={self.camera_process_enabled} '
             f'camera_upload_enabled={self.camera_upload_enabled} '
             f'risk_observation_publish_enabled={self.risk_observation_publish_enabled} '
             f'robot={self.robot_name or "unknown"}'
         )
+
+    def on_role(self, msg: String):
+        raw = msg.data.strip()
+        role = raw
+        if raw.startswith('{'):
+            role, epoch = parse_role_payload(raw, self.current_role)
+            self.current_role = role
+            self.current_role_epoch = epoch
+        else:
+            self.current_role = raw.strip().upper()
+        role_name = role.strip().upper()
+        # Only active_roles (ACTIVE_SCOUT/SCOUT/RECOVERING by default) may
+        # open the camera, upload to the YOLO server, or publish a risk
+        # observation. FOLLOWER/IDLE/TAKEOVER_PENDING/RECOVERY_NAVIGATING
+        # get none of the three, even at a throttled rate -- a follower has
+        # no scout authority until it actually takes over.
+        self.role_topic_camera_enabled = role_name in self.active_roles
+        self.role_topic_publish_enabled = role_name in self.publish_roles
+        self._apply_role_gate('role_topic', role_name)
+
+    def on_active_scout_id(self, msg: String):
+        active_scout_id = str(msg.data or '').strip()
+        if not active_scout_id:
+            return
+        active = active_scout_id == self.robot_name
+        self.active_scout_id_enabled = active
+        if active:
+            self.current_role = 'ACTIVE_SCOUT'
+        self._apply_role_gate('active_scout_id', active_scout_id)
 
     @staticmethod
     def stamp_to_sec(stamp) -> float:

@@ -11,7 +11,12 @@ active scout.
 
 import threading
 
-from std_msgs.msg import String
+try:
+    from std_msgs.msg import String
+except ModuleNotFoundError:
+    class String:
+        def __init__(self, data=''):
+            self.data = data
 
 from flask_yolo_bridge.opencv_camera_to_flask_yolo import OpenCVCameraToFlaskYolo
 
@@ -32,6 +37,9 @@ def _bare_node(initial_role='ACTIVE_SCOUT'):
     node.standby_roles = {'FOLLOWER', 'IDLE', 'TAKEOVER_PENDING'}
     node.publish_roles = {'ACTIVE_SCOUT', 'SCOUT', 'RECOVERING'}
     active = initial_role in node.active_roles
+    node.role_topic_camera_enabled = active
+    node.role_topic_publish_enabled = initial_role in node.publish_roles
+    node.active_scout_id_enabled = None
     node.camera_process_enabled = active
     node.camera_upload_enabled = active
     node.risk_observation_publish_enabled = initial_role in node.publish_roles
@@ -69,6 +77,24 @@ def test_takeover_to_active_scout_re_enables_all_three_gates():
     assert node.risk_observation_publish_enabled is False
 
     node.on_role(String(data='ACTIVE_SCOUT'))
+
+    assert node.camera_process_enabled is True
+    assert node.camera_upload_enabled is True
+    assert node.risk_observation_publish_enabled is True
+
+
+def test_active_scout_id_handoff_enables_follower_camera_and_survives_stale_role():
+    node = _bare_node(initial_role='FOLLOWER')
+    node.robot_name = 'follower21'
+
+    node.on_active_scout_id(String(data='follower21'))
+
+    assert node.current_role == 'ACTIVE_SCOUT'
+    assert node.camera_process_enabled is True
+    assert node.camera_upload_enabled is True
+    assert node.risk_observation_publish_enabled is True
+
+    node.on_role(String(data='FOLLOWER'))
 
     assert node.camera_process_enabled is True
     assert node.camera_upload_enabled is True
