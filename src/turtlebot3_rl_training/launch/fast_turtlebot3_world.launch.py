@@ -24,6 +24,7 @@ def generate_launch_description():
     y_pose = LaunchConfiguration("y_pose")
     gui = LaunchConfiguration("gui")
     verbose = LaunchConfiguration("verbose")
+    update_rate = LaunchConfiguration("update_rate")
 
     source_training_world = os.path.abspath(
         os.path.join(os.path.dirname(__file__), "..", "world", "training_house.sdf")
@@ -69,6 +70,12 @@ def generate_launch_description():
         description="Gazebo verbosity level.",
     )
 
+    declare_update_rate = DeclareLaunchArgument(
+        "update_rate",
+        default_value=os.environ.get("SIM_UPDATE_RATE", "200"),
+        description="Gazebo server update rate cap in Hz. 200Hz matches max_step_size=0.005s; use 0 for uncapped.",
+    )
+
     declare_world = DeclareLaunchArgument(
         "world",
         default_value=default_world,
@@ -85,7 +92,7 @@ def generate_launch_description():
             os.path.join(ros_gz_sim_share, "launch", "gz_sim.launch.py")
         ),
         launch_arguments={
-            "gz_args": ["-r -s -v", verbose, " ", world],
+            "gz_args": ["-r -s -z ", update_rate, " -v", verbose, " ", world],
             "on_exit_shutdown": "true",
         }.items(),
     )
@@ -127,6 +134,7 @@ def generate_launch_description():
     ld.add_action(declare_y_pose)
     ld.add_action(declare_gui)
     ld.add_action(declare_verbose)
+    ld.add_action(declare_update_rate)
     ld.add_action(declare_world)
 
     # 중요: Gazebo 실행 전에 resource path를 먼저 잡는다.

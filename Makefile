@@ -16,6 +16,11 @@ help:
 gazebo:
 	bash run_gazebo.sh
 
+build:
+	source ~/venv/ros/bin/activate
+	python -m colcon build
+	source install/setup.zsh
+
 train:
 	bash run_train_v132_clean.sh
 

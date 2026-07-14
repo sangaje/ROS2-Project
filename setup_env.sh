@@ -101,3 +101,33 @@ tb3_rl_wait_for_gazebo_ready() {
     tb3_rl_wait_for_topic "/odom" "${max_wait}"
     export TB3_RL_GAZEBO_READY_CHECKED=1
 }
+
+tb3_rl_pause_gazebo_world() {
+    local world="${1:-default}"
+    local timeout_ms="${2:-1200}"
+    local service="/world/${world}/control"
+    local req='pause: true'
+
+    echo "  Gazebo world pause 요청 (${service})..."
+    if gz service -s "${service}" \
+        --reqtype gz.msgs.WorldControl \
+        --reptype gz.msgs.Boolean \
+        --timeout "${timeout_ms}" \
+        --req "${req}" >/tmp/tb3_rl_pause_gazebo.log 2>&1; then
+        echo "  ✓ Gazebo world paused"
+        return 0
+    fi
+
+    if ign service -s "${service}" \
+        --reqtype ignition.msgs.WorldControl \
+        --reptype ignition.msgs.Boolean \
+        --timeout "${timeout_ms}" \
+        --req "${req}" >/tmp/tb3_rl_pause_gazebo.log 2>&1; then
+        echo "  ✓ Gazebo world paused"
+        return 0
+    fi
+
+    echo "  ! Gazebo world pause 실패. 로그:"
+    sed 's/^/    /' /tmp/tb3_rl_pause_gazebo.log 2>/dev/null || true
+    return 1
+}

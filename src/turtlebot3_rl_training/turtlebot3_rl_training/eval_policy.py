@@ -410,6 +410,8 @@ def parse_args():
     parser.add_argument("--max-angular-speed", type=float, default=0.75)
     parser.add_argument("--velocity-command-linear-limit", type=float, default=0.0)
     parser.add_argument("--velocity-command-angular-limit", type=float, default=0.0)
+    parser.add_argument("--velocity-allow-reverse", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--reverse-action-penalty-ratio", type=float, default=1.3 / 15.0)
 
     # Policy action 해석 방식.
     # waypoint + polar: SAC는 [거리 비율, 방향 비율]을 내고,
@@ -933,6 +935,8 @@ def main(args=None):
         max_angular_speed=cli_args.max_angular_speed,
         velocity_command_linear_limit=cli_args.velocity_command_linear_limit,
         velocity_command_angular_limit=cli_args.velocity_command_angular_limit,
+        velocity_allow_reverse=cli_args.velocity_allow_reverse,
+        reverse_action_penalty_ratio=cli_args.reverse_action_penalty_ratio,
         action_mode=cli_args.action_mode,
         waypoint_action_type="polar",
         waypoint_lateral_max_offset=cli_args.waypoint_lateral_max_offset,

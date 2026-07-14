@@ -66,7 +66,13 @@ def generate_launch_description() -> LaunchDescription:
         os.path.join(os.path.dirname(__file__), "..", "rviz", "rl_sim_headless.rviz")
     )
     installed_rviz = os.path.join(this_pkg_share, "rviz", "rl_sim_headless.rviz")
-    rviz_default = installed_rviz if os.path.exists(installed_rviz) else source_rviz
+    rviz_default = (
+        source_rviz
+        if prefer_source_launch not in {"0", "false", "no", "off"} and os.path.exists(source_rviz)
+        else installed_rviz
+        if os.path.exists(installed_rviz)
+        else source_rviz
+    )
 
     source_training_world = os.path.abspath(
         os.path.join(os.path.dirname(__file__), "..", "world", "training_house.sdf")
@@ -91,6 +97,7 @@ def generate_launch_description() -> LaunchDescription:
     use_sim_time = LaunchConfiguration("use_sim_time")
     gui = LaunchConfiguration("gui")
     verbose = LaunchConfiguration("verbose")
+    update_rate = LaunchConfiguration("update_rate")
     x_pose = LaunchConfiguration("x_pose")
     y_pose = LaunchConfiguration("y_pose")
     start_rviz = LaunchConfiguration("start_rviz")
@@ -106,6 +113,11 @@ def generate_launch_description() -> LaunchDescription:
             description="Gazebo GUI 클라이언트 실행 여부. false=헤드리스.",
         ),
         DeclareLaunchArgument("verbose", default_value="1"),
+        DeclareLaunchArgument(
+            "update_rate",
+            default_value=os.environ.get("SIM_UPDATE_RATE", "200"),
+            description="Gazebo server update rate cap in Hz. Use 0 for uncapped.",
+        ),
         DeclareLaunchArgument("x_pose", default_value="-2.80"),
         DeclareLaunchArgument("y_pose", default_value="0.96"),
         DeclareLaunchArgument("start_rviz", default_value="true"),
@@ -129,6 +141,7 @@ def generate_launch_description() -> LaunchDescription:
             "use_sim_time": use_sim_time,
             "gui": gui,
             "verbose": verbose,
+            "update_rate": update_rate,
             "x_pose": x_pose,
             "y_pose": y_pose,
             "world": world,

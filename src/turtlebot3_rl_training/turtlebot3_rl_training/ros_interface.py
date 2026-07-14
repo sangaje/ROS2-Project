@@ -82,6 +82,22 @@ def _quiet_reset_logs() -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _is_context_invalid_error(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return (
+        "context is invalid" in text
+        or "publisher's context is invalid" in text
+        or "rcl node's context is invalid" in text
+    )
+
+
+def _context_ok(context) -> bool:
+    try:
+        return bool(rclpy.ok(context=context))
+    except Exception:
+        return False
+
+
 
 class _BackgroundMapSubscriber(Node):
     """
@@ -1207,15 +1223,27 @@ class TurtleBot3RosInterface(Node):
             pass
         if self.cmd_pub is None:
             return
-        msg = TwistStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = "base_link"
-        msg.twist.linear.x = float(linear_x)
-        msg.twist.angular.z = float(angular_z)
-        self.cmd_pub.publish(msg)
+        if not _context_ok(getattr(self, "context", None)):
+            return
+        try:
+            msg = TwistStamped()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = "base_link"
+            msg.twist.linear.x = float(linear_x)
+            msg.twist.angular.z = float(angular_z)
+            self.cmd_pub.publish(msg)
+        except Exception as exc:
+            if _is_context_invalid_error(exc) or not _context_ok(getattr(self, "context", None)):
+                return
+            raise
 
     def stop_robot(self):
-        self.publish_cmd_vel(0.0, 0.0)
+        try:
+            self.publish_cmd_vel(0.0, 0.0)
+        except Exception as exc:
+            if _is_context_invalid_error(exc) or not _context_ok(getattr(self, "context", None)):
+                return
+            raise
 
     def _start_background_map_mirror(self):
         """Start a dedicated /map subscriber in a separate executor thread."""
@@ -1299,7 +1327,7 @@ class TurtleBot3RosInterface(Node):
         while time.time() - start < duration_sec:
             rclpy.spin_once(self, timeout_sec=0.01)
 
-    def wait_for_sensor_ready(self, timeout_sec: float = 10.0) -> bool:
+    def wait_for_sensor_ready(self, timeout_sec: float = 10.0, *, log_on_timeout: bool = True) -> bool:
         start = time.time()
 
         while time.time() - start < timeout_sec:
@@ -1310,18 +1338,19 @@ class TurtleBot3RosInterface(Node):
                     self.get_logger().info("Received /scan and /odom.")
                 return True
 
-        missing = []
-        if self.scan is None:
-            missing.append(self.scan_topic or "/scan")
-        if self.odom is None:
-            missing.append(self.odom_topic or "/odom")
-        missing_text = ", ".join(missing) if missing else "/scan, /odom"
-        self.get_logger().error(
-            "Timeout while waiting for /scan and /odom. "
-            f"Missing callbacks: {missing_text}. "
-            "If this is Gazebo training, start terminal 1 first with: "
-            "cd ~/Desktop/ROS2_Project && bash run_gazebo.sh"
-        )
+        if log_on_timeout:
+            missing = []
+            if self.scan is None:
+                missing.append(self.scan_topic or "/scan")
+            if self.odom is None:
+                missing.append(self.odom_topic or "/odom")
+            missing_text = ", ".join(missing) if missing else "/scan, /odom"
+            self.get_logger().error(
+                "Timeout while waiting for /scan and /odom. "
+                f"Missing callbacks: {missing_text}. "
+                "If this is Gazebo training, start terminal 1 first with: "
+                "cd ~/Desktop/ROS2_Project && bash run_gazebo.sh"
+            )
         return False
 
     def wait_for_slam_map_ready(self, timeout_sec: float = 5.0) -> bool:
@@ -1784,6 +1813,18 @@ return options
         if self.slam_proc is not None and self.slam_proc.poll() is None:
             return True
 
+        if not self._launch_cartographer_process():
+            return False
+        return self.verify_cartographer_started(timeout_sec=timeout_sec)
+
+    def _launch_cartographer_process(self) -> bool:
+        """Build the launch command and Popen it. Non-blocking: returns as soon
+        as the process handle exists, before checking whether it actually
+        stays up or produces a map -- see verify_cartographer_started().
+        Split out of start_cartographer() so a caller (per-episode reset) can
+        do other useful work while this process is still initializing/doing
+        its own DDS discovery, instead of blocking on it immediately.
+        """
         # v25.2: prefer the official TurtleBot3 Cartographer launch.  The
         # generated bare cartographer_node path was too fragile: a process could
         # start but occupancy_grid_node never produced /map.  The official launch
@@ -1934,7 +1975,19 @@ return options
             self.get_logger().error(f"Failed to start Cartographer: {exc}")
             self.slam_proc = None
             return False
+        return True
 
+    def verify_cartographer_started(self, timeout_sec: float = 3.0) -> bool:
+        """Poll the process Popen'd by _launch_cartographer_process().
+
+        Returns False only on an early process exit (real launch failure).
+        Otherwise returns True once /map is seen, or once timeout_sec elapses
+        with the process still alive (map may just need more sim-time steps,
+        which is the caller's job, not this function's -- see the comment on
+        the timeout_sec cap at the reset_slam_mapping call site).
+        """
+        if self.slam_proc is None:
+            return False
         start = time.time()
         node_seen = False
         while rclpy.ok() and time.time() - start < timeout_sec:
@@ -2080,6 +2133,30 @@ return options
         except Exception:
             pass
 
+    def kickoff_cartographer_restart(self, settle_sec: Optional[float] = None) -> bool:
+        """Kill any existing Cartographer/occupancy_grid processes and Popen a
+        fresh one, without waiting for it to become ready (see
+        verify_cartographer_started()). Split out of reset_slam_mapping() so
+        a per-episode reset caller can do other independent work (obstacle
+        placement, etc.) while this process is initializing/doing its own DDS
+        discovery in the background, instead of blocking on it immediately.
+        """
+        self.reset_slam_state()
+        self.stop_slam_toolbox()
+        self._kill_external_cartographer()
+        # Give the killed cartographer/occupancy_grid processes time to fully
+        # exit and release their DDS endpoints before relaunching.  Too short
+        # a delay can race the new node against the dying one.  Configurable
+        # via TB3_RL_CARTOGRAPHER_RESTART_DELAY_SEC.
+        try:
+            settle = float(settle_sec) if settle_sec is not None else float(
+                os.environ.get("TB3_RL_CARTOGRAPHER_RESTART_DELAY_SEC", "0.8") or 0.8
+            )
+        except Exception:
+            settle = 0.8
+        self.spin_for(max(settle, 0.1))
+        return self._launch_cartographer_process()
+
     def reset_slam_mapping(
         self,
         timeout_sec: float = 8.0,
@@ -2104,25 +2181,15 @@ return options
                     "MANDATORY_CARTOGRAPHER_RESET | Cartographer has no per-episode map reset service; "
                     "restarting cartographer_node + occupancy_grid_node."
                 )
-            self.reset_slam_state()
-            self.stop_slam_toolbox()
-            self._kill_external_cartographer()
-            # Give the killed cartographer/occupancy_grid processes time to fully
-            # exit and release their DDS endpoints before relaunching.  Too short
-            # a delay can race the new node against the dying one.  Configurable
-            # via TB3_RL_CARTOGRAPHER_RESTART_DELAY_SEC.
-            try:
-                settle = float(os.environ.get("TB3_RL_CARTOGRAPHER_RESTART_DELAY_SEC", "0.8") or 0.8)
-            except Exception:
-                settle = 0.8
-            self.spin_for(max(settle, 0.1))
-            # start_cartographer()'s own /map wait only spins real-time and does
-            # not advance the (paused/lockstep) sim clock, so it cannot succeed
-            # here -- it would just burn up to timeout_sec doing nothing. Give it
-            # a short budget purely to catch an immediate process crash; the
-            # caller (gazebo_nav_env._reset_slam_map_after_pose_reset) is
+            if not self.kickoff_cartographer_restart():
+                return False
+            # verify_cartographer_started()'s own /map wait only spins real-time
+            # and does not advance the (paused/lockstep) sim clock, so it cannot
+            # succeed here -- it would just burn up to timeout_sec doing nothing.
+            # Give it a short budget purely to catch an immediate process crash;
+            # the caller (gazebo_nav_env._reset_slam_map_after_pose_reset) is
             # responsible for actually stepping the world until /map appears.
-            return self.start_cartographer(timeout_sec=min(float(timeout_sec), 3.0))
+            return self.verify_cartographer_started(timeout_sec=min(float(timeout_sec), 3.0))
 
         self.reset_slam_state()
 

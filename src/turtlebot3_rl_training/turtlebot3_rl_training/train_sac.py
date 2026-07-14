@@ -38,7 +38,7 @@ warnings.filterwarnings("ignore", message=".*constant_fn.*deprecated.*")
 # Bump this only when transition semantics change enough that old critic targets
 # and replay samples are no longer compatible.  The value is stored inside SB3
 # model zips, making the actor-only migration automatic and exactly once.
-TRAINING_SEMANTICS_VERSION = "robust_collision_safety_v1"
+TRAINING_SEMANTICS_VERSION = "pause_action_velocity_fwd0p30_cmd0p22_rev0p22_conf2p0_fov36_reverse_debt_v1"
 
 
 
@@ -211,6 +211,14 @@ def _install_warmup_action_mixer(
         model._tb3_original_sample_action = original_sample_action
 
     rng = np.random.default_rng()
+    try:
+        warmup_reverse_probability = float(os.environ.get("TB3_RL_WARMUP_ACTION_REVERSE_PROB", "0.05") or 0.05)
+    except Exception:
+        warmup_reverse_probability = 0.05
+    warmup_reverse_probability = min(max(float(warmup_reverse_probability), 0.0), 1.0)
+    warmup_reverse_mode = str(os.environ.get("TB3_RL_WARMUP_ACTION_REVERSE_MODE", "mirror") or "mirror").strip().lower()
+    if warmup_reverse_mode not in {"mirror", "clamp"}:
+        warmup_reverse_mode = "mirror"
     start_timesteps = int(getattr(model, "num_timesteps", 0))
     model._tb3_warmup_action_start_timesteps = start_timesteps
     model._tb3_warmup_action_steps = steps
@@ -218,9 +226,12 @@ def _install_warmup_action_mixer(
     model._tb3_warmup_action_random_prob = random_probability
     model._tb3_warmup_action_noise_prob = noise_probability
     model._tb3_warmup_action_noise_std = std
+    model._tb3_warmup_action_reverse_prob = warmup_reverse_probability
+    model._tb3_warmup_action_reverse_mode = warmup_reverse_mode
     model._tb3_warmup_action_zero_linear_count = 0
     model._tb3_warmup_action_random_count = 0
     model._tb3_warmup_action_noise_count = 0
+    model._tb3_warmup_action_reverse_limited_count = 0
     model._tb3_last_warmup_action_source = "policy"
 
     def _sample_action_with_warmup(self, learning_starts: int, action_noise=None, n_envs: int = 1):
@@ -241,6 +252,35 @@ def _install_warmup_action_mixer(
         random_mask = (draws >= zero_linear_prob_now) & (draws < random_cutoff)
         noisy_mask = (draws >= random_cutoff) & (draws < noise_cutoff)
 
+        def _limit_warmup_reverse(sampled_action: np.ndarray) -> np.ndarray:
+            limited = np.asarray(sampled_action, dtype=np.float32).copy()
+            if limited.ndim != 2 or limited.shape[1] < 1:
+                return limited
+            try:
+                low = np.asarray(self.action_space.low, dtype=np.float32).reshape(-1)
+                high = np.asarray(self.action_space.high, dtype=np.float32).reshape(-1)
+            except Exception:
+                return limited
+            if low.size < 1 or high.size < 1 or not (float(low[0]) < 0.0 < float(high[0])):
+                return limited
+            reverse_mask = limited[:, 0] < 0.0
+            if not np.any(reverse_mask):
+                return limited
+            allow_reverse = rng.random(limited.shape[0]) < float(getattr(self, "_tb3_warmup_action_reverse_prob", 0.05))
+            fix_mask = reverse_mask & (~allow_reverse)
+            if not np.any(fix_mask):
+                return limited
+            mode = str(getattr(self, "_tb3_warmup_action_reverse_mode", "mirror") or "mirror").strip().lower()
+            if mode == "clamp":
+                limited[fix_mask, 0] = 0.0
+            else:
+                limited[fix_mask, 0] = np.clip(-limited[fix_mask, 0], 0.0, float(high[0]))
+            self._tb3_warmup_action_reverse_limited_count = (
+                int(getattr(self, "_tb3_warmup_action_reverse_limited_count", 0))
+                + int(np.count_nonzero(fix_mask))
+            )
+            return limited
+
         if np.any(zero_linear_mask):
             sampled_action = np.asarray([self.action_space.sample() for _ in range(env_count)], dtype=np.float32)
             sampled_action[:, 0] = 0.0
@@ -251,6 +291,7 @@ def _install_warmup_action_mixer(
 
         if np.any(random_mask):
             sampled_action = np.asarray([self.action_space.sample() for _ in range(env_count)], dtype=np.float32)
+            sampled_action = _limit_warmup_reverse(sampled_action)
             sampled_buffer_action = self.policy.scale_action(sampled_action)
             action_arr[random_mask] = sampled_action[random_mask]
             buffer_arr[random_mask] = sampled_buffer_action[random_mask]
@@ -259,8 +300,11 @@ def _install_warmup_action_mixer(
         if np.any(noisy_mask):
             noise = rng.normal(0.0, float(getattr(self, "_tb3_warmup_action_noise_std", 0.0)), size=buffer_arr[noisy_mask].shape)
             noisy_buffer_action = np.clip(buffer_arr[noisy_mask] + noise, -1.0, 1.0)
+            noisy_action = self.policy.unscale_action(noisy_buffer_action)
+            noisy_action = _limit_warmup_reverse(noisy_action)
+            noisy_buffer_action = self.policy.scale_action(noisy_action)
             buffer_arr[noisy_mask] = noisy_buffer_action
-            action_arr[noisy_mask] = self.policy.unscale_action(noisy_buffer_action)
+            action_arr[noisy_mask] = noisy_action
             self._tb3_warmup_action_noise_count = int(getattr(self, "_tb3_warmup_action_noise_count", 0)) + int(np.count_nonzero(noisy_mask))
 
         if np.count_nonzero([np.any(zero_linear_mask), np.any(random_mask), np.any(noisy_mask)]) > 1:
@@ -282,7 +326,8 @@ def _install_warmup_action_mixer(
             "WARMUP_ACTION_MIXER | "
             f"resume_start={start_timesteps} steps={steps} "
             f"zero_linear_prob={zero_linear_probability:.3f} "
-            f"random_prob={random_probability:.3f} noise_prob={noise_probability:.3f} noise_std={std:.3f}"
+            f"random_prob={random_probability:.3f} noise_prob={noise_probability:.3f} noise_std={std:.3f} "
+            f"warmup_reverse_prob={warmup_reverse_probability:.3f} reverse_mode={warmup_reverse_mode}"
         )
     return True
 
@@ -335,6 +380,103 @@ def _start_gazebo_if_requested(cli_args) -> Optional[subprocess.Popen]:
     if wait_sec > 0.0:
         time.sleep(wait_sec)
     return proc
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return str(value).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _world_name_from_control_service(service: str) -> str:
+    match = re.search(r"/world/([^/]+)/control", str(service or ""))
+    if match:
+        return match.group(1)
+    return "default"
+
+
+def _set_gazebo_world_paused(world_name: str, paused: bool, *, timeout_ms: int = 1500) -> bool:
+    service = f"/world/{world_name or 'default'}/control"
+    req = f"pause: {'true' if paused else 'false'}"
+    timeout_ms = max(int(timeout_ms), 100)
+    attempts = (
+        ("gz", "gz.msgs.WorldControl", "gz.msgs.Boolean"),
+        ("ign", "ignition.msgs.WorldControl", "ignition.msgs.Boolean"),
+    )
+
+    for exe, reqtype, reptype in attempts:
+        try:
+            result = subprocess.run(
+                [
+                    exe,
+                    "service",
+                    "-s",
+                    service,
+                    "--reqtype",
+                    reqtype,
+                    "--reptype",
+                    reptype,
+                    "--timeout",
+                    str(timeout_ms),
+                    "--req",
+                    req,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=max((timeout_ms / 1000.0) + 1.0, 2.0),
+            )
+        except FileNotFoundError:
+            continue
+        except Exception:
+            continue
+        if result.returncode == 0:
+            return True
+    return False
+
+
+def _wait_for_sensor_ready_with_gazebo_wake(ros, cli_args, timeout_sec: float) -> bool:
+    """Receive first /scan and /odom even when terminal-1 left Gazebo paused."""
+    quick_wait = max(float(os.environ.get("TB3_RL_SENSOR_READY_PAUSED_WAIT_SEC", "2.0") or 2.0), 0.0)
+    if quick_wait > 0.0 and ros.wait_for_sensor_ready(
+        timeout_sec=min(timeout_sec, quick_wait),
+        log_on_timeout=False,
+    ):
+        return True
+
+    if not _env_flag("TB3_RL_WAKE_GAZEBO_FOR_SENSOR_READY", True):
+        return ros.wait_for_sensor_ready(timeout_sec=max(timeout_sec - quick_wait, 0.1))
+
+    world_name = _world_name_from_control_service(getattr(cli_args, "world_control_service", "/world/default/control"))
+    control_timeout_ms = int(float(os.environ.get("TB3_RL_SENSOR_READY_WORLD_CONTROL_TIMEOUT_MS", "1500") or 1500))
+    unpause_timeout = max(float(os.environ.get("TB3_RL_SENSOR_READY_UNPAUSE_TIMEOUT_SEC", "5.0") or 5.0), 0.1)
+    wait_timeout = min(timeout_sec, unpause_timeout)
+
+    try:
+        ros.get_logger().warn(
+            "SENSOR_READY_WAKE_GAZEBO | /scan and /odom callbacks not received while paused; "
+            f"briefly unpausing /world/{world_name}/control for startup sensors"
+        )
+    except Exception:
+        pass
+
+    unpaused = _set_gazebo_world_paused(world_name, False, timeout_ms=control_timeout_ms)
+    if not unpaused:
+        try:
+            ros.get_logger().warn("SENSOR_READY_WAKE_GAZEBO_FAILED | falling back to normal sensor wait")
+        except Exception:
+            pass
+        return ros.wait_for_sensor_ready(timeout_sec=max(timeout_sec - quick_wait, 0.1))
+
+    try:
+        if ros.wait_for_sensor_ready(timeout_sec=wait_timeout, log_on_timeout=False):
+            return True
+    finally:
+        if not bool(getattr(cli_args, "disable_world_step", False)):
+            _set_gazebo_world_paused(world_name, True, timeout_ms=control_timeout_ms)
+
+    return ros.wait_for_sensor_ready(timeout_sec=0.1, log_on_timeout=True)
 
 
 def _scan_geometry_counts(scan_msg, *, max_valid_range_m: float = 3.35) -> tuple[int, int, float]:
@@ -1300,7 +1442,7 @@ class TrainingProgressCallback(BaseCallback):
                 "velocity_safety_terminal,velocity_safety_distance,"
                 "executed_v,executed_w,policy_v,policy_w,"
                 "r_confidence,r_confidence_fill,r_slam,r_priority,r_wall,"
-                "r_safety_slow,r_safety_terminal,r_collision,r_step,reward_total,"
+                "r_safety_slow,r_safety_terminal,r_collision,r_reverse,r_step,reward_total,"
                 "safety_terminal_count_ep,collision_count_ep\n"
             )
             append_mode = path.exists() and path.stat().st_size > 0
@@ -1577,7 +1719,9 @@ class TrainingProgressCallback(BaseCallback):
                 f"cov={float(info.get('coverage_ratio', -1.0)):6.3f}  "
                 f"term={terminal_reason}  err={bool(info.get('step_recovery', False))}\n"
                 f"      act : policy=({float(info.get('policy_v', 0.0)):+.3f},{float(info.get('policy_w', 0.0)):+.3f})  "
+                f"cmd=({float(info.get('commanded_v', 0.0)):+.3f},{float(info.get('commanded_w', 0.0)):+.3f})  "
                 f"exec=({float(info.get('executed_v', 0.0)):+.3f},{float(info.get('executed_w', 0.0)):+.3f})  "
+                f"rev_pen={float(info.get('reverse_action_penalty', 0.0)):5.2f}  "
                 f"w_recent L/R/Z={exec_left:4.2f}/{exec_right:4.2f}/{exec_zero:4.2f}  "
                 f"mean_w={exec_mean_w:+.3f}"
             )
@@ -1601,6 +1745,7 @@ class TrainingProgressCallback(BaseCallback):
                 f"cov={float(info.get('coverage_ratio', -1.0)):.3f} "
                 f"p=({float(info.get('policy_v', 0.0)):+.2f},{float(info.get('policy_w', 0.0)):+.2f}) "
                 f"e=({float(info.get('executed_v', 0.0)):+.2f},{float(info.get('executed_w', 0.0)):+.2f}) "
+                f"rev_pen={float(info.get('reverse_action_penalty', 0.0)):.2f} "
                 f"wL/R/Z={exec_left:.2f}/{exec_right:.2f}/{exec_zero:.2f} "
                 f"term={terminal_reason} "
                 f"err={bool(info.get('step_recovery', False))}"
@@ -1686,6 +1831,7 @@ class TrainingProgressCallback(BaseCallback):
                 f"{self._finite_or_blank(float(info.get('r_safety_slow', 0.0)))},"
                 f"{self._finite_or_blank(float(info.get('r_safety_terminal', 0.0)))},"
                 f"{self._finite_or_blank(float(info.get('r_collision', 0.0)))},"
+                f"{self._finite_or_blank(float(info.get('r_reverse', 0.0)))},"
                 f"{self._finite_or_blank(float(info.get('r_step', 0.0)))},"
                 f"{self._finite_or_blank(float(info.get('reward_total', 0.0)))},"
                 f"{int(getattr(self, '_last_ep_safety_terminal_count', 0))},"
@@ -2093,6 +2239,8 @@ def parse_args():
     parser.add_argument("--max-angular-speed", type=float, default=0.75)
     parser.add_argument("--velocity-command-linear-limit", type=float, default=0.0, help="Clamp executed TwistStamped linear.x without changing SAC action_space. Use for resume fine-tuning old wide-action checkpoints under real-robot speed limits.")
     parser.add_argument("--velocity-command-angular-limit", type=float, default=0.0, help="Clamp executed TwistStamped angular.z without changing SAC action_space. Use for resume fine-tuning old wide-action checkpoints under real-robot turn limits.")
+    parser.add_argument("--velocity-allow-reverse", action=argparse.BooleanOptionalAction, default=True, help="Allow SAC velocity action[0] to command negative linear.x. Reverse steps do not receive confidence/map information rewards.")
+    parser.add_argument("--reverse-action-penalty-ratio", type=float, default=1.3 / 15.0, help="Max dense penalty for policy reverse as a ratio of abs(collision terminal reward). Default 1.3/15 -> max about 1.3 when collision is -15.")
 
     # Policy action 해석 방식.
     # waypoint + polar: SAC는 [거리 비율, 방향 비율]을 내고,
@@ -2334,8 +2482,8 @@ def parse_args():
     parser.add_argument("--coverage-stall-terminal-penalty", type=float, default=0.0)
 
     # Pure velocity SAC safety shield.  Used only when --action-mode velocity.
-    # Policy action remains forward-only; the shield may publish a short reverse
-    # TwistStamped when the front sector is too close to an obstacle.
+    # With --velocity-allow-reverse the policy may also publish reverse directly;
+    # the shield can still run a forced backup near a front obstacle.
     parser.add_argument("--velocity-safety-backup", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--velocity-safety-trigger-distance-m", type=float, default=0.28)
     parser.add_argument("--velocity-safety-stop-distance-m", type=float, default=0.36)
@@ -2515,7 +2663,10 @@ def parse_args():
     parser.add_argument("--progress-csv-flush-every", type=int, default=20)
     parser.add_argument("--sac-verbose", type=int, default=0)
     parser.add_argument("--checkpoint-freq", type=int, default=50_000)
-    parser.add_argument("--save-replay-buffer", action=argparse.BooleanOptionalAction, default=True)
+    _save_replay_default = str(
+        os.environ.get("TB3_RL_SAVE_REPLAY_BUFFER", "0")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    parser.add_argument("--save-replay-buffer", action=argparse.BooleanOptionalAction, default=_save_replay_default)
     parser.add_argument("--save-vecnormalize", action=argparse.BooleanOptionalAction, default=False)
 
     # Existing model continuation.
@@ -2523,7 +2674,15 @@ def parse_args():
     parser.add_argument("--load-model", type=str, default="")
     parser.add_argument("--load-replay-buffer", type=str, default="")
     parser.add_argument("--resume-latest", action=argparse.BooleanOptionalAction, default=False, help="Load the newest SAC checkpoint/final model from --model-dir if --load-model is not given.")
-    parser.add_argument("--resume-replay-buffer", action=argparse.BooleanOptionalAction, default=True, help="When resuming, auto-load the matching replay buffer if present.")
+    _resume_replay_default = str(
+        os.environ.get("TB3_RL_RESUME_REPLAY_BUFFER", "0")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    parser.add_argument(
+        "--resume-replay-buffer",
+        action=argparse.BooleanOptionalAction,
+        default=_resume_replay_default,
+        help="When resuming, auto-load the matching replay buffer if present.",
+    )
     parser.add_argument("--sac-reset-critics", action=argparse.BooleanOptionalAction, default=False, help="When loading a model, reinitialize SAC critics/targets but keep the actor. Useful after reward/action-execution changes.")
     parser.add_argument("--continue-timesteps", action=argparse.BooleanOptionalAction, default=True)
 
@@ -2558,6 +2717,13 @@ def parse_args():
 
 def main(args=None):
     cli_args = parse_args()
+    if _env_flag("TB3_RL_PAUSE_GAZEBO_ON_TRAIN_EXIT", True):
+        atexit.register(
+            _set_gazebo_world_paused,
+            _world_name_from_control_service(getattr(cli_args, "world_control_service", "/world/default/control")),
+            True,
+            timeout_ms=int(float(os.environ.get("TB3_RL_SENSOR_READY_WORLD_CONTROL_TIMEOUT_MS", "1500") or 1500)),
+        )
 
     if bool(getattr(cli_args, "disable_priority_map", False)) or str(os.environ.get("TB3_RL_FORCE_NO_PRIORITY", "0")).strip().lower() not in {"0", "false", "no", "off"}:
         # v93 hard no-priority observation contract.
@@ -2617,7 +2783,7 @@ def main(args=None):
     )
 
     sensor_wait_timeout = max(10.0, float(getattr(cli_args, "gazebo_sensor_wait_timeout_sec", 45.0)))
-    if not ros.wait_for_sensor_ready(timeout_sec=sensor_wait_timeout):
+    if not _wait_for_sensor_ready_with_gazebo_wake(ros, cli_args, sensor_wait_timeout):
         if not bool(getattr(cli_args, "auto_start_gazebo", False)):
             print(
                 "\n[TRAIN STARTUP ERROR] /scan and /odom were not received.\n"
@@ -2646,6 +2812,24 @@ def main(args=None):
 
     if use_slam_map and cli_args.wait_slam_map:
         ros.wait_for_slam_map_ready(timeout_sec=max(10.0, cli_args.slam_reset_timeout))
+
+    # v145: GazeboNavEnv's episode_index (and the maze curriculum keyed off
+    # it, see TB3_RL_RANDOM_MAZE_CURRICULUM*) always starts at 0 for a new
+    # process, with no persistence across restarts. Loading an existing
+    # checkpoint means real training already happened, so treat the
+    # curriculum as already complete instead of silently re-running warmup+
+    # ramp episodes at "easiest" every time this process gets relaunched.
+    # A user-set TB3_RL_EPISODE_INDEX_START always wins.
+    if str(getattr(cli_args, "load_model", "") or "").strip() and not os.environ.get("TB3_RL_EPISODE_INDEX_START", "").strip():
+        try:
+            _curriculum_skip_episodes = (
+                int(os.environ.get("TB3_RL_RANDOM_MAZE_CURRICULUM_WARMUP_EPISODES", "75") or 75)
+                + int(os.environ.get("TB3_RL_RANDOM_MAZE_CURRICULUM_RAMP_EPISODES", "600") or 600)
+                + 1
+            )
+        except Exception:
+            _curriculum_skip_episodes = 676
+        os.environ["TB3_RL_EPISODE_INDEX_START"] = str(_curriculum_skip_episodes)
 
     raw_env = GazeboNavEnv(
         ros_interface=ros,
@@ -2710,6 +2894,8 @@ def main(args=None):
         max_angular_speed=cli_args.max_angular_speed,
         velocity_command_linear_limit=cli_args.velocity_command_linear_limit,
         velocity_command_angular_limit=cli_args.velocity_command_angular_limit,
+        velocity_allow_reverse=cli_args.velocity_allow_reverse,
+        reverse_action_penalty_ratio=cli_args.reverse_action_penalty_ratio,
         action_mode=cli_args.action_mode,
         waypoint_action_type="polar",
         waypoint_lateral_max_offset=cli_args.waypoint_lateral_max_offset,
@@ -3009,6 +3195,13 @@ def main(args=None):
             print(f"[INFO] model_dir free space: ~{_free_gib:.1f} GiB", flush=True)
     except Exception:
         pass
+    print(
+        "STARTUP_STAGE | after_disk_check "
+        f"load_model={cli_args.load_model or '(new)'} "
+        f"resume_replay={int(bool(getattr(cli_args, 'resume_replay_buffer', False)))} "
+        f"save_replay={int(bool(getattr(cli_args, 'save_replay_buffer', False)))}",
+        flush=True,
+    )
 
     if bool(getattr(cli_args, "resume_latest", False)) and not str(cli_args.load_model).strip():
         latest_model = _find_latest_sac_model(model_dir)
@@ -3229,14 +3422,22 @@ def main(args=None):
             raise FileNotFoundError(f"--load-model not found: {load_path}")
 
         ros.get_logger().info(f"Loading existing SAC model: {load_path}")
+        print(f"STARTUP_STAGE | before_sac_load path={load_path}", flush=True)
         model = SAC.load(
             str(load_path),
             env=env,
             tensorboard_log=str(log_dir),
             print_system_info=False,
             device=sac_device,
-            custom_objects={"replay_buffer_class": SkipStoreDictReplayBuffer},
+            custom_objects={
+                "replay_buffer_class": SkipStoreDictReplayBuffer,
+                # Reverse velocity changes the Box low bound but not the network
+                # shape.  Load old actor weights against the current env space;
+                # the semantics version below resets critics/replay.
+                "action_space": env.action_space,
+            },
         )
+        print("STARTUP_STAGE | after_sac_load", flush=True)
         loaded_semantics_version = str(
             getattr(model, "_tb3_training_semantics_version", "legacy") or "legacy"
         )
@@ -3306,12 +3507,28 @@ def main(args=None):
             rb_path = Path(cli_args.load_replay_buffer).expanduser()
             if not rb_path.exists():
                 raise FileNotFoundError(f"--load-replay-buffer not found: {rb_path}")
-            model.load_replay_buffer(str(rb_path))
-            replay_buffer_loaded = bool(
-                getattr(model, "replay_buffer", None) is not None
-                and model.replay_buffer.size() > 0
-            )
-            ros.get_logger().info(f"Loaded replay buffer: {rb_path}")
+            try:
+                max_replay_gib = float(os.environ.get("TB3_RL_REPLAY_LOAD_MAX_GIB", "2.0") or 2.0)
+            except Exception:
+                max_replay_gib = 2.0
+            rb_gib = float(rb_path.stat().st_size) / (1024 ** 3)
+            if max_replay_gib > 0.0 and rb_gib > max_replay_gib:
+                ros.get_logger().warn(
+                    "REPLAY_BUFFER_LOAD_SKIPPED_LARGE | "
+                    f"path={rb_path} size={rb_gib:.1f}GiB > limit={max_replay_gib:.1f}GiB. "
+                    "Starting with an empty replay buffer so training begins immediately. "
+                    "Set TB3_RL_REPLAY_LOAD_MAX_GIB higher, or 0 to disable this guard."
+                )
+            else:
+                ros.get_logger().info(
+                    f"Loading replay buffer: {rb_path} size={rb_gib:.1f}GiB"
+                )
+                model.load_replay_buffer(str(rb_path))
+                replay_buffer_loaded = bool(
+                    getattr(model, "replay_buffer", None) is not None
+                    and model.replay_buffer.size() > 0
+                )
+                ros.get_logger().info(f"Loaded replay buffer: {rb_path}")
         elif semantics_migration_required:
             ros.get_logger().warn(
                 "REPLAY_BUFFER_SKIPPED_FOR_SEMANTICS_MIGRATION | "
@@ -3323,6 +3540,12 @@ def main(args=None):
                 "but the off-policy replay buffer starts from the loaded model default state. "
                 "For future continuation, train with --save-replay-buffer."
             )
+        print(
+            "STARTUP_STAGE | replay_ready "
+            f"loaded={int(bool(replay_buffer_loaded))} "
+            f"load_replay={cli_args.load_replay_buffer or '(none)'}",
+            flush=True,
+        )
         warmup_steps = max(int(cli_args.learning_starts), 0)
         if replay_buffer_loaded:
             model.learning_starts = warmup_steps
@@ -3494,6 +3717,7 @@ def main(args=None):
 
         learn_error = None
         try:
+            print("STARTUP_STAGE | before_model_learn", flush=True)
             model.learn(
                 total_timesteps=cli_args.timesteps,
                 callback=callbacks,
@@ -3611,11 +3835,27 @@ def main(args=None):
                         pass
 
     finally:
-        ros.stop_robot()
-        env.close()
-        ros.destroy_node()
-        rclpy.shutdown()
-        _terminate_process(gazebo_proc, "Gazebo")
+        try:
+            ros.stop_robot()
+        except Exception:
+            pass
+        try:
+            env.close()
+        except Exception:
+            pass
+        try:
+            ros.destroy_node()
+        except Exception:
+            pass
+        try:
+            if rclpy.ok():
+                rclpy.shutdown()
+        except Exception:
+            pass
+        try:
+            _terminate_process(gazebo_proc, "Gazebo")
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

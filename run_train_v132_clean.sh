@@ -37,9 +37,17 @@ export TB3_RL_MODEL_ODOM_TOPIC=/model/burger/odometry
 export TB3_RL_DISABLE_SHM_TRANSPORT=1
 export TB3_RL_DISABLE_BUFFER_GUARD=0
 
+# Default to the lighter RViz/debug publish mode added for better wall-clock SPS.
+# Set TB3_RL_FAST_WATCH=0 before make train to restore the fully chatty view.
+export TB3_RL_FAST_WATCH="${TB3_RL_FAST_WATCH:-1}"
+
 # ===== v132: Cartographer는 학습 프로세스가 관리 =====
 # reset 때 SLAM map/process를 초기화해서 episode 간 stale map/TF를 끊는다.
 export TB3_RL_CARTOGRAPHER_RESTART_DELAY_SEC=0.5
+# Reset warmup may advance paused Gazebo with explicit multi_step calls before
+# the first policy step. Keep that bounded so startup/reset cannot burn huge
+# chunks of simulation time while waiting for Cartographer.
+export TB3_RL_SLAM_RESET_MAX_SIM_ADVANCE_SEC="${TB3_RL_SLAM_RESET_MAX_SIM_ADVANCE_SEC:-6.0}"
 
 # reset이 어디서 오래 걸리는지 단계별(pose_reset/slam_reset/post_reset_stabilize/
 # map_reset/ready_gate/obs_info) ms로 stdout에 RESET_PROFILE 로그를 찍는다.
@@ -61,27 +69,46 @@ export TB3_RL_LIDAR_OBSTACLE_MARGIN_M=0.08
 # 기존에 이미 칠해진 confidence를 지우는 것이 아니라, 이후 업데이트에서 그 지점을
 # 넘어가는 새 painting만 막는다 (occlusion_threshold, FOV, range는 그대로).
 export TB3_RL_CONFIDENCE_LIDAR_OCCLUSION_RADIUS_CELLS=3
+export TB3_RL_CONFIDENCE_MAX_RANGE_M="${TB3_RL_CONFIDENCE_MAX_RANGE_M:-2.00}"
+export TB3_RL_CONFIDENCE_FRONT_FOV_DEG="${TB3_RL_CONFIDENCE_FRONT_FOV_DEG:-36.0}"
 
 # v133: control-dt=0.20 keeps SAC decisions/gradient updates cheap, but that
 # alone means confidence is only painted every 0.2s of sim time (sparser than
 # the original 0.1s). Split every control_dt advance into 2 physics sub-ticks
-# of 0.1s each, painting confidence after every sub-tick, while the agent
-# still only sees/acts once per 0.2s (step_count, train-freq-steps etc. are
-# unaffected). Collision/fallen are also checked after the intermediate
-# sub-tick so a hit mid-macro-step is not missed.
+# of 0.1s each, painting confidence after the first sub-tick and again at the
+# normal post-action map update, while the agent still only sees/acts once per
+# 0.2s (step_count, train-freq-steps etc. are unaffected).
 export TB3_RL_MAP_SUBSTEPS_PER_ACTION=2
 export TB3_RL_DEBUG_MAP_UPDATE_COUNT=0
 
-# RViz debug visibility: publish policy scan / map overlay diagnostics at a
-# throttled rate (every Nth step) instead of every step, so RViz has something
-# to show without reintroducing a per-step publish bottleneck. Override
-# TB3_RL_*_EVERY_N=1000000 (or blank the topic vars) from the calling shell to
-# go back to throughput-only mode for long unattended runs.
-export TB3_RL_POLICY_SCAN_TOPIC=
-export TB3_RL_POLICY_SCAN_60_TOPIC=
-export TB3_RL_POLICY_SCAN_PUBLISH_EVERY_N=1000000
-export TB3_RL_POLICY_SCAN_MARKER_TOPIC=
-export TB3_RL_RAW_SCAN_MARKER_TOPIC=
+# Optional "same-behavior, lighter dashboard" mode.  It keeps action/reward,
+# control_dt, SLAM reset, and map usage intact, but reduces RViz/debug publish
+# frequency and batches SAC updates a little more coarsely.  Use it when the
+# current motion looks right but wall-clock SPS is the sore spot.
+if [[ "${TB3_RL_FAST_WATCH:-0}" == "1" ]]; then
+    : "${TB3_RL_POLICY_SCAN_PUBLISH_EVERY_N:=5}"
+    : "${TB3_RL_MAP_PUBLISH_EVERY_N:=3}"
+    : "${TB3_RL_MAP_KEEPALIVE_SEC:=0.5}"
+    : "${TB3_RL_TRAIN_FREQ_STEPS:=8}"
+    : "${TB3_RL_GRADIENT_STEPS:=2}"
+    : "${TB3_RL_PROGRESS_PRINT_FREQ:=10}"
+    : "${TB3_RL_PROGRESS_CSV_FLUSH_EVERY:=10}"
+    echo "  ✓ TB3_RL_FAST_WATCH=1: RViz/debug publish + progress output throttled; SAC update ratio kept near baseline"
+else
+    : "${TB3_RL_TRAIN_FREQ_STEPS:=4}"
+    : "${TB3_RL_GRADIENT_STEPS:=1}"
+    : "${TB3_RL_PROGRESS_PRINT_FREQ:=10}"
+    : "${TB3_RL_PROGRESS_CSV_FLUSH_EVERY:=10}"
+fi
+
+# RViz debug visibility: keep the topics that rl_sim_headless.rviz subscribes
+# to alive by default.  The previous throughput-only defaults blanked these
+# topics, so RViz looked empty even while training was running.
+export TB3_RL_POLICY_SCAN_TOPIC="${TB3_RL_POLICY_SCAN_TOPIC:-/rl_policy_scan}"
+export TB3_RL_POLICY_SCAN_60_TOPIC="${TB3_RL_POLICY_SCAN_60_TOPIC:-/rl_policy_scan_60}"
+export TB3_RL_POLICY_SCAN_PUBLISH_EVERY_N="${TB3_RL_POLICY_SCAN_PUBLISH_EVERY_N:-1}"
+export TB3_RL_POLICY_SCAN_MARKER_TOPIC="${TB3_RL_POLICY_SCAN_MARKER_TOPIC:-/rl_policy_scan_60_points}"
+export TB3_RL_RAW_SCAN_MARKER_TOPIC="${TB3_RL_RAW_SCAN_MARKER_TOPIC:-/rl_raw_scan_points}"
 export TB3_RL_RAW_SCAN_MARKER_UNCORRECTED=0
 
 # ===== priority: disabled completely for this training run =====
@@ -165,39 +192,168 @@ export TB3_RL_MAP_CPROFILE=0
 export TB3_RL_MAP_CPROFILE_EVERY_N=150
 export TB3_RL_FAST_NO_PRIORITY_STATS="${TB3_RL_FAST_NO_PRIORITY_STATS:-1}"
 export TB3_RL_WORLD_STEP_CONTRACT_WAIT_SEC="${TB3_RL_WORLD_STEP_CONTRACT_WAIT_SEC:-0.25}"
+# After each accepted multi_step, send a final pause barrier from the env side
+# (after sim time advanced, not immediately inside the service call) so Gazebo
+# cannot free-run between policy actions.
+export TB3_RL_WORLD_STEP_POST_PAUSE_BARRIER="${TB3_RL_WORLD_STEP_POST_PAUSE_BARRIER:-1}"
+# v141: this pacing forces every step to take >= control_dt/SPEED_FACTOR of
+# *real* wall-clock time (originally added to keep RViz motion watchable),
+# which caps throughput at SPEED_FACTOR/control_dt sps regardless of how fast
+# the paused/lockstep Gazebo stepping could otherwise go. At factor=1 this
+# measured dropping overall sps from 20+ down to ~3-5. factor=3 caps at
+# ~3/0.2=15 sps -- Gazebo motion looks 3x sped up (still watchable) instead of
+# capped at real-time.
+export TB3_RL_WORLD_STEP_REALTIME_PACING="${TB3_RL_WORLD_STEP_REALTIME_PACING:-1}"
+export TB3_RL_OUTER_STEP_REALTIME_PACING="${TB3_RL_OUTER_STEP_REALTIME_PACING:-1}"
+export TB3_RL_REALTIME_PACING_SPEED_FACTOR="${TB3_RL_REALTIME_PACING_SPEED_FACTOR:-3.0}"
+export TB3_RL_WORLD_STEP_REALTIME_CHUNK_SEC="${TB3_RL_WORLD_STEP_REALTIME_CHUNK_SEC:-0.02}"
+export TB3_RL_WORLD_STEP_MAX_OVERSHOOT_SEC="${TB3_RL_WORLD_STEP_MAX_OVERSHOOT_SEC:-0.025}"
+# In visible free-running Gazebo mode, keep one action equal to control_dt in
+# /clock time, not wall-clock time.  With SIM_UPDATE_RATE=400 (~2x realtime),
+# control_dt=0.20 should hold the command for about 0.10s wall while preserving
+# the intended 5 policy decisions per simulated second.
+export TB3_RL_REALTIME_CONTROL_DT_CLOCK="${TB3_RL_REALTIME_CONTROL_DT_CLOCK:-sim}"
+export TB3_RL_REALTIME_SIM_DT_TIMEOUT_SEC="${TB3_RL_REALTIME_SIM_DT_TIMEOUT_SEC:-1.0}"
+# Pause Gazebo between direct-control ticks instead of relying on cmd_vel=0
+# while physics is still running. This keeps the robot and moving obstacles
+# frozen together outside the action window, and makes exec_v closer to the
+# velocity that was actually commanded during the action.
+export TB3_RL_PAUSE_WORLD_EACH_ACTION="${TB3_RL_PAUSE_WORLD_EACH_ACTION:-1}"
+export TB3_RL_PAUSE_WORLD_EACH_ACTION_TIMEOUT_SEC="${TB3_RL_PAUSE_WORLD_EACH_ACTION_TIMEOUT_SEC:-0.5}"
+# Gazebo is paused after each action/substep, so do not overwrite /cmd_vel with
+# zero between policy commands. The next action publishes its command before
+# unpausing; explicit stop/reset/close paths still publish zero for safety.
+export TB3_RL_STOP_AFTER_CONTROL_TICK="${TB3_RL_STOP_AFTER_CONTROL_TICK:-0}"
+# Reverse penalty debt: brief reverse is allowed as an escape tool, but
+# sustained reverse accumulates extra dense penalty and then decays when the
+# policy stops reversing.
+export TB3_RL_REVERSE_ACTION_DEBT_RAMP_STEPS="${TB3_RL_REVERSE_ACTION_DEBT_RAMP_STEPS:-10}"
+export TB3_RL_REVERSE_ACTION_DEBT_DECAY_PER_STEP="${TB3_RL_REVERSE_ACTION_DEBT_DECAY_PER_STEP:-0.12}"
+export TB3_RL_REVERSE_ACTION_DEBT_MAX_EXTRA_RATIO="${TB3_RL_REVERSE_ACTION_DEBT_MAX_EXTRA_RATIO:-0.60}"
+# During the 15k-step warmup mixer, random/noisy samples used to draw reverse
+# linear actions about half the time because the velocity action space is
+# symmetric.  Keep rare reverse exploration, but map most warmup reverse draws
+# into forward motion so early replay is not dominated by backwards driving.
+export TB3_RL_WARMUP_ACTION_REVERSE_PROB="${TB3_RL_WARMUP_ACTION_REVERSE_PROB:-0.05}"
+export TB3_RL_WARMUP_ACTION_REVERSE_MODE="${TB3_RL_WARMUP_ACTION_REVERSE_MODE:-mirror}"
+export TB3_RL_VELOCITY_MAX_LINEAR_MPS="${TB3_RL_VELOCITY_MAX_LINEAR_MPS:-0.30}"
+export TB3_RL_VELOCITY_COMMAND_LINEAR_LIMIT_MPS="${TB3_RL_VELOCITY_COMMAND_LINEAR_LIMIT_MPS:-0.22}"
+export TB3_RL_VELOCITY_REVERSE_LINEAR_LIMIT_MPS="${TB3_RL_VELOCITY_REVERSE_LINEAR_LIMIT_MPS:-0.22}"
 
 # ===== world reset (episode-level) =====
 # 정체/충돌 루프에서 물리 상태까지 확실히 초기화하려면 world reset을 함께 건다.
 export TB3_RL_WORLD_RESET_ON_EPISODE=1
-export TB3_RL_WORLD_RESET_MODE=all
+# The robot itself is runtime-spawned as the Gazebo model "burger". A full
+# WorldControl reset can invalidate runtime-created entity ids while the RL
+# reset code is already trying to teleport the robot, which produces
+# "Unable to update the pose for entity id:[0], name[burger]". Reset model
+# physics/poses only; the env still explicitly teleports Burger and refreshes
+# the maze/moving-obstacle layout below.
+export TB3_RL_WORLD_RESET_MODE="${TB3_RL_WORLD_RESET_MODE:-model_only}"
+if [[ -z "${TB3_RL_WORLD_RESET_CLEARS_RUNTIME_ENTITIES+x}" ]]; then
+    if [[ "${TB3_RL_WORLD_RESET_MODE}" == "all" ]]; then
+        export TB3_RL_WORLD_RESET_CLEARS_RUNTIME_ENTITIES=1
+    else
+        export TB3_RL_WORLD_RESET_CLEARS_RUNTIME_ENTITIES=0
+    fi
+fi
 export TB3_RL_WORLD_RESET_TIMEOUT_SEC=3.0
-# world reset(all)이 15~20개 random obstacle까지 다시 초기화하는 동안 아직 안정화가
-# 안 된 상태에서 곧바로 SetEntityPose(burger)를 부르면 "Failed to reset pose for all
-# discovered Gazebo robot candidates" 에러가 난다. world reset 직후에만 약간 더 기다린다.
+# random maze mode: start from the small empty world and create one composite
+# maze model per episode. This replaces the old many-model random obstacle
+# layout, so Gazebo has far fewer model entities while the LiDAR still sees
+# real wall geometry.
+# v142: re-enabled per explicit request despite the earlier v141 note above
+# (narrow corridors + warmup randomness drove ~75% collision-in-4-6-steps).
+# Needs run_sim_headless.sh's SIM_WORLD pointed at random_maze_empty.sdf again
+# (switched back below this block) -- the maze model provides its own walls,
+# so it cannot coexist with training_house.sdf's walls without overlap.
+export TB3_RL_RANDOM_MAZE_ENABLED=1
+export TB3_RL_RANDOM_MAZE_DISABLE_RANDOM_OBSTACLES=1
+# v150: was 20 -- felt visually static within a single watch session since a
+# lot of real time elapses per episode (Cartographer restart etc.), so 20
+# episodes can take several minutes before the layout actually changes.
+# Lowered to 8 for more perceptible variety; still far cheaper than
+# regenerating every episode.
+export TB3_RL_RANDOM_MAZE_REFRESH_EPISODES=8
+export TB3_RL_RANDOM_MAZE_WIDTH_M=8.0
+export TB3_RL_RANDOM_MAZE_HEIGHT_M=5.2
+export TB3_RL_RANDOM_MAZE_MIN_ROOM_SIZE_M=1.15
+export TB3_RL_RANDOM_MAZE_GAP_MIN_M=0.85
+export TB3_RL_RANDOM_MAZE_GAP_MAX_M=1.20
+# v150: more recursive splits (depth) and a higher inner-wall cap for a
+# visibly more intricate layout -- gap width and min room size (the two
+# knobs that actually control difficulty/collision risk) are unchanged.
+export TB3_RL_RANDOM_MAZE_MAX_DEPTH=6
+export TB3_RL_RANDOM_MAZE_MAX_INNER_WALLS=20
+# Maze curriculum: learn basic forward/turn/centering in easier rooms first,
+# then converge to the final narrow-corridor distribution above.
+export TB3_RL_RANDOM_MAZE_CURRICULUM="${TB3_RL_RANDOM_MAZE_CURRICULUM:-1}"
+export TB3_RL_RANDOM_MAZE_CURRICULUM_WARMUP_EPISODES="${TB3_RL_RANDOM_MAZE_CURRICULUM_WARMUP_EPISODES:-75}"
+export TB3_RL_RANDOM_MAZE_CURRICULUM_RAMP_EPISODES="${TB3_RL_RANDOM_MAZE_CURRICULUM_RAMP_EPISODES:-600}"
+export TB3_RL_RANDOM_MAZE_CURRICULUM_START_GAP_MIN_M="${TB3_RL_RANDOM_MAZE_CURRICULUM_START_GAP_MIN_M:-1.10}"
+export TB3_RL_RANDOM_MAZE_CURRICULUM_START_GAP_MAX_M="${TB3_RL_RANDOM_MAZE_CURRICULUM_START_GAP_MAX_M:-1.45}"
+export TB3_RL_RANDOM_MAZE_CURRICULUM_START_MIN_ROOM_SIZE_M="${TB3_RL_RANDOM_MAZE_CURRICULUM_START_MIN_ROOM_SIZE_M:-1.35}"
+export TB3_RL_RANDOM_MAZE_CURRICULUM_START_MAX_DEPTH="${TB3_RL_RANDOM_MAZE_CURRICULUM_START_MAX_DEPTH:-2}"
+export TB3_RL_RANDOM_MAZE_CURRICULUM_START_MAX_INNER_WALLS="${TB3_RL_RANDOM_MAZE_CURRICULUM_START_MAX_INNER_WALLS:-5}"
+# Static clutter inside the generated maze.  This is safer than re-enabling the
+# old global random-obstacle pool because placement is room-aware and keeps
+# spawn candidates clear.
+export TB3_RL_RANDOM_MAZE_CURRICULUM_START_CLUTTER_ROOM_FRACTION="${TB3_RL_RANDOM_MAZE_CURRICULUM_START_CLUTTER_ROOM_FRACTION:-0.50}"
+export TB3_RL_RANDOM_MAZE_CURRICULUM_START_CLUTTER_MAX_COUNT="${TB3_RL_RANDOM_MAZE_CURRICULUM_START_CLUTTER_MAX_COUNT:-4}"
+export TB3_RL_RANDOM_MAZE_CLUTTER_ENABLED="${TB3_RL_RANDOM_MAZE_CLUTTER_ENABLED:-1}"
+export TB3_RL_RANDOM_MAZE_CLUTTER_ROOM_FRACTION="${TB3_RL_RANDOM_MAZE_CLUTTER_ROOM_FRACTION:-0.55}"
+export TB3_RL_RANDOM_MAZE_CLUTTER_MAX_COUNT="${TB3_RL_RANDOM_MAZE_CLUTTER_MAX_COUNT:-14}"
+export TB3_RL_RANDOM_MAZE_CLUTTER_SIZE_MIN_M="${TB3_RL_RANDOM_MAZE_CLUTTER_SIZE_MIN_M:-0.14}"
+export TB3_RL_RANDOM_MAZE_CLUTTER_SIZE_MAX_M="${TB3_RL_RANDOM_MAZE_CLUTTER_SIZE_MAX_M:-0.34}"
+export TB3_RL_RANDOM_MAZE_CLUTTER_HEIGHT_MIN_M="${TB3_RL_RANDOM_MAZE_CLUTTER_HEIGHT_MIN_M:-0.25}"
+export TB3_RL_RANDOM_MAZE_CLUTTER_HEIGHT_MAX_M="${TB3_RL_RANDOM_MAZE_CLUTTER_HEIGHT_MAX_M:-0.65}"
+export TB3_RL_RANDOM_MAZE_CLUTTER_CLEARANCE_M="${TB3_RL_RANDOM_MAZE_CLUTTER_CLEARANCE_M:-0.50}"
+# world reset 직후 Gazebo UserCommands / pose-info가 안정화되기 전에 곧바로
+# SetEntityPose(burger)를 부르면 pose update가 실패할 수 있다. 짧게만 기다린다.
 export TB3_RL_POST_WORLD_RESET_SETTLE_SEC=0.30
-export TB3_RL_RANDOM_OBSTACLES=1
-export TB3_RL_RANDOM_OBSTACLE_COUNT_MIN=50
-export TB3_RL_RANDOM_OBSTACLE_COUNT_MAX=60
-# v135: obstacle layout only re-randomizes every N episodes; robot pose/SLAM/
-# confidence/TF etc. still reset every single episode regardless (see
+export TB3_RL_RANDOM_OBSTACLES=0
+export TB3_RL_RANDOM_OBSTACLE_COUNT_MIN=30
+export TB3_RL_RANDOM_OBSTACLE_COUNT_MAX=40
+# v135/v146: obstacle layout only re-randomizes every N episodes; robot pose/
+# SLAM/confidence/TF etc. still reset every single episode regardless (see
 # _reset_random_episode_obstacles()). N=1 would be every-episode (unchanged).
-export TB3_RL_RANDOM_OBSTACLE_REFRESH_EPISODES=5
+# Currently inert while the maze is enabled (random obstacles get force-
+# disabled, see TB3_RL_RANDOM_MAZE_DISABLE_RANDOM_OBSTACLES above) -- kept at
+# the same 20 as the maze so "20-episode map hold" is one consistent policy
+# regardless of which obstacle system ends up active.
+export TB3_RL_RANDOM_OBSTACLE_REFRESH_EPISODES=20
 export TB3_RL_RANDOM_OBSTACLE_ROBOT_CLEARANCE_M=0.85
 export TB3_RL_RANDOM_OBSTACLE_PAIR_CLEARANCE_M=0.34
 export TB3_RL_RANDOM_OBSTACLE_NOISE_SIGMA_M=0.35
-# v138: small circular obstacles that keep wandering for the whole episode
-# (separate from the static layout above -- always reset fresh every episode,
-# not throttled by RANDOM_OBSTACLE_REFRESH_EPISODES). Movement is pushed via
-# a fire-and-forget pose call once per RL step, not the CLI-based helpers
+export TB3_RL_POST_OBSTACLE_RESET_CLEARANCE_RETRIES=3
+export TB3_RL_POST_OBSTACLE_RESET_CLEARANCE_WAIT_SEC=0.40
+export TB3_RL_POST_OBSTACLE_RESET_CLEARANCE_STRICT=0
+# Static obstacles may overlap each other; only robot spawn clearance matters
+# for training. This avoids O(n^2) obstacle-obstacle placement checks.
+export TB3_RL_RANDOM_OBSTACLE_AVOID_STATIC_OVERLAP=0
+# Add SDF contact filtering so random obstacles do not request contact with
+# other random obstacles. Robot collision still works via the default robot
+# collision category.
+export TB3_RL_RANDOM_OBSTACLE_ROBOT_ONLY_COLLISION=1
+# v138/v143: small circular obstacles that spawn every episode but only start
+# wandering after the robot has actually moved. They are separate from the
+# static layout above and are not throttled by RANDOM_OBSTACLE_REFRESH_EPISODES.
+# Movement is pushed via a fire-and-forget pose call once per RL step, not the CLI-based helpers
 # used for per-episode static layout changes, so it does not reintroduce the
 # per-step overhead that TB3_RL_RANDOM_OBSTACLE_REFRESH_EPISODES was added to
 # avoid.
 export TB3_RL_RANDOM_MOVING_OBSTACLE_ENABLED=1
-export TB3_RL_RANDOM_MOVING_OBSTACLE_COUNT=5
-export TB3_RL_RANDOM_MOVING_OBSTACLE_RADIUS_MIN_M=0.12
-export TB3_RL_RANDOM_MOVING_OBSTACLE_RADIUS_MAX_M=0.25
-export TB3_RL_RANDOM_MOVING_OBSTACLE_SPEED_MIN_MPS=0.08
-export TB3_RL_RANDOM_MOVING_OBSTACLE_SPEED_MAX_MPS=0.22
+export TB3_RL_RANDOM_MOVING_OBSTACLE_COUNT=3
+export TB3_RL_RANDOM_MOVING_OBSTACLE_RADIUS_MIN_M=0.055
+export TB3_RL_RANDOM_MOVING_OBSTACLE_RADIUS_MAX_M=0.11
+export TB3_RL_RANDOM_MOVING_OBSTACLE_HEIGHT_M=0.25
+# v144: was 0.08-0.22 m/s -- the top end matched the robot's own max linear
+# speed (0.22 m/s), which is far too fast inside maze corridors only
+# 0.85-1.2m wide (gap_min/max above): the robot has almost no room to react,
+# so episodes kept dying to a moving obstacle regardless of the robot's own
+# behavior. Slowed to ambient-wandering speed instead of robot-speed threat.
+export TB3_RL_RANDOM_MOVING_OBSTACLE_SPEED_MIN_MPS=0.015
+export TB3_RL_RANDOM_MOVING_OBSTACLE_SPEED_MAX_MPS=0.05
 # Coverage/confidence 부족은 종료 조건이 아니라 reward/diagnostic 신호로만 사용한다.
 # v132: SLAM/confidence/coverage 업데이트가 같이 멈춘 episode tail은 penalty 없이 reset한다.
 
@@ -283,6 +439,15 @@ else
     echo "  DDS 안정화 대기 (3초)..."
     sleep 3
 fi
+# Do not pause before the training node exists: the new node still needs fresh
+# /scan and /odom callbacks. train_sac.py briefly wakes a paused world for
+# startup sensors, then GazeboNavEnv enforces the fixed multi_step contract.
+if [[ "${TB3_RL_PAUSE_GAZEBO_BEFORE_TRAIN:-0}" == "1" ]]; then
+    tb3_rl_pause_gazebo_world default "${TB3_RL_PAUSE_GAZEBO_TIMEOUT_MS:-1500}" || {
+        echo "[오류] Gazebo pause 실패: 5 steps/sec sim-time contract를 보장할 수 없습니다."
+        exit 1
+    }
+fi
 
 # ============================================================
 # 학습 실행
@@ -299,10 +464,40 @@ fi
 # successfully saved migrated checkpoint will not reset critics again even if
 # it is copied to another directory.
 
-REPLAY_RESUME_ARG=(--resume-replay-buffer)
-if [[ "${TB3_RL_RESUME_REPLAY_BUFFER:-1}" == "0" ]]; then
-    echo "  ✓ TB3_RL_RESUME_REPLAY_BUFFER=0: actor만 재사용하고 replay는 새로 시작"
+REPLAY_RESUME_ARG=(--no-resume-replay-buffer)
+if [[ "${TB3_RL_RESUME_REPLAY_BUFFER:-0}" == "1" ]]; then
+    echo "  ✓ TB3_RL_RESUME_REPLAY_BUFFER=1: 저장된 replay buffer까지 재사용"
+    REPLAY_RESUME_ARG=(--resume-replay-buffer)
+else
+    echo "  ✓ replay buffer 재사용 안 함: actor/model만 재사용하고 replay는 새로 시작"
     REPLAY_RESUME_ARG=(--no-resume-replay-buffer)
+fi
+
+REPLAY_SAVE_ARG=(--no-save-replay-buffer)
+if [[ "${TB3_RL_SAVE_REPLAY_BUFFER:-0}" == "1" ]]; then
+    echo "  ✓ TB3_RL_SAVE_REPLAY_BUFFER=1: checkpoint/final replay buffer 저장 활성화"
+    REPLAY_SAVE_ARG=(--save-replay-buffer)
+else
+    echo "  ✓ replay buffer 저장 안 함: 10GiB+ pickle 저장/로드 지연 방지"
+fi
+
+WORLD_STEP_ARG=(
+    --disable-world-step
+    --realtime-enforce-control-dt
+    --realtime-spin-steps 8
+    --realtime-spin-timeout-sec 0.001
+    --realtime-sleep-sec 0.0
+)
+if [[ "${TB3_RL_LOCKSTEP_WORLD_STEP:-0}" == "1" ]]; then
+    echo "  ✓ TB3_RL_LOCKSTEP_WORLD_STEP=1: Gazebo lockstep world-step 모드 사용 (RViz는 paused 구간에서 덜 보일 수 있음)"
+    WORLD_STEP_ARG=(
+        --world-step-target-fraction 1.0
+        --world-step-wait-timeout-sec 0.10
+        --world-step-sensor-timeout-sec 0.08
+        --no-world-step-auto-disable
+    )
+else
+    echo "  ✓ RViz visible mode: --disable-world-step + realtime control_dt로 /scan,/tf,/map 지속 발행"
 fi
 
 # Fast confidence-visible mode with a fixed sim-time control contract:
@@ -325,11 +520,11 @@ python3 -m turtlebot3_rl_training.train_sac \
     --sac-learning-rate 0.0001 \
     --sac-gamma 0.97 \
     --sac-use-sde \
-    --sac-sde-sample-freq 4 \
+    --sac-sde-sample-freq "${TB3_RL_SAC_SDE_SAMPLE_FREQ:-8}" \
     --sac-target-entropy -2.0 \
-    --sac-reset-ent-coef 0.20 \
+    --sac-reset-ent-coef "${TB3_RL_SAC_RESET_ENT_COEF:-0.24}" \
     --sac-min-ent-coef 0.03 \
-    --sac-max-ent-coef 0.20 \
+    --sac-max-ent-coef "${TB3_RL_SAC_MAX_ENT_COEF:-0.24}" \
     --warmup-action-steps 15000 \
     --warmup-action-zero-linear-prob 0.05 \
     --warmup-action-random-prob 0.45 \
@@ -338,10 +533,7 @@ python3 -m turtlebot3_rl_training.train_sac \
     --reward-gamma 0.97 \
     --control-dt 0.20 \
     --physics-step-size 0.005 \
-    --world-step-target-fraction 1.0 \
-    --world-step-wait-timeout-sec 0.10 \
-    --world-step-sensor-timeout-sec 0.05 \
-    --no-world-step-auto-disable \
+    "${WORLD_STEP_ARG[@]}" \
     --max-episode-steps 5000 \
     --entity-name burger \
     --set-pose-service /world/default/set_pose \
@@ -360,18 +552,21 @@ python3 -m turtlebot3_rl_training.train_sac \
     --vector-features-dim 96 \
     --combined-features-dim 192 \
     \
-    --max-linear-speed 0.22 \
+    --max-linear-speed "${TB3_RL_VELOCITY_MAX_LINEAR_MPS}" \
     --max-angular-speed 0.70 \
-    --velocity-command-linear-limit 0.22 \
+    --velocity-command-linear-limit "${TB3_RL_VELOCITY_COMMAND_LINEAR_LIMIT_MPS}" \
     --velocity-command-angular-limit 0.70 \
+    --velocity-allow-reverse \
+    --reverse-action-penalty-ratio "${TB3_RL_REVERSE_ACTION_PENALTY_RATIO:-0.03}" \
     --linear-deadband 0.02 \
     --angular-deadband 0.04 \
     --velocity-forward-assist-mps 0.00 \
     --action-smoothing-alpha 0.65 \
     \
     --max-scan-age-sec 0.50 \
+    --no-startup-require-training-geometry \
     \
-    --velocity-safety-backup \
+    --no-velocity-safety-backup \
     --velocity-safety-backup-steps 4 \
     --velocity-safety-cooldown-steps 1 \
     --velocity-safety-penalty 2.50 \
@@ -382,15 +577,15 @@ python3 -m turtlebot3_rl_training.train_sac \
     --velocity-safety-trigger-distance-m 0.22 \
     --velocity-safety-stop-distance-m 0.22 \
     --velocity-safety-slow-distance-m 0.40 \
-    --velocity-safety-slowdown \
+    --no-velocity-safety-slowdown \
     --velocity-safety-slow-min-scale 1.00 \
     --velocity-safety-slow-penalty 1.00 \
     --velocity-safety-slow-speed-power 1.20 \
     --velocity-safety-slow-danger-power 1.00 \
     \
-    --front-fov-deg 60.0 \
+    --front-fov-deg "${TB3_RL_CONFIDENCE_FRONT_FOV_DEG}" \
     --front-angle-sigma-deg 20.0 \
-    --confidence-max-range 2.0 \
+    --confidence-max-range "${TB3_RL_CONFIDENCE_MAX_RANGE_M}" \
     --seen-confidence-floor 70.0 \
     --confidence-decay-per-step 0.0 \
     --confidence-reward-weight 1.8 \
@@ -442,6 +637,7 @@ python3 -m turtlebot3_rl_training.train_sac \
     --shake-restart-penalty 20.0 \
     --restart-on-collision \
     --no-terminate-on-out-of-bounds \
+    --no-map-bounds-restart \
     --safety-boundary-radius-m 8.0 \
     \
     --slam-backend cartographer \
@@ -473,10 +669,10 @@ python3 -m turtlebot3_rl_training.train_sac \
     --reset-pose-max-attempts 20 \
     --reset-pose-min-clearance-m 0.30 \
     \
-    --rl-map-topic "" \
-    --rl-confidence-topic "" \
+    --rl-map-topic /rl_task_map \
+    --rl-confidence-topic /rl_confidence_map \
     --rl-priority-topic "" \
-    --rl-filtered-slam-topic "" \
+    --rl-filtered-slam-topic /rl_filtered_slam_map \
     --waypoint-marker-topic "" \
     --map-publish-every-n "${TB3_RL_MAP_PUBLISH_EVERY_N:-1}" \
     --map-live-update-period-sec 0 \
@@ -487,17 +683,17 @@ python3 -m turtlebot3_rl_training.train_sac \
     ${LOAD_ARG} \
     "${RESET_CRITICS_ARG[@]}" \
     "${REPLAY_RESUME_ARG[@]}" \
-    --save-replay-buffer \
-    --train-freq-steps 4 \
-    --gradient-steps 1 \
+    "${REPLAY_SAVE_ARG[@]}" \
+    --train-freq-steps "${TB3_RL_TRAIN_FREQ_STEPS}" \
+    --gradient-steps "${TB3_RL_GRADIENT_STEPS}" \
     --checkpoint-freq 50000 \
     \
     --show-training-progress \
     --progress-style block \
-    --progress-print-freq 10 \
+    --progress-print-freq "${TB3_RL_PROGRESS_PRINT_FREQ}" \
     --progress-window 10 \
     --progress-csv "${LOG_DIR}/metrics_compact_v132.csv" \
-    --progress-csv-flush-every 10 \
+    --progress-csv-flush-every "${TB3_RL_PROGRESS_CSV_FLUSH_EVERY}" \
     \
     --sac-verbose 0 \
     --debug-print-freq 0 \

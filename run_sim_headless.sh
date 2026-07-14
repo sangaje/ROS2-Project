@@ -55,7 +55,7 @@ esac
 SIM_GUI="${SIM_GUI:-false}"
 SIM_CARTO="${SIM_CARTO:-false}"
 SIM_RVIZ="${SIM_RVIZ:-true}"
-SIM_WORLD="${SIM_WORLD:-${SCRIPT_DIR}/src/turtlebot3_rl_training/world/training_house.sdf}"
+SIM_WORLD="${SIM_WORLD:-${SCRIPT_DIR}/src/turtlebot3_rl_training/world/random_maze_empty.sdf}"
 SIM_LAUNCH="${SCRIPT_DIR}/src/turtlebot3_rl_training/launch/sim_headless_rviz.launch.py"
 export TB3_RL_PREFER_SOURCE_LAUNCH="${TB3_RL_PREFER_SOURCE_LAUNCH:-1}"
 

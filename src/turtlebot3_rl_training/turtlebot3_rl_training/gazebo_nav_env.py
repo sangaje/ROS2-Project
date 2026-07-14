@@ -60,6 +60,24 @@ from turtlebot3_rl_training.reward import (
 from turtlebot3_rl_training.sim_controller import GazeboSimController
 
 
+def _is_ros_context_invalid_error(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return (
+        "context is invalid" in text
+        or "publisher's context is invalid" in text
+        or "rcl node's context is invalid" in text
+    )
+
+
+def _ros_context_ok(context=None) -> bool:
+    try:
+        if context is None:
+            return bool(rclpy.ok())
+        return bool(rclpy.ok(context=context))
+    except Exception:
+        return False
+
+
 class _ThreadSafeScanAnglesCache(dict):
     """Defensive cache for scan-angle arrays shared across env/timer callbacks.
 
@@ -331,6 +349,8 @@ class GazeboNavEnv(gym.Env):
         max_angular_speed: float = 0.90,
         velocity_command_linear_limit: float = 0.0,
         velocity_command_angular_limit: float = 0.0,
+        velocity_allow_reverse: bool = True,
+        reverse_action_penalty_ratio: float = 1.3 / abs(PHYSICAL_TERMINAL_REWARD),
         action_mode: str = "waypoint",
         waypoint_action_type: str = "polar",
         waypoint_lateral_max_offset: float = 0.20,
@@ -609,11 +629,11 @@ class GazeboNavEnv(gym.Env):
         self.random_reset_yaw = bool(random_reset_yaw)
         self.random_obstacles_enabled = str(os.environ.get("TB3_RL_RANDOM_OBSTACLES", "0")).strip().lower() in {"1", "true", "yes", "on"}
         try:
-            self.random_obstacle_count_min = max(int(os.environ.get("TB3_RL_RANDOM_OBSTACLE_COUNT_MIN", "15") or 15), 0)
-            self.random_obstacle_count_max = max(int(os.environ.get("TB3_RL_RANDOM_OBSTACLE_COUNT_MAX", "20") or 20), self.random_obstacle_count_min)
+            self.random_obstacle_count_min = max(int(os.environ.get("TB3_RL_RANDOM_OBSTACLE_COUNT_MIN", "30") or 30), 0)
+            self.random_obstacle_count_max = max(int(os.environ.get("TB3_RL_RANDOM_OBSTACLE_COUNT_MAX", "40") or 40), self.random_obstacle_count_min)
         except Exception:
-            self.random_obstacle_count_min = 15
-            self.random_obstacle_count_max = 20
+            self.random_obstacle_count_min = 30
+            self.random_obstacle_count_max = 40
         try:
             self.random_obstacle_robot_clearance_m = max(float(os.environ.get("TB3_RL_RANDOM_OBSTACLE_ROBOT_CLEARANCE_M", "0.85") or 0.85), 0.30)
             self.random_obstacle_pair_clearance_m = max(float(os.environ.get("TB3_RL_RANDOM_OBSTACLE_PAIR_CLEARANCE_M", "0.34") or 0.34), 0.18)
@@ -622,6 +642,12 @@ class GazeboNavEnv(gym.Env):
             self.random_obstacle_robot_clearance_m = 0.85
             self.random_obstacle_pair_clearance_m = 0.34
             self.random_obstacle_noise_sigma_m = 0.35
+        self.random_obstacle_avoid_static_overlap = str(
+            os.environ.get("TB3_RL_RANDOM_OBSTACLE_AVOID_STATIC_OVERLAP", "0")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self.random_obstacle_robot_only_collision_filter = str(
+            os.environ.get("TB3_RL_RANDOM_OBSTACLE_ROBOT_ONLY_COLLISION", "1")
+        ).strip().lower() in {"1", "true", "yes", "on"}
         # v135: obstacle *layout* only re-randomizes every N episodes (default
         # 1 = every episode, unchanged). Robot pose/SLAM/confidence/TF etc.
         # still reset every episode regardless of this value -- this only
@@ -634,6 +660,176 @@ class GazeboNavEnv(gym.Env):
             self.random_obstacle_refresh_episodes = 1
         self.random_obstacle_prefix = str(os.environ.get("TB3_RL_RANDOM_OBSTACLE_PREFIX", "tb3_rl_rand_obs")).strip() or "tb3_rl_rand_obs"
         self.random_obstacle_world_name = self._world_name_from_service_path(world_control_service, fallback="default")
+        self.random_maze_enabled = str(
+            os.environ.get("TB3_RL_RANDOM_MAZE_ENABLED", "0")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self.random_maze_disable_random_obstacles = str(
+            os.environ.get("TB3_RL_RANDOM_MAZE_DISABLE_RANDOM_OBSTACLES", "1")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self.random_maze_model_name = str(
+            os.environ.get("TB3_RL_RANDOM_MAZE_MODEL_NAME", "tb3_rl_random_maze")
+        ).strip() or "tb3_rl_random_maze"
+        try:
+            self.random_maze_refresh_episodes = max(
+                int(os.environ.get("TB3_RL_RANDOM_MAZE_REFRESH_EPISODES", "1") or 1),
+                1,
+            )
+        except Exception:
+            self.random_maze_refresh_episodes = 1
+        self.random_maze_width_m = max(
+            float(os.environ.get("TB3_RL_RANDOM_MAZE_WIDTH_M", "8.0") or 8.0),
+            3.0,
+        )
+        self.random_maze_height_m = max(
+            float(os.environ.get("TB3_RL_RANDOM_MAZE_HEIGHT_M", "5.2") or 5.2),
+            3.0,
+        )
+        self.random_maze_wall_thickness_m = float(
+            np.clip(float(os.environ.get("TB3_RL_RANDOM_MAZE_WALL_THICKNESS_M", "0.16") or 0.16), 0.08, 0.35)
+        )
+        self.random_maze_wall_height_m = max(
+            float(os.environ.get("TB3_RL_RANDOM_MAZE_WALL_HEIGHT_M", "1.0") or 1.0),
+            0.30,
+        )
+        self.random_maze_min_room_size_m = max(
+            float(os.environ.get("TB3_RL_RANDOM_MAZE_MIN_ROOM_SIZE_M", "1.15") or 1.15),
+            0.75,
+        )
+        self.random_maze_gap_min_m = max(
+            float(os.environ.get("TB3_RL_RANDOM_MAZE_GAP_MIN_M", "0.85") or 0.85),
+            0.45,
+        )
+        self.random_maze_gap_max_m = max(
+            float(os.environ.get("TB3_RL_RANDOM_MAZE_GAP_MAX_M", "1.20") or 1.20),
+            self.random_maze_gap_min_m,
+        )
+        self.random_maze_max_depth = max(
+            int(os.environ.get("TB3_RL_RANDOM_MAZE_MAX_DEPTH", "4") or 4),
+            1,
+        )
+        self.random_maze_max_inner_walls = max(
+            int(os.environ.get("TB3_RL_RANDOM_MAZE_MAX_INNER_WALLS", "12") or 12),
+            1,
+        )
+        self.random_maze_curriculum_enabled = str(
+            os.environ.get("TB3_RL_RANDOM_MAZE_CURRICULUM", "0")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        try:
+            self.random_maze_curriculum_warmup_episodes = max(
+                int(os.environ.get("TB3_RL_RANDOM_MAZE_CURRICULUM_WARMUP_EPISODES", "75") or 75),
+                0,
+            )
+        except Exception:
+            self.random_maze_curriculum_warmup_episodes = 75
+        try:
+            self.random_maze_curriculum_ramp_episodes = max(
+                int(os.environ.get("TB3_RL_RANDOM_MAZE_CURRICULUM_RAMP_EPISODES", "600") or 600),
+                0,
+            )
+        except Exception:
+            self.random_maze_curriculum_ramp_episodes = 600
+        try:
+            self.random_maze_curriculum_start_gap_min_m = max(
+                float(os.environ.get("TB3_RL_RANDOM_MAZE_CURRICULUM_START_GAP_MIN_M", "1.10") or 1.10),
+                0.45,
+            )
+        except Exception:
+            self.random_maze_curriculum_start_gap_min_m = 1.10
+        try:
+            self.random_maze_curriculum_start_gap_max_m = max(
+                float(os.environ.get("TB3_RL_RANDOM_MAZE_CURRICULUM_START_GAP_MAX_M", "1.45") or 1.45),
+                self.random_maze_curriculum_start_gap_min_m,
+            )
+        except Exception:
+            self.random_maze_curriculum_start_gap_max_m = 1.45
+        try:
+            self.random_maze_curriculum_start_min_room_size_m = max(
+                float(os.environ.get("TB3_RL_RANDOM_MAZE_CURRICULUM_START_MIN_ROOM_SIZE_M", "1.35") or 1.35),
+                0.75,
+            )
+        except Exception:
+            self.random_maze_curriculum_start_min_room_size_m = 1.35
+        try:
+            self.random_maze_curriculum_start_max_depth = max(
+                int(os.environ.get("TB3_RL_RANDOM_MAZE_CURRICULUM_START_MAX_DEPTH", "2") or 2),
+                1,
+            )
+        except Exception:
+            self.random_maze_curriculum_start_max_depth = 2
+        try:
+            self.random_maze_curriculum_start_max_inner_walls = max(
+                int(os.environ.get("TB3_RL_RANDOM_MAZE_CURRICULUM_START_MAX_INNER_WALLS", "5") or 5),
+                1,
+            )
+        except Exception:
+            self.random_maze_curriculum_start_max_inner_walls = 5
+        try:
+            self.random_maze_curriculum_start_clutter_room_fraction = float(
+                np.clip(
+                    float(os.environ.get("TB3_RL_RANDOM_MAZE_CURRICULUM_START_CLUTTER_ROOM_FRACTION", "0.0") or 0.0),
+                    0.0,
+                    1.0,
+                )
+            )
+        except Exception:
+            self.random_maze_curriculum_start_clutter_room_fraction = 0.0
+        try:
+            self.random_maze_curriculum_start_clutter_max_count = max(
+                int(os.environ.get("TB3_RL_RANDOM_MAZE_CURRICULUM_START_CLUTTER_MAX_COUNT", "0") or 0),
+                0,
+            )
+        except Exception:
+            self.random_maze_curriculum_start_clutter_max_count = 0
+        self.random_maze_clutter_enabled = str(
+            os.environ.get("TB3_RL_RANDOM_MAZE_CLUTTER_ENABLED", "0")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self.random_maze_clutter_room_fraction = float(
+            np.clip(float(os.environ.get("TB3_RL_RANDOM_MAZE_CLUTTER_ROOM_FRACTION", "0.30") or 0.30), 0.0, 1.0)
+        )
+        self.random_maze_clutter_max_count = max(
+            int(os.environ.get("TB3_RL_RANDOM_MAZE_CLUTTER_MAX_COUNT", "10") or 10),
+            0,
+        )
+        self.random_maze_clutter_size_min_m = max(
+            float(os.environ.get("TB3_RL_RANDOM_MAZE_CLUTTER_SIZE_MIN_M", "0.16") or 0.16),
+            0.06,
+        )
+        self.random_maze_clutter_size_max_m = max(
+            float(os.environ.get("TB3_RL_RANDOM_MAZE_CLUTTER_SIZE_MAX_M", "0.38") or 0.38),
+            self.random_maze_clutter_size_min_m,
+        )
+        self.random_maze_clutter_height_min_m = max(
+            float(os.environ.get("TB3_RL_RANDOM_MAZE_CLUTTER_HEIGHT_MIN_M", "0.30") or 0.30),
+            0.10,
+        )
+        self.random_maze_clutter_height_max_m = max(
+            float(os.environ.get("TB3_RL_RANDOM_MAZE_CLUTTER_HEIGHT_MAX_M", "0.70") or 0.70),
+            self.random_maze_clutter_height_min_m,
+        )
+        self.random_maze_clutter_clearance_m = max(
+            float(os.environ.get("TB3_RL_RANDOM_MAZE_CLUTTER_CLEARANCE_M", "0.45") or 0.45),
+            0.20,
+        )
+        self._random_maze_active = False
+        self._random_maze_active_name = ""
+        self._random_maze_generation = -1
+        self._random_maze_layout_episode = -1
+        self._random_maze_layout_block = -1
+        self._random_maze_cached_walls: Optional[list[tuple[float, float, float, float]]] = None
+        self._random_maze_layout_hash = ""
+        self._random_maze_reset_candidates: list[tuple[float, float]] = []
+        self._random_maze_rooms: list[tuple[float, float, float, float]] = []
+        self._random_maze_clutter_entries: list[tuple[float, float, float, float, float, float, str]] = []
+        self._random_maze_wall_count = 0
+        self._random_maze_clutter_count = 0
+        self._last_random_maze_curriculum_progress = 1.0 if not self.random_maze_curriculum_enabled else 0.0
+        self._last_random_maze_gap_min_m = float(self.random_maze_gap_min_m)
+        self._last_random_maze_gap_max_m = float(self.random_maze_gap_max_m)
+        self._last_random_maze_min_room_size_m = float(self.random_maze_min_room_size_m)
+        self._last_random_maze_max_depth = int(self.random_maze_max_depth)
+        self._last_random_maze_max_inner_walls = int(self.random_maze_max_inner_walls)
+        self._last_random_maze_clutter_room_fraction = float(getattr(self, "random_maze_clutter_room_fraction", 0.0))
+        self._last_random_maze_clutter_max_count = int(getattr(self, "random_maze_clutter_max_count", 0))
         # Pool size must cover random_obstacle_count_max: count is silently
         # clamped to len(_random_obstacle_names) below (see the reset method),
         # so a pool smaller than the configured max caps the real spawn count
@@ -642,10 +838,34 @@ class GazeboNavEnv(gym.Env):
             f"{self.random_obstacle_prefix}_{idx}" for idx in range(int(self.random_obstacle_count_max))
         ]
         self._active_random_obstacle_names: list[str] = []
+        self._active_random_obstacle_entries: list[dict] = []
         self._known_random_obstacle_names: set[str] = set()
+        try:
+            self.post_obstacle_reset_clearance_retries = max(
+                int(os.environ.get("TB3_RL_POST_OBSTACLE_RESET_CLEARANCE_RETRIES", "3") or 3),
+                1,
+            )
+        except Exception:
+            self.post_obstacle_reset_clearance_retries = 3
+        try:
+            self.post_obstacle_reset_clearance_wait_sec = max(
+                float(os.environ.get("TB3_RL_POST_OBSTACLE_RESET_CLEARANCE_WAIT_SEC", "0.40") or 0.40),
+                0.0,
+            )
+        except Exception:
+            self.post_obstacle_reset_clearance_wait_sec = 0.40
+        self.post_obstacle_reset_clearance_strict = str(
+            os.environ.get("TB3_RL_POST_OBSTACLE_RESET_CLEARANCE_STRICT", "1")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._last_post_obstacle_clearance_ok = True
+        self._last_post_obstacle_clearance_reason = "not_checked"
+        self._last_post_obstacle_clearance_attempts = 0
+        self._last_post_obstacle_clearance_global_min = 999.0
+        self._last_post_obstacle_clearance_front_min = 999.0
+        self._last_post_obstacle_clearance_rear_min = 999.0
 
-        # v138: a handful of small circular obstacles that keep wandering for
-        # the whole episode instead of sitting still like the obstacles above.
+        # v138/v143: a handful of small circular obstacles that can wander after
+        # the robot has actually started moving in the episode.
         # Deliberately a separate name pool/prefix so they never get swept up
         # by the static obstacle refresh/remove logic. Positions are updated
         # every RL step via a fire-and-forget pose call (set_model_poses_batch_nowait)
@@ -663,10 +883,10 @@ class GazeboNavEnv(gym.Env):
         except Exception:
             self.random_moving_obstacle_count = 5
         self.random_moving_obstacle_radius_min_m = max(
-            float(os.environ.get("TB3_RL_RANDOM_MOVING_OBSTACLE_RADIUS_MIN_M", "0.12") or 0.12), 0.04
+            float(os.environ.get("TB3_RL_RANDOM_MOVING_OBSTACLE_RADIUS_MIN_M", "0.10") or 0.10), 0.04
         )
         self.random_moving_obstacle_radius_max_m = max(
-            float(os.environ.get("TB3_RL_RANDOM_MOVING_OBSTACLE_RADIUS_MAX_M", "0.25") or 0.25),
+            float(os.environ.get("TB3_RL_RANDOM_MOVING_OBSTACLE_RADIUS_MAX_M", "0.22") or 0.22),
             self.random_moving_obstacle_radius_min_m,
         )
         self.random_moving_obstacle_height_m = max(
@@ -682,14 +902,40 @@ class GazeboNavEnv(gym.Env):
         self.random_moving_obstacle_heading_noise_rad = max(
             float(os.environ.get("TB3_RL_RANDOM_MOVING_OBSTACLE_HEADING_NOISE_RAD", "0.25") or 0.25), 0.0
         )
+        try:
+            self.moving_obstacle_start_linear_m = max(
+                float(os.environ.get("TB3_RL_MOVING_OBSTACLE_START_LINEAR_M", "0.015") or 0.015),
+                0.0,
+            )
+        except Exception:
+            self.moving_obstacle_start_linear_m = 0.015
+        try:
+            self.moving_obstacle_start_yaw_rad = max(
+                float(os.environ.get("TB3_RL_MOVING_OBSTACLE_START_YAW_RAD", "0.035") or 0.035),
+                0.0,
+            )
+        except Exception:
+            self.moving_obstacle_start_yaw_rad = 0.035
         self.random_moving_obstacle_prefix = str(
             os.environ.get("TB3_RL_RANDOM_MOVING_OBSTACLE_PREFIX", "tb3_rl_mov_obs")
         ).strip() or "tb3_rl_mov_obs"
         self._random_moving_obstacle_names = [
             f"{self.random_moving_obstacle_prefix}_{idx}" for idx in range(int(self.random_moving_obstacle_count))
         ]
+        self._moving_obstacle_generation = -1
+        self._active_moving_obstacle_names: list[str] = []
         self._known_moving_obstacle_names: set[str] = set()
         self._moving_obstacle_state: list[dict] = []
+        self._moving_obstacles_motion_started = False
+        self._moving_obstacles_start_step = -1
+        self._moving_obstacles_start_reason = "waiting_for_robot_motion"
+        self._moving_obstacles_reference_pose = None
+        self._moving_obstacles_last_delta_m = 0.0
+        self._moving_obstacles_last_delta_yaw_rad = 0.0
+        if bool(getattr(self, "random_maze_enabled", False)) and bool(
+            getattr(self, "random_maze_disable_random_obstacles", True)
+        ):
+            self.random_obstacles_enabled = False
 
         self.control_dt = float(control_dt)
         # v133: decouple confidence-map sampling density from the SAC decision
@@ -716,6 +962,46 @@ class GazeboNavEnv(gym.Env):
         self.world_step_stale_warn_every_n = max(int(world_step_stale_warn_every_n), 1)
         self.world_step_auto_disable_on_stale = bool(world_step_auto_disable_on_stale)
         self.world_step_stale_limit = max(int(world_step_stale_limit), 1)
+        self.world_step_post_pause_barrier = str(
+            os.environ.get("TB3_RL_WORLD_STEP_POST_PAUSE_BARRIER", "1")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self.world_step_realtime_pacing = str(
+            os.environ.get("TB3_RL_WORLD_STEP_REALTIME_PACING", "1")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self.outer_step_realtime_pacing = str(
+            os.environ.get("TB3_RL_OUTER_STEP_REALTIME_PACING", "1")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        # v141: both pacing mechanisms below used to always target exactly 1x
+        # real time. A factor > 1 paces to that many multiples of real time
+        # instead (e.g. 3.0 = Gazebo motion looks 3x sped up in RViz) --
+        # still bounded/watchable, but not throttled all the way down to 1x.
+        try:
+            self.realtime_pacing_speed_factor = max(
+                float(os.environ.get("TB3_RL_REALTIME_PACING_SPEED_FACTOR", "1.0") or 1.0),
+                0.001,
+            )
+        except Exception:
+            self.realtime_pacing_speed_factor = 1.0
+        try:
+            self.world_step_realtime_chunk_sec = max(
+                float(os.environ.get("TB3_RL_WORLD_STEP_REALTIME_CHUNK_SEC", "0.02") or 0.02),
+                0.0,
+            )
+        except Exception:
+            self.world_step_realtime_chunk_sec = 0.02
+        try:
+            # v142: tightened from 0.025 (5 physics ticks) to 1 tick -- the
+            # smallest slack possible given physics only advances in discrete
+            # physics_step_size units. Combined with the physics_step_size*1.0
+            # floor below (was *2.5), a step now hard-fails (RecoverableResetError)
+            # on any overshoot beyond one tick instead of silently tolerating
+            # up to 5 ticks of drift past the requested control_dt.
+            self.world_step_max_overshoot_sec = max(
+                float(os.environ.get("TB3_RL_WORLD_STEP_MAX_OVERSHOOT_SEC", "0.005") or 0.005),
+                0.0,
+            )
+        except Exception:
+            self.world_step_max_overshoot_sec = 0.005
         try:
             self.world_step_contract_wait_sec = max(
                 float(os.environ.get("TB3_RL_WORLD_STEP_CONTRACT_WAIT_SEC", "0.25") or 0.25),
@@ -747,7 +1033,54 @@ class GazeboNavEnv(gym.Env):
         self.realtime_sleep_sec = max(float(realtime_sleep_sec), 0.0)
         self.realtime_enforce_control_dt = bool(realtime_enforce_control_dt)
         self.realtime_control_dt_wall_margin_sec = max(float(realtime_control_dt_wall_margin_sec), 0.0)
+        _realtime_clock = str(os.environ.get("TB3_RL_REALTIME_CONTROL_DT_CLOCK", "wall")).strip().lower()
+        if _realtime_clock in {"sim", "sim_time", "simulation", "clock", "/clock"}:
+            self.realtime_control_dt_clock = "sim"
+        else:
+            self.realtime_control_dt_clock = "wall"
+        try:
+            self.realtime_sim_dt_timeout_sec = max(
+                float(os.environ.get("TB3_RL_REALTIME_SIM_DT_TIMEOUT_SEC", "1.0") or 1.0),
+                0.0,
+            )
+        except Exception:
+            self.realtime_sim_dt_timeout_sec = 1.0
+        self.pause_world_each_action = str(
+            os.environ.get("TB3_RL_PAUSE_WORLD_EACH_ACTION", "0")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        try:
+            self.pause_world_each_action_timeout_sec = max(
+                float(os.environ.get("TB3_RL_PAUSE_WORLD_EACH_ACTION_TIMEOUT_SEC", "0.5") or 0.5),
+                0.05,
+            )
+        except Exception:
+            self.pause_world_each_action_timeout_sec = 0.5
+        # With pause-per-action enabled, Gazebo is frozen after each consumed
+        # control_dt.  Keeping the last non-zero command latched while paused is
+        # preferable: the next policy command replaces it before unpause, and we
+        # avoid flooding /cmd_vel with zeros between every action/substep.
+        _default_stop_after_control_tick = "0" if self.pause_world_each_action else "1"
+        self.stop_after_control_tick = str(
+            os.environ.get("TB3_RL_STOP_AFTER_CONTROL_TICK", _default_stop_after_control_tick)
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        try:
+            self.stop_after_control_tick_publish_count = max(
+                int(os.environ.get("TB3_RL_STOP_AFTER_CONTROL_TICK_PUBLISH_COUNT", "2") or 2),
+                1,
+            )
+        except Exception:
+            self.stop_after_control_tick_publish_count = 2
+        try:
+            self.stop_after_control_tick_spin_steps = max(
+                int(os.environ.get("TB3_RL_STOP_AFTER_CONTROL_TICK_SPIN_STEPS", "4") or 4),
+                0,
+            )
+        except Exception:
+            self.stop_after_control_tick_spin_steps = 4
         self._last_realtime_step_wall_elapsed_sec = 0.0
+        self._last_pause_world_each_action_used = False
+        self._last_pause_world_each_action_ok = True
+        self._last_pause_world_each_action_reason = "disabled"
         self._world_step_stale_count = 0
         # Lifetime (never-reset) counter of steps where Gazebo returned before
         # sim-time/odom/sensor actually advanced by the requested control_dt.
@@ -765,6 +1098,10 @@ class GazeboNavEnv(gym.Env):
         self.world_reset_mode = str(
             os.environ.get("TB3_RL_WORLD_RESET_MODE", "all")
         ).strip().lower() or "all"
+        _runtime_clear_default = "1" if self.world_reset_mode == "all" else "0"
+        self.world_reset_clears_runtime_entities = str(
+            os.environ.get("TB3_RL_WORLD_RESET_CLEARS_RUNTIME_ENTITIES", _runtime_clear_default)
+        ).strip().lower() in {"1", "true", "yes", "on"}
         try:
             self.world_reset_timeout_sec = max(
                 float(os.environ.get("TB3_RL_WORLD_RESET_TIMEOUT_SEC", "3.0") or 3.0),
@@ -842,6 +1179,45 @@ class GazeboNavEnv(gym.Env):
         )
         self.velocity_command_linear_limit = float(np.clip(self.velocity_command_linear_limit, 0.0, self.max_linear_speed))
         self.velocity_command_angular_limit = float(np.clip(self.velocity_command_angular_limit, 0.0, self.max_angular_speed))
+        self.velocity_allow_reverse = bool(velocity_allow_reverse)
+        try:
+            reverse_limit = float(os.environ.get("TB3_RL_VELOCITY_REVERSE_LINEAR_LIMIT_MPS", "0.0") or 0.0)
+        except Exception:
+            reverse_limit = 0.0
+        if reverse_limit <= 0.0:
+            reverse_limit = float(self.max_linear_speed)
+        if not self.velocity_allow_reverse:
+            reverse_limit = 0.0
+        self.velocity_reverse_linear_limit = float(np.clip(reverse_limit, 0.0, self.max_linear_speed))
+        self.reverse_action_penalty_ratio = max(float(reverse_action_penalty_ratio), 0.0)
+        self.reverse_action_penalty_max = abs(float(PHYSICAL_TERMINAL_REWARD)) * float(self.reverse_action_penalty_ratio)
+        try:
+            self.reverse_action_debt_ramp_steps = max(
+                float(os.environ.get("TB3_RL_REVERSE_ACTION_DEBT_RAMP_STEPS", "10") or 10),
+                1.0,
+            )
+        except Exception:
+            self.reverse_action_debt_ramp_steps = 10.0
+        try:
+            self.reverse_action_debt_decay_per_step = max(
+                float(os.environ.get("TB3_RL_REVERSE_ACTION_DEBT_DECAY_PER_STEP", "0.12") or 0.12),
+                0.0,
+            )
+        except Exception:
+            self.reverse_action_debt_decay_per_step = 0.12
+        try:
+            self.reverse_action_debt_max_extra_ratio = max(
+                float(os.environ.get("TB3_RL_REVERSE_ACTION_DEBT_MAX_EXTRA_RATIO", "0.60") or 0.60),
+                0.0,
+            )
+        except Exception:
+            self.reverse_action_debt_max_extra_ratio = 0.60
+        self._reverse_action_penalty_debt = 0.0
+        self._last_reverse_action_penalty = 0.0
+        self._last_reverse_action_penalty_base = 0.0
+        self._last_reverse_action_penalty_norm = 0.0
+        self._last_reverse_action_penalty_debt = 0.0
+        self._last_reverse_action_penalty_multiplier = 1.0
 
         # Episode safety envelope. Out-of-envelope poses are treated as
         # collision-like terminal states because they usually mean the robot has
@@ -1352,7 +1728,20 @@ class GazeboNavEnv(gym.Env):
         self.restart_slam_on_reset = bool(restart_slam_on_reset)
         self.reset_slam_every_n_episodes = max(int(reset_slam_every_n_episodes), 0)
         self.reset_tf_buffer_on_reset = bool(reset_tf_buffer_on_reset)
-        self.episode_index = 0
+        # v145: episode_index (and therefore the maze curriculum below, which
+        # is keyed off it) always started at 0 for a brand new process, with
+        # no persistence across restarts. Every --load-model/--resume-latest
+        # relaunch this whole session therefore silently reset the maze
+        # curriculum back to "easiest" and made it re-climb warmup+ramp
+        # episodes from scratch, even though the loaded checkpoint already
+        # represented far more training than that. train_sac.py sets
+        # TB3_RL_EPISODE_INDEX_START past warmup+ramp when --load-model is
+        # used specifically to avoid this; 0 (unset) preserves old behavior
+        # for a genuinely fresh run.
+        try:
+            self.episode_index = max(int(os.environ.get("TB3_RL_EPISODE_INDEX_START", "0") or 0), 0)
+        except Exception:
+            self.episode_index = 0
         self.slam_reset_timeout_sec = float(slam_reset_timeout_sec)
         self.slam_reset_warmup_steps = max(int(slam_reset_warmup_steps), 0)
         self.ignore_slam_prior_this_episode = False
@@ -1482,15 +1871,11 @@ class GazeboNavEnv(gym.Env):
         self.directional_bias_accum = 0.0
         self._directional_bias_sign = 0
 
-        # v134: set at each episode reset; consumed (and cleared) by the next
-        # confidence update to paint a full circle around the spawn point.
-        self._pending_omnidirectional_confidence_seed = False
-
         # Policy 출력은 바로 cmd_vel로 보내지 않고, 물리적으로 가능한 제어 신호로 필터링한다.
         # 목적:
         #   - 좌우 각속도 sign flip으로 생기는 본체 떨림 억제
         #   - 직진/호 주행/제자리 회전 모드가 매 step 흔들리지 않게 hysteresis 부여
-        #   - 후진은 action_space에서 이미 제거되어 있으므로 linear_x는 [0, max_linear_speed] 유지
+        #   - velocity_allow_reverse=True면 linear_x는 [-reverse_limit, max_linear_speed] 허용
         self.filtered_action = np.zeros(2, dtype=np.float32)
         self.raw_action = np.zeros(2, dtype=np.float32)
         self.prev_policy_action = np.zeros(2, dtype=np.float32)
@@ -1544,14 +1929,35 @@ class GazeboNavEnv(gym.Env):
                 reset_z=reset_z,
             )
 
-        if self.use_world_step:
+        # v146: used to only exist when use_world_step was on, so
+        # world_reset_on_episode (a separate flag) would silently no-op its
+        # sim_controller.reset_world() calls if someone ever ran with
+        # --disable-world-step but still wanted per-episode world resets.
+        # Anything that needs to talk to Gazebo's world control (lockstep
+        # stepping, world reset, or pausing during reset) shares the same
+        # controller/bridge instead of each needing it created separately.
+        needs_world_control = (
+            self.use_world_step
+            or bool(getattr(self, "world_reset_on_episode", False))
+            or bool(getattr(self, "pause_world_each_action", False))
+        )
+        if needs_world_control:
             self.sim_controller = GazeboSimController(
                 node=self.ros,
                 control_service=world_control_service,
                 auto_start_bridge=True,
             )
 
-            self.sim_controller.pause(True)
+            # Lockstep and pause-per-action realtime modes both want Gazebo
+            # paused between policy actions.  The action executor publishes the
+            # next cmd_vel while paused, then unpauses only for the measured
+            # control_dt slice, so dynamic obstacles and robot physics advance
+            # together and stop together.
+            if (self.use_world_step or bool(getattr(self, "pause_world_each_action", False))) and not self.sim_controller.pause(True):
+                raise RuntimeError(
+                    "WORLD_STEP_PAUSE_FAILED: cannot enforce 5 steps/sec sim-time contract "
+                    "without a working /world/default/control pause service"
+                )
 
             self.ros.get_logger().info(
                 "World stepping enabled: "
@@ -1740,9 +2146,11 @@ class GazeboNavEnv(gym.Env):
                 dtype=np.float32,
             )
         else:
-            # Backward-compatible direct velocity mode.
+            # Direct velocity mode.  Reverse is a policy action when enabled,
+            # not only an internal safety-backup command.
+            linear_low = -float(getattr(self, "velocity_reverse_linear_limit", self.max_linear_speed)) if bool(getattr(self, "velocity_allow_reverse", True)) else 0.0
             self.action_space = spaces.Box(
-                low=np.array([0.0, -self.max_angular_speed], dtype=np.float32),
+                low=np.array([linear_low, -self.max_angular_speed], dtype=np.float32),
                 high=np.array(
                     [self.max_linear_speed, self.max_angular_speed], dtype=np.float32
                 ),
@@ -2119,11 +2527,11 @@ class GazeboNavEnv(gym.Env):
         self._last_coverage_stall_window_len = 0
         self._last_coverage_stall_no_progress_steps = 0
 
-        # Direct velocity safety shield.  The policy action space remains forward-only
-        # [0, max_linear_speed] x [-max_angular_speed, max_angular_speed], but the
-        # shield may temporarily publish a negative linear velocity to escape an
-        # imminent front collision.  A dense penalty is added in step(); actual
-        # collision still terminates/resets exactly as before.
+        # Direct velocity safety shield.  In velocity_allow_reverse mode the
+        # policy may command signed linear.x directly.  Positive commands still
+        # use the forward backup/slowdown shield; negative policy reverse
+        # commands are allowed but do not receive confidence/map information
+        # rewards in step().
         self.velocity_safety_backup = bool(velocity_safety_backup)
         self.velocity_safety_trigger_distance_m = max(float(velocity_safety_trigger_distance_m), 0.05)
         self.velocity_safety_stop_distance_m = max(float(velocity_safety_stop_distance_m), self.velocity_safety_trigger_distance_m)
@@ -2167,7 +2575,18 @@ class GazeboNavEnv(gym.Env):
         self._last_velocity_safety_slowdown_risk = 0.0
         self._last_velocity_safety_policy_v = 0.0
         self._last_velocity_safety_executed_v = 0.0
+        self._last_velocity_commanded_v = 0.0
+        self._last_velocity_commanded_w = 0.0
+        self._last_velocity_execution_source = "none"
+        self._last_velocity_execution_delta_m = 0.0
+        self._last_velocity_execution_dt_sec = 0.0
         self._last_velocity_safety_penalty = 0.0
+        self._reverse_action_penalty_debt = 0.0
+        self._last_reverse_action_penalty = 0.0
+        self._last_reverse_action_penalty_base = 0.0
+        self._last_reverse_action_penalty_norm = 0.0
+        self._last_reverse_action_penalty_debt = 0.0
+        self._last_reverse_action_penalty_multiplier = 1.0
         self._last_velocity_safety_reason = "none"
         self._last_velocity_safety_terminal_triggered = False
         self._last_velocity_safety_terminal_distance = 999.0
@@ -2549,14 +2968,506 @@ class GazeboNavEnv(gym.Env):
             geometry = f"<ellipsoid><radii>{rx:.3f} {ry:.3f} {rz:.3f}</radii></ellipsoid>"
         else:
             geometry = f"<box><size>{size_x:.3f} {size_y:.3f} {size_z:.3f}</size></box>"
+        contact_filter = ""
+        if bool(getattr(self, "random_obstacle_robot_only_collision_filter", True)):
+            # Random obstacles are category 0x0200 and only ask to collide with
+            # category bit 0x0001. Default robot collisions use category 0xffff,
+            # so robot contact still works, while obstacle-obstacle contact is
+            # filtered out. Ray/LiDAR geometry stays present.
+            contact_filter = (
+                "<surface><contact>"
+                "<category_bitmask>0x0200</category_bitmask>"
+                "<collide_bitmask>0x0001</collide_bitmask>"
+                "</contact></surface>"
+            )
         return (
             f"<sdf version='1.9'><model name='{name}'><static>true</static>"
             "<link name='link'>"
-            f"<collision name='collision'><geometry>{geometry}</geometry></collision>"
+            f"<collision name='collision'><geometry>{geometry}</geometry>{contact_filter}</collision>"
             f"<visual name='visual'><geometry>{geometry}</geometry>"
             f"<material><ambient>{color}</ambient><diffuse>{color}</diffuse></material></visual>"
             "</link></model></sdf>"
         )
+
+    @staticmethod
+    def _layout_block_for_episode(episode_index: int, refresh_every: int) -> int:
+        """Which map-layout block a given (1-indexed) episode belongs to.
+
+        block = (episode_index - 1) // refresh_every, so with refresh_every=20:
+        episodes 1-20 -> block 0, episodes 21-40 -> block 1, etc. A modulo-
+        equality check (regenerate when episode_index % refresh_every == 0)
+        looks equivalent but is off by one episode -- it regenerates *at*
+        episode 20 instead of at episode 21, so block 0 only actually covers
+        19 episodes. Comparing block numbers directly avoids that entirely.
+        """
+        refresh_every = max(int(refresh_every), 1)
+        ep = max(int(episode_index), 1)
+        return (ep - 1) // refresh_every
+
+    @staticmethod
+    def _layout_spec_hash(entries: list, extra: list) -> str:
+        """Short, stable hash of a map layout for MAP_LAYOUT_* debug logging.
+
+        Accepts a mix of dict entries (obstacle placement dicts) and plain
+        tuples (maze walls/clutter), rounds floats so float-repr jitter does
+        not change the hash, and is otherwise agnostic to caller-specific
+        field names/order.
+        """
+        import hashlib
+
+        def _norm(v):
+            if isinstance(v, dict):
+                return tuple(sorted((k, _norm(val)) for k, val in v.items()))
+            if isinstance(v, (list, tuple)):
+                return tuple(_norm(x) for x in v)
+            if isinstance(v, float):
+                return round(v, 4)
+            return v
+
+        payload = repr((_norm(list(entries)), _norm(list(extra))))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:8]
+
+    @staticmethod
+    def _maze_add_wall(
+        walls: list[tuple[float, float, float, float]],
+        x: float,
+        y: float,
+        sx: float,
+        sy: float,
+        *,
+        min_len: float = 0.18,
+    ) -> None:
+        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(sx) and math.isfinite(sy)):
+            return
+        if float(sx) <= 0.02 or float(sy) <= 0.02:
+            return
+        if max(float(sx), float(sy)) < min_len:
+            return
+        walls.append((float(x), float(y), float(sx), float(sy)))
+
+    @staticmethod
+    def _lerp_float(a: float, b: float, t: float) -> float:
+        return float(a) + (float(b) - float(a)) * float(np.clip(t, 0.0, 1.0))
+
+    def _random_maze_curriculum_progress(self) -> float:
+        if not bool(getattr(self, "random_maze_curriculum_enabled", False)):
+            return 1.0
+        episode = max(int(getattr(self, "episode_index", 0)), 0)
+        warmup = max(int(getattr(self, "random_maze_curriculum_warmup_episodes", 75)), 0)
+        ramp = max(int(getattr(self, "random_maze_curriculum_ramp_episodes", 600)), 0)
+        if ramp <= 0:
+            progress = 1.0 if episode >= warmup else 0.0
+        else:
+            progress = (float(episode) - float(warmup)) / float(ramp)
+        progress = float(np.clip(progress, 0.0, 1.0))
+        return float(progress * progress * (3.0 - 2.0 * progress))
+
+    def _random_maze_curriculum_params(self) -> dict[str, float | int]:
+        progress = self._random_maze_curriculum_progress()
+
+        gap_min = self._lerp_float(
+            float(getattr(self, "random_maze_curriculum_start_gap_min_m", 1.10)),
+            float(getattr(self, "random_maze_gap_min_m", 0.85)),
+            progress,
+        )
+        gap_max = self._lerp_float(
+            float(getattr(self, "random_maze_curriculum_start_gap_max_m", 1.45)),
+            float(getattr(self, "random_maze_gap_max_m", 1.20)),
+            progress,
+        )
+        gap_min = max(float(gap_min), 0.45)
+        gap_max = max(float(gap_max), float(gap_min))
+
+        min_room = self._lerp_float(
+            float(getattr(self, "random_maze_curriculum_start_min_room_size_m", 1.35)),
+            float(getattr(self, "random_maze_min_room_size_m", 1.15)),
+            progress,
+        )
+        max_depth = int(round(self._lerp_float(
+            int(getattr(self, "random_maze_curriculum_start_max_depth", 2)),
+            int(getattr(self, "random_maze_max_depth", 4)),
+            progress,
+        )))
+        max_inner_walls = int(round(self._lerp_float(
+            int(getattr(self, "random_maze_curriculum_start_max_inner_walls", 5)),
+            int(getattr(self, "random_maze_max_inner_walls", 12)),
+            progress,
+        )))
+        clutter_fraction = self._lerp_float(
+            float(getattr(self, "random_maze_curriculum_start_clutter_room_fraction", 0.0)),
+            float(getattr(self, "random_maze_clutter_room_fraction", 0.30)),
+            progress,
+        )
+        clutter_max_count = int(round(self._lerp_float(
+            int(getattr(self, "random_maze_curriculum_start_clutter_max_count", 0)),
+            int(getattr(self, "random_maze_clutter_max_count", 10)),
+            progress,
+        )))
+
+        params: dict[str, float | int] = {
+            "progress": progress,
+            "gap_min_m": float(gap_min),
+            "gap_max_m": float(gap_max),
+            "min_room_size_m": max(float(min_room), 0.75),
+            "max_depth": max(int(max_depth), 1),
+            "max_inner_walls": max(int(max_inner_walls), 1),
+            "clutter_room_fraction": float(np.clip(clutter_fraction, 0.0, 1.0)),
+            "clutter_max_count": max(int(clutter_max_count), 0),
+        }
+        self._last_random_maze_curriculum_progress = float(params["progress"])
+        self._last_random_maze_gap_min_m = float(params["gap_min_m"])
+        self._last_random_maze_gap_max_m = float(params["gap_max_m"])
+        self._last_random_maze_min_room_size_m = float(params["min_room_size_m"])
+        self._last_random_maze_max_depth = int(params["max_depth"])
+        self._last_random_maze_max_inner_walls = int(params["max_inner_walls"])
+        self._last_random_maze_clutter_room_fraction = float(params["clutter_room_fraction"])
+        self._last_random_maze_clutter_max_count = int(params["clutter_max_count"])
+        return params
+
+    def _generate_random_maze_layout(
+        self,
+    ) -> tuple[
+        list[tuple[float, float, float, float]],
+        list[tuple[float, float]],
+        list[tuple[float, float, float, float]],
+        list[tuple[float, float, float, float, float, float, str]],
+    ]:
+        """Generate a small connected maze as axis-aligned wall segments.
+
+        The maze is recursive-division based: each split adds exactly one wall
+        with one doorway, so every final room stays reachable while room sizes
+        vary with the random split positions.
+        """
+        width = float(getattr(self, "random_maze_width_m", 8.0))
+        height = float(getattr(self, "random_maze_height_m", 5.2))
+        t = float(getattr(self, "random_maze_wall_thickness_m", 0.16))
+        wall_h = float(getattr(self, "random_maze_wall_height_m", 1.0))
+        curriculum = self._random_maze_curriculum_params()
+        min_room = float(curriculum["min_room_size_m"])
+        gap_min = float(curriculum["gap_min_m"])
+        gap_max = float(curriculum["gap_max_m"])
+        max_depth = int(curriculum["max_depth"])
+        max_inner_walls = int(curriculum["max_inner_walls"])
+
+        xmin, xmax = -width / 2.0, width / 2.0
+        ymin, ymax = -height / 2.0, height / 2.0
+        walls: list[tuple[float, float, float, float]] = []
+        rooms: list[tuple[float, float, float, float]] = []
+        inner_wall_count = 0
+
+        self._maze_add_wall(walls, 0.0, ymax - t / 2.0, width, t)
+        self._maze_add_wall(walls, 0.0, ymin + t / 2.0, width, t)
+        self._maze_add_wall(walls, xmin + t / 2.0, 0.0, t, height)
+        self._maze_add_wall(walls, xmax - t / 2.0, 0.0, t, height)
+
+        ix0, ix1 = xmin + t, xmax - t
+        iy0, iy1 = ymin + t, ymax - t
+
+        def add_room(x0: float, x1: float, y0: float, y1: float) -> None:
+            if x1 - x0 >= 0.75 and y1 - y0 >= 0.75:
+                rooms.append((x0, x1, y0, y1))
+
+        def divide(x0: float, x1: float, y0: float, y1: float, depth: int) -> None:
+            nonlocal inner_wall_count
+            w = x1 - x0
+            h = y1 - y0
+            can_vertical = w >= (2.0 * min_room + t)
+            can_horizontal = h >= (2.0 * min_room + t)
+            if depth <= 0 or inner_wall_count >= max_inner_walls or not (can_vertical or can_horizontal):
+                add_room(x0, x1, y0, y1)
+                return
+
+            if can_vertical and can_horizontal:
+                vertical = random.random() < (w / max(w + h, 1e-6))
+            else:
+                vertical = can_vertical
+
+            if vertical:
+                split = random.uniform(x0 + min_room, x1 - min_room)
+                gap = random.uniform(gap_min, min(gap_max, max(gap_min, h - 0.35)))
+                gap_half = min(gap / 2.0, max(h / 2.0 - 0.20, 0.20))
+                gap_center = random.uniform(y0 + gap_half + 0.12, y1 - gap_half - 0.12)
+                low_len = (gap_center - gap_half) - y0
+                high_len = y1 - (gap_center + gap_half)
+                self._maze_add_wall(walls, split, y0 + low_len / 2.0, t, low_len)
+                self._maze_add_wall(walls, split, gap_center + gap_half + high_len / 2.0, t, high_len)
+                inner_wall_count += 1
+                divide(x0, split - t / 2.0, y0, y1, depth - 1)
+                divide(split + t / 2.0, x1, y0, y1, depth - 1)
+            else:
+                split = random.uniform(y0 + min_room, y1 - min_room)
+                gap = random.uniform(gap_min, min(gap_max, max(gap_min, w - 0.35)))
+                gap_half = min(gap / 2.0, max(w / 2.0 - 0.20, 0.20))
+                gap_center = random.uniform(x0 + gap_half + 0.12, x1 - gap_half - 0.12)
+                left_len = (gap_center - gap_half) - x0
+                right_len = x1 - (gap_center + gap_half)
+                self._maze_add_wall(walls, x0 + left_len / 2.0, split, left_len, t)
+                self._maze_add_wall(walls, gap_center + gap_half + right_len / 2.0, split, right_len, t)
+                inner_wall_count += 1
+                divide(x0, x1, y0, split - t / 2.0, depth - 1)
+                divide(x0, x1, split + t / 2.0, y1, depth - 1)
+
+        divide(ix0, ix1, iy0, iy1, max_depth)
+
+        candidates: list[tuple[float, float]] = []
+        clearance = max(float(getattr(self, "reset_pose_min_clearance_m", 0.30)), 0.30)
+        margin = max(clearance + 0.12, 0.42)
+        for x0, x1, y0, y1 in rooms:
+            if (x1 - x0) <= 2.0 * margin or (y1 - y0) <= 2.0 * margin:
+                cx = (x0 + x1) / 2.0
+                cy = (y0 + y1) / 2.0
+                candidates.append((cx, cy))
+                continue
+            cx = random.uniform(x0 + margin, x1 - margin)
+            cy = random.uniform(y0 + margin, y1 - margin)
+            candidates.append((cx, cy))
+            if random.random() < 0.35:
+                candidates.append(((x0 + x1) / 2.0, (y0 + y1) / 2.0))
+
+        if not candidates:
+            candidates = [(0.0, 0.0)]
+
+        clutter: list[tuple[float, float, float, float, float, float, str]] = []
+        if bool(getattr(self, "random_maze_clutter_enabled", False)) and rooms:
+            fraction = float(curriculum["clutter_room_fraction"])
+            max_count = int(curriculum["clutter_max_count"])
+            target_count = min(max_count, max(0, int(round(len(rooms) * fraction))))
+            if fraction > 0.0 and target_count <= 0:
+                target_count = min(max_count, 1)
+            room_indices = list(range(len(rooms)))
+            random.shuffle(room_indices)
+            size_min = float(getattr(self, "random_maze_clutter_size_min_m", 0.16))
+            size_max = float(getattr(self, "random_maze_clutter_size_max_m", 0.38))
+            height_min = float(getattr(self, "random_maze_clutter_height_min_m", 0.30))
+            height_max = float(getattr(self, "random_maze_clutter_height_max_m", 0.70))
+            clearance = float(getattr(self, "random_maze_clutter_clearance_m", 0.45))
+            for room_idx in room_indices:
+                if len(clutter) >= target_count:
+                    break
+                x0, x1, y0, y1 = rooms[room_idx]
+                for _attempt in range(24):
+                    shape = "cylinder" if random.random() < 0.45 else "box"
+                    if shape == "cylinder":
+                        diameter = random.uniform(size_min, size_max)
+                        sx = sy = diameter
+                    else:
+                        sx = random.uniform(size_min, size_max)
+                        sy = random.uniform(size_min, size_max)
+                        if random.random() < 0.25:
+                            sx = min(size_max * 1.35, sx * random.uniform(1.2, 1.6))
+                    sz = random.uniform(height_min, height_max)
+                    yaw = random.uniform(-math.pi, math.pi)
+                    pad = max(sx, sy) / 2.0 + 0.16
+                    if (x1 - x0) <= 2.0 * pad or (y1 - y0) <= 2.0 * pad:
+                        continue
+                    x = random.uniform(x0 + pad, x1 - pad)
+                    y = random.uniform(y0 + pad, y1 - pad)
+                    half_extent = math.hypot(sx, sy) / 2.0
+                    if any(math.hypot(x - cx, y - cy) < (clearance + half_extent) for cx, cy in candidates):
+                        continue
+                    if any(
+                        math.hypot(x - ox, y - oy) < (half_extent + math.hypot(osx, osy) / 2.0 + 0.18)
+                        for ox, oy, osx, osy, _osz, _oyaw, _oshape in clutter
+                    ):
+                        continue
+                    clutter.append((x, y, sx, sy, sz, yaw, shape))
+                    break
+
+        return walls, candidates, rooms, clutter
+
+    def _random_maze_sdf(
+        self,
+        name: str,
+        walls: list[tuple[float, float, float, float]],
+        clutter: list[tuple[float, float, float, float, float, float, str]] | None = None,
+        *,
+        color: str = "0.50 0.52 0.50 1",
+    ) -> str:
+        wall_h = float(getattr(self, "random_maze_wall_height_m", 1.0))
+        contact_filter = ""
+        if bool(getattr(self, "random_obstacle_robot_only_collision_filter", True)):
+            contact_filter = (
+                "<surface><contact>"
+                "<category_bitmask>0x0200</category_bitmask>"
+                "<collide_bitmask>0x0001</collide_bitmask>"
+                "</contact></surface>"
+            )
+        parts = [f"<sdf version='1.9'><model name='{name}'><static>true</static><link name='maze_walls'>"]
+        for idx, (x, y, sx, sy) in enumerate(walls):
+            geometry = f"<box><size>{sx:.3f} {sy:.3f} {wall_h:.3f}</size></box>"
+            pose = f"{x:.3f} {y:.3f} {wall_h / 2.0:.3f} 0 0 0"
+            parts.append(
+                f"<collision name='wall_{idx}_collision'><pose>{pose}</pose><geometry>{geometry}</geometry>{contact_filter}</collision>"
+                f"<visual name='wall_{idx}_visual'><pose>{pose}</pose><geometry>{geometry}</geometry>"
+                f"<material><ambient>{color}</ambient><diffuse>{color}</diffuse></material></visual>"
+            )
+        for idx, (x, y, sx, sy, sz, yaw, shape) in enumerate(list(clutter or [])):
+            if shape == "cylinder":
+                radius = max((float(sx) + float(sy)) / 4.0, 0.04)
+                geometry = f"<cylinder><radius>{radius:.3f}</radius><length>{sz:.3f}</length></cylinder>"
+            else:
+                geometry = f"<box><size>{sx:.3f} {sy:.3f} {sz:.3f}</size></box>"
+            pose = f"{x:.3f} {y:.3f} {sz / 2.0:.3f} 0 0 {yaw:.3f}"
+            clutter_color = "0.64 0.42 0.20 1"
+            parts.append(
+                f"<collision name='clutter_{idx}_collision'><pose>{pose}</pose><geometry>{geometry}</geometry>{contact_filter}</collision>"
+                f"<visual name='clutter_{idx}_visual'><pose>{pose}</pose><geometry>{geometry}</geometry>"
+                f"<material><ambient>{clutter_color}</ambient><diffuse>{clutter_color}</diffuse></material></visual>"
+            )
+        parts.append("</link></model></sdf>")
+        return "".join(parts)
+
+    def _current_reset_candidates(self) -> list[tuple[float, float]]:
+        if bool(getattr(self, "random_maze_enabled", False)) and getattr(self, "_random_maze_reset_candidates", None):
+            return list(getattr(self, "_random_maze_reset_candidates", []))
+        return list(getattr(self, "reset_pose_candidates", []))
+
+    def _remove_random_maze_model(self, name: Optional[str] = None) -> None:
+        if not bool(getattr(self, "random_maze_enabled", False)):
+            return
+        target = str(name) if name else str(getattr(self, "_random_maze_active_name", "") or "")
+        if not target:
+            self._random_maze_active = False
+            return
+        service = f"/world/{self.random_obstacle_world_name}/remove"
+        req = f'name: "{self._textproto_quote(target)}" type: MODEL'
+        # Best-effort: a previous world_reset_on_episode may have already
+        # destroyed this on the physics/ECM side (logs "not found, so not
+        # removed", which is expected and harmless in that case). We do not
+        # retry or block on this -- see _reset_random_maze()'s generation
+        # naming, which is what actually makes recreation safe regardless of
+        # whether this cleanup succeeds.
+        self._gz_service_bool(service, "gz.msgs.Entity", req, timeout_ms=900)
+        if not name or target == str(getattr(self, "_random_maze_active_name", "")):
+            self._random_maze_active = False
+
+    def _reset_random_maze(self, *, force_refresh: bool = False) -> None:
+        if not bool(getattr(self, "random_maze_enabled", False)):
+            return
+        refresh_every = max(int(getattr(self, "random_maze_refresh_episodes", 1)), 1)
+        layout_block = self._layout_block_for_episode(int(getattr(self, "episode_index", 0)), refresh_every)
+        cached_walls = getattr(self, "_random_maze_cached_walls", None)
+        has_spec = bool(cached_walls) and bool(getattr(self, "_random_maze_reset_candidates", []))
+        # v147: "do we need a new *random* layout" and "does the Gazebo-side
+        # entity need to be (re)created" are different questions.
+        # world_reset_on_episode wipes runtime-created models (including this
+        # one) every episode, but _random_maze_active used to be the only
+        # gate here -- once True it stayed True even after a world reset
+        # destroyed the actual entity, so a "same block, skip regeneration"
+        # episode silently left the robot in a maze-less empty world for the
+        # rest of that block. Recreation is judged solely on whether Gazebo
+        # currently has the entity (_random_maze_active); a fresh *random*
+        # layout is judged solely on the block/force_refresh, and reuses the
+        # cached spec otherwise so 20-episode-hold semantics are unaffected.
+        need_new_layout = (
+            bool(force_refresh)
+            or not has_spec
+            or layout_block != int(getattr(self, "_random_maze_layout_block", -1))
+        )
+        need_recreate = need_new_layout or not bool(getattr(self, "_random_maze_active", False))
+        if not need_recreate:
+            return
+
+        # v148: recreating under the *same* fixed name right after
+        # world_reset_on_episode destroyed the previous entity produced an
+        # infinite "Visual already exists" / entity-create-failure loop --
+        # gz-sim's render-layer SceneManager did not reliably drop the old
+        # Visual for that name in the same tick the ECM model was removed, so
+        # the new create raced a stale visual under the identical name.
+        # Monotonically-incrementing generation names never collide with a
+        # previous (possibly not-yet-fully-cleaned-up) instance, which is
+        # what actually fixes this rather than retrying the same name harder.
+        # The previous generation is still removed (best-effort) so orphaned
+        # entities do not accumulate over a long run.
+        old_name = str(getattr(self, "_random_maze_active_name", "") or "")
+        self._random_maze_generation = int(getattr(self, "_random_maze_generation", -1)) + 1
+        base_name = str(getattr(self, "random_maze_model_name", "tb3_rl_random_maze"))
+        name = f"{base_name}_g{self._random_maze_generation:04d}"
+        create_service = f"/world/{self.random_obstacle_world_name}/create"
+        if old_name:
+            self._remove_random_maze_model(old_name)
+        if need_new_layout:
+            walls, candidates, rooms, clutter = self._generate_random_maze_layout()
+        else:
+            # Reusing the cached spec: recreate the Gazebo-side entity (it was
+            # destroyed by a world reset) without calling the RNG again.
+            walls = list(cached_walls)
+            candidates = list(getattr(self, "_random_maze_reset_candidates", []))
+            rooms = list(getattr(self, "_random_maze_rooms", []))
+            clutter = list(getattr(self, "_random_maze_clutter_entries", []))
+        sdf = self._textproto_quote(self._random_maze_sdf(name, walls, clutter))
+        req = (
+            f'name: "{self._textproto_quote(name)}" allow_renaming: false '
+            f'sdf: "{sdf}" '
+            "pose { position { x: 0.000000 y: 0.000000 z: 0.000000 } orientation { w: 1.000000 } }"
+        )
+        ok = self._gz_service_bool(create_service, "gz.msgs.EntityFactory", req, timeout_ms=2200)
+        if not ok:
+            # name is a fresh generation suffix that has never been used
+            # before, so a failure here is a genuine service/timing issue,
+            # not a name collision -- no removal needed before retrying the
+            # exact same create call once more.
+            ok = self._gz_service_bool(create_service, "gz.msgs.EntityFactory", req, timeout_ms=2600)
+
+        if ok:
+            prev_block = int(getattr(self, "_random_maze_layout_block", -1))
+            prev_hash = str(getattr(self, "_random_maze_layout_hash", ""))
+            self._random_maze_active = True
+            self._random_maze_active_name = name
+            self._random_maze_layout_episode = int(getattr(self, "episode_index", 0))
+            self._random_maze_layout_block = layout_block
+            self._random_maze_cached_walls = list(walls)
+            self._random_maze_reset_candidates = [(float(x), float(y)) for x, y in candidates]
+            self._random_maze_rooms = [(float(x0), float(x1), float(y0), float(y1)) for x0, x1, y0, y1 in rooms]
+            self._random_maze_clutter_entries = list(clutter)
+            self._random_maze_wall_count = len(walls)
+            self._random_maze_clutter_count = len(clutter)
+            new_hash = self._layout_spec_hash(walls, clutter)
+            self._random_maze_layout_hash = new_hash
+            try:
+                if not need_new_layout:
+                    event = "MAP_LAYOUT_RECREATED"
+                elif prev_hash and prev_hash != new_hash:
+                    event = "MAP_LAYOUT_CHANGED"
+                else:
+                    event = "MAP_LAYOUT_GENERATED"
+                self.ros.get_logger().info(
+                    f"{event} | "
+                    f"episode={int(getattr(self, 'episode_index', 0))} block={layout_block} "
+                    f"range={layout_block * refresh_every + 1}-{(layout_block + 1) * refresh_every} "
+                    f"prev_block={prev_block} hash={new_hash} "
+                    f"walls={len(walls)} clutter={len(clutter)} candidates={len(candidates)} "
+                    f"curriculum={int(bool(getattr(self, 'random_maze_curriculum_enabled', False)))} "
+                    f"progress={float(getattr(self, '_last_random_maze_curriculum_progress', 1.0)):.3f} "
+                    f"gap=[{float(getattr(self, '_last_random_maze_gap_min_m', 0.0)):.2f},"
+                    f"{float(getattr(self, '_last_random_maze_gap_max_m', 0.0)):.2f}] "
+                    f"depth={int(getattr(self, '_last_random_maze_max_depth', 0))} "
+                    f"inner_walls={int(getattr(self, '_last_random_maze_max_inner_walls', 0))} "
+                    f"clutter_cfg={float(getattr(self, '_last_random_maze_clutter_room_fraction', 0.0)):.2f}/"
+                    f"{int(getattr(self, '_last_random_maze_clutter_max_count', 0))} "
+                    f"size=({float(getattr(self, 'random_maze_width_m', 0.0)):.1f}x"
+                    f"{float(getattr(self, 'random_maze_height_m', 0.0)):.1f}) "
+                    f"model={name}"
+                )
+                self.ros.spin_steps(num_spins=8, timeout_sec=0.002)
+                self._advance_world_after_command(target_delta_sec=0.04)
+            except Exception:
+                pass
+        else:
+            self._random_maze_active = False
+            self._random_maze_active_name = ""
+            self._random_maze_cached_walls = None
+            self._random_maze_reset_candidates = [(0.0, 0.0)]
+            self._random_maze_rooms = []
+            self._random_maze_clutter_entries = []
+            self._random_maze_wall_count = 0
+            self._random_maze_clutter_count = 0
+            try:
+                self.ros.get_logger().warn(
+                    f"RANDOM_MAZE_RESET_FAILED | model={name} service={create_service}; using center reset fallback"
+                )
+            except Exception:
+                pass
 
     def _set_random_obstacle_pose(self, name: str, x: float, y: float, z: float, yaw: float, timeout_ms: int = 900) -> bool:
         service = f"/world/{self.random_obstacle_world_name}/set_pose"
@@ -2610,7 +3521,42 @@ class GazeboNavEnv(gym.Env):
                 return False
         return True
 
-    def _reset_random_episode_obstacles(self, reset_xy: np.ndarray | None = None) -> None:
+    def _active_random_obstacle_layout_clear_for_robot(
+        self,
+        reset_xy: np.ndarray | None = None,
+    ) -> tuple[bool, str]:
+        try:
+            reset_arr = np.asarray(
+                reset_xy if reset_xy is not None else getattr(self, "current_reset_xy", np.zeros(2)),
+                dtype=np.float32,
+            )[:2]
+        except Exception:
+            reset_arr = np.zeros(2, dtype=np.float32)
+        entries = list(getattr(self, "_active_random_obstacle_entries", []) or [])
+        if not entries:
+            return False, "no_cached_entries"
+        clearance = float(getattr(self, "random_obstacle_robot_clearance_m", 0.85))
+        for e in entries:
+            try:
+                x = float(e["x"])
+                y = float(e["y"])
+                sx = float(e["sx"])
+                sy = float(e["sy"])
+                name = str(e.get("name", "unknown"))
+            except Exception:
+                return False, "bad_cached_entry"
+            half_extent = math.hypot(max(sx, 0.0), max(sy, 0.0)) / 2.0
+            dist = float(np.linalg.norm(np.asarray([x, y], dtype=np.float32) - reset_arr))
+            required = clearance + half_extent
+            if dist < required:
+                return False, f"{name}:dist={dist:.3f}<required={required:.3f}"
+        return True, f"clear:{len(entries)}"
+
+    def _reset_random_episode_obstacles(
+        self,
+        reset_xy: np.ndarray | None = None,
+        force_refresh: bool = False,
+    ) -> None:
         if not bool(getattr(self, "random_obstacles_enabled", False)):
             return
         # v135: obstacle *layout* only re-randomizes every
@@ -2624,10 +3570,26 @@ class GazeboNavEnv(gym.Env):
         # episode, existing obstacles are left exactly where they are -- no
         # reposition network calls at all, which is also most of this
         # function's per-episode cost.
-        refresh_every = int(getattr(self, "random_obstacle_refresh_episodes", 1))
+        refresh_every = max(int(getattr(self, "random_obstacle_refresh_episodes", 1)), 1)
         has_existing_layout = bool(getattr(self, "_active_random_obstacle_names", []))
-        if has_existing_layout and refresh_every > 1 and (int(getattr(self, "episode_index", 0)) % refresh_every) != 0:
-            return
+        layout_block = self._layout_block_for_episode(int(getattr(self, "episode_index", 0)), refresh_every)
+        if (
+            not bool(force_refresh)
+            and has_existing_layout
+            and refresh_every > 1
+            and layout_block == int(getattr(self, "_active_random_obstacle_layout_block", -1))
+        ):
+            layout_clear, layout_reason = self._active_random_obstacle_layout_clear_for_robot(reset_xy)
+            if layout_clear:
+                return
+            try:
+                self.ros.get_logger().warn(
+                    "RANDOM_OBSTACLES_REUSE_REJECTED | "
+                    f"episode={int(getattr(self, 'episode_index', 0))} "
+                    f"reason={layout_reason} | forcing_refresh_for_current_spawn"
+                )
+            except Exception:
+                pass
         _diag_on = str(os.environ.get("TB3_RL_RESET_PROFILER", "0")).strip().lower() in {"1", "true", "yes", "on"}
         _diag_t0 = time.perf_counter() if _diag_on else 0.0
         # Discovery is needed once after a training-process restart because the
@@ -2680,20 +3642,29 @@ class GazeboNavEnv(gym.Env):
             # clearance-satisfying space, not placement attempts. v140 pulls
             # the ceiling back down specifically to raise the *actually
             # placed* count (measured ~47 avg with these numbers, vs ~26
-            # before) while still keeping obstacles meaningfully bigger/
-            # longer than the original v135 sizes (1.65/3.2m).
+            # before). v141 lowers the requested count to 20-30 in the train
+            # script, so the individual static footprints can be bumped back
+            # up without exhausting the house layout as badly. Moving
+            # obstacles use their own small radius settings below and are not
+            # affected by these static footprint ranges. v142 keeps every
+            # static footprint axis at least 0.5m while allowing the major
+            # axis to vary up to 3.4m.
             shape = random.choice(("box", "box", "cylinder", "ellipsoid", "ellipsoid", "capsule"))
             if shape != "cylinder" and random.random() < 0.35:
-                long_len = random.uniform(1.4, 2.4)
-                short_len = random.uniform(0.10, 0.35)
+                long_len = random.uniform(1.0, 3.4)
+                short_len = random.uniform(0.5, min(1.2, long_len))
                 if random.random() < 0.5:
                     sx, sy = long_len, short_len
                 else:
                     sx, sy = short_len, long_len
             else:
-                sx = random.uniform(0.08, 1.30)
-                sy = random.uniform(0.08, 1.30)
-            sz = random.uniform(0.25, 2.40)
+                base_len = random.uniform(0.5, 3.4)
+                aspect = random.uniform(0.65, 1.0)
+                if random.random() < 0.5:
+                    sx, sy = base_len, max(0.5, base_len * aspect)
+                else:
+                    sx, sy = max(0.5, base_len * aspect), base_len
+            sz = random.uniform(0.40, 2.90)
             # Hard safety clamp: training_house.sdf's outer walls are at
             # x=+-6.5/y=+-3.5 with 0.18m thickness, so the inner face is at
             # +-6.41/+-3.41. The +-0.55m noise clip above can otherwise push an
@@ -2717,25 +3688,20 @@ class GazeboNavEnv(gym.Env):
             ):
                 continue
             yaw = random.uniform(-math.pi, math.pi)
-            # v139: obstacle-obstacle clearance used to also use the
-            # half-diagonal circle above, which is very conservative for a
-            # long/thin panel (a 4.2m x 0.1m panel got treated like a 2.1m-
-            # radius disk) -- with the v136-v137 size increases this made the
-            # room geometrically unable to fit anywhere near the requested
-            # 40-50 count (measured: ~16-17 actually placed). A proper
-            # oriented-rectangle separating-axis check respects each
-            # obstacle's real footprint/orientation instead of its worst-case
-            # diagonal, which roughly doubles how many actually fit (measured
-            # ~25).
-            if any(
-                self._obb_too_close(
-                    x, y, sx / 2.0, sy / 2.0, yaw,
-                    ox, oy, osx / 2.0, osy / 2.0, oyaw,
-                    float(self.random_obstacle_pair_clearance_m),
-                )
-                for ox, oy, osx, osy, _osz, oyaw, _oshape in selected
-            ):
-                continue
+            if bool(getattr(self, "random_obstacle_avoid_static_overlap", False)):
+                # Optional old behavior: keep static obstacles from overlapping
+                # each other. Disabled by default because training only needs
+                # robot-vs-obstacle collision, and this check grows O(n^2)
+                # during layout sampling.
+                if any(
+                    self._obb_too_close(
+                        x, y, sx / 2.0, sy / 2.0, yaw,
+                        ox, oy, osx / 2.0, osy / 2.0, oyaw,
+                        float(self.random_obstacle_pair_clearance_m),
+                    )
+                    for ox, oy, osx, osy, _osz, oyaw, _oshape in selected
+                ):
+                    continue
             selected.append((x, y, sx, sy, sz, yaw, shape))
 
         pose_service = f"/world/{self.random_obstacle_world_name}/set_pose"
@@ -2847,11 +3813,13 @@ class GazeboNavEnv(gym.Env):
 
         placed = 0
         placed_names: list[str] = []
+        placed_entries: list[dict] = []
         for e in entries:
             if e["placed_ok"]:
                 placed += 1
                 placed_names.append(e["name"])
                 self._known_random_obstacle_names.add(e["name"])
+                placed_entries.append(dict(e))
 
         inactive_names = [name for name in list(getattr(self, "_active_random_obstacle_names", [])) if name not in set(placed_names)]
         if inactive_names:
@@ -2867,13 +3835,25 @@ class GazeboNavEnv(gym.Env):
                     for name in inactive_names
                 ]
                 self._gz_service_bool_batch(reqs)
+        prev_obstacle_block = int(getattr(self, "_active_random_obstacle_layout_block", -1))
+        prev_obstacle_hash = str(getattr(self, "_active_random_obstacle_layout_hash", ""))
         self._active_random_obstacle_names = placed_names
+        self._active_random_obstacle_entries = placed_entries
+        self._active_random_obstacle_layout_block = layout_block
+        new_obstacle_hash = self._layout_spec_hash(placed_entries, [])
+        self._active_random_obstacle_layout_hash = new_obstacle_hash
         if _diag_on:
             print(f"OBSTACLE_DIAG | placed={placed}/{len(selected)} known_after={len(self._known_random_obstacle_names)}", flush=True)
         if placed > 0:
+            event = "MAP_LAYOUT_CHANGED" if prev_obstacle_hash and prev_obstacle_hash != new_obstacle_hash else "MAP_LAYOUT_GENERATED"
             self.ros.get_logger().info(
+                f"{event} | episode={int(getattr(self, 'episode_index', 0))} block={layout_block} "
+                f"range={layout_block * refresh_every + 1}-{(layout_block + 1) * refresh_every} "
+                f"prev_block={prev_obstacle_block} hash={new_obstacle_hash} | "
                 f"RANDOM_OBSTACLES_RESET | placed={placed}/{len(selected)} requested={count} "
-                f"reset=({float(reset_arr[0]):+.2f},{float(reset_arr[1]):+.2f})"
+                f"reset=({float(reset_arr[0]):+.2f},{float(reset_arr[1]):+.2f}) "
+                f"static_overlap_check={int(bool(getattr(self, 'random_obstacle_avoid_static_overlap', False)))} "
+                f"robot_only_collision_filter={int(bool(getattr(self, 'random_obstacle_robot_only_collision_filter', True)))}"
             )
             # v139: `selected` (how many valid, non-overlapping spots the
             # placement loop actually found) can end up well under `count`
@@ -2883,9 +3863,14 @@ class GazeboNavEnv(gym.Env):
             # geometrically full, not under-sampled. Surface it instead of
             # letting the shortfall pass by silently.
             if len(selected) < count * 0.75:
+                spot_desc = (
+                    "non-overlapping spots"
+                    if bool(getattr(self, "random_obstacle_avoid_static_overlap", False))
+                    else "robot-clear spots"
+                )
                 self.ros.get_logger().warn(
                     f"RANDOM_OBSTACLES_UNDERFILLED | only found {len(selected)}/{count} "
-                    "non-overlapping spots -- current obstacle sizes likely leave the "
+                    f"{spot_desc} -- current obstacle sizes likely leave the "
                     "room too full to fit the requested count regardless of retries."
                 )
             try:
@@ -2896,16 +3881,98 @@ class GazeboNavEnv(gym.Env):
         elif selected:
             self.ros.get_logger().warn(f"RANDOM_OBSTACLES_RESET_FAILED | requested={len(selected)} service={create_service}")
 
+    def _moving_obstacle_robot_pose2d(self) -> Optional[tuple[np.ndarray, float]]:
+        try:
+            pose = self._velocity_measurement_pose2d()
+            if pose is not None:
+                xy, yaw, *_rest = pose
+                xy = np.asarray(xy, dtype=np.float32)[:2]
+                if xy.size >= 2 and np.all(np.isfinite(xy)) and math.isfinite(float(yaw)):
+                    return xy, float(yaw)
+        except Exception:
+            pass
+        try:
+            pose = self._get_robot_pose2d(frame_id="odom")
+            if pose is not None:
+                xy, yaw = pose
+                xy = np.asarray(xy, dtype=np.float32)[:2]
+                if xy.size >= 2 and np.all(np.isfinite(xy)) and math.isfinite(float(yaw)):
+                    return xy, float(yaw)
+        except Exception:
+            pass
+        return None
+
+    def _reset_moving_obstacle_motion_gate(self) -> None:
+        self._moving_obstacles_motion_started = False
+        self._moving_obstacles_start_step = -1
+        self._moving_obstacles_start_reason = "waiting_for_robot_motion"
+        self._moving_obstacles_last_delta_m = 0.0
+        self._moving_obstacles_last_delta_yaw_rad = 0.0
+        self._moving_obstacles_reference_pose = self._moving_obstacle_robot_pose2d()
+        if self._moving_obstacles_reference_pose is None:
+            self._moving_obstacles_start_reason = "waiting_for_robot_motion:no_reference_pose"
+
+    def _moving_obstacles_should_advance_after_robot_motion(self) -> bool:
+        if not self.random_moving_obstacle_enabled or not self._moving_obstacle_state:
+            return False
+        if bool(getattr(self, "_moving_obstacles_motion_started", False)):
+            return True
+
+        pose = self._moving_obstacle_robot_pose2d()
+        if pose is None:
+            self._moving_obstacles_start_reason = "waiting_for_robot_motion:no_current_pose"
+            return False
+
+        ref_pose = getattr(self, "_moving_obstacles_reference_pose", None)
+        if ref_pose is None:
+            self._moving_obstacles_reference_pose = pose
+            self._moving_obstacles_start_reason = "waiting_for_robot_motion:reference_initialized"
+            return False
+
+        xy, yaw = pose
+        ref_xy, ref_yaw = ref_pose
+        delta_m = float(np.linalg.norm(np.asarray(xy, dtype=np.float32)[:2] - np.asarray(ref_xy, dtype=np.float32)[:2]))
+        delta_yaw = abs(self._normalize_angle(float(yaw) - float(ref_yaw)))
+        self._moving_obstacles_last_delta_m = float(delta_m)
+        self._moving_obstacles_last_delta_yaw_rad = float(delta_yaw)
+
+        linear_threshold = float(getattr(self, "moving_obstacle_start_linear_m", 0.015))
+        yaw_threshold = float(getattr(self, "moving_obstacle_start_yaw_rad", 0.035))
+        if delta_m < linear_threshold and delta_yaw < yaw_threshold:
+            self._moving_obstacles_start_reason = (
+                f"waiting_for_robot_motion:delta={delta_m:.4f}<{linear_threshold:.4f},"
+                f"yaw={delta_yaw:.4f}<{yaw_threshold:.4f}"
+            )
+            return False
+
+        self._moving_obstacles_motion_started = True
+        self._moving_obstacles_start_step = int(getattr(self, "step_count", 0))
+        self._moving_obstacles_start_reason = (
+            f"robot_motion_started:delta={delta_m:.4f},yaw={delta_yaw:.4f},"
+            f"thresholds=({linear_threshold:.4f},{yaw_threshold:.4f})"
+        )
+        try:
+            self.ros.get_logger().info(
+                "MOVING_OBSTACLES_STARTED | "
+                f"step={self._moving_obstacles_start_step} "
+                f"delta={delta_m:.4f}m yaw={delta_yaw:.4f}rad"
+            )
+        except Exception:
+            pass
+        return True
+
     def _reset_moving_obstacles(self, reset_xy: np.ndarray | None = None) -> None:
         """(Re)spawn the small wandering circular obstacles for a fresh episode.
 
         Unlike the static layout above, these always get a fresh random start
         position/heading every single episode regardless of
         random_obstacle_refresh_episodes -- they are moving targets, not a
-        memorizable layout, so there is no "episode independence" reason to
-        throttle their reset, and repositioning 0-8 of them is cheap.
+        memorizable layout.  They are spawned immediately, but their wandering
+        motion stays paused until the robot pose has actually changed.
         """
+        self._reset_moving_obstacle_motion_gate()
         if not self.random_moving_obstacle_enabled or self.random_moving_obstacle_count <= 0:
+            self._moving_obstacle_state = []
             return
         try:
             reset_arr = np.asarray(
@@ -2918,6 +3985,8 @@ class GazeboNavEnv(gym.Env):
         margin = 0.10
         x_bound = 6.41 - margin
         y_bound = 3.41 - margin
+        maze_rooms = list(getattr(self, "_random_maze_rooms", []) or []) if bool(getattr(self, "random_maze_enabled", False)) else []
+        maze_clutter = list(getattr(self, "_random_maze_clutter_entries", []) or [])
 
         state: list[dict] = []
         for _idx in range(int(self.random_moving_obstacle_count)):
@@ -2925,11 +3994,31 @@ class GazeboNavEnv(gym.Env):
                 self.random_moving_obstacle_radius_min_m, self.random_moving_obstacle_radius_max_m
             )
             x = y = 0.0
-            for _attempt in range(40):
-                cand_x = random.uniform(-(x_bound - radius), x_bound - radius)
-                cand_y = random.uniform(-(y_bound - radius), y_bound - radius)
+            bounds = None
+            cand_x = float(reset_arr[0]) + float(self.random_obstacle_robot_clearance_m) + radius + 0.20
+            cand_y = float(reset_arr[1])
+            cand_bounds = None
+            for _attempt in range(60):
+                if maze_rooms:
+                    room = random.choice(maze_rooms)
+                    x0, x1, y0, y1 = room
+                    pad = radius + 0.14
+                    if (x1 - x0) <= 2.0 * pad or (y1 - y0) <= 2.0 * pad:
+                        continue
+                    cand_x = random.uniform(x0 + pad, x1 - pad)
+                    cand_y = random.uniform(y0 + pad, y1 - pad)
+                    cand_bounds = (x0 + pad, x1 - pad, y0 + pad, y1 - pad)
+                else:
+                    cand_x = random.uniform(-(x_bound - radius), x_bound - radius)
+                    cand_y = random.uniform(-(y_bound - radius), y_bound - radius)
+                    cand_bounds = None
                 if float(np.hypot(cand_x - reset_arr[0], cand_y - reset_arr[1])) < (
                     float(self.random_obstacle_robot_clearance_m) + radius
+                ):
+                    continue
+                if any(
+                    math.hypot(cand_x - ox, cand_y - oy) < (radius + math.hypot(osx, osy) / 2.0 + 0.10)
+                    for ox, oy, osx, osy, _osz, _oyaw, _oshape in maze_clutter
                 ):
                     continue
                 if any(
@@ -2938,6 +4027,7 @@ class GazeboNavEnv(gym.Env):
                 ):
                     continue
                 x, y = cand_x, cand_y
+                bounds = cand_bounds
                 break
             else:
                 # Fell through 40 attempts (very cluttered spawn area) -- keep
@@ -2945,17 +4035,58 @@ class GazeboNavEnv(gym.Env):
                 # entirely; it will bounce/wander away from any overlap on
                 # the very next step.
                 x, y = cand_x, cand_y
+                bounds = cand_bounds
             heading = random.uniform(-math.pi, math.pi)
             speed = random.uniform(
                 self.random_moving_obstacle_speed_min_mps, self.random_moving_obstacle_speed_max_mps
             )
-            state.append({"x": x, "y": y, "heading": heading, "speed": speed, "radius": radius})
+            state.append({"x": x, "y": y, "heading": heading, "speed": speed, "radius": radius, "bounds": bounds})
 
         self._moving_obstacle_state = state
 
         create_service = f"/world/{self.random_obstacle_world_name}/create"
 
-        names = list(self._random_moving_obstacle_names[: len(state)])
+        # v148: same fix as the maze (see _reset_random_maze) -- recreating
+        # under a fixed/reused name raced gz-sim's render-layer SceneManager
+        # not having dropped the old Visual yet ("Visual already exists").
+        # A fresh, never-reused generation suffix cannot collide with a
+        # not-yet-cleaned-up previous instance.
+        #
+        # v149: this must NOT bump generation on every call.
+        # _reset_episode_obstacles_with_start_clearance() calls this
+        # function up to post_obstacle_reset_clearance_retries (default 3)
+        # times per *single* episode reset while it searches for a spawn-
+        # clear layout -- generation-bumping (destroy+recreate) on every one
+        # of those retries, on top of the maze's own recreate, flooded
+        # gz-transport with remove/create traffic (observed as cascading
+        # "Host unreachable" / robot pose-update failures). Only bump when
+        # we do not already have this episode's generation still known-alive
+        # (i.e. the very first call of the episode, or after a world reset
+        # cleared _known_moving_obstacle_names) -- a same-episode retry then
+        # just repositions the existing entities via Pass 1 below instead of
+        # tearing them down and rebuilding them.
+        current_names = list(getattr(self, "_active_moving_obstacle_names", []) or [])
+        reuse_generation = (
+            len(current_names) == len(state)
+            and bool(current_names)
+            and all(n in self._known_moving_obstacle_names for n in current_names)
+        )
+        if reuse_generation:
+            names = current_names
+        else:
+            old_names = current_names
+            if old_names:
+                remove_service = f"/world/{self.random_obstacle_world_name}/remove"
+                remove_reqs = [
+                    (remove_service, "gz.msgs.Entity", f'name: "{self._textproto_quote(n)}" type: MODEL', 700)
+                    for n in old_names
+                ]
+                self._gz_service_bool_batch(remove_reqs)
+            self._moving_obstacle_generation = int(getattr(self, "_moving_obstacle_generation", -1)) + 1
+            gen = self._moving_obstacle_generation
+            names = [f"{self.random_moving_obstacle_prefix}_g{gen:04d}_{idx}" for idx in range(len(state))]
+            self._active_moving_obstacle_names = names
+            self._known_moving_obstacle_names = set()
         known_idx = [i for i, name in enumerate(names) if name in self._known_moving_obstacle_names]
         if known_idx and self.reset_manager is not None and hasattr(self.reset_manager, "set_model_poses_batch"):
             pose_requests = [
@@ -2999,17 +4130,110 @@ class GazeboNavEnv(gym.Env):
                         names[i], state[i]["x"], state[i]["y"], self.random_moving_obstacle_height_m / 2.0, state[i]["heading"]
                     ):
                         self._known_moving_obstacle_names.add(names[i])
+        self._reset_moving_obstacle_motion_gate()
+
+    def _wait_for_post_obstacle_scan(self, prev_scan_wall_time: Optional[float]) -> bool:
+        deadline = time.time() + max(float(getattr(self, "post_obstacle_reset_clearance_wait_sec", 0.40)), 0.0)
+        self.ros.stop_robot()
+        saw_scan = False
+        while rclpy.ok() and time.time() < deadline:
+            self.ros.spin_steps(num_spins=4, timeout_sec=0.003)
+            try:
+                if self.use_world_step:
+                    self._advance_world_after_command(target_delta_sec=min(float(self.control_dt), 0.03))
+                else:
+                    time.sleep(0.005)
+            except Exception:
+                pass
+            try:
+                if (
+                    prev_scan_wall_time is not None
+                    and getattr(self.ros, "last_scan_time", None) is not None
+                    and float(self.ros.last_scan_time) > float(prev_scan_wall_time)
+                ):
+                    saw_scan = True
+                    break
+            except Exception:
+                pass
+        if not saw_scan and prev_scan_wall_time is None:
+            saw_scan = getattr(self.ros, "scan", None) is not None
+        return bool(saw_scan)
+
+    def _reset_episode_obstacles_with_start_clearance(self, reset_xy: np.ndarray) -> None:
+        """Reset obstacle layouts and reject starts that are LiDAR-colliding afterward."""
+        attempts = max(int(getattr(self, "post_obstacle_reset_clearance_retries", 3)), 1)
+        strict = bool(getattr(self, "post_obstacle_reset_clearance_strict", True))
+        self._last_post_obstacle_clearance_ok = True
+        self._last_post_obstacle_clearance_reason = "not_checked"
+        self._last_post_obstacle_clearance_attempts = 0
+        self._last_post_obstacle_clearance_global_min = 999.0
+        self._last_post_obstacle_clearance_front_min = 999.0
+        self._last_post_obstacle_clearance_rear_min = 999.0
+
+        if not (
+            bool(getattr(self, "random_obstacles_enabled", False))
+            or bool(getattr(self, "random_moving_obstacle_enabled", False))
+        ):
+            return
+
+        last_msg = "not_checked"
+        for attempt_idx in range(1, attempts + 1):
+            force_refresh = attempt_idx > 1
+            prev_scan_wall = getattr(self.ros, "last_scan_time", None)
+            self._reset_random_episode_obstacles(
+                reset_xy=np.asarray(reset_xy, dtype=np.float32).copy(),
+                force_refresh=force_refresh,
+            )
+            self._reset_moving_obstacles(reset_xy=np.asarray(reset_xy, dtype=np.float32).copy())
+            fresh_scan = self._wait_for_post_obstacle_scan(prev_scan_wall)
+
+            clear, reason, gmin, fmin, rmin = self._is_reset_pose_clear()
+            if not fresh_scan:
+                allow_existing_scan = str(
+                    os.environ.get("TB3_RL_POST_OBSTACLE_ALLOW_EXISTING_SCAN", "1")
+                ).strip().lower() in {"1", "true", "yes", "on"}
+                if allow_existing_scan and clear and getattr(self.ros, "scan", None) is not None:
+                    reason = "clear_existing_post_obstacle_scan"
+                else:
+                    clear = False
+                    reason = "no_fresh_post_obstacle_scan"
+            self._last_post_obstacle_clearance_ok = bool(clear)
+            self._last_post_obstacle_clearance_reason = str(reason)
+            self._last_post_obstacle_clearance_attempts = int(attempt_idx)
+            self._last_post_obstacle_clearance_global_min = float(gmin)
+            self._last_post_obstacle_clearance_front_min = float(fmin)
+            self._last_post_obstacle_clearance_rear_min = float(rmin)
+            last_msg = (
+                f"attempt={attempt_idx}/{attempts} clear={clear} reason={reason} "
+                f"lidar_min={gmin:.3f},front={fmin:.3f},rear={rmin:.3f}"
+            )
+
+            if clear:
+                if attempt_idx > 1:
+                    self.ros.get_logger().info(
+                        "POST_OBSTACLE_RESET_CLEARANCE_RECOVERED | " + last_msg
+                    )
+                return
+
+            self.ros.get_logger().warn(
+                "POST_OBSTACLE_RESET_CLEARANCE_FAILED | "
+                + last_msg
+                + " | retrying_obstacle_layout"
+            )
+
+        if strict:
+            raise RecoverableResetError(
+                "post_obstacle_start_clearance_failed | " + last_msg
+            )
 
     def _update_moving_obstacles(self, dt: float) -> None:
         """Advance the wandering obstacles by dt seconds and push new poses.
 
-        Called once per env.step() (not per world sub-tick) so this adds
-        exactly one extra, non-blocking pose request per RL step regardless
-        of action mode or how many internal _advance_world_after_command
-        calls that step ends up making (backup/spin-breaker sequences can
-        call it several times). Fire-and-forget (set_model_poses_batch_nowait)
-        on purpose -- waiting on the reply every control_dt would put a
-        network round trip back on the hot per-step path.
+        Called at most once per env.step(), after the robot-motion gate opens,
+        so this adds at most one extra non-blocking pose request per RL step.
+        Fire-and-forget (set_model_poses_batch_nowait) is intentional; waiting
+        on the reply every control_dt would put a network round trip back on the
+        hot per-step path.
         """
         if not self.random_moving_obstacle_enabled or not self._moving_obstacle_state:
             return
@@ -3021,26 +4245,30 @@ class GazeboNavEnv(gym.Env):
         heading_noise = self.random_moving_obstacle_heading_noise_rad
 
         requests = []
-        names = self._random_moving_obstacle_names
+        names = getattr(self, "_active_moving_obstacle_names", None) or self._random_moving_obstacle_names
         for i, st in enumerate(self._moving_obstacle_state):
             if heading_noise > 0.0:
                 st["heading"] = float(st["heading"] + random.gauss(0.0, heading_noise))
             r = float(st["radius"])
             nx = float(st["x"] + math.cos(st["heading"]) * st["speed"] * dt)
             ny = float(st["y"] + math.sin(st["heading"]) * st["speed"] * dt)
-            bx = x_bound - r
-            by = y_bound - r
-            if nx > bx:
-                nx = bx
+            bounds = st.get("bounds")
+            if bounds is not None:
+                x_min, x_max, y_min, y_max = bounds
+            else:
+                x_min, x_max = -(x_bound - r), x_bound - r
+                y_min, y_max = -(y_bound - r), y_bound - r
+            if nx > x_max:
+                nx = x_max
                 st["heading"] = math.pi - st["heading"]
-            elif nx < -bx:
-                nx = -bx
+            elif nx < x_min:
+                nx = x_min
                 st["heading"] = math.pi - st["heading"]
-            if ny > by:
-                ny = by
+            if ny > y_max:
+                ny = y_max
                 st["heading"] = -st["heading"]
-            elif ny < -by:
-                ny = -by
+            elif ny < y_min:
+                ny = y_min
                 st["heading"] = -st["heading"]
             st["x"], st["y"] = nx, ny
             if i < len(names) and names[i] in self._known_moving_obstacle_names:
@@ -3155,7 +4383,7 @@ class GazeboNavEnv(gym.Env):
         return True, "clear", global_min, front_min, rear_min
 
     def _select_reset_candidate_order(self) -> list[tuple[float, float]]:
-        candidates = list(self.reset_pose_candidates)
+        candidates = self._current_reset_candidates()
         if not candidates:
             candidates = [(self.reset_x, self.reset_y)]
         random.shuffle(candidates)
@@ -3187,6 +4415,17 @@ class GazeboNavEnv(gym.Env):
         sec = float(getattr(self, "post_reset_stabilize_sec", 0.0))
         if sec <= 0.0:
             return
+
+        # v146: none of the polling loops below call _advance_world_after_command
+        # (they only spin ROS callbacks + time.sleep), so in the paused/lockstep
+        # world nothing here can physically move at all -- explicitly pause here
+        # instead of relying on whatever pause state the previous call happened
+        # to leave behind, so this is guaranteed rather than assumed.
+        if self.use_world_step and self.sim_controller is not None:
+            try:
+                self.sim_controller.pause(True, timeout_sec=0.5)
+            except Exception:
+                pass
 
         try:
             stable_window_sec = float(os.environ.get("TB3_RL_POST_RESET_STABLE_WINDOW_SEC", "0.35") or 0.35)
@@ -3784,7 +5023,7 @@ class GazeboNavEnv(gym.Env):
         self._last_conf_rate_ema = 0.0
         self._last_direct_tf_pose_xy = None
         self._last_direct_tf_pose_yaw = None
-        self._last_direct_tf_pose_wall = None
+        self._last_direct_tf_pose_wall = 0.0
         self._last_direct_tf_pose_frame = ""
         self._last_direct_tf_pose_source = ""
         try:
@@ -3882,7 +5121,7 @@ class GazeboNavEnv(gym.Env):
 
         attempt = 0
         last_exc = None
-        while rclpy.ok():
+        while _ros_context_ok(getattr(getattr(self, "ros", None), "context", None)):
             episode_before = int(getattr(self, "episode_index", 0))
             try:
                 obs, info = self._reset_once(seed=seed, options=options)
@@ -3932,6 +5171,12 @@ class GazeboNavEnv(gym.Env):
                     )
                 except Exception:
                     pass
+                print(
+                    "RESET_RECOVERY_RETRY | "
+                    f"attempt={attempt} cycle_attempt={((attempt - 1) % max_per_cycle) + 1}/{max_per_cycle} "
+                    f"fatal_after={fatal_after if fatal_after > 0 else 'never'} | {exc}",
+                    flush=True,
+                )
 
                 if fatal_after > 0 and attempt >= fatal_after:
                     try:
@@ -3951,6 +5196,20 @@ class GazeboNavEnv(gym.Env):
                 raise
 
             except Exception as exc:
+                if _is_ros_context_invalid_error(exc) or not _ros_context_ok(
+                    getattr(getattr(self, "ros", None), "context", None)
+                ):
+                    msg = (
+                        "RESET_RECOVERY_INTERRUPTED | ROS context is no longer valid; "
+                        f"treating reset exception as external shutdown | {type(exc).__name__}: {exc}"
+                    )
+                    try:
+                        self.ros.get_logger().warn(msg)
+                    except Exception:
+                        pass
+                    print(msg, flush=True)
+                    raise RuntimeError("ROS shutdown while reset recovery was waiting") from exc
+
                 # Non-Recoverable exceptions (transient ROS/Gazebo/SHM failures that
                 # were not wrapped as RecoverableResetError) must also not kill the
                 # whole training job.  Retry with the same recovery machinery, but
@@ -3979,6 +5238,12 @@ class GazeboNavEnv(gym.Env):
                     )
                 except Exception:
                     pass
+                print(
+                    "RESET_RECOVERY_RETRY_UNEXPECTED | "
+                    f"attempt={attempt} unexpected_fatal_after={unexpected_fatal_after} | "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
 
                 if attempt >= unexpected_fatal_after:
                     try:
@@ -4012,6 +5277,11 @@ class GazeboNavEnv(gym.Env):
             pass
         try:
             self.ros.stop_robot()
+        except Exception:
+            pass
+        try:
+            if bool(getattr(self, "use_world_step", False)) and self.sim_controller is not None:
+                self.sim_controller.pause(True, timeout_sec=0.5)
         except Exception:
             pass
         try:
@@ -4076,6 +5346,14 @@ class GazeboNavEnv(gym.Env):
         reset_trigger_reason = str(getattr(self, "_last_terminal_reason", "none"))
         _reset_prof_on = str(os.environ.get("TB3_RL_RESET_PROFILER", "0")).strip().lower() in {"1", "true", "yes", "on"}
         if _reset_prof_on:
+            print(
+                "RESET_STAGE | start "
+                f"next_episode={int(getattr(self, 'episode_index', 0)) + 1} "
+                f"reason={reset_trigger_reason} "
+                f"world_reset={int(bool(getattr(self, 'world_reset_on_episode', False)))}:"
+                f"{getattr(self, 'world_reset_mode', 'none')}",
+                flush=True,
+            )
             _reset_prof_t0 = time.perf_counter()
             _reset_prof_last = _reset_prof_t0
             _reset_prof_parts = {}
@@ -4092,6 +5370,18 @@ class GazeboNavEnv(gym.Env):
         self._map_live_update_paused = True
         self.episode_index += 1
 
+        # v146: pause the Gazebo world itself first, before anything else --
+        # including stop_robot(). /cmd_vel=0 only stops the robot; it does not
+        # freeze dynamic obstacles (teleport-driven, independent of cmd_vel)
+        # and does not stop physics from continuing to integrate whatever the
+        # last accepted command was for however long it takes the rest of the
+        # reset sequence to get around to calling stop_robot(). A failed pause
+        # here is not safe to silently continue past -- teleporting/resetting
+        # state while the world might still be running can race with physics.
+        if self.use_world_step and self.sim_controller is not None:
+            if not self.sim_controller.pause(True, timeout_sec=0.5):
+                raise RecoverableResetError("world_pause_failed_at_reset_start")
+
         self.ros.stop_robot()
         if self.world_reset_on_episode and self.sim_controller is not None:
             try:
@@ -4104,6 +5394,35 @@ class GazeboNavEnv(gym.Env):
                         "WORLD_RESET_APPLIED | "
                         f"mode={self.world_reset_mode} timeout={self.world_reset_timeout_sec:.2f}s"
                     )
+                    if not bool(getattr(self, "use_world_step", False)):
+                        try:
+                            self.sim_controller.pause(False, timeout_sec=0.5)
+                        except Exception:
+                            pass
+                    if bool(getattr(self, "world_reset_clears_runtime_entities", False)):
+                        try:
+                            if self.reset_manager is not None and hasattr(self.reset_manager, "mark_world_reset"):
+                                self.reset_manager.mark_world_reset()
+                        except Exception:
+                            pass
+                    # v147: a full world reset destroys every runtime-created
+                    # entity (random obstacles, moving obstacles, the maze
+                    # model) -- confirmed by the "Entity ... not found" /
+                    # "Unable to update the pose" Gazebo errors this used to
+                    # produce every single episode. These "known entity"
+                    # caches assumed entities persist across resets, so they
+                    # made the reset code try to *reposition* things that no
+                    # longer existed instead of recreating them. Clearing
+                    # them here routes straight to (re)create.
+                    if bool(getattr(self, "world_reset_clears_runtime_entities", False)):
+                        self._known_random_obstacle_names = set()
+                        self._active_random_obstacle_names = []
+                        self._active_random_obstacle_entries = []
+                        self._known_moving_obstacle_names = set()
+                        self._active_moving_obstacle_names = []
+                        self._moving_obstacle_state = []
+                        self._random_maze_active = False
+                        self._random_maze_active_name = ""
                 else:
                     self.ros.get_logger().warn(
                         "WORLD_RESET_FAILED | "
@@ -4121,14 +5440,44 @@ class GazeboNavEnv(gym.Env):
             # candidates" -- give the sim a bit more time here instead of at
             # the pose-reset service call itself.
             self._advance_world_after_command(target_delta_sec=self.post_world_reset_settle_sec)
+            # v149: the wait above is sim-time (a handful of lockstep physics
+            # ticks), which under lockstep pacing can complete in well under
+            # 100ms of *real* time -- but re-registering "burger" in Gazebo's
+            # ECS/UserCommands after a full world reset is control-plane
+            # bookkeeping, not a physics-integration step, so it is bound by
+            # real wall-clock processing time, not sim-time. This was still
+            # producing "Unable to update the pose for entity id:[0],
+            # name[burger]" every episode. A short, bounded real-time sleep
+            # here (while callbacks keep draining) targets that specific gap
+            # without turning the physics-settling wait above into wall-clock
+            # sleeping too.
+            try:
+                _settle_deadline = time.time() + 0.25
+                while time.time() < _settle_deadline:
+                    self.ros.spin_steps(num_spins=4, timeout_sec=0.01)
+                    time.sleep(0.01)
+            except Exception:
+                pass
         self._advance_world_after_command(target_delta_sec=0.02)
+
+        # 0.5) If requested, rebuild a compact random maze before choosing the
+        # robot spawn. Reset candidates then come from the open rooms in the
+        # freshly generated layout, and the normal LiDAR clearance validator
+        # below rejects any unlucky room center near a wall.
+        if bool(getattr(self, "random_maze_enabled", False)):
+            self._reset_random_maze(force_refresh=False)
+            if _reset_prof_on:
+                _reset_prof_mark("maze_reset")
 
         # 1) Burger를 episode 시작점으로 보낸다.
         #    house_random/list 모드에서는 후보를 무작위 순서로 검증한다.
         #    Gazebo pose reset 자체가 성공해도 벽/기둥에 너무 가까우면 SLAM 첫 scan이
         #    깨지므로 fresh scan clearance가 충분한 후보만 채택한다.
         reset_pose = None
-        reset_x, reset_y = random.choice(self.reset_pose_candidates)
+        reset_candidates = self._current_reset_candidates()
+        if not reset_candidates:
+            reset_candidates = [(self.reset_x, self.reset_y)]
+        reset_x, reset_y = random.choice(reset_candidates)
         accepted_reason = "not_validated"
 
         if self.enable_pose_reset:
@@ -4201,10 +5550,35 @@ class GazeboNavEnv(gym.Env):
         if _reset_prof_on:
             _reset_prof_mark("pose_reset")
 
+        # v143: kick off the Cartographer process restart (kill old + Popen new)
+        # here, *before* obstacle placement, instead of waiting until the
+        # should_reset_slam block below (which used to run after obstacle
+        # placement). Popen itself is non-blocking, so Cartographer's own
+        # process spawn/DDS discovery now happens in the background while this
+        # thread spends time on the independent, non-SLAM obstacle-placement
+        # network calls -- real overlap without any extra threads touching
+        # rclpy. _reset_slam_map_after_pose_reset() below picks up from
+        # verify_cartographer_started() instead of repeating the kill+launch
+        # if this kickoff already ran.
+        self._slam_restart_kicked_off = False
+        should_reset_slam_early = (
+            bool(self.use_slam_map)
+            and bool(self.reset_slam_on_reset)
+            and int(self.reset_slam_every_n_episodes) > 0
+            and (int(self.episode_index) % int(self.reset_slam_every_n_episodes) == 0)
+        )
+        if (
+            should_reset_slam_early
+            and str(getattr(self, "slam_backend", "")) == "cartographer"
+            and hasattr(self.ros, "kickoff_cartographer_restart")
+        ):
+            self._slam_restart_kicked_off = bool(self.ros.kickoff_cartographer_restart())
+            if _reset_prof_on:
+                _reset_prof_mark("slam_kickoff")
+
         self.current_reset_xy = np.array([reset_x, reset_y], dtype=np.float32)
         _obstacles_t0 = time.perf_counter() if _reset_prof_on else 0.0
-        self._reset_random_episode_obstacles(reset_xy=self.current_reset_xy.copy())
-        self._reset_moving_obstacles(reset_xy=self.current_reset_xy.copy())
+        self._reset_episode_obstacles_with_start_clearance(reset_xy=self.current_reset_xy.copy())
         if _reset_prof_on:
             print(f"OBSTACLE_RESET_DIAG | {(time.perf_counter()-_obstacles_t0)*1000.0:.1f}ms", flush=True)
             _reset_prof_mark("obstacle_reset")
@@ -4213,6 +5587,8 @@ class GazeboNavEnv(gym.Env):
         self.filtered_action = np.zeros(2, dtype=np.float32)
         self.raw_action = np.zeros(2, dtype=np.float32)
         self.prev_policy_action = np.zeros(2, dtype=np.float32)
+        self._last_reverse_action_reward_suppressed = False
+        self._suppress_confidence_update_for_current_action = False
         self._last_waypoint_local = np.zeros(2, dtype=np.float32)
         self._last_waypoint_world = np.zeros(2, dtype=np.float32)
         self._last_waypoint_distance = 0.0
@@ -4278,7 +5654,18 @@ class GazeboNavEnv(gym.Env):
         self._last_velocity_safety_executed_v = 0.0
         self._last_velocity_safety_policy_w = 0.0
         self._last_velocity_safety_executed_w = 0.0
+        self._last_velocity_commanded_v = 0.0
+        self._last_velocity_commanded_w = 0.0
+        self._last_velocity_execution_source = "none"
+        self._last_velocity_execution_delta_m = 0.0
+        self._last_velocity_execution_dt_sec = 0.0
         self._last_velocity_safety_penalty = 0.0
+        self._reverse_action_penalty_debt = 0.0
+        self._last_reverse_action_penalty = 0.0
+        self._last_reverse_action_penalty_base = 0.0
+        self._last_reverse_action_penalty_norm = 0.0
+        self._last_reverse_action_penalty_debt = 0.0
+        self._last_reverse_action_penalty_multiplier = 1.0
         self._last_velocity_safety_reason = "none"
         self._last_velocity_safety_terminal_triggered = False
         self._last_velocity_safety_terminal_distance = 999.0
@@ -4313,6 +5700,7 @@ class GazeboNavEnv(gym.Env):
         self._last_r_safety_slow = 0.0
         self._last_r_safety_terminal = 0.0
         self._last_r_collision = 0.0
+        self._last_r_reverse = 0.0
         self._last_r_step = 0.0
         self._last_reward_total = 0.0
         self._last_confidence_fill_score = 0.0
@@ -4399,12 +5787,10 @@ class GazeboNavEnv(gym.Env):
         self._slam_transform_cache_key = None
         self._slam_transform_cache_msg = None
         self._reset_confidence_pose_runtime_state()
-        should_reset_slam = (
-            bool(self.use_slam_map)
-            and bool(self.reset_slam_on_reset)
-            and int(self.reset_slam_every_n_episodes) > 0
-            and (int(self.episode_index) % int(self.reset_slam_every_n_episodes) == 0)
-        )
+        # Computed early (see should_reset_slam_early above, before obstacle
+        # placement) so the kickoff and this verify step always agree on
+        # whether this episode resets SLAM.
+        should_reset_slam = should_reset_slam_early
 
         if should_reset_slam:
             slam_reset_ok = self._reset_slam_map_after_pose_reset()
@@ -4486,10 +5872,6 @@ class GazeboNavEnv(gym.Env):
         # this episode anchors real odometry to this episode's map pose.
         self._sync_exploration_canvas_to_current_slam(reason="after_exploration_reset", publish=True)
         self._reset_confidence_pose_runtime_state()
-        # v134: the next confidence update (this episode's first) paints a
-        # full circle around the spawn point instead of the normal
-        # front_fov_deg forward cone -- see _update_exploration_map_with_unified_tf().
-        self._pending_omnidirectional_confidence_seed = True
         if _reset_prof_on:
             _reset_prof_mark("map_reset")
 
@@ -4506,6 +5888,12 @@ class GazeboNavEnv(gym.Env):
         if _reset_prof_on:
             _reset_prof_mark("ready_gate")
 
+        if not bool(getattr(self, "use_world_step", False)) and self.sim_controller is not None:
+            try:
+                self.sim_controller.pause(False, timeout_sec=0.5)
+            except Exception:
+                pass
+
         obs = self._get_obs()
 
         info = self._build_info(
@@ -4520,7 +5908,7 @@ class GazeboNavEnv(gym.Env):
         if _reset_prof_on:
             total = float(time.perf_counter() - _reset_prof_t0)
             _reset_prof_parts["total"] = total
-            order = ["pose_reset", "obstacle_reset", "slam_reset", "post_reset_stabilize", "map_reset", "ready_gate", "obs_info", "total"]
+            order = ["maze_reset", "pose_reset", "obstacle_reset", "slam_reset", "post_reset_stabilize", "map_reset", "ready_gate", "obs_info", "total"]
             txt = " ".join(
                 f"{k}={float(_reset_prof_parts.get(k, 0.0))*1000.0:.1f}ms"
                 for k in order if k in _reset_prof_parts
@@ -5128,7 +6516,22 @@ class GazeboNavEnv(gym.Env):
             except Exception:
                 pass
             try:
+                import traceback
+
+                print(
+                    "STEP_RECOVERY_TRACEBACK | "
+                    + "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+                    flush=True,
+                )
+            except Exception:
+                pass
+            try:
                 self.ros.stop_robot()
+            except Exception:
+                pass
+            try:
+                if bool(getattr(self, "use_world_step", False)) and self.sim_controller is not None:
+                    self.sim_controller.pause(True, timeout_sec=0.5)
             except Exception:
                 pass
             obs = self._safe_fallback_observation()
@@ -5175,12 +6578,160 @@ class GazeboNavEnv(gym.Env):
         except Exception:
             return None
 
+    def _compute_reverse_action_penalty(
+        self,
+        policy_action: np.ndarray,
+        action_for_reward: np.ndarray,
+        *,
+        reverse_reward_suppressed: bool,
+        physical_unsafe_terminal: bool,
+    ) -> float:
+        """Dense policy penalty for intentionally driving backward.
+
+        Reverse is allowed as an escape tool, but it should not become a cheap
+        exploration strategy.  The cap is configured as a ratio of the physical
+        collision/fall terminal penalty; the default ratio makes full-speed
+        reverse cost about 1.3 when PHYSICAL_TERMINAL_REWARD is -15.0.
+        """
+        self._last_reverse_action_penalty = 0.0
+        self._last_reverse_action_penalty_base = 0.0
+        self._last_reverse_action_penalty_norm = 0.0
+        self._last_reverse_action_penalty_debt = float(getattr(self, "_reverse_action_penalty_debt", 0.0))
+        self._last_reverse_action_penalty_multiplier = 1.0
+
+        def _decay_reverse_debt() -> None:
+            debt = float(getattr(self, "_reverse_action_penalty_debt", 0.0))
+            decay = max(float(getattr(self, "reverse_action_debt_decay_per_step", 0.12)), 0.0)
+            debt = float(np.clip(debt - decay, 0.0, 1.0))
+            self._reverse_action_penalty_debt = debt
+            self._last_reverse_action_penalty_debt = debt
+            self._last_reverse_action_penalty_multiplier = 1.0 + (
+                max(float(getattr(self, "reverse_action_debt_max_extra_ratio", 0.60)), 0.0) * debt
+            )
+
+        if self.action_mode != "velocity":
+            self._reverse_action_penalty_debt = 0.0
+            self._last_reverse_action_penalty_debt = 0.0
+            return 0.0
+        if not bool(reverse_reward_suppressed):
+            _decay_reverse_debt()
+            return 0.0
+        if bool(physical_unsafe_terminal):
+            return 0.0
+        if bool(getattr(self, "_last_velocity_safety_backup_triggered", False)):
+            _decay_reverse_debt()
+            return 0.0
+        if bool(getattr(self, "_last_velocity_safety_skip_store", False)):
+            _decay_reverse_debt()
+            return 0.0
+
+        try:
+            policy_v = float(policy_action[0]) if policy_action is not None and len(policy_action) > 0 else 0.0
+        except Exception:
+            policy_v = 0.0
+        try:
+            commanded_v = float(getattr(self, "_last_velocity_commanded_v", 0.0))
+        except Exception:
+            commanded_v = 0.0
+        try:
+            executed_v = float(action_for_reward[0]) if action_for_reward is not None and len(action_for_reward) > 0 else 0.0
+        except Exception:
+            executed_v = 0.0
+
+        reverse_v = max(0.0, -policy_v, -commanded_v, -executed_v)
+        deadband = max(float(getattr(self, "linear_deadband", 0.015)), 0.0)
+        if reverse_v <= deadband:
+            _decay_reverse_debt()
+            return 0.0
+
+        reverse_limit = float(getattr(self, "velocity_reverse_linear_limit", getattr(self, "max_linear_speed", 0.22)))
+        max_v = max(reverse_limit - deadband, 1e-6)
+        reverse_norm = float(np.clip((reverse_v - deadband) / max_v, 0.0, 1.0))
+        penalty_max = abs(float(PHYSICAL_TERMINAL_REWARD)) * max(float(getattr(self, "reverse_action_penalty_ratio", 1.3 / abs(float(PHYSICAL_TERMINAL_REWARD)))), 0.0)
+        debt = float(getattr(self, "_reverse_action_penalty_debt", 0.0))
+        ramp_steps = max(float(getattr(self, "reverse_action_debt_ramp_steps", 10.0)), 1.0)
+        debt = float(np.clip(debt + (reverse_norm / ramp_steps), 0.0, 1.0))
+        self._reverse_action_penalty_debt = debt
+        extra_ratio = max(float(getattr(self, "reverse_action_debt_max_extra_ratio", 0.60)), 0.0)
+        multiplier = 1.0 + (extra_ratio * debt)
+        base_penalty = float(penalty_max * reverse_norm)
+        penalty = float(base_penalty * multiplier)
+        self._last_reverse_action_penalty = penalty
+        self._last_reverse_action_penalty_base = base_penalty
+        self._last_reverse_action_penalty_norm = reverse_norm
+        self._last_reverse_action_penalty_debt = debt
+        self._last_reverse_action_penalty_multiplier = multiplier
+        return penalty
+
+    def _accumulate_step_map_stats(self, stats: Optional[MapUpdateStats]) -> None:
+        if stats is None:
+            return
+        current = getattr(self, "_map_update_stats_accum_this_step", None)
+        if current is None:
+            self._map_update_stats_accum_this_step = stats
+            return
+
+        self._map_update_stats_accum_this_step = replace(
+            current,
+            new_known_cells=int(getattr(current, "new_known_cells", 0)) + int(getattr(stats, "new_known_cells", 0)),
+            coverage_delta=float(getattr(current, "coverage_delta", 0.0)) + float(getattr(stats, "coverage_delta", 0.0)),
+            stale_refresh_cells=int(getattr(current, "stale_refresh_cells", 0)) + int(getattr(stats, "stale_refresh_cells", 0)),
+            confidence_gain=float(getattr(current, "confidence_gain", 0.0)) + float(getattr(stats, "confidence_gain", 0.0)),
+            priority_gain=float(getattr(current, "priority_gain", 0.0)) + float(getattr(stats, "priority_gain", 0.0)),
+            priority_cleared_cells=int(getattr(current, "priority_cleared_cells", 0)) + int(getattr(stats, "priority_cleared_cells", 0)),
+            priority_clear_gain=float(getattr(current, "priority_clear_gain", 0.0)) + float(getattr(stats, "priority_clear_gain", 0.0)),
+            priority_invalidated_cells=int(getattr(current, "priority_invalidated_cells", 0)) + int(getattr(stats, "priority_invalidated_cells", 0)),
+            priority_invalidated_gain=float(getattr(current, "priority_invalidated_gain", 0.0)) + float(getattr(stats, "priority_invalidated_gain", 0.0)),
+            priority_rechecked_cells=int(getattr(current, "priority_rechecked_cells", 0)) + int(getattr(stats, "priority_rechecked_cells", 0)),
+            priority_rechecked_gain=float(getattr(current, "priority_rechecked_gain", 0.0)) + float(getattr(stats, "priority_rechecked_gain", 0.0)),
+            slam_update_new_known_cells=int(getattr(current, "slam_update_new_known_cells", 0)) + int(getattr(stats, "slam_update_new_known_cells", 0)),
+            slam_update_new_free_cells=int(getattr(current, "slam_update_new_free_cells", 0)) + int(getattr(stats, "slam_update_new_free_cells", 0)),
+            slam_update_new_occupied_cells=int(getattr(current, "slam_update_new_occupied_cells", 0)) + int(getattr(stats, "slam_update_new_occupied_cells", 0)),
+            slam_update_expand_known_cells=int(getattr(current, "slam_update_expand_known_cells", 0)) + int(getattr(stats, "slam_update_expand_known_cells", 0)),
+            confidence_observed_cells=int(getattr(current, "confidence_observed_cells", 0)) + int(getattr(stats, "confidence_observed_cells", 0)),
+            confidence_updated_cells=int(getattr(current, "confidence_updated_cells", 0)) + int(getattr(stats, "confidence_updated_cells", 0)),
+        )
+
+    def _merge_accumulated_step_map_stats(self, final_stats: MapUpdateStats) -> MapUpdateStats:
+        accum = getattr(self, "_map_update_stats_accum_this_step", None)
+        if accum is None:
+            return final_stats
+
+        return replace(
+            final_stats,
+            new_known_cells=int(getattr(accum, "new_known_cells", 0)) + int(getattr(final_stats, "new_known_cells", 0)),
+            coverage_delta=float(getattr(accum, "coverage_delta", 0.0)) + float(getattr(final_stats, "coverage_delta", 0.0)),
+            stale_refresh_cells=int(getattr(accum, "stale_refresh_cells", 0)) + int(getattr(final_stats, "stale_refresh_cells", 0)),
+            confidence_gain=float(getattr(accum, "confidence_gain", 0.0)) + float(getattr(final_stats, "confidence_gain", 0.0)),
+            priority_gain=float(getattr(accum, "priority_gain", 0.0)) + float(getattr(final_stats, "priority_gain", 0.0)),
+            priority_cleared_cells=int(getattr(accum, "priority_cleared_cells", 0)) + int(getattr(final_stats, "priority_cleared_cells", 0)),
+            priority_clear_gain=float(getattr(accum, "priority_clear_gain", 0.0)) + float(getattr(final_stats, "priority_clear_gain", 0.0)),
+            priority_invalidated_cells=int(getattr(accum, "priority_invalidated_cells", 0)) + int(getattr(final_stats, "priority_invalidated_cells", 0)),
+            priority_invalidated_gain=float(getattr(accum, "priority_invalidated_gain", 0.0)) + float(getattr(final_stats, "priority_invalidated_gain", 0.0)),
+            priority_rechecked_cells=int(getattr(accum, "priority_rechecked_cells", 0)) + int(getattr(final_stats, "priority_rechecked_cells", 0)),
+            priority_rechecked_gain=float(getattr(accum, "priority_rechecked_gain", 0.0)) + float(getattr(final_stats, "priority_rechecked_gain", 0.0)),
+            slam_update_new_known_cells=int(getattr(accum, "slam_update_new_known_cells", 0)) + int(getattr(final_stats, "slam_update_new_known_cells", 0)),
+            slam_update_new_free_cells=int(getattr(accum, "slam_update_new_free_cells", 0)) + int(getattr(final_stats, "slam_update_new_free_cells", 0)),
+            slam_update_new_occupied_cells=int(getattr(accum, "slam_update_new_occupied_cells", 0)) + int(getattr(final_stats, "slam_update_new_occupied_cells", 0)),
+            slam_update_expand_known_cells=int(getattr(accum, "slam_update_expand_known_cells", 0)) + int(getattr(final_stats, "slam_update_expand_known_cells", 0)),
+            confidence_observed_cells=int(getattr(accum, "confidence_observed_cells", 0)) + int(getattr(final_stats, "confidence_observed_cells", 0)),
+            confidence_updated_cells=int(getattr(accum, "confidence_updated_cells", 0)) + int(getattr(final_stats, "confidence_updated_cells", 0)),
+        )
+
     def _step_impl(self, action):
+        outer_step_wall_start = time.monotonic()
         self._map_update_call_count_this_step = 0
-        # v138: advance the wandering obstacles exactly once per env.step(),
-        # regardless of action mode, so their movement stays bounded to one
-        # extra (non-blocking) pose request per RL step.
-        self._update_moving_obstacles(self.control_dt)
+        self._map_update_stats_accum_this_step = None
+        self._last_world_step_sim_delta_sec = 0.0
+        self._last_world_step_target_delta_sec = 0.0
+        self._last_world_step_wall_elapsed_sec = 0.0
+        self._last_world_step_overshoot_sec = 0.0
+        self._action_world_step_sim_delta_sec = 0.0
+        self._action_world_step_target_delta_sec = 0.0
+        self._action_world_step_wall_elapsed_sec = 0.0
+        self._action_world_step_overshoot_sec = 0.0
+        self._action_confidence_update_called = False
+        self._last_outer_step_wall_elapsed_sec = 0.0
         if not hasattr(self, "_step_profiler_initialized"):
             raw = str(os.environ.get("TB3_RL_STEP_PROFILER", "0")).strip().lower()
             self._step_profiler_enabled = raw in {"1", "true", "yes", "on"}
@@ -5227,6 +6778,12 @@ class GazeboNavEnv(gym.Env):
         policy_action = np.clip(policy_action, self.action_space.low, self.action_space.high)
         self.raw_action = policy_action.astype(np.float32).copy()
         self.prev_policy_action = self.raw_action.copy()
+        policy_reverse_requested = bool(
+            self.action_mode == "velocity"
+            and policy_action.size > 0
+            and float(policy_action[0]) < -max(float(getattr(self, "linear_deadband", 0.015)), 1e-6)
+        )
+        self._suppress_confidence_update_for_current_action = bool(policy_reverse_requested)
         # While Nav2 is moving toward this waypoint, the 10Hz live map timer may
         # clear/recheck priority cells.  Those event rewards belong to this SAC
         # action, so collect them until reward calculation drains the accumulator.
@@ -5278,6 +6835,21 @@ class GazeboNavEnv(gym.Env):
                 lidar_action_obstacle_score = max(float(lidar_action_obstacle_score), float(s_obs))
                 lidar_front_obstacle_distance = float(f_obs)
 
+        # v143: moving obstacles are spawned at reset but remain paused until
+        # the robot's own pose actually changes.  This prevents dynamic objects
+        # from drifting during the initial stationary/reset period or while a
+        # policy is producing no physical motion.
+        # v144: once that gate opens it used to stay open, advancing obstacles
+        # by a flat self.control_dt every _step_impl call regardless of
+        # whether the world actually advanced that much sim time -- so a
+        # contract-wait retry / stall / effective pause did not visibly pause
+        # the obstacles at all, they kept marching forward on wall-clock alone.
+        # Use the *confirmed* sim-time delta this step actually produced
+        # (accumulated inside _advance_world_after_command) instead, so a
+        # stalled/paused step correctly moves them by ~0.
+        if self._moving_obstacles_should_advance_after_robot_motion():
+            self._update_moving_obstacles(float(getattr(self, "_action_world_step_sim_delta_sec", 0.0)))
+
         if _prof_on:
             _prof_mark("action_execute")
             _prof_parts["gz_step"] = _prof_parts.get("gz_step", 0.0) + float(
@@ -5290,10 +6862,25 @@ class GazeboNavEnv(gym.Env):
                 getattr(self, "_last_advance_wait_sensor_sec", 0.0)
             )
 
-        # Reward와 observation에는 policy raw action이 아니라 실제 controller가 수행한 cmd_vel 평균을 넣는다.
+        # Reward와 observation에는 policy raw action이나 publish한 cmd_vel이 아니라
+        # 실제 pose delta로 추정한 물리 실행 속도를 넣는다.
         # 이렇게 해야 path alignment / obstacle penalty가 실제 궤적 기준으로 계산된다.
         action_for_reward = executed_action.astype(np.float32)
         self.filtered_action = action_for_reward.copy()
+        reverse_reward_suppressed = bool(
+            self.action_mode == "velocity"
+            and (
+                (
+                    action_for_reward.size > 0
+                    and float(action_for_reward[0]) < -max(float(getattr(self, "linear_deadband", 0.015)), 1e-6)
+                )
+                or bool(policy_reverse_requested)
+                or bool(getattr(self, "_suppress_confidence_update_for_current_action", False))
+                or bool(getattr(self, "_last_velocity_safety_backup_triggered", False))
+            )
+        )
+        self._last_reverse_action_reward_suppressed = bool(reverse_reward_suppressed)
+        self._suppress_confidence_update_for_current_action = bool(reverse_reward_suppressed)
 
         self._last_lidar_action_obstacle_distance = float(lidar_action_obstacle_distance)
         self._last_lidar_action_obstacle_score = float(lidar_action_obstacle_score)
@@ -5327,6 +6914,11 @@ class GazeboNavEnv(gym.Env):
             )
         else:
             map_stats = self._update_exploration_map()
+        final_map_update_applied = bool(getattr(self, "_last_map_update_applied", False))
+        if final_map_update_applied:
+            map_stats = self._merge_accumulated_step_map_stats(map_stats)
+        elif getattr(self, "_map_update_stats_accum_this_step", None) is not None:
+            map_stats = self._map_update_stats_accum_this_step
         if str(os.environ.get("TB3_RL_DEBUG_MAP_UPDATE_COUNT", "0")).strip().lower() in {"1", "true", "yes", "on"}:
             every_n = 20
             try:
@@ -5443,6 +7035,25 @@ class GazeboNavEnv(gym.Env):
         # only the final map_stats snapshot would be rewarded and intermediate
         # priority-clearing work would be lost.
         reward_map_stats = self._merge_and_drain_pending_priority_events(map_stats)
+        if bool(reverse_reward_suppressed):
+            reward_map_stats = replace(
+                reward_map_stats,
+                new_known_cells=0,
+                coverage_delta=0.0,
+                stale_refresh_cells=0,
+                confidence_gain=0.0,
+                priority_gain=0.0,
+                priority_cleared_cells=0,
+                priority_clear_gain=0.0,
+                priority_invalidated_cells=0,
+                priority_invalidated_gain=0.0,
+                priority_rechecked_cells=0,
+                priority_rechecked_gain=0.0,
+                slam_update_new_known_cells=0,
+                slam_update_new_free_cells=0,
+                slam_update_new_occupied_cells=0,
+                slam_update_expand_known_cells=0,
+            )
         self._live_priority_reward_collection_enabled = False
 
         # Reward의 action smoothness penalty는 실제로 수행된 controller command 기준으로 계산한다.
@@ -5521,6 +7132,14 @@ class GazeboNavEnv(gym.Env):
         self._last_confidence_fill_delta = _confidence_fill_delta
         self._last_confidence_fill_hold = float(_confidence_fill_score)
         self._last_confidence_fill_score = float(_confidence_fill_score)
+        reverse_action_penalty = self._compute_reverse_action_penalty(
+            policy_action=policy_action,
+            action_for_reward=action_for_reward,
+            reverse_reward_suppressed=bool(reverse_reward_suppressed),
+            physical_unsafe_terminal=bool(physical_unsafe_terminal),
+        )
+        if reverse_action_penalty > 0.0:
+            reward -= float(reverse_action_penalty)
         if _prof_on:
             _prof_mark("reward_compute")
 
@@ -5642,6 +7261,7 @@ class GazeboNavEnv(gym.Env):
             _r_safe_slow = -float(getattr(self, "_last_velocity_safety_penalty", 0.0)) if not bool(getattr(self, "_last_velocity_safety_terminal_triggered", False)) else 0.0
             _r_safe_term = -float(getattr(self, "velocity_safety_terminal_penalty", 0.0)) if bool(getattr(self, "_last_velocity_safety_terminal_triggered", False)) else 0.0
             _r_coll = float(PHYSICAL_TERMINAL_REWARD) if bool(physical_collision_like or fallen) else 0.0
+            _r_reverse = -float(getattr(self, "_last_reverse_action_penalty", 0.0))
             _r_step = 0.0
             self._last_r_confidence = float(_r_conf)
             self._last_r_confidence_fill = float(_r_conf_fill)
@@ -5651,6 +7271,7 @@ class GazeboNavEnv(gym.Env):
             self._last_r_safety_slow = float(_r_safe_slow)
             self._last_r_safety_terminal = float(_r_safe_term)
             self._last_r_collision = float(_r_coll)
+            self._last_r_reverse = float(_r_reverse)
             self._last_r_step = float(_r_step)
             self._last_reward_total = reward
         except Exception:
@@ -5774,6 +7395,19 @@ class GazeboNavEnv(gym.Env):
         info["episode_wall_sec"] = max(
             float(time.time() - float(getattr(self, "_episode_wall_start_time", time.time()))), 0.0
         )
+        if bool(getattr(self, "outer_step_realtime_pacing", True)):
+            speed_factor = max(float(getattr(self, "realtime_pacing_speed_factor", 1.0)), 0.001)
+            target_outer_wall = max(float(getattr(self, "control_dt", 0.0)), 0.0) / speed_factor
+            while rclpy.ok():
+                elapsed_outer = time.monotonic() - outer_step_wall_start
+                remaining_outer = target_outer_wall - elapsed_outer
+                if remaining_outer <= 0.0:
+                    break
+                self.ros.spin_steps(num_spins=1, timeout_sec=min(max(float(remaining_outer), 0.0), 0.005))
+                if remaining_outer > 0.001:
+                    time.sleep(min(0.001, max(float(remaining_outer), 0.0)))
+        self._last_outer_step_wall_elapsed_sec = float(time.monotonic() - outer_step_wall_start)
+        info["outer_step_wall_elapsed_sec"] = float(self._last_outer_step_wall_elapsed_sec)
         if _prof_on:
             _prof_mark("info_build")
 
@@ -5806,7 +7440,11 @@ class GazeboNavEnv(gym.Env):
                     "STEP_PROFILE | "
                     f"episode={self.episode_index} step={self.step_count} count={self._step_profiler_count} "
                     f"term={self._last_terminal_reason} collision={collision} truncated={truncated} "
-                    f"stale_sim_time_steps={getattr(self, '_world_step_stale_total', 0)} | "
+                    f"stale_sim_time_steps={getattr(self, '_world_step_stale_total', 0)} "
+                    f"sim_dt={float(getattr(self, '_action_world_step_sim_delta_sec', 0.0)):.3f}/"
+                    f"{float(getattr(self, '_action_world_step_target_delta_sec', 0.0)):.3f} "
+                    f"outer_wall={float(getattr(self, '_last_outer_step_wall_elapsed_sec', 0.0)):.3f} "
+                    f"map_updates={int(getattr(self, '_map_update_call_count_this_step', 0))} | "
                     f"last {last_txt} | avg {avg_txt}"
                 )
 
@@ -5967,6 +7605,8 @@ class GazeboNavEnv(gym.Env):
         backup_w = 0.0
         backup_v = -abs(float(backup_v))
         cmd = np.array([backup_v, backup_w], dtype=np.float32)
+        prev_confidence_suppress = bool(getattr(self, "_suppress_confidence_update_for_current_action", False))
+        self._suppress_confidence_update_for_current_action = True
         rear_during_backup = float(rear_min)
         stopped_by_rear = False
         steps_done = 0
@@ -6003,6 +7643,7 @@ class GazeboNavEnv(gym.Env):
                 prev_scan_wall = getattr(self.ros, "last_scan_time", None)
                 self.ros.spin_steps(num_spins=2, timeout_sec=0.001)
                 self._advance_world_after_command(target_delta_sec=self.control_dt)
+                self._stop_direct_cmd_after_control_tick("velocity_backup_rear_stop")
                 try:
                     self.ros.wait_for_new_sensor_frame(prev_scan_wall, None, timeout_wall_sec=0.04)
                 except Exception:
@@ -6015,6 +7656,7 @@ class GazeboNavEnv(gym.Env):
             self.ros.publish_cmd_vel(float(cmd[0]), float(cmd[1]))
             self.ros.spin_steps(num_spins=2, timeout_sec=0.001)
             self._advance_world_after_command(target_delta_sec=self.control_dt)
+            self._stop_direct_cmd_after_control_tick("velocity_backup")
             try:
                 self.ros.wait_for_new_sensor_frame(prev_scan_wall, None, timeout_wall_sec=0.04)
             except Exception:
@@ -6032,6 +7674,7 @@ class GazeboNavEnv(gym.Env):
         self.ros.publish_cmd_vel(0.0, 0.0)
         self.ros.spin_steps(num_spins=2, timeout_sec=0.001)
         self._advance_world_after_command(target_delta_sec=self.control_dt)
+        self._stop_direct_cmd_after_control_tick("velocity_backup_final_stop")
         try:
             self.ros.wait_for_new_sensor_frame(prev_scan_wall, None, timeout_wall_sec=0.06)
         except Exception:
@@ -6085,6 +7728,7 @@ class GazeboNavEnv(gym.Env):
                 f"penalty={float(self._last_velocity_safety_penalty):.2f} "
                 f"actor_forward_skipped_during_backup=1"
             )
+        self._suppress_confidence_update_for_current_action = prev_confidence_suppress
         return (
             cmd.astype(np.float32),
             float(lidar_action_obstacle_distance),
@@ -6097,7 +7741,9 @@ class GazeboNavEnv(gym.Env):
         Direct pure-velocity SAC executor.
 
         Policy action meaning:
-          action[0] = commanded forward linear velocity in [0, max_linear_speed]
+          action[0] = commanded linear velocity
+                      [-velocity_reverse_linear_limit, max_linear_speed] when reverse is enabled,
+                      otherwise [0, max_linear_speed]
           action[1] = commanded angular velocity in [-max_angular_speed, max_angular_speed]
 
         The safety shield does not change the observation/action space.  When an
@@ -6110,9 +7756,10 @@ class GazeboNavEnv(gym.Env):
         episode exactly as before.
         """
         action = np.asarray(policy_action, dtype=np.float32).copy()
+        linear_low = -float(getattr(self, "velocity_reverse_linear_limit", self.max_linear_speed)) if bool(getattr(self, "velocity_allow_reverse", True)) else 0.0
         action = np.clip(
             action,
-            np.array([0.0, -self.max_angular_speed], dtype=np.float32),
+            np.array([linear_low, -self.max_angular_speed], dtype=np.float32),
             np.array([self.max_linear_speed, self.max_angular_speed], dtype=np.float32),
         )
 
@@ -6125,6 +7772,11 @@ class GazeboNavEnv(gym.Env):
         self._last_velocity_safety_executed_v = float(action[0]) if action.size > 0 else 0.0
         self._last_velocity_safety_policy_w = float(action[1]) if action.size > 1 else 0.0
         self._last_velocity_safety_executed_w = float(action[1]) if action.size > 1 else 0.0
+        self._last_velocity_commanded_v = float(action[0]) if action.size > 0 else 0.0
+        self._last_velocity_commanded_w = float(action[1]) if action.size > 1 else 0.0
+        self._last_velocity_execution_source = "pending"
+        self._last_velocity_execution_delta_m = 0.0
+        self._last_velocity_execution_dt_sec = 0.0
         self._last_velocity_safety_penalty = 0.0
         self._last_velocity_safety_reason = "none"
         self._last_velocity_safety_terminal_triggered = False
@@ -6133,6 +7785,7 @@ class GazeboNavEnv(gym.Env):
         self._last_velocity_safety_sync_steps = 0
         self._last_velocity_forward_assist = False
         self._last_velocity_spin_breaker = False
+        self._last_reverse_action_reward_suppressed = False
 
         fast_passthrough = (
             not bool(getattr(self, "velocity_safety_backup", True))
@@ -6150,7 +7803,8 @@ class GazeboNavEnv(gym.Env):
             angular_limit = float(getattr(self, "velocity_command_angular_limit", self.max_angular_speed))
             if linear_limit < float(self.max_linear_speed) - 1e-6 or angular_limit < float(self.max_angular_speed) - 1e-6:
                 before = cmd.copy()
-                cmd[0] = float(np.clip(float(cmd[0]), 0.0, linear_limit))
+                cmd_linear_low = -min(linear_limit, float(getattr(self, "velocity_reverse_linear_limit", linear_limit))) if bool(getattr(self, "velocity_allow_reverse", True)) else 0.0
+                cmd[0] = float(np.clip(float(cmd[0]), cmd_linear_low, linear_limit))
                 cmd[1] = float(np.clip(float(cmd[1]), -angular_limit, angular_limit))
                 if abs(float(before[0]) - float(cmd[0])) > 1e-6 or abs(float(before[1]) - float(cmd[1])) > 1e-6:
                     self._last_velocity_command_limited = True
@@ -6161,7 +7815,7 @@ class GazeboNavEnv(gym.Env):
             deadband_reasons: list[str] = []
             linear_deadband = max(float(getattr(self, "linear_deadband", 0.015)), 0.0)
             angular_deadband = max(float(getattr(self, "angular_deadband", 0.04)), 0.0)
-            if 0.0 < float(cmd[0]) < linear_deadband:
+            if 0.0 < abs(float(cmd[0])) < linear_deadband:
                 old_v = float(cmd[0])
                 cmd[0] = 0.0
                 deadband_reasons.append(f"v_deadband:{old_v:.3f}<{linear_deadband:.3f}")
@@ -6175,12 +7829,17 @@ class GazeboNavEnv(gym.Env):
                 suffix = ",".join(deadband_reasons)
                 self._last_velocity_command_limit_reason = suffix if prev_reason == "none" else f"{prev_reason};{suffix}"
 
-            self._last_velocity_safety_executed_v = float(cmd[0])
-            self._last_velocity_safety_executed_w = float(cmd[1])
+            measurement_start = self._velocity_measurement_pose2d()
+            self._last_velocity_commanded_v = float(cmd[0])
+            self._last_velocity_commanded_w = float(cmd[1])
             self.ros.publish_cmd_vel(float(cmd[0]), float(cmd[1]))
             self.ros.spin_steps(num_spins=1, timeout_sec=0.0)
             self._advance_world_after_command(target_delta_sec=self.control_dt)
-            return cmd.astype(np.float32), 999.0, 0.0, 999.0
+            self._stop_direct_cmd_after_control_tick("velocity_fast_passthrough")
+            executed_cmd = self._estimate_velocity_executed_action_from_delta(measurement_start, cmd)
+            self._last_velocity_safety_executed_v = float(executed_cmd[0])
+            self._last_velocity_safety_executed_w = float(executed_cmd[1])
+            return executed_cmd.astype(np.float32), 999.0, 0.0, 999.0
 
         # Cooldown prevents repeated new backup starts.  It must not consume the
         # already-started sticky backup lock; otherwise the policy can re-enter
@@ -6264,7 +7923,8 @@ class GazeboNavEnv(gym.Env):
         angular_limit = float(getattr(self, "velocity_command_angular_limit", self.max_angular_speed))
         if linear_limit < float(self.max_linear_speed) - 1e-6 or angular_limit < float(self.max_angular_speed) - 1e-6:
             before = cmd.copy()
-            cmd[0] = float(np.clip(float(cmd[0]), 0.0, linear_limit))
+            cmd_linear_low = -min(linear_limit, float(getattr(self, "velocity_reverse_linear_limit", linear_limit))) if bool(getattr(self, "velocity_allow_reverse", True)) else 0.0
+            cmd[0] = float(np.clip(float(cmd[0]), cmd_linear_low, linear_limit))
             cmd[1] = float(np.clip(float(cmd[1]), -angular_limit, angular_limit))
             if abs(float(before[0]) - float(cmd[0])) > 1e-6 or abs(float(before[1]) - float(cmd[1])) > 1e-6:
                 self._last_velocity_command_limited = True
@@ -6275,7 +7935,7 @@ class GazeboNavEnv(gym.Env):
         deadband_reasons: list[str] = []
         linear_deadband = max(float(getattr(self, "linear_deadband", 0.015)), 0.0)
         angular_deadband = max(float(getattr(self, "angular_deadband", 0.04)), 0.0)
-        if 0.0 < float(cmd[0]) < linear_deadband:
+        if 0.0 < abs(float(cmd[0])) < linear_deadband:
             old_v = float(cmd[0])
             cmd[0] = 0.0
             deadband_reasons.append(f"v_deadband:{old_v:.3f}<{linear_deadband:.3f}")
@@ -6410,11 +8070,18 @@ class GazeboNavEnv(gym.Env):
             )
             cmd[0] = 0.0
             cmd[1] = 0.0
+            measurement_start = self._velocity_measurement_pose2d()
+            self._last_velocity_commanded_v = float(cmd[0])
+            self._last_velocity_commanded_w = float(cmd[1])
             self.ros.publish_cmd_vel(0.0, 0.0)
             self.ros.spin_steps(num_spins=2, timeout_sec=0.001)
             self._advance_world_after_command(target_delta_sec=self.control_dt)
+            self._stop_direct_cmd_after_control_tick("velocity_safety_terminal")
+            executed_cmd = self._estimate_velocity_executed_action_from_delta(measurement_start, cmd)
+            self._last_velocity_safety_executed_v = float(executed_cmd[0])
+            self._last_velocity_safety_executed_w = float(executed_cmd[1])
             return (
-                cmd.astype(np.float32),
+                executed_cmd.astype(np.float32),
                 float(lidar_action_obstacle_distance),
                 float(lidar_action_obstacle_score),
                 float(lidar_front_obstacle_distance),
@@ -6526,6 +8193,7 @@ class GazeboNavEnv(gym.Env):
         if (
             assist_v > 0.0
             and float(cmd[0]) < assist_v
+            and float(cmd[0]) >= 0.0
             and abs(float(cmd[1])) >= assist_w_thr
             and float(front_min) > assist_clear
             and float(lidar_action_obstacle_distance) > assist_clear
@@ -6558,6 +8226,7 @@ class GazeboNavEnv(gym.Env):
             bool(getattr(self, "velocity_spin_breaker", False))
             and int(getattr(self, "_velocity_spin_same_sign_steps", 0)) >= int(getattr(self, "velocity_spin_breaker_steps", 14))
             and spin_ratio >= float(getattr(self, "velocity_spin_breaker_angular_ratio", 0.85))
+            and float(cmd[0]) >= 0.0
             and float(front_min) > float(getattr(self, "velocity_spin_breaker_min_clearance_m", 0.48))
             and float(lidar_action_obstacle_distance) > float(getattr(self, "velocity_spin_breaker_min_clearance_m", 0.48))
             and not bool(getattr(self, "_last_velocity_safety_blocked", False))
@@ -6585,14 +8254,19 @@ class GazeboNavEnv(gym.Env):
                     f"front={front_min:.3f} action={lidar_action_obstacle_distance:.3f}"
                 )
 
-        self._last_velocity_safety_executed_v = float(cmd[0])
-        self._last_velocity_safety_executed_w = float(cmd[1])
+        measurement_start = self._velocity_measurement_pose2d()
+        self._last_velocity_commanded_v = float(cmd[0])
+        self._last_velocity_commanded_w = float(cmd[1])
         self.ros.publish_cmd_vel(float(cmd[0]), float(cmd[1]))
         self.ros.spin_steps(num_spins=5, timeout_sec=0.001)
         self._advance_world_after_command(target_delta_sec=self.control_dt)
+        self._stop_direct_cmd_after_control_tick("velocity_action")
+        executed_cmd = self._estimate_velocity_executed_action_from_delta(measurement_start, cmd)
+        self._last_velocity_safety_executed_v = float(executed_cmd[0])
+        self._last_velocity_safety_executed_w = float(executed_cmd[1])
 
         return (
-            cmd.astype(np.float32),
+            executed_cmd.astype(np.float32),
             float(lidar_action_obstacle_distance),
             float(lidar_action_obstacle_score),
             float(lidar_front_obstacle_distance),
@@ -7648,6 +9322,7 @@ class GazeboNavEnv(gym.Env):
                 self.ros.step_simulation(self.sim_steps_per_action)
             else:
                 time.sleep(self.control_dt)
+            self._stop_direct_cmd_after_control_tick("wall_escape_motion")
             self._last_controller_steps += 1
             if self._check_collision() or self._check_fallen():
                 self.ros.stop_robot()
@@ -8291,6 +9966,7 @@ class GazeboNavEnv(gym.Env):
             self.ros.publish_cmd_vel(float(cmd[0]), float(cmd[1]))
             executed.append(np.asarray(cmd, dtype=np.float32))
             self._advance_world_after_command(target_delta_sec=self.control_dt)
+            self._stop_direct_cmd_after_control_tick("direct_fallback_to_goal")
             self._last_controller_steps += 1
 
             if self._check_collision() or self._check_fallen():
@@ -8332,6 +10008,130 @@ class GazeboNavEnv(gym.Env):
             angular_z = float(np.clip(yaw_delta / elapsed, -self.max_angular_speed, self.max_angular_speed))
             return np.array([linear_x, angular_z], dtype=np.float32)
         return np.zeros(2, dtype=np.float32)
+
+    @staticmethod
+    def _odometry_stamp_sec(msg) -> Optional[float]:
+        try:
+            stamp = msg.header.stamp
+            sec = float(stamp.sec) + float(stamp.nanosec) * 1e-9
+            if math.isfinite(sec) and sec > 0.0:
+                return sec
+        except Exception:
+            pass
+        return None
+
+    def _velocity_measurement_pose2d(self) -> Optional[tuple[np.ndarray, float, Optional[float], Optional[float], str]]:
+        """Return a self-consistent pose sample for physical velocity measurement.
+
+        Direct velocity mode used to report the published cmd_vel as "executed".
+        That hides the exact bug we care about: steps can continue and commands can
+        be non-zero while Gazebo/odom did not actually move.  For velocity-mode
+        reward and diagnostics, use a before/after odom delta instead.  The
+        absolute odom pose may be offset after Gazebo teleports, but its local
+        delta over one control tick is still the right physical measurement.
+        """
+        odom_msg = getattr(self.ros, "odom", None)
+        pose = self._pose2d_from_odometry_msg(odom_msg, "odom_msg")
+        if pose is not None:
+            xy, yaw, label = pose
+            return (
+                np.asarray(xy, dtype=np.float32)[:2],
+                float(yaw),
+                self._odometry_stamp_sec(odom_msg),
+                getattr(self.ros, "last_odom_time", None),
+                str(label),
+            )
+
+        model_msg = getattr(self.ros, "model_odom", None)
+        pose = self._pose2d_from_odometry_msg(model_msg, "model_odom")
+        if pose is not None:
+            xy, yaw, label = pose
+            return (
+                np.asarray(xy, dtype=np.float32)[:2],
+                float(yaw),
+                self._odometry_stamp_sec(model_msg),
+                getattr(self.ros, "last_model_odom_time", None),
+                str(label),
+            )
+
+        try:
+            tf_pose = self.ros.get_pose2d(frame_id="odom") if hasattr(self.ros, "get_pose2d") else None
+            if tf_pose is not None:
+                xy, yaw = tf_pose
+                xy = np.asarray(xy, dtype=np.float32)[:2]
+                if xy.size >= 2 and np.all(np.isfinite(xy)) and math.isfinite(float(yaw)):
+                    return xy, float(yaw), None, getattr(self.ros, "last_odom_time", None), "odom_tf"
+        except Exception:
+            pass
+        return None
+
+    def _estimate_velocity_executed_action_from_delta(
+        self,
+        start_pose,
+        fallback_cmd: np.ndarray,
+    ) -> np.ndarray:
+        """Estimate the velocity actually executed during the last control tick."""
+        fallback = np.asarray(fallback_cmd, dtype=np.float32).reshape(-1)
+        if fallback.size < 2:
+            padded = np.zeros(2, dtype=np.float32)
+            padded[: fallback.size] = fallback
+            fallback = padded
+        else:
+            fallback = fallback[:2].astype(np.float32, copy=True)
+
+        self._last_velocity_commanded_v = float(fallback[0])
+        self._last_velocity_commanded_w = float(fallback[1])
+        self._last_velocity_execution_delta_m = 0.0
+        self._last_velocity_execution_dt_sec = 0.0
+
+        end_pose = self._velocity_measurement_pose2d()
+        if start_pose is None or end_pose is None:
+            self._last_velocity_execution_source = "cmd_fallback:no_pose_delta"
+            return fallback
+
+        start_xy, start_yaw, start_stamp, start_wall, start_source = start_pose
+        end_xy, end_yaw, end_stamp, end_wall, end_source = end_pose
+        if str(start_source) != str(end_source):
+            self._last_velocity_execution_source = f"cmd_fallback:source_changed:{start_source}->{end_source}"
+            return fallback
+
+        try:
+            start_xy = np.asarray(start_xy, dtype=np.float32)[:2]
+            end_xy = np.asarray(end_xy, dtype=np.float32)[:2]
+            if (
+                start_xy.size < 2
+                or end_xy.size < 2
+                or not np.all(np.isfinite(start_xy))
+                or not np.all(np.isfinite(end_xy))
+                or not math.isfinite(float(start_yaw))
+                or not math.isfinite(float(end_yaw))
+            ):
+                self._last_velocity_execution_source = f"cmd_fallback:bad_pose:{start_source}"
+                return fallback
+
+            dt = float(getattr(self, "control_dt", 0.0))
+            fresh = False
+            if start_stamp is not None and end_stamp is not None and float(end_stamp) > float(start_stamp):
+                dt = float(end_stamp) - float(start_stamp)
+                fresh = True
+            elif start_wall is not None and end_wall is not None and float(end_wall) > float(start_wall):
+                fresh = True
+
+            dt = max(float(dt), 1e-3)
+            delta_xy = end_xy - start_xy
+            forward_axis = np.array([math.cos(float(start_yaw)), math.sin(float(start_yaw))], dtype=np.float32)
+            forward_delta = float(np.dot(delta_xy, forward_axis))
+            yaw_delta = self._normalize_angle(float(end_yaw) - float(start_yaw))
+            reverse_limit = float(getattr(self, "velocity_reverse_linear_limit", self.max_linear_speed))
+            linear_x = float(np.clip(forward_delta / dt, -reverse_limit, float(self.max_linear_speed)))
+            angular_z = float(np.clip(yaw_delta / dt, -float(self.max_angular_speed), float(self.max_angular_speed)))
+            self._last_velocity_execution_delta_m = float(np.linalg.norm(delta_xy))
+            self._last_velocity_execution_dt_sec = float(dt)
+            self._last_velocity_execution_source = f"{start_source}:{'fresh' if fresh else 'same_sample'}"
+            return np.array([linear_x, angular_z], dtype=np.float32)
+        except Exception as exc:
+            self._last_velocity_execution_source = f"cmd_fallback:{type(exc).__name__}"
+            return fallback
 
     def _transform_pose_xy_yaw_between_frames(
         self,
@@ -8935,6 +10735,7 @@ class GazeboNavEnv(gym.Env):
 
             self.ros.spin_steps(num_spins=5, timeout_sec=0.001)
             self._advance_world_after_command(target_delta_sec=self.control_dt)
+            self._stop_direct_cmd_after_control_tick("waypoint_action")
 
             # waypoint가 고정된 상태에서도 marker를 계속 갱신해야 RViz에서 목표점과 로봇 사이 선이 따라 움직인다.
             if (low_level_i + 1) % self.waypoint_visual_publish_every_n == 0:
@@ -9963,6 +11764,60 @@ class GazeboNavEnv(gym.Env):
         """No-op. Kept only for CLI/API compatibility."""
         return np.asarray(action, dtype=np.float32).copy()
 
+    def _paced_world_step(self, step_n: int, target_delta_sec: float, advance_wall_start: float) -> tuple[bool, bool]:
+        """Run Gazebo multi_step in small wall-paced chunks.
+
+        Returns (ok, partial_advanced). If a later chunk fails after earlier
+        chunks may have advanced physics, the caller must not retry the full
+        step because that would over-advance sim time.
+        """
+        step_n = max(int(step_n), 0)
+        if step_n <= 0:
+            return True, False
+        if self.sim_controller is None:
+            return False, False
+
+        chunk_sec = float(getattr(self, "world_step_realtime_chunk_sec", 0.02))
+        target_delta = max(float(target_delta_sec), 0.0)
+        speed_factor = max(float(getattr(self, "realtime_pacing_speed_factor", 1.0)), 0.001)
+        # target_delta is sim-seconds; pacing needs the *wall*-seconds budget
+        # that sim-time is supposed to map to (target_delta at 1x, less at
+        # higher speed factors).
+        paced_wall_target = target_delta / speed_factor
+        should_chunk = (
+            bool(getattr(self, "world_step_realtime_pacing", True))
+            and chunk_sec > 0.0
+            and paced_wall_target > chunk_sec * 1.25
+            and step_n > 1
+        )
+        if not should_chunk:
+            return bool(self.sim_controller.step(step_n)), False
+
+        chunk_steps = int(round(float(step_n) * chunk_sec / max(paced_wall_target, 1e-6)))
+        chunk_steps = max(1, min(int(chunk_steps), int(step_n)))
+        done_steps = 0
+        partial_advanced = False
+
+        while done_steps < step_n:
+            n = min(chunk_steps, step_n - done_steps)
+            ok = bool(self.sim_controller.step(n))
+            if not ok:
+                return False, partial_advanced
+            done_steps += int(n)
+            partial_advanced = True
+
+            target_wall_elapsed = paced_wall_target * (float(done_steps) / max(float(step_n), 1.0))
+            while rclpy.ok():
+                elapsed = time.monotonic() - float(advance_wall_start)
+                remaining = target_wall_elapsed - elapsed
+                if remaining <= 0.0:
+                    break
+                self.ros.spin_steps(num_spins=1, timeout_sec=min(max(float(remaining), 0.0), 0.005))
+                if remaining > 0.001:
+                    time.sleep(min(0.001, max(float(remaining), 0.0)))
+
+        return True, partial_advanced
+
     def _advance_world_after_command(
         self,
         target_delta_sec: float,
@@ -9987,15 +11842,27 @@ class GazeboNavEnv(gym.Env):
         ):
             sub_dt = float(self.control_dt) / float(substeps)
             sub_steps_count = max(int(round(float(self.sim_steps_per_action) / float(substeps))), 1)
+            held_linear = float(getattr(self.ros, "last_cmd_linear_x", 0.0) or 0.0)
+            held_angular = float(getattr(self.ros, "last_cmd_angular_z", 0.0) or 0.0)
+            republish_held_cmd = bool(abs(held_linear) > 1e-9 or abs(held_angular) > 1e-9)
             for sub_i in range(substeps):
+                if sub_i > 0 and republish_held_cmd:
+                    try:
+                        self.ros.publish_cmd_vel(held_linear, held_angular)
+                        self.ros.spin_steps(num_spins=2, timeout_sec=0.001)
+                    except Exception:
+                        pass
                 self._advance_world_after_command(
                     target_delta_sec=sub_dt,
                     override_sim_steps=sub_steps_count,
                     _is_substep=True,
                 )
+                self._stop_direct_cmd_after_control_tick(f"map_substep_{sub_i + 1}/{substeps}")
                 if sub_i < substeps - 1:
                     try:
-                        self._update_exploration_map()
+                        sub_stats = self._update_exploration_map()
+                        if bool(getattr(self, "_last_map_update_applied", False)):
+                            self._accumulate_step_map_stats(sub_stats)
                     except Exception:
                         pass
                     # v133: no early break on collision/fallen here. A real hit
@@ -10012,6 +11879,10 @@ class GazeboNavEnv(gym.Env):
         prev_odom_stamp = self.ros.get_odom_stamp_sec()
         prev_scan_wall = self.ros.last_scan_time
         prev_odom_wall = self.ros.last_odom_time
+        advance_wall_start = time.monotonic()
+        self._last_pause_world_each_action_used = False
+        self._last_pause_world_each_action_ok = True
+        self._last_pause_world_each_action_reason = "disabled"
 
         # v133: split out where the time inside action_execute actually goes
         # (gz-transport multi_step round trip vs the two post-step wait/poll
@@ -10023,7 +11894,7 @@ class GazeboNavEnv(gym.Env):
 
         if self.use_world_step and self.sim_controller is not None:
             step_n = int(override_sim_steps) if override_sim_steps is not None else self.sim_steps_per_action
-            ok = self.sim_controller.step(step_n)
+            ok, partial_advanced = self._paced_world_step(step_n, float(target_delta_sec), advance_wall_start)
 
             if not ok:
                 # v135: a single ControlWorld timeout used to give up after one
@@ -10034,8 +11905,12 @@ class GazeboNavEnv(gym.Env):
                 # sim-time-advance contract instead of a single-shot attempt.
                 self._world_step_call_fail_total += 1
                 _retry_start = time.time()
-                while not ok and (time.time() - _retry_start) < self.world_step_contract_max_wait_sec:
-                    ok = self.sim_controller.step(step_n)
+                while (
+                    not ok
+                    and not bool(partial_advanced)
+                    and (time.time() - _retry_start) < self.world_step_contract_max_wait_sec
+                ):
+                    ok, partial_advanced = self._paced_world_step(step_n, float(target_delta_sec), advance_wall_start)
 
             if _prof_on:
                 _t1 = time.perf_counter()
@@ -10048,10 +11923,17 @@ class GazeboNavEnv(gym.Env):
                     "World multi_step failed after retrying for "
                     f"{self.world_step_contract_max_wait_sec:.1f}s "
                     f"(fail_total={self._world_step_call_fail_total}). "
-                    "Falling back to short ROS spin."
+                    "Forcing robot/world stop and dropping this episode."
                 )
-                self.ros.spin_steps(num_spins=20, timeout_sec=0.001)
-                return
+                try:
+                    self.ros.stop_robot()
+                except Exception:
+                    pass
+                try:
+                    self.sim_controller.pause(True, timeout_sec=0.5)
+                except Exception:
+                    pass
+                raise RecoverableResetError("world_multi_step_failed")
 
             target_fraction = self.world_step_target_fraction
             time_advanced = True
@@ -10081,6 +11963,10 @@ class GazeboNavEnv(gym.Env):
                     # robot before waiting; the next real command is sent once
                     # this step actually completes.
                     self.ros.stop_robot()
+                    try:
+                        self.sim_controller.pause(True, timeout_sec=0.5)
+                    except Exception:
+                        pass
                     _contract_wait_start = time.time()
                     while not time_advanced:
                         time_advanced = self.ros.wait_for_time_advance(
@@ -10093,6 +11979,15 @@ class GazeboNavEnv(gym.Env):
                             break
                         if (time.time() - _contract_wait_start) >= self.world_step_contract_max_wait_sec:
                             break
+                    if not time_advanced:
+                        try:
+                            self.sim_controller.pause(True, timeout_sec=0.5)
+                        except Exception:
+                            pass
+                        raise RecoverableResetError(
+                            f"world_step_contract_missed target_delta={target_delta:.6f} "
+                            f"start_sim={prev_sim_time:.6f} now_sim={self.ros.get_sim_time_sec():.6f}"
+                        )
             if _prof_on:
                 _t2 = time.perf_counter()
                 self._last_advance_wait_time_adv_sec = _t2 - _t1
@@ -10106,6 +12001,42 @@ class GazeboNavEnv(gym.Env):
             )
             if _prof_on:
                 self._last_advance_wait_sensor_sec = time.perf_counter() - _t2
+
+            now_sim_time = self.ros.get_sim_time_sec()
+            actual_delta = 0.0
+            try:
+                if float(prev_sim_time) >= 0.0 and float(now_sim_time) >= 0.0:
+                    actual_delta = max(float(now_sim_time) - float(prev_sim_time), 0.0)
+            except Exception:
+                actual_delta = 0.0
+            expected_delta = max(float(target_delta_sec), 0.0)
+            overshoot = max(float(actual_delta) - float(expected_delta), 0.0)
+            self._last_world_step_sim_delta_sec = float(actual_delta)
+            self._last_world_step_target_delta_sec = float(expected_delta)
+            self._last_world_step_overshoot_sec = float(overshoot)
+            self._action_world_step_sim_delta_sec = float(getattr(self, "_action_world_step_sim_delta_sec", 0.0)) + float(actual_delta)
+            self._action_world_step_target_delta_sec = float(getattr(self, "_action_world_step_target_delta_sec", 0.0)) + float(expected_delta)
+            self._action_world_step_overshoot_sec = max(
+                float(getattr(self, "_action_world_step_overshoot_sec", 0.0)),
+                float(overshoot),
+            )
+            overshoot_tol = max(
+                float(getattr(self, "world_step_max_overshoot_sec", 0.005)),
+                float(getattr(self, "physics_step_size", 0.005)) * 1.0,
+            )
+            if expected_delta > 0.0 and overshoot > overshoot_tol:
+                try:
+                    self.ros.stop_robot()
+                except Exception:
+                    pass
+                try:
+                    self.sim_controller.pause(True, timeout_sec=0.5)
+                except Exception:
+                    pass
+                raise RecoverableResetError(
+                    f"world_step_overshot target_delta={expected_delta:.6f} "
+                    f"actual_delta={actual_delta:.6f} overshoot={overshoot:.6f}"
+                )
 
             if time_advanced or sensor_updated:
                 self._world_step_stale_count = 0
@@ -10125,14 +12056,53 @@ class GazeboNavEnv(gym.Env):
                     self.world_step_auto_disable_on_stale
                     and self._world_step_stale_count >= self.world_step_stale_limit
                 ):
-                    self.use_world_step = False
+                    # v146: this used to silently flip self.use_world_step=False and
+                    # fall back to wall-clock/free-running Gazebo. That decouples
+                    # RL decision rate from physics rate mid-run -- dynamic
+                    # obstacles (sim-time driven) and the robot (now real-time
+                    # driven) would no longer share one simulation-time
+                    # reference, sensor/action timing would drift, and corrupted
+                    # transitions could land in the replay buffer. A stale
+                    # lockstep contract now hard-fails into a recoverable reset
+                    # instead of silently downgrading the whole run's timing
+                    # model. world_step_auto_disable_on_stale defaults off
+                    # (--no-world-step-auto-disable) for exactly this reason.
                     self._world_step_stale_count = 0
-                    self.ros.get_logger().error(
-                        "Disabling Gazebo multi_step for this run because observations stayed stale. "
-                        "Falling back to wall-clock ROS spinning. For future runs, add --disable-world-step."
+                    try:
+                        self.ros.stop_robot()
+                    except Exception:
+                        pass
+                    try:
+                        self.sim_controller.pause(True, timeout_sec=0.5)
+                    except Exception:
+                        pass
+                    raise RecoverableResetError(
+                        f"world_step_stale_limit_reached | stale_total={self._world_step_stale_total} "
+                        f"limit={self.world_step_stale_limit}"
                     )
 
             self.ros.spin_steps(num_spins=5, timeout_sec=0.0)
+            if bool(getattr(self, "world_step_post_pause_barrier", True)):
+                try:
+                    self.sim_controller.pause(True, timeout_sec=0.25)
+                except Exception:
+                    pass
+            if bool(getattr(self, "world_step_realtime_pacing", True)):
+                speed_factor = max(float(getattr(self, "realtime_pacing_speed_factor", 1.0)), 0.001)
+                target_wall = max(float(target_delta_sec), 0.0) / speed_factor
+                while rclpy.ok():
+                    elapsed = time.monotonic() - advance_wall_start
+                    remaining = target_wall - elapsed
+                    if remaining <= 0.0:
+                        break
+                    self.ros.spin_steps(num_spins=1, timeout_sec=min(max(float(remaining), 0.0), 0.005))
+                    if remaining > 0.001:
+                        time.sleep(min(0.001, max(float(remaining), 0.0)))
+            self._last_world_step_wall_elapsed_sec = float(time.monotonic() - advance_wall_start)
+            self._action_world_step_wall_elapsed_sec = (
+                float(getattr(self, "_action_world_step_wall_elapsed_sec", 0.0))
+                + float(self._last_world_step_wall_elapsed_sec)
+            )
 
         else:
             # Real-time fallback: Gazebo is already running unpaused in its own
@@ -10156,23 +12126,170 @@ class GazeboNavEnv(gym.Env):
                 )
 
             if bool(getattr(self, "realtime_enforce_control_dt", False)):
-                target_wall = max(float(target_delta_sec), 0.0) + float(getattr(self, "realtime_control_dt_wall_margin_sec", 0.0))
-                # Keep small spin/sleep slices so /clock, odom, scan, SLAM, and
-                # map timers can update while the command is being held.
-                while rclpy.ok():
-                    elapsed = time.monotonic() - start_wall
-                    remaining = target_wall - elapsed
-                    if remaining <= 0.0:
-                        break
-                    spin_timeout = min(max(float(remaining), 0.0), 0.005)
-                    self.ros.spin_steps(num_spins=1, timeout_sec=spin_timeout)
-                    if remaining > 0.001:
-                        time.sleep(min(0.001, max(remaining, 0.0)))
+                target_delta = max(float(target_delta_sec), 0.0)
+                handled_realtime_dt = False
+                pause_each_action = bool(getattr(self, "pause_world_each_action", False)) and self.sim_controller is not None
+                if pause_each_action:
+                    self._last_pause_world_each_action_used = True
+                    self._last_pause_world_each_action_ok = True
+                    self._last_pause_world_each_action_reason = "pending"
+                    try:
+                        self.ros.spin_steps(num_spins=2, timeout_sec=0.001)
+                    except Exception:
+                        pass
+                    timeout_sec = float(getattr(self, "pause_world_each_action_timeout_sec", 0.5))
+                    unpause_ok = False
+                    try:
+                        unpause_ok = bool(self.sim_controller.pause(False, timeout_sec=timeout_sec))
+                    except Exception:
+                        unpause_ok = False
+                    if unpause_ok:
+                        handled_realtime_dt = True
+                        time_advanced = True
+                        if target_delta > 1e-6:
+                            time_advanced = self.ros.wait_for_time_advance(
+                                start_sim_time_sec=prev_sim_time,
+                                start_odom_stamp_sec=prev_odom_stamp,
+                                target_delta_sec=target_delta,
+                                timeout_wall_sec=float(getattr(self, "realtime_sim_dt_timeout_sec", 1.0)),
+                            )
+                        if not time_advanced:
+                            self._world_step_stale_total = int(getattr(self, "_world_step_stale_total", 0)) + 1
+                            if self.step_count % self.world_step_stale_warn_every_n == 0:
+                                self.ros.get_logger().warn(
+                                    "Pause-per-action sim-clock wait timed out; holding wall-clock before re-pausing. "
+                                    f"target_delta={target_delta:.3f} start_sim={prev_sim_time} "
+                                    f"now_sim={self.ros.get_sim_time_sec()} stale_total={self._world_step_stale_total}"
+                                )
+                            target_wall = target_delta + float(getattr(self, "realtime_control_dt_wall_margin_sec", 0.0))
+                            while rclpy.ok():
+                                elapsed = time.monotonic() - start_wall
+                                remaining = target_wall - elapsed
+                                if remaining <= 0.0:
+                                    break
+                                spin_timeout = min(max(float(remaining), 0.0), 0.005)
+                                self.ros.spin_steps(num_spins=1, timeout_sec=spin_timeout)
+                                if remaining > 0.001:
+                                    time.sleep(min(0.001, max(remaining, 0.0)))
+                            self._last_pause_world_each_action_reason = "sim_dt_timeout_wall_fallback"
+                        else:
+                            self._last_pause_world_each_action_reason = "sim_dt"
+                        pause_ok = False
+                        try:
+                            pause_ok = bool(self.sim_controller.pause(True, timeout_sec=timeout_sec))
+                        except Exception:
+                            pause_ok = False
+                        if not pause_ok:
+                            self._last_pause_world_each_action_ok = False
+                            self._last_pause_world_each_action_reason += ":pause_failed"
+                    else:
+                        self._last_pause_world_each_action_ok = False
+                        self._last_pause_world_each_action_reason = "unpause_failed_free_run_fallback"
+
+                if not handled_realtime_dt and str(getattr(self, "realtime_control_dt_clock", "wall")) == "sim":
+                    time_advanced = True
+                    if target_delta > 1e-6:
+                        time_advanced = self.ros.wait_for_time_advance(
+                            start_sim_time_sec=prev_sim_time,
+                            start_odom_stamp_sec=prev_odom_stamp,
+                            target_delta_sec=target_delta,
+                            timeout_wall_sec=float(getattr(self, "realtime_sim_dt_timeout_sec", 1.0)),
+                        )
+                    if not time_advanced:
+                        self._world_step_stale_total = int(getattr(self, "_world_step_stale_total", 0)) + 1
+                        if self.step_count % self.world_step_stale_warn_every_n == 0:
+                            self.ros.get_logger().warn(
+                                "Realtime sim-clock control_dt wait timed out; falling back to wall-clock hold. "
+                                f"target_delta={target_delta:.3f} start_sim={prev_sim_time} "
+                                f"now_sim={self.ros.get_sim_time_sec()} stale_total={self._world_step_stale_total}"
+                            )
+                        # Fallback preserves the old behavior if /clock or odom
+                        # stalls, instead of turning this action into a near no-op.
+                        target_wall = target_delta + float(getattr(self, "realtime_control_dt_wall_margin_sec", 0.0))
+                        while rclpy.ok():
+                            elapsed = time.monotonic() - start_wall
+                            remaining = target_wall - elapsed
+                            if remaining <= 0.0:
+                                break
+                            spin_timeout = min(max(float(remaining), 0.0), 0.005)
+                            self.ros.spin_steps(num_spins=1, timeout_sec=spin_timeout)
+                            if remaining > 0.001:
+                                time.sleep(min(0.001, max(remaining, 0.0)))
+                elif not handled_realtime_dt:
+                    target_wall = target_delta + float(getattr(self, "realtime_control_dt_wall_margin_sec", 0.0))
+                    # Keep small spin/sleep slices so /clock, odom, scan, SLAM, and
+                    # map timers can update while the command is being held.
+                    while rclpy.ok():
+                        elapsed = time.monotonic() - start_wall
+                        remaining = target_wall - elapsed
+                        if remaining <= 0.0:
+                            break
+                        spin_timeout = min(max(float(remaining), 0.0), 0.005)
+                        self.ros.spin_steps(num_spins=1, timeout_sec=spin_timeout)
+                        if remaining > 0.001:
+                            time.sleep(min(0.001, max(remaining, 0.0)))
                 self._last_realtime_step_wall_elapsed_sec = float(time.monotonic() - start_wall)
             else:
                 if self.realtime_sleep_sec > 0.0:
                     time.sleep(self.realtime_sleep_sec)
                 self._last_realtime_step_wall_elapsed_sec = float(time.monotonic() - start_wall)
+
+            now_sim_time = self.ros.get_sim_time_sec()
+            actual_delta = 0.0
+            try:
+                if float(prev_sim_time) >= 0.0 and float(now_sim_time) >= 0.0:
+                    actual_delta = max(float(now_sim_time) - float(prev_sim_time), 0.0)
+            except Exception:
+                actual_delta = 0.0
+            expected_delta = max(float(target_delta_sec), 0.0)
+            overshoot = max(float(actual_delta) - float(expected_delta), 0.0)
+            self._last_world_step_sim_delta_sec = float(actual_delta)
+            self._last_world_step_target_delta_sec = float(expected_delta)
+            self._last_world_step_overshoot_sec = float(overshoot)
+            self._action_world_step_sim_delta_sec = float(getattr(self, "_action_world_step_sim_delta_sec", 0.0)) + float(actual_delta)
+            self._action_world_step_target_delta_sec = float(getattr(self, "_action_world_step_target_delta_sec", 0.0)) + float(expected_delta)
+            self._action_world_step_overshoot_sec = max(
+                float(getattr(self, "_action_world_step_overshoot_sec", 0.0)),
+                float(overshoot),
+            )
+
+    def _stop_direct_cmd_after_control_tick(self, reason: str = "control_tick") -> None:
+        """Optionally latch zero velocity after a direct-control tick.
+
+        Normal pause-per-action training leaves this disabled: Gazebo is paused
+        after the tick, and the next policy command is published before unpause.
+        """
+        if not bool(getattr(self, "stop_after_control_tick", True)):
+            return
+
+        for _ in range(max(int(getattr(self, "stop_after_control_tick_publish_count", 2)), 1)):
+            try:
+                self.ros.publish_cmd_vel(0.0, 0.0)
+            except Exception:
+                pass
+            try:
+                spins = max(int(getattr(self, "stop_after_control_tick_spin_steps", 4)), 0)
+                if spins > 0:
+                    self.ros.spin_steps(num_spins=spins, timeout_sec=0.001)
+            except Exception:
+                pass
+
+        if (
+            (bool(getattr(self, "use_world_step", False)) or bool(getattr(self, "pause_world_each_action", False)))
+            and self.sim_controller is not None
+        ):
+            try:
+                self.sim_controller.pause(
+                    True,
+                    timeout_sec=min(float(getattr(self, "pause_world_each_action_timeout_sec", 0.5)), 0.5),
+                )
+            except Exception as exc:
+                try:
+                    self.ros.get_logger().debug(
+                        f"STOP_AFTER_CONTROL_TICK_PAUSE_FAILED | reason={reason} | {type(exc).__name__}: {exc}"
+                    )
+                except Exception:
+                    pass
 
     def close(self):
         self._map_live_update_paused = True
@@ -10289,10 +12406,17 @@ class GazeboNavEnv(gym.Env):
         _diag_on = str(os.environ.get("TB3_RL_RESET_PROFILER", "0")).strip().lower() in {"1", "true", "yes", "on"}
         _diag_t0 = time.perf_counter() if _diag_on else 0.0
 
-        ok = self.ros.reset_slam_mapping(
-            timeout_sec=self.slam_reset_timeout_sec,
-            allow_process_restart=self.restart_slam_on_reset,
-        )
+        if bool(getattr(self, "_slam_restart_kicked_off", False)) and hasattr(self.ros, "verify_cartographer_started"):
+            # v143: _reset_once() already kicked off Cartographer's kill+relaunch
+            # before obstacle placement so the process's own startup time
+            # overlaps with that independent work. Do not repeat the kill+
+            # relaunch here -- just verify the already-launched process.
+            ok = self.ros.verify_cartographer_started(timeout_sec=min(float(self.slam_reset_timeout_sec), 3.0))
+        else:
+            ok = self.ros.reset_slam_mapping(
+                timeout_sec=self.slam_reset_timeout_sec,
+                allow_process_restart=self.restart_slam_on_reset,
+            )
         if _diag_on:
             print(f"SLAM_RESET_DIAG | reset_slam_mapping={  (time.perf_counter()-_diag_t0)*1000.0:.1f}ms ok={ok} map_ready={self.ros.slam_map is not None}", flush=True)
 
@@ -10305,7 +12429,14 @@ class GazeboNavEnv(gym.Env):
         _diag_t1 = time.perf_counter() if _diag_on else 0.0
         deadline = time.time() + max(float(self.slam_reset_timeout_sec), 1.0)
         step_sec = max(float(self.control_dt), 0.05)
-        max_iters = max(int(self.slam_reset_warmup_steps), 1) * 20
+        try:
+            max_warmup_sim_sec = max(
+                float(os.environ.get("TB3_RL_SLAM_RESET_MAX_SIM_ADVANCE_SEC", "6.0") or 6.0),
+                step_sec,
+            )
+        except Exception:
+            max_warmup_sim_sec = 6.0
+        max_iters = max(int(math.ceil(max_warmup_sim_sec / max(step_sec, 1e-6))), 1)
         iters = 0
         while self.ros.slam_map is None and time.time() < deadline and iters < max_iters:
             _iter_t0 = time.perf_counter() if _diag_on else 0.0
@@ -10585,7 +12716,10 @@ class GazeboNavEnv(gym.Env):
             hold_sec = 1.5
         held_xy = getattr(self, "_last_direct_tf_pose_xy", None)
         held_yaw = getattr(self, "_last_direct_tf_pose_yaw", None)
-        held_wall = float(getattr(self, "_last_direct_tf_pose_wall", 0.0))
+        try:
+            held_wall = float(getattr(self, "_last_direct_tf_pose_wall", 0.0) or 0.0)
+        except Exception:
+            held_wall = 0.0
         if (
             isinstance(held_xy, np.ndarray)
             and held_xy.size >= 2
@@ -11696,7 +13830,10 @@ class GazeboNavEnv(gym.Env):
                     hold_sec = 0.5
                 held_xy = getattr(self, "_last_direct_tf_pose_xy", None)
                 held_yaw = getattr(self, "_last_direct_tf_pose_yaw", None)
-                held_wall = float(getattr(self, "_last_direct_tf_pose_wall", 0.0))
+                try:
+                    held_wall = float(getattr(self, "_last_direct_tf_pose_wall", 0.0) or 0.0)
+                except Exception:
+                    held_wall = 0.0
                 if (
                     isinstance(held_xy, np.ndarray)
                     and held_xy.size >= 2
@@ -13675,10 +15812,17 @@ class GazeboNavEnv(gym.Env):
 
             prev_stamp_key = getattr(self, "_direct_slam_stamp_key", None)
             prev_map_data: Optional[np.ndarray] = getattr(self, "_direct_slam_prev_map_data", None)
+            cur_data = np.asarray(slam_map.data, dtype=np.int8)
+
+            if bool(getattr(self, "_last_reverse_action_reward_suppressed", False)):
+                self._direct_slam_stamp_key = stamp_key
+                self._direct_slam_prev_map_data = cur_data.copy()
+                self._last_slam_map_update_reward_reason = "reverse_suppressed"
+                return 0.0
 
             if prev_map_data is None or prev_stamp_key is None:
                 self._direct_slam_stamp_key = stamp_key
-                self._direct_slam_prev_map_data = np.asarray(slam_map.data, dtype=np.int8).copy()
+                self._direct_slam_prev_map_data = cur_data.copy()
                 self._last_slam_map_update_reward_reason = "init"
                 return 0.0
 
@@ -13686,7 +15830,6 @@ class GazeboNavEnv(gym.Env):
                 self._last_slam_map_update_reward_reason = "no_new_known"
                 return 0.0
 
-            cur_data = np.asarray(slam_map.data, dtype=np.int8)
             cur_size = cur_data.shape[0]
             prev_size = prev_map_data.shape[0]
 
@@ -13739,6 +15882,9 @@ class GazeboNavEnv(gym.Env):
             return 0.0
         if not bool(getattr(self, "_last_post_reset_ready", True)):
             self._last_slam_map_update_reward_reason = "post_reset_not_ready"
+            return 0.0
+        if bool(getattr(self, "_last_reverse_action_reward_suppressed", False)):
+            self._last_slam_map_update_reward_reason = "reverse_suppressed"
             return 0.0
         new_known = max(int(getattr(stats, "slam_update_new_known_cells", 0)), 0)
         if new_known <= 0:
@@ -14281,8 +16427,11 @@ class GazeboNavEnv(gym.Env):
           - scan pose:  map -> scan.header.frame_id, at scan timestamp
           - grid:       latest accepted /map metadata
         """
+        self._last_map_update_applied = False
+        self._last_confidence_update_called = False
         if self.ros.scan is None or self.ros.odom is None:
             self._last_confidence_pose_ok = False
+            self._last_confidence_update_reason_if_zero = "missing_scan_or_odom"
             return self.last_map_stats
 
         # v8 pose anchor rule:
@@ -14316,10 +16465,12 @@ class GazeboNavEnv(gym.Env):
             ).strip().lower() in {"1", "true", "yes", "on"}
             if map_locked and not allow_odom_fallback:
                 self._last_confidence_pose_ok = False
+                self._last_confidence_update_reason_if_zero = "missing_tf_pose_map_locked"
                 return self.last_map_stats
             pose_fallback = self._get_robot_pose2d(frame_id=fallback_frame)
             if pose_fallback is None:
                 self._last_confidence_pose_ok = False
+                self._last_confidence_update_reason_if_zero = "missing_pose_fallback"
                 return self.last_map_stats
             robot_xy, robot_yaw = pose_fallback
             sensor_xy = robot_xy.copy()
@@ -14369,50 +16520,40 @@ class GazeboNavEnv(gym.Env):
         if slam_map is None:
             slam_map = self._filtered_slam_map_for_update()
 
-        # v134: the very first confidence update of an episode paints a full
-        # 360 degree circle around the robot instead of the normal
-        # front_fov_deg forward cone. The forward-only gate exists to keep the
-        # per-step reward-relevant confidence signal forward-facing, but it
-        # means the robot's own sides/rear are otherwise never marked
-        # confident even though the robot is physically standing there,
-        # leaving a permanent unconfident gap at every spawn point. Reuse the
-        # exact same wall-aware/occlusion LiDAR ray-painting logic in
-        # exploration_map.update() -- just temporarily widen the angular gate
-        # so no direction is excluded -- rather than a separate naive disk
-        # fill that could paint through walls.
-        _seed_full_circle = bool(getattr(self, "_pending_omnidirectional_confidence_seed", False))
-        _orig_front_fov_rad = None
-        if _seed_full_circle:
-            _orig_front_fov_rad = self.exploration_map.front_fov_rad
-            self.exploration_map.front_fov_rad = 2.0 * math.pi
-
         try:
+            suppress_conf = bool(getattr(self, "_suppress_confidence_update_for_current_action", False))
+            stats = self.exploration_map.update(
+                scan=self.ros.scan,
+                robot_xy=robot_xy,
+                robot_yaw=robot_yaw,
+                publish=True,
+                slam_map=slam_map,
+                sensor_xy=sensor_xy,
+                sensor_yaw=sensor_yaw,
+                suppress_confidence_update=suppress_conf,
+            )
+            self._last_map_update_applied = True
+            self._last_confidence_update_called = not bool(suppress_conf)
+            if not bool(suppress_conf):
+                self._action_confidence_update_called = True
+            if bool(suppress_conf):
+                self._last_confidence_update_reason_if_zero = "suppressed_reverse_or_backup"
+            elif int(getattr(stats, "confidence_updated_cells", 0)) <= 0:
+                self._last_confidence_update_reason_if_zero = "no_confidence_cells_updated"
+            else:
+                self._last_confidence_update_reason_if_zero = "updated"
+        except TypeError as exc:
+            # Do not silently fall back to the old robot_yaw-only update path.
+            # If this fires, colcon/symlink-install is still loading an older
+            # ExplorationGridMap and confidence direction/pose will be wrong.
             try:
-                stats = self.exploration_map.update(
-                    scan=self.ros.scan,
-                    robot_xy=robot_xy,
-                    robot_yaw=robot_yaw,
-                    publish=True,
-                    slam_map=slam_map,
-                    sensor_xy=sensor_xy,
-                    sensor_yaw=sensor_yaw,
+                self.ros.get_logger().error(
+                    "CONFIDENCE_UPDATE_API_MISMATCH | "
+                    f"ExplorationGridMap.update() does not accept the current confidence-update arguments: {exc}"
                 )
-            except TypeError as exc:
-                # Do not silently fall back to the old robot_yaw-only update path.
-                # If this fires, colcon/symlink-install is still loading an older
-                # ExplorationGridMap and confidence direction/pose will be wrong.
-                try:
-                    self.ros.get_logger().error(
-                        "CONFIDENCE_UPDATE_API_MISMATCH | "
-                        f"ExplorationGridMap.update() does not accept sensor_xy/sensor_yaw: {exc}"
-                    )
-                except Exception:
-                    pass
-                return self.last_map_stats
-        finally:
-            if _seed_full_circle:
-                self.exploration_map.front_fov_rad = _orig_front_fov_rad
-                self._pending_omnidirectional_confidence_seed = False
+            except Exception:
+                pass
+            return self.last_map_stats
 
         try:
             if self._force_map_publish_every_update:
@@ -14433,9 +16574,8 @@ class GazeboNavEnv(gym.Env):
         This fixes the failure mode where /rl_confidence_map keeps being painted
         around the first-step pose while the RViz robot has already moved/rotated.
         """
-        if str(os.environ.get("TB3_RL_DEBUG_MAP_UPDATE_COUNT", "0")).strip().lower() in {"1", "true", "yes", "on"}:
-            self._map_update_call_count = int(getattr(self, "_map_update_call_count", 0)) + 1
-            self._map_update_call_count_this_step = int(getattr(self, "_map_update_call_count_this_step", 0)) + 1
+        self._map_update_call_count = int(getattr(self, "_map_update_call_count", 0)) + 1
+        self._map_update_call_count_this_step = int(getattr(self, "_map_update_call_count_this_step", 0)) + 1
         return self._update_exploration_map_with_unified_tf()
 
     @staticmethod
@@ -14810,6 +16950,24 @@ class GazeboNavEnv(gym.Env):
         info["priority_direction_alignment"] = float(priority_direction_alignment)
         info["priority_direction_signed"] = float(priority_direction_signed)
         info["action_mode"] = str(self.action_mode)
+        info["moving_obstacles_enabled"] = bool(getattr(self, "random_moving_obstacle_enabled", False))
+        info["moving_obstacles_started"] = bool(getattr(self, "_moving_obstacles_motion_started", False))
+        info["moving_obstacles_start_step"] = int(getattr(self, "_moving_obstacles_start_step", -1))
+        info["moving_obstacles_start_reason"] = str(getattr(self, "_moving_obstacles_start_reason", "none"))
+        info["moving_obstacles_robot_delta_m"] = float(getattr(self, "_moving_obstacles_last_delta_m", 0.0))
+        info["moving_obstacles_robot_delta_yaw_rad"] = float(getattr(self, "_moving_obstacles_last_delta_yaw_rad", 0.0))
+        info["velocity_allow_reverse"] = bool(getattr(self, "velocity_allow_reverse", False))
+        info["velocity_reverse_linear_limit"] = float(getattr(self, "velocity_reverse_linear_limit", 0.0))
+        info["reverse_action_reward_suppressed"] = bool(getattr(self, "_last_reverse_action_reward_suppressed", False))
+        info["reverse_action_penalty"] = float(getattr(self, "_last_reverse_action_penalty", 0.0))
+        info["reverse_action_penalty_base"] = float(getattr(self, "_last_reverse_action_penalty_base", 0.0))
+        info["reverse_action_penalty_norm"] = float(getattr(self, "_last_reverse_action_penalty_norm", 0.0))
+        info["reverse_action_penalty_debt"] = float(getattr(self, "_last_reverse_action_penalty_debt", 0.0))
+        info["reverse_action_penalty_multiplier"] = float(getattr(self, "_last_reverse_action_penalty_multiplier", 1.0))
+        info["reverse_action_penalty_ratio"] = float(getattr(self, "reverse_action_penalty_ratio", 0.0))
+        info["reverse_action_debt_ramp_steps"] = float(getattr(self, "reverse_action_debt_ramp_steps", 0.0))
+        info["reverse_action_debt_decay_per_step"] = float(getattr(self, "reverse_action_debt_decay_per_step", 0.0))
+        info["reverse_action_debt_max_extra_ratio"] = float(getattr(self, "reverse_action_debt_max_extra_ratio", 0.0))
         info["policy_action_0"] = float(self.raw_action[0]) if self.raw_action.size > 0 else 0.0
         info["policy_action_1"] = float(self.raw_action[1]) if self.raw_action.size > 1 else 0.0
         info["executed_linear_x"] = float(self.prev_action[0]) if self.prev_action.size > 0 else 0.0
@@ -14892,6 +17050,11 @@ class GazeboNavEnv(gym.Env):
         info["velocity_safety_slowdown_risk"] = float(getattr(self, "_last_velocity_safety_slowdown_risk", 0.0))
         info["velocity_safety_policy_v"] = float(getattr(self, "_last_velocity_safety_policy_v", 0.0))
         info["velocity_safety_executed_v"] = float(getattr(self, "_last_velocity_safety_executed_v", 0.0))
+        info["velocity_commanded_v"] = float(getattr(self, "_last_velocity_commanded_v", 0.0))
+        info["velocity_commanded_w"] = float(getattr(self, "_last_velocity_commanded_w", 0.0))
+        info["velocity_execution_source"] = str(getattr(self, "_last_velocity_execution_source", "none"))
+        info["velocity_execution_delta_m"] = float(getattr(self, "_last_velocity_execution_delta_m", 0.0))
+        info["velocity_execution_dt_sec"] = float(getattr(self, "_last_velocity_execution_dt_sec", 0.0))
         info["velocity_safety_penalty"] = float(getattr(self, "_last_velocity_safety_penalty", 0.0))
         info["velocity_safety_reason"] = str(getattr(self, "_last_velocity_safety_reason", "none"))
         info["velocity_safety_cooldown_steps"] = int(getattr(self, "velocity_safety_cooldown_steps", 0))
@@ -14923,6 +17086,17 @@ class GazeboNavEnv(gym.Env):
         info["step_count"] = int(self.step_count)
         info["sim_time"] = self._safe_sim_time()
         info["episode_index"] = int(getattr(self, "episode_index", 0))
+        info["random_maze_curriculum_enabled"] = bool(getattr(self, "random_maze_curriculum_enabled", False))
+        info["random_maze_curriculum_progress"] = float(getattr(self, "_last_random_maze_curriculum_progress", 1.0))
+        info["random_maze_gap_min_m"] = float(getattr(self, "_last_random_maze_gap_min_m", 0.0))
+        info["random_maze_gap_max_m"] = float(getattr(self, "_last_random_maze_gap_max_m", 0.0))
+        info["random_maze_min_room_size_m"] = float(getattr(self, "_last_random_maze_min_room_size_m", 0.0))
+        info["random_maze_max_depth"] = int(getattr(self, "_last_random_maze_max_depth", 0))
+        info["random_maze_max_inner_walls"] = int(getattr(self, "_last_random_maze_max_inner_walls", 0))
+        info["random_maze_clutter_room_fraction"] = float(getattr(self, "_last_random_maze_clutter_room_fraction", 0.0))
+        info["random_maze_clutter_max_count"] = int(getattr(self, "_last_random_maze_clutter_max_count", 0))
+        info["random_maze_wall_count"] = int(getattr(self, "_random_maze_wall_count", 0))
+        info["random_maze_clutter_count"] = int(getattr(self, "_random_maze_clutter_count", 0))
         info["use_slam_map"] = bool(self.use_slam_map)
         info["map_frame"] = str(self.map_frame)
         info["pose_frame"] = str(self.pose_frame)
@@ -14938,11 +17112,29 @@ class GazeboNavEnv(gym.Env):
         info["post_reset_ready_known_cells"] = int(getattr(self, "_last_post_reset_ready_known_cells", 0))
         info["post_reset_ready_lidar_beams"] = int(getattr(self, "_last_post_reset_ready_lidar_beams", 0))
         info["post_reset_ready_priority"] = float(getattr(self, "_last_post_reset_ready_priority", 0.0))
+        info["post_obstacle_clearance_ok"] = bool(getattr(self, "_last_post_obstacle_clearance_ok", True))
+        info["post_obstacle_clearance_reason"] = str(getattr(self, "_last_post_obstacle_clearance_reason", "not_checked"))
+        info["post_obstacle_clearance_attempts"] = int(getattr(self, "_last_post_obstacle_clearance_attempts", 0))
+        info["post_obstacle_clearance_global_min"] = float(getattr(self, "_last_post_obstacle_clearance_global_min", 999.0))
+        info["post_obstacle_clearance_front_min"] = float(getattr(self, "_last_post_obstacle_clearance_front_min", 999.0))
+        info["post_obstacle_clearance_rear_min"] = float(getattr(self, "_last_post_obstacle_clearance_rear_min", 999.0))
         info["action_sync_ok"] = bool(getattr(self, "_last_action_sync_ok", False))
         info["action_sync_reason"] = str(getattr(self, "_last_action_sync_reason", "none"))
         info["action_sync_wait_sec"] = float(getattr(self, "_last_action_sync_wait_sec", 0.0))
         info["action_sync_scan_fresh"] = bool(getattr(self, "_last_action_sync_scan_fresh", False))
         info["action_sync_odom_fresh"] = bool(getattr(self, "_last_action_sync_odom_fresh", False))
+        info["map_update_calls_this_step"] = int(getattr(self, "_map_update_call_count_this_step", 0))
+        info["map_substeps_per_action"] = int(getattr(self, "map_substeps_per_action", 1))
+        info["world_step_target_delta_sec"] = float(getattr(self, "_action_world_step_target_delta_sec", 0.0))
+        info["world_step_sim_delta_sec"] = float(getattr(self, "_action_world_step_sim_delta_sec", 0.0))
+        info["world_step_wall_elapsed_sec"] = float(getattr(self, "_action_world_step_wall_elapsed_sec", 0.0))
+        info["world_step_overshoot_sec"] = float(getattr(self, "_action_world_step_overshoot_sec", 0.0))
+        info["world_step_last_substep_target_delta_sec"] = float(getattr(self, "_last_world_step_target_delta_sec", 0.0))
+        info["world_step_last_substep_sim_delta_sec"] = float(getattr(self, "_last_world_step_sim_delta_sec", 0.0))
+        info["pause_world_each_action"] = bool(getattr(self, "pause_world_each_action", False))
+        info["pause_world_each_action_used"] = bool(getattr(self, "_last_pause_world_each_action_used", False))
+        info["pause_world_each_action_ok"] = bool(getattr(self, "_last_pause_world_each_action_ok", True))
+        info["pause_world_each_action_reason"] = str(getattr(self, "_last_pause_world_each_action_reason", "disabled"))
         info["map_bounds_restart"] = bool(getattr(self, "_last_map_bounds_restart", False))
         info["map_bounds_reason"] = str(getattr(self, "_last_map_bounds_reason", "none"))
         info["map_bounds_bad_steps"] = int(getattr(self, "map_bounds_bad_steps", 0))
@@ -14981,7 +17173,10 @@ class GazeboNavEnv(gym.Env):
         )
         info["tf_pose_ok"] = bool(getattr(self, "_last_tf_pose_ok", False))
         info["confidence_pose_ok"] = bool(getattr(self, "_last_confidence_pose_ok", False))
-        info["confidence_update_called"] = bool(getattr(self, "_last_confidence_update_called", False))
+        info["confidence_update_called"] = bool(
+            getattr(self, "_action_confidence_update_called", False)
+            or getattr(self, "_last_confidence_update_called", False)
+        )
         info["confidence_pose_source"] = str(getattr(self, "_last_confidence_pose_source_v131", "none"))
         info["confidence_update_reason_if_zero"] = str(getattr(self, "_last_confidence_update_reason_if_zero", "none"))
         info["policy_scan_front"] = float(getattr(self, "_last_policy_scan_front", 999.0))
@@ -14999,6 +17194,8 @@ class GazeboNavEnv(gym.Env):
         info["executed_w"] = float(getattr(self, "_last_velocity_safety_executed_w", 0.0))
         info["policy_v"] = float(getattr(self, "_last_velocity_safety_policy_v", 0.0))
         info["policy_w"] = float(getattr(self, "_last_velocity_safety_policy_w", 0.0))
+        info["commanded_v"] = float(getattr(self, "_last_velocity_commanded_v", 0.0))
+        info["commanded_w"] = float(getattr(self, "_last_velocity_commanded_w", 0.0))
         # v131: reward breakdown
         info["r_confidence"] = float(getattr(self, "_last_r_confidence", 0.0))
         info["r_confidence_fill"] = float(getattr(self, "_last_r_confidence_fill", 0.0))
@@ -15008,6 +17205,7 @@ class GazeboNavEnv(gym.Env):
         info["r_safety_slow"] = float(getattr(self, "_last_r_safety_slow", 0.0))
         info["r_safety_terminal"] = float(getattr(self, "_last_r_safety_terminal", 0.0))
         info["r_collision"] = float(getattr(self, "_last_r_collision", 0.0))
+        info["r_reverse"] = float(getattr(self, "_last_r_reverse", 0.0))
         info["r_step"] = float(getattr(self, "_last_r_step", 0.0))
         info["reward_total"] = float(getattr(self, "_last_reward_total", 0.0))
         return info

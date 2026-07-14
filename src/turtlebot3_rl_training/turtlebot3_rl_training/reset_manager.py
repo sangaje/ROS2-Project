@@ -82,6 +82,10 @@ class ResetManager:
         self._pose_echo_lock = threading.Lock()
         self._pose_echo_buffer: str = ""
         self._pose_echo_world: Optional[str] = None
+        self._require_fresh_entity_presence = False
+        self._fresh_entity_presence_wait_sec = 0.0
+        self._fresh_entity_presence_deadline = 0.0
+        self._presence_wait_warned_entities: set[str] = set()
 
         self.node.get_logger().info(f"Reset service     : {self.set_pose_service}")
         self.node.get_logger().info(f"Reset entity hint : {self.entity_name}")
@@ -387,12 +391,41 @@ class ResetManager:
         )
         return False
 
+    def mark_world_reset(self, wait_entity_sec: Optional[float] = None) -> None:
+        """Forget stale pose/info samples after Gazebo world reset.
+
+        A WorldControl reset can briefly leave UserCommands with a model name
+        whose resolved entity id is still 0. Sending SetEntityPose during that
+        window is what makes Gazebo print "Unable to update the pose for entity
+        id:[0], name[burger]". Require one fresh post-reset pose/info sample
+        before the next robot teleport.
+        """
+        try:
+            wait_sec = (
+                float(os.environ.get("TB3_RL_RESET_WAIT_ENTITY_AFTER_WORLD_RESET_SEC", "1.5") or 1.5)
+                if wait_entity_sec is None
+                else float(wait_entity_sec)
+            )
+        except Exception:
+            wait_sec = 1.5
+        wait_sec = max(float(wait_sec), 0.0)
+        self._ensure_pose_echo_stream()
+        with self._pose_echo_lock:
+            self._pose_echo_buffer = ""
+        self._require_fresh_entity_presence = wait_sec > 0.0
+        self._fresh_entity_presence_wait_sec = wait_sec
+        self._fresh_entity_presence_deadline = 0.0
+        self._presence_wait_warned_entities.clear()
+
     def _reset_to_pose_with_entity_name(
         self,
         entity_name: str,
         reset_pose: ResetPose,
         timeout_sec: float,
     ) -> bool:
+        if not self._wait_for_required_entity_presence(entity_name):
+            return False
+
         # 1) ROS bridge SetEntityPose 우선 시도.
         # wrong name일 때 Gazebo가 error를 찍으므로 entity type은 MODEL 하나만 시도한다.
         if self._reset_by_ros_service(entity_name, reset_pose, timeout_sec):
@@ -403,6 +436,35 @@ class ResetManager:
             return True
 
         return False
+
+    def _wait_for_required_entity_presence(self, entity_name: str) -> bool:
+        if not bool(getattr(self, "_require_fresh_entity_presence", False)):
+            return True
+
+        deadline = float(getattr(self, "_fresh_entity_presence_deadline", 0.0))
+        if deadline <= 0.0:
+            wait_sec = max(float(getattr(self, "_fresh_entity_presence_wait_sec", 0.0)), 0.0)
+            deadline = time.time() + wait_sec
+            self._fresh_entity_presence_deadline = deadline
+        while rclpy.ok() and time.time() < deadline:
+            if self._read_gazebo_pose(entity_name) is not None:
+                self._require_fresh_entity_presence = False
+                return True
+            try:
+                rclpy.spin_once(self.node, timeout_sec=0.01)
+            except Exception:
+                pass
+            time.sleep(0.03)
+
+        if entity_name not in self._presence_wait_warned_entities:
+            self._presence_wait_warned_entities.add(entity_name)
+            self.node.get_logger().warn(
+                f"Gazebo entity='{entity_name}' was not visible on fresh pose/info "
+                "after world reset; attempting SetEntityPose anyway rather than "
+                "failing the whole RL reset."
+            )
+        self._require_fresh_entity_presence = False
+        return True
 
     def _reset_by_ros_service(
         self,

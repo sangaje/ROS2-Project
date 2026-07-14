@@ -8,6 +8,7 @@
 #
 # 옵션 (환경변수로 오버라이드):
 #   SPAWN_POSE=1|2|rand  스폰 위치 (기본=rand)
+#   SIM_UPDATE_RATE=400   Gazebo 서버 update cap (0이면 uncapped)
 #   SIM_GUI=true         Gazebo GUI 함께 실행
 #   SIM_RVIZ=false       RViz 없이 실행
 #   SIM_CARTO=true       Gazebo 터미널에서 Cartographer까지 실행
@@ -24,6 +25,10 @@ SCRIPT_DIR="$(cd "$(dirname "${_TB3_RL_SCRIPT_PATH}")" && pwd)"
 
 # ── 환경 설정 로드 ──────────────────────────────────────────
 source "${SCRIPT_DIR}/setup_env.sh"
+
+# Slightly faster than real-time while keeping RViz/watch mode usable.
+# Override with SIM_UPDATE_RATE=0 for uncapped throughput or 200 for calmer RViz.
+export SIM_UPDATE_RATE="${SIM_UPDATE_RATE:-400}"
 
 cleanup_gazebo_stack() {
     pkill -SIGTERM -f "gz sim"                2>/dev/null || true
@@ -91,6 +96,12 @@ echo " Gazebo 준비 대기 (/clock + /scan + /odom)"
 echo "================================================================"
 
 tb3_rl_wait_for_gazebo_ready "${GAZEBO_READY_TIMEOUT:-120}"
+if [[ "${TB3_RL_PAUSE_GAZEBO_AFTER_READY:-0}" == "1" ]]; then
+    tb3_rl_pause_gazebo_world default "${TB3_RL_PAUSE_GAZEBO_TIMEOUT_MS:-1500}" || true
+else
+    echo "  Gazebo world는 계속 실행 상태로 둠 (RViz TF/scan 유지)."
+    echo "  기존 pause 동작이 필요하면 TB3_RL_PAUSE_GAZEBO_AFTER_READY=1 로 실행하세요."
+fi
 echo "  ✓ Gazebo 준비 완료. 터미널 2에서 실행하세요:"
 echo "    cd ${SCRIPT_DIR}"
 echo "    bash run_train.sh"

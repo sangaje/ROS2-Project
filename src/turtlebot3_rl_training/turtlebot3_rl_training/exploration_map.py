@@ -750,6 +750,7 @@ class ExplorationGridMap:
         slam_map: Optional[OccupancyGrid] = None,
         sensor_xy: Optional[np.ndarray] = None,
         sensor_yaw: Optional[float] = None,
+        suppress_confidence_update: bool = False,
     ) -> MapUpdateStats:
         self.step_index += 1
         self._last_priority_invalidated_cells = 0
@@ -757,6 +758,7 @@ class ExplorationGridMap:
         self._last_priority_rechecked_cells = 0
         self._last_priority_rechecked_gain = 0.0
         self._apply_temporal_decay()
+        suppress_confidence_update = bool(suppress_confidence_update)
 
         # In map/map/map mode the internal confidence/priority canvas must be
         # the exact SLAM /map canvas.  Lock to the latest /map before any local
@@ -886,9 +888,9 @@ class ExplorationGridMap:
                 robot_ix,
                 robot_iy,
                 logodds_delta=self.free_logodds_delta,
-                confidence_gain=16.0,
+                confidence_gain=0.0 if suppress_confidence_update else 16.0,
                 observed_mask=observed_mask,
-                confidence_floor=100.0,
+                confidence_floor=0.0 if suppress_confidence_update else 100.0,
             )
             if float(_robot_conf_delta or 0.0) > 1e-6:
                 confidence_gain_accum += float(_robot_conf_delta) / 100.0
@@ -1159,9 +1161,9 @@ class ExplorationGridMap:
                     cx,
                     cy,
                     logodds_delta=self.free_logodds_delta * weight,
-                    confidence_gain=12.0 * weight,
+                    confidence_gain=0.0 if suppress_confidence_update else 12.0 * weight,
                     observed_mask=observed_mask,
-                    confidence_floor=self.seen_confidence_floor * angle_weight,
+                    confidence_floor=0.0 if suppress_confidence_update else self.seen_confidence_floor * angle_weight,
                 )
                 if float(_conf_delta or 0.0) > 1e-6:
                     confidence_gain_accum += float(_conf_delta) / 100.0

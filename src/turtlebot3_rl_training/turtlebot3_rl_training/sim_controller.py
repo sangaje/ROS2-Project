@@ -129,6 +129,9 @@ class GazeboSimController:
             return False
 
         req = ControlWorld.Request()
+        # Keep the world paused after exactly this multi_step batch. If Gazebo
+        # was accidentally left running, the first accepted control request must
+        # clamp it back to lockstep mode before the next policy action.
         req.world_control.pause = True
         req.world_control.multi_step = int(num_steps)
 
@@ -146,6 +149,11 @@ class GazeboSimController:
             return False
 
         req = ControlWorld.Request()
+        # Critical for RL lockstep: Gazebo's WorldControl reset request leaves
+        # pause false unless explicitly set. That lets the world free-run during
+        # reset/SLAM/readiness waits, so step_count no longer means fixed sim
+        # time. Keep reset results paused.
+        req.world_control.pause = True
         world_reset = getattr(req.world_control, "reset", None)
         if world_reset is None:
             self.node.get_logger().error(
@@ -165,7 +173,10 @@ class GazeboSimController:
             self.node.get_logger().error(f"Failed to configure world reset request: {exc}")
             return False
 
-        return self._call(req, timeout_sec=timeout_sec)
+        ok = self._call(req, timeout_sec=timeout_sec)
+        if not ok:
+            return False
+        return self.pause(True, timeout_sec=min(max(float(timeout_sec), 0.25), 0.75))
 
     def _call(self, req: ControlWorld.Request, timeout_sec: float = 2.0) -> bool:
         future = self.client.call_async(req)
