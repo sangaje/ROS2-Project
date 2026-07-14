@@ -190,7 +190,9 @@ def test_scout_rl_worker_uses_launch_env_and_preloads_follower_model():
     assert "'load_model_on_start'" in launch
     assert "self.declare_parameter('load_model_on_start', True)" in worker
     assert "if self.load_model_on_start or self.role_active:" in worker
-    assert "self._ensure_model_loader_started('active_scout_role')" in worker
+    assert "self.create_subscription(\n                String,\n                self.active_scout_id_topic,\n                self._on_active_scout_id" in worker
+    assert "self.active_scout_id_active = active_scout_id == self.robot_name" in worker
+    assert "self._ensure_model_loader_started(reason)" in worker
     assert 'durability=DurabilityPolicy.TRANSIENT_LOCAL' in worker
 
 

@@ -50,6 +50,7 @@ class ScoutRLPolicyWorker(Node):
 
         self.robot_name = str(get('robot_name').value).strip() or 'scout'
         self.role_topic = str(get('role_topic').value).strip() or f'/{self.robot_name}/role'
+        self.active_scout_id_topic = str(get('active_scout_id_topic').value).strip()
         self.cmd_vel_topic = str(get('cmd_vel_topic').value).strip() or '/cmd_vel'
         self.config = active_scout_config()
         self.map_topic = str(get('map_topic').value).strip() or self.config.map_topic
@@ -79,7 +80,10 @@ class ScoutRLPolicyWorker(Node):
         self.model_loading = False
         self.model_loader_started = False
         self.model_load_started = time.monotonic()
-        self.role_active = bool(get('initial_role_active').value) or self.direct_rl_start
+        initial_active = bool(get('initial_role_active').value) or self.direct_rl_start
+        self.role_topic_active = initial_active
+        self.active_scout_id_active: Optional[bool] = None
+        self.role_active = initial_active
         self.system_ready = not self.require_system_ready
         self.latest_scan: Optional[LaserScan] = None
         self.latest_scan_at = 0.0
@@ -111,6 +115,13 @@ class ScoutRLPolicyWorker(Node):
             history=HistoryPolicy.KEEP_LAST,
         )
         self.create_subscription(String, self.role_topic, self._on_role, latched_qos)
+        if self.active_scout_id_topic:
+            self.create_subscription(
+                String,
+                self.active_scout_id_topic,
+                self._on_active_scout_id,
+                latched_qos,
+            )
         self.create_subscription(
             LaserScan,
             self.config.scan_topic,
@@ -154,6 +165,8 @@ class ScoutRLPolicyWorker(Node):
             'SCOUT_RL_MINIMAL_WORKER_READY | '
             f'robot={self.robot_name} role_active={self.role_active} '
             f'cmd_vel={self.cmd_vel_topic} stamped={self.use_stamped} '
+            f'role_topic={self.role_topic} '
+            f'active_scout_id_topic={self.active_scout_id_topic} '
             f'scan_topic={self.config.scan_topic} '
             f'map_topic={self.map_topic} confidence_topic={self.confidence_map_topic} '
             f'checkpoint={self.config.checkpoint} '
@@ -207,8 +220,11 @@ class ScoutRLPolicyWorker(Node):
                 f'SCOUT_MODEL_LOAD_START | reason={reason} model_path={self.config.checkpoint}'
             )
             try:
+                self.get_logger().warning('SCOUT_MODEL_LOAD_STAGE | stage=load_deployment_model')
                 model = load_deployment_model()
+                self.get_logger().warning('SCOUT_MODEL_LOAD_STAGE | stage=probe_checkpoint')
                 probe_checkpoint(model=model)
+                self.get_logger().warning('SCOUT_MODEL_LOAD_STAGE | stage=ready')
             except Exception as exc:  # noqa: BLE001
                 self.model_error = f'{exc}'
                 self.get_logger().error(
@@ -227,6 +243,23 @@ class ScoutRLPolicyWorker(Node):
 
         threading.Thread(target=load, name='scout_rl_model_loader', daemon=True).start()
 
+    def _set_role_active(self, reason: str, value: str) -> None:
+        was_active = self.role_active
+        if self.active_scout_id_active is None:
+            self.role_active = self.role_topic_active
+        else:
+            self.role_active = self.active_scout_id_active
+        if was_active == self.role_active:
+            return
+        self.get_logger().warning(
+            'SCOUT_RL_ROLE | '
+            f'reason={reason} value={value} active={self.role_active}'
+        )
+        if self.role_active:
+            self._ensure_model_loader_started(reason)
+        else:
+            self._publish_zero()
+
     def _on_role(self, msg: String) -> None:
         update = parse_role_message(msg.data, self.robot_name)
         if update is None:
@@ -234,16 +267,15 @@ class ScoutRLPolicyWorker(Node):
         if update.robot and update.robot != self.robot_name:
             return
         role = str(getattr(update.role, 'value', update.role)).strip().upper()
-        was_active = self.role_active
-        self.role_active = role == 'ACTIVE_SCOUT'
-        if was_active != self.role_active:
-            self.get_logger().warning(
-                f'SCOUT_RL_ROLE | role={role} active={self.role_active}'
-            )
-            if self.role_active:
-                self._ensure_model_loader_started('active_scout_role')
-            if not self.role_active:
-                self._publish_zero()
+        self.role_topic_active = role == 'ACTIVE_SCOUT'
+        self._set_role_active('role_topic', role)
+
+    def _on_active_scout_id(self, msg: String) -> None:
+        active_scout_id = str(msg.data or '').strip()
+        if not active_scout_id:
+            return
+        self.active_scout_id_active = active_scout_id == self.robot_name
+        self._set_role_active('active_scout_id', active_scout_id)
 
     def _on_system_ready(self, msg: Bool) -> None:
         self.system_ready = bool(msg.data)
