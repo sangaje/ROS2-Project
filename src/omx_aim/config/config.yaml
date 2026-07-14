@@ -120,7 +120,7 @@ yolo:
   device: 0                 # Jetson CUDA device. cpu로 강제하려면 "cpu"
   half: true                # CUDA에서 FP16 사용
   target_class: 0           # target_v3 클래스 0 = 표적 (실기 테스트로 확인됨)
-  conf_threshold: 0.3        # 0.0~1.0. 낮을수록 더 많이 검출 (오검출 늘어남)
+  conf_threshold: 0.6        # 0.0~1.0. 낮을수록 더 많이 검출 (오검출 늘어남)
   imgsz: 640                 # target_v3.engine 고정 입력 해상도와 반드시 일치
 
 # ===========================================================
