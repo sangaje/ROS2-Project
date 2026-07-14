@@ -36,7 +36,6 @@ def generate_launch_description():
     video_ready_topic = LaunchConfiguration('video_ready_topic')
     require_start_motion = LaunchConfiguration('require_start_motion')
     start_motion_topic = LaunchConfiguration('start_motion_topic')
-    direct_rl_start = LaunchConfiguration('direct_rl_start')
     cmd_vel_topic = LaunchConfiguration('cmd_vel_topic')
     use_stamped_cmd_vel = LaunchConfiguration('use_stamped_cmd_vel')
     odom_topic = LaunchConfiguration('odom_topic')
@@ -144,15 +143,6 @@ def generate_launch_description():
             description='Latched leader-owned final motion permission topic.',
         ),
         DeclareLaunchArgument(
-            'direct_rl_start',
-            default_value='true',
-            choices=['true', 'false'],
-            description=(
-                'Start inference immediately. Followers pass false so the '
-                'worker waits for /<robot>/role=ACTIVE_SCOUT before movement.'
-            ),
-        ),
-        DeclareLaunchArgument(
             'cmd_vel_topic',
             default_value=DEFAULT_CMD_VEL_TOPIC,
             description='Velocity topic owned by this inference process.',
@@ -225,10 +215,7 @@ def generate_launch_description():
                     value_type=bool,
                 ),
                 'start_motion_topic': start_motion_topic,
-                'direct_rl_start': ParameterValue(
-                    direct_rl_start,
-                    value_type=bool,
-                ),
+                'direct_rl_start': True,
                 'cmd_vel_topic': cmd_vel_topic,
                 'odom_topic': odom_topic,
                 'max_odom_age_sec': ParameterValue(

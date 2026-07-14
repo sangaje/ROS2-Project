@@ -449,7 +449,7 @@ def generate_launch_description():
                 ' role=FOLLOWER active_scout_id=',
                 active_scout_robot_name.perform(context),
                 ' follow_enabled=true amcl_enabled=true nav2_enabled=true ',
-                'cartographer_enabled=false rl_worker_standby=true ',
+                'cartographer_enabled=false rl_enabled=false ',
                 'confidence_enabled=false map_authority=false ',
                 'local_map_outbound=false blocking_reason=normal_follower',
             ]))
@@ -474,20 +474,18 @@ def generate_launch_description():
         if (
             role_value == 'scout'
             and (
-                fleet_role_value in ('member', 'follower')
-                or launch_bool(enable_scout_failover.perform(context))
+                fleet_role_value == 'member'
+                or (
+                    launch_bool(enable_scout_failover.perform(context))
+                    and not follower_initial_role
+                )
             )
         ):
-            takeover_exploration = bool(
-                follower_initial_role
-                and launch_bool(enable_scout_failover.perform(context))
-            )
             local_exploration = (
                 False
                 if follower_initial_role
                 else launch_bool(enable_exploration.perform(context))
             )
-            rl_capability = bool(local_exploration or takeover_exploration)
             if local_exploration and rl_backend_value == 'external_worker':
                 actions.append(LogInfo(msg=[
                     'SYSTEM_BRINGUP | ACTIVE_SCOUT RL backend=external_worker; '
@@ -501,7 +499,7 @@ def generate_launch_description():
             else:
                 actions.append(LogInfo(msg=[
                     'SYSTEM_BRINGUP | enable_exploration:=false -- this robot '
-                    'will wait for failover before publishing ACTIVE_SCOUT RL commands.'
+                    'will not publish ACTIVE_SCOUT RL commands.'
                 ]))
             local_robot_name = (
                 follower_robot_name.perform(context)
@@ -530,7 +528,7 @@ def generate_launch_description():
                         'enable_localization_spin': launch_bool(
                             enable_localization_spin_on_takeover.perform(context)
                         ),
-                        'enable_exploration': rl_capability,
+                        'enable_exploration': local_exploration,
                         'rl_backend': rl_backend_value,
                         'leader_pose_topic': '/leader_pose',
                         'self_pose_topic': self_pose_topic,
@@ -568,7 +566,7 @@ def generate_launch_description():
                     respawn_delay=3.0,
             ))
             if (
-                rl_capability
+                local_exploration
                 and rl_backend_value == 'external_worker'
                 and start_rl_worker_value
             ):
@@ -586,9 +584,6 @@ def generate_launch_description():
                                 robot_name=local_robot_name
                             ),
                             'initial_role_active': (
-                                'true' if fleet_role_value == 'member' else 'false'
-                            ),
-                            'direct_rl_start': (
                                 'true' if fleet_role_value == 'member' else 'false'
                             ),
                             'require_failover_activation': 'true',
@@ -633,14 +628,6 @@ def generate_launch_description():
                     respawn_delay=3.0,
                 ))
             risk_domain_value = risk_domain_id.perform(context).strip()
-            if not risk_domain_value:
-                risk_domain_value = member_domain_id.perform(context).strip()
-                if risk_domain_value:
-                    actions.append(LogInfo(msg=[
-                        'SYSTEM_BRINGUP | risk_domain_id not set; using ',
-                        'member_domain_id=', risk_domain_value,
-                        ' for the Scout map bridge.',
-                    ]))
             if (
                 launch_bool(enable_risk_to_leader_bridge.perform(context))
                 and risk_domain_value
@@ -674,9 +661,7 @@ def generate_launch_description():
                             'MAP_BRIDGE_STAGE_A | source_domain=',
                             str(risk_domain),
                             ' | destination_domain=', str(domain),
-                            ' | source_topic=/field/',
-                            active_scout_robot_name.perform(context),
-                            '/map_out',
+                            ' | source_topic=/map',
                             ' | bridge_topic=/map_bridge',
                             ' | final_topic=/map',
                             ' | type=nav_msgs/msg/OccupancyGrid',

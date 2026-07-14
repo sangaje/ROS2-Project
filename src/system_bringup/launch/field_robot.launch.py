@@ -59,7 +59,6 @@ def generate_launch_description():
             default_cartographer,
         )
         requested_rl = _bool_text(enable_rl.perform(context), default_exploration)
-        standby_takeover_rl = 'true' if is_follower else requested_rl
         requested_map_authority = _bool_text(
             map_authority_eligible.perform(context),
             default_map_authority,
@@ -72,6 +71,11 @@ def generate_launch_description():
             raise ValueError(
                 'initial_role=FOLLOWER cannot start Cartographer. '
                 'Follower uses shared map + AMCL until takeover is confirmed.'
+            )
+        if is_follower and requested_rl == 'true':
+            raise ValueError(
+                'initial_role=FOLLOWER cannot start the RL worker. '
+                'RL starts only after ACTIVE_SCOUT takeover authority.'
             )
         if is_follower and requested_map_authority == 'true':
             raise ValueError(
@@ -98,7 +102,7 @@ def generate_launch_description():
                 field_enable_exploration.perform(context),
                 default_exploration,
             ),
-            'start_rl_worker': standby_takeover_rl,
+            'start_rl_worker': requested_rl,
             'start_camera_sender': _bool_text(
                 enable_observation_tx.perform(context),
                 True,
@@ -126,7 +130,7 @@ def generate_launch_description():
                 ' domain=', domain_id.perform(context),
                 ' main_domain=', main_domain_id.perform(context),
                 ' cartographer=', launch_args['start_cartographer'],
-                ' rl_worker=', launch_args['start_rl_worker'],
+                ' rl=', launch_args['start_rl_worker'],
                 ' map_authority=', requested_map_authority,
             ]),
             IncludeLaunchDescription(
