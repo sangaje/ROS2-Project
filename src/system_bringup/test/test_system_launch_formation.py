@@ -166,3 +166,10 @@ def test_follower_map_forwarding_is_explicit_for_takeover_commit():
     assert "f'/field/{follower_robot_name.perform(context)}/map'" in text
     assert "'active_scout_id_topic': active_scout_id_topic" in leader_launch
     assert "'follower_input_topic': follower_map_bridge_topic" in leader_launch
+
+
+def test_leader_map_bridge_can_fallback_to_member_domain_id():
+    text = SYSTEM_LAUNCH.read_text(encoding='utf-8')
+
+    assert 'risk_domain_id not set; using ' in text
+    assert 'risk_domain_value = member_domain_id.perform(context).strip()' in text
