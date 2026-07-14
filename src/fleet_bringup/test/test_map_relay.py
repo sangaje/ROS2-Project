@@ -306,6 +306,33 @@ def test_relay_selects_follower_map_after_active_scout_takeover():
         destroy_node(node)
 
 
+def test_external_mode_republishes_cached_map_as_keepalive():
+    node = make_node()
+    try:
+        published = []
+        node.relay_without_primary = True
+        node.cached_republish_period_sec = 1.0
+        node.min_publish_period_sec = 0.0
+        now = [10.0]
+        node._now_mono_sec = lambda: now[0]
+        node._pub.publish = lambda msg: published.append(msg)
+
+        node._on_bridged_map(grid(24))
+        node._check_primary()
+        assert len(published) == 1
+
+        now[0] += 0.5
+        node._check_primary()
+        assert len(published) == 1
+
+        now[0] += 0.5
+        node._check_primary()
+        assert len(published) == 2
+        assert published[-1].info.width == 24
+    finally:
+        destroy_node(node)
+
+
 def test_invalid_bridged_map_is_not_treated_as_available():
     node = make_node()
     try:

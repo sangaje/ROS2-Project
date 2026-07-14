@@ -45,6 +45,7 @@ class MapRelay(Node):
         self.declare_parameter('standby_confirm_sec', 2.0)
         self.declare_parameter('relay_without_primary', False)
         self.declare_parameter('max_publish_rate_hz', 1.0)
+        self.declare_parameter('cached_republish_period_sec', 0.0)
         self.declare_parameter('active_scout_id_topic', '')
         self.declare_parameter('primary_scout_id', 'scout22')
         self.declare_parameter('follower_scout_id', 'follower21')
@@ -68,6 +69,9 @@ class MapRelay(Node):
         )
         self.max_publish_rate_hz = max(
             0.0, float(self.get_parameter('max_publish_rate_hz').value)
+        )
+        self.cached_republish_period_sec = max(
+            0.0, float(self.get_parameter('cached_republish_period_sec').value)
         )
         self.min_publish_period_sec = (
             1.0 / self.max_publish_rate_hz
@@ -156,6 +160,7 @@ class MapRelay(Node):
             f'publisher is active on {self.output_topic}; '
             f'relay_without_primary={self.relay_without_primary} '
             f'max_publish_rate_hz={self.max_publish_rate_hz:.2f} '
+            f'cached_republish_period_sec={self.cached_republish_period_sec:.2f} '
             f'active_scout_topic={self.active_scout_id_topic or "(disabled)"} '
             f'follower_input={self.follower_input_topic or "(disabled)"}'
         )
@@ -257,6 +262,9 @@ class MapRelay(Node):
     def _now_sec(self) -> float:
         return self.get_clock().now().nanoseconds * 1.0e-9
 
+    def _now_mono_sec(self) -> float:
+        return time.monotonic()
+
     def _external_publisher_count(self) -> int:
         # count_publishers() includes our own publishers on this topic, so
         # subtract them to learn whether anyone else is active.
@@ -277,6 +285,16 @@ class MapRelay(Node):
                 self._publish_latest()
             elif self._pending_rate_limited:
                 self._publish_latest()
+            elif (
+                self.cached_republish_period_sec > 0.0
+                and self._selected_map_source() is not None
+                and (
+                    self._last_publish_mono_sec <= 0.0
+                    or self._now_mono_sec() - self._last_publish_mono_sec
+                    >= self.cached_republish_period_sec
+                )
+            ):
+                self._publish_latest(force=True)
             return
 
         now = self._now_sec()
@@ -328,7 +346,7 @@ class MapRelay(Node):
                 throttle_duration_sec=10.0,
             )
 
-    def _publish_latest(self):
+    def _publish_latest(self, *, force: bool = False):
         # Prefer continuing from whatever the primary itself last
         # published (e.g. Cartographer's own last map before it died);
         # only fall back to the bridged leader map if we never saw one.
@@ -343,7 +361,7 @@ class MapRelay(Node):
                 throttle_duration_sec=5.0,
             )
             return
-        self._publish(source)
+        self._publish(source, force=force)
 
     def _selected_input_topic(self) -> str:
         if (
@@ -359,14 +377,14 @@ class MapRelay(Node):
             return self._latest_follower or self._latest_bridged
         return self._latest_bridged
 
-    def _publish(self, source: OccupancyGrid):
+    def _publish(self, source: OccupancyGrid, *, force: bool = False):
         signature = self._map_signature(source)
-        if signature == self._last_published_signature:
+        if not force and signature == self._last_published_signature:
             self.get_logger().debug(
                 'MAP_RELAY_DUPLICATE_SKIPPED | unchanged map sample'
             )
             return False
-        now = time.monotonic()
+        now = self._now_mono_sec()
         elapsed = now - self._last_publish_mono_sec
         if (
             self.min_publish_period_sec > 0.0
