@@ -247,7 +247,7 @@ def test_risk_to_leader_bridge_is_one_way_map_source(tmp_path):
     assert (config['from_domain'], config['to_domain']) == (22, 24)
     assert config['topics']['/map']['remap'] == '/field/scout22/map'
     assert config['topics']['/map']['qos']['reliability'] == 'reliable'
-    assert config['topics']['/map']['qos']['durability'] == 'transient_local'
+    assert config['topics']['/map']['qos']['durability'] == 'volatile'
     assert config['topics']['/map']['qos']['history'] == 'keep_last'
     assert '/member_pose' not in config['topics']
     assert '/scout/signal' not in config['topics']
