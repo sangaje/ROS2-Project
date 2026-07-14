@@ -641,9 +641,6 @@ def generate_launch_description():
                         risk_domain,
                         domain,
                         include_map=not leader_owns_map,
-                        map_source_topic=(
-                            f'/field/{active_scout_robot_name.perform(context)}/map_out'
-                        ),
                         include_identity_topics=False,
                         include_rl_confidence_map=False,
                         include_risk_outputs=not launch_bool(
