@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Leader Unified Dashboard</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css', v=asset_version) }}">
 </head>
 <body>
   <header>
@@ -21,21 +21,12 @@
   <main>
     <div class="video-column">
       <section>
-        <h2>OMX AIM Debug Stream</h2>
+        <h2>Leader OMX/YOLO Detection</h2>
         <div class="stream-wrap"><img id="omxStream" alt="OMX MJPEG stream"></div>
       </section>
       <section>
-        <h2>Scout Camera</h2>
-        <div class="scout-stream-grid">
-          <div class="stream-tile">
-            <div class="stream-label">Raw</div>
-            <img id="scoutRawStream" alt="Scout raw camera stream">
-          </div>
-          <div class="stream-tile">
-            <div class="stream-label">YOLO</div>
-            <img id="scoutYoloStream" alt="Scout YOLO overlay stream">
-          </div>
-        </div>
+        <h2>Scout YOLO Detection</h2>
+        <div class="stream-wrap"><img id="scoutYoloStream" alt="Scout YOLO overlay stream"></div>
       </section>
     </div>
     <section class="map-panel">
@@ -90,6 +81,6 @@
       </section>
     </div>
   </main>
-  <script src="{{ url_for('static', filename='dashboard.js') }}"></script>
+  <script src="{{ url_for('static', filename='dashboard.js', v=asset_version) }}"></script>
 </body>
 </html>

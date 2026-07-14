@@ -1,10 +1,17 @@
 import math
+from pathlib import Path
 
 import pytest
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
 
 from fleet_bringup.global_localize_kickstart import GlobalLocalizeKickstart, State
+
+SOURCE = (
+    Path(__file__).parents[1]
+    / 'fleet_bringup'
+    / 'global_localize_kickstart.py'
+).read_text(encoding='utf-8')
 
 
 class _Logger:
@@ -76,6 +83,10 @@ def test_scout_seed_uses_fresh_member_pose_without_active_id():
     assert yaw == pytest.approx(0.7)
     assert node._pending_seed_source == 'scout22'
     assert node._pending_seed_age == 2.5
+
+
+def test_default_ready_topic_is_absolute():
+    assert "self.declare_parameter('ready_topic', '/localization_ready')" in SOURCE
 
 
 def test_scout_seed_prefers_active_follower_when_available():

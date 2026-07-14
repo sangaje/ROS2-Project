@@ -31,6 +31,7 @@ import time
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from std_msgs.msg import Empty, Bool, String
 
@@ -92,11 +93,17 @@ class FireNode(Node):
             GPIO.setup(self.pin, GPIO.OUT, initial=initial)
 
         # ---------- Pub/Sub ----------
+        fire_disable_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+        )
         self.create_subscription(Empty, '/omx/fire', self.on_fire, 10)
         self.create_subscription(
-            Bool, '/omx/fire_disable', self.on_disable, 10)
+            Bool, '/omx/fire_disable', self.on_disable, fire_disable_qos)
         self.create_subscription(
-            Bool, '/omx/fire_diable', self.on_disable_alias, 10)
+            Bool, '/omx/fire_diable', self.on_disable_alias, fire_disable_qos)
         self.pub_status = self.create_publisher(String, '/omx/fire_status', 10)
 
         # ---------- Status timer ----------
@@ -147,7 +154,10 @@ class FireNode(Node):
 
     def on_disable(self, msg: Bool):
         with self.lock:
+            previous = self.disabled
             self.disabled = msg.data
+        if previous == msg.data:
+            return
         state = "DISABLED" if msg.data else "ARMED"
         self.get_logger().info(f"Fire {state}")
 

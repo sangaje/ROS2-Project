@@ -42,6 +42,7 @@ def generate_launch_description():
     start_robot_bringup = LaunchConfiguration('start_robot_bringup')
     hardware_param_file = LaunchConfiguration('hardware_param_file')
     forward_map_to_main = LaunchConfiguration('forward_map_to_main')
+    include_follower_scan = LaunchConfiguration('include_follower_scan')
     follow_distance = LaunchConfiguration('follow_distance')
     start_legacy_follower = LaunchConfiguration('start_legacy_follower')
     initial_x = LaunchConfiguration('follower_initial_x')
@@ -61,6 +62,7 @@ def generate_launch_description():
             )
         main_domain = int(main_domain_value)
         process_env = clean_process_environment(str(follower_domain))
+        amcl_enabled = launch_bool(enable_amcl.perform(context))
 
         nav2_source = os.path.join(
             package_share,
@@ -88,6 +90,20 @@ def generate_launch_description():
             follower_domain,
             simulation=simulation,
             forward_map_to_main=launch_bool(forward_map_to_main.perform(context)),
+            include_follower_scan=launch_bool(include_follower_scan.perform(context)),
+            include_leader_map=amcl_enabled,
+        )
+        with open(main_to_follower, 'r', encoding='utf-8') as handle:
+            main_bridge_config = yaml.safe_load(handle) or {}
+        with open(follower_to_main, 'r', encoding='utf-8') as handle:
+            follower_bridge_config = yaml.safe_load(handle) or {}
+        all_bridge_topics = list((main_bridge_config.get('topics') or {}).values())
+        all_bridge_topics.extend((follower_bridge_config.get('topics') or {}).values())
+        large_grid_routes = sum(
+            1
+            for spec in all_bridge_topics
+            if isinstance(spec, dict)
+            and spec.get('type') == 'nav_msgs/msg/OccupancyGrid'
         )
         bridges = [
             Node(
@@ -125,7 +141,13 @@ def generate_launch_description():
             executable='map_relay',
             name='follower_map_relay',
             output='screen',
-            parameters=[{'use_sim_time': simulation}],
+            parameters=[{
+                'use_sim_time': simulation,
+                'input_topic': '/map_bridge',
+                'output_topic': '/map',
+                'robot_role': 'FOLLOWER',
+                'local_map_outbound': launch_bool(forward_map_to_main.perform(context)),
+            }],
             env=process_env,
             respawn=True,
             respawn_delay=3.0,
@@ -146,7 +168,7 @@ def generate_launch_description():
             respawn_delay=3.0,
         )
 
-        relay_nodes = [map_relay]
+        relay_nodes = [map_relay] if amcl_enabled else []
         robot_state_publisher = None
         if simulation:
             gazebo_share = get_package_share_directory('turtlebot3_gazebo')
@@ -197,13 +219,12 @@ def generate_launch_description():
                 }],
                 env=process_env,
             ))
-
-        amcl_enabled = launch_bool(enable_amcl.perform(context))
         auto = launch_bool(auto_localize.perform(context))
-        require_ready_for_follow = bool(amcl_enabled and auto and not simulation)
+        require_ready_for_follow = bool(amcl_enabled and not simulation)
 
         amcl = None
         localization_lifecycle = None
+        fixed_seed_ready = None
         if amcl_enabled:
             # AMCL is the one TF source this stack owns by default (map->
             # odom over a shared, bridged map). Set enable_amcl:=false only
@@ -311,7 +332,7 @@ def generate_launch_description():
                 output='screen',
                 parameters=[{
                     'use_sim_time': simulation,
-                    'enable_scout_pose_seed': True,
+                    'enable_scout_pose_seed': False,
                     'active_scout_id_topic': '/failover/active_scout_id',
                     'active_scout_robot_name': 'scout22',
                     'follower_robot_name': 'follower21',
@@ -352,6 +373,27 @@ def generate_launch_description():
                 respawn=True,
                 respawn_delay=3.0,
             )
+        elif amcl_enabled and not simulation:
+            fixed_seed_ready = Node(
+                package='fleet_bringup',
+                executable='amcl_fixed_seed_ready',
+                name='follower_amcl_fixed_seed_ready',
+                output='screen',
+                parameters=[{
+                    'map_topic': '/map',
+                    'scan_topic': '/scan',
+                    'odom_topic': '/odom',
+                    'amcl_pose_topic': '/amcl_pose',
+                    'amcl_get_state_service': '/amcl/get_state',
+                    'global_frame': 'map',
+                    'base_frame': 'base_footprint',
+                    'ready_topic': '/localization_ready',
+                    'fixed_seed_initial_pose_applied': True,
+                }],
+                env=process_env,
+                respawn=True,
+                respawn_delay=3.0,
+            )
 
         goal_proxy = Node(
             package='fleet_bringup',
@@ -361,6 +403,10 @@ def generate_launch_description():
             parameters=[{
                 'use_sim_time': simulation,
                 'goal_pose_topic': '/burger_goal_pose',
+                'require_system_ready': False,
+                'system_ready_topic': '/system/ready',
+                'require_start_motion': False,
+                'start_motion_topic': '/fleet/start_motion',
             }],
             env=process_env,
         )
@@ -372,6 +418,13 @@ def generate_launch_description():
             parameters=[{
                 'use_sim_time': simulation,
                 'follow_distance': float(follow_distance.perform(context)),
+                'stop_distance_m': 0.35,
+                'resume_distance_m': 0.55,
+                'goal_period_sec': 0.5,
+                'goal_update_distance': 0.10,
+                'pose_timeout_sec': 0.5,
+                'require_start_motion': False,
+                'start_motion_topic': '/fleet/start_motion',
                 'start_following': True,
                 'require_localization_ready': require_ready_for_follow,
             }],
@@ -412,12 +465,29 @@ def generate_launch_description():
 
         actions.extend([
             LogInfo(msg=[
+                'FOLLOWER_STARTUP_PROFILE | robot=follower21 role=FOLLOWER ',
+                'domain=', str(follower_domain),
+                ' leader_pose_topic=/leader_pose self_pose_topic=/burger_pose ',
+                'amcl=', str(amcl_enabled).lower(),
+                ' nav2=true cartographer=false rl=false camera=false',
+            ]),
+            LogInfo(msg=[
                 'LEADER_EGRESS_BRIDGE | source_domain=', str(main_domain),
                 ' | destination_domain=', str(follower_domain),
                 ' | topics=/map,/leader_pose',
                 ' | bridge_topic=/map_bridge',
                 ' | map_type=nav_msgs/msg/OccupancyGrid',
                 ' | pose_type=geometry_msgs/msg/PoseStamped',
+            ]),
+            LogInfo(msg=[
+                'FOLLOWER_BRIDGE_STATUS | route_count=',
+                str(len(main_bridge_config.get('topics') or {}) + len(follower_bridge_config.get('topics') or {})),
+                ' | large_grid_routes=', str(large_grid_routes),
+                ' | scan_outbound=', str(launch_bool(include_follower_scan.perform(context))).lower(),
+                ' | tf_outbound=false',
+                ' | map_outbound=', str(launch_bool(forward_map_to_main.perform(context))).lower(),
+                ' | duplicate_routes=0',
+                ' | cycle_count=0',
             ]),
             TimerAction(period=bridge_t, actions=bridges),
             TimerAction(period=relay_t, actions=relay_nodes + [follower_pose]),
@@ -437,6 +507,16 @@ def generate_launch_description():
             actions.append(
                 TimerAction(period=kickstart_t, actions=[kickstart_node])
             )
+        if fixed_seed_ready is not None:
+            actions.append(TimerAction(
+                period=kickstart_t,
+                actions=[
+                    LogInfo(msg=[
+                        'FOLLOWER_STAGE | starting fixed-seed AMCL ready watcher',
+                    ]),
+                    fixed_seed_ready,
+                ],
+            ))
         return actions
 
     return LaunchDescription([
@@ -486,21 +566,31 @@ def generate_launch_description():
             ),
         ),
         DeclareLaunchArgument(
+            'include_follower_scan',
+            default_value='false',
+            choices=['true', 'false'],
+            description=(
+                'Bridge /burger_scan_relay to the leader domain. Default '
+                'false because leader control uses compact pose/status/ack '
+                'topics, not follower raw LaserScan.'
+            ),
+        ),
+        DeclareLaunchArgument(
             'follow_distance',
-            default_value='0.70',
+            default_value='0.50',
             description='Desired distance behind the leader in metres.',
         ),
         DeclareLaunchArgument(
             'start_legacy_follower',
-            default_value='true',
+            default_value='false',
             choices=['true', 'false'],
             description=(
-                'Start fleet_follower. Set false when system_bringup '
-                'unified_field_robot owns FOLLOWER mode.'
+                'Start the minimal fleet_follower Nav2 follower. Set false '
+                'when system_bringup unified_field_robot owns FOLLOWER mode.'
             ),
         ),
-        DeclareLaunchArgument('follower_initial_x', default_value='-0.70'),
-        DeclareLaunchArgument('follower_initial_y', default_value='0.0'),
+        DeclareLaunchArgument('follower_initial_x', default_value='0.0'),
+        DeclareLaunchArgument('follower_initial_y', default_value='-0.10'),
         DeclareLaunchArgument('follower_initial_yaw', default_value='0.0'),
         DeclareLaunchArgument(
             'enable_amcl',
@@ -515,13 +605,13 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'auto_localize',
-            default_value='true',
+            default_value='false',
             choices=['true', 'false'],
             description=(
                 'Let AMCL search the whole map via '
                 'reinitialize_global_localization after seeding from '
-                'follower_initial_x/y/yaw. Set false to use only the fixed '
-                'seed.'
+                'follower_initial_x/y/yaw. Default false uses only the fixed '
+                'seed and amcl_fixed_seed_ready.'
             ),
         ),
         *dds_launch_environment(domain_id),

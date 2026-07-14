@@ -18,7 +18,11 @@ setup(
     packages=[package_name],
     data_files=[
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
-        ('share/' + package_name, ['package.xml', 'README.md']),
+        ('share/' + package_name, [
+            'package.xml',
+            'README.md',
+            'TRACKED_WAFFLE_KINEMATICS.md',
+        ]),
         (os.path.join('share', package_name, 'launch'), launch_files),
         (os.path.join('share', package_name, 'scripts'), only_files('scripts/*.bash') + only_files('scripts/*.zsh')),
         (os.path.join('share', package_name, 'config'), only_files('config/*.yaml') + only_files('config/*.lua') + only_files('config/*.xml')),
@@ -35,6 +39,7 @@ setup(
     entry_points={
         'console_scripts': [
             'cmd_vel_marker = fleet_bringup.cmd_vel_marker:main',
+            'amcl_fixed_seed_ready = fleet_bringup.amcl_fixed_seed_ready:main',
             'fleet_debug_marker = fleet_bringup.fleet_debug_marker:main',
             'fleet_follow_signal = fleet_bringup.fleet_follow_signal:main',
             'fleet_follower = fleet_bringup.fleet_follower:main',
@@ -44,9 +49,12 @@ setup(
             'pose_to_nav2 = fleet_bringup.pose_to_nav2:main',
             'pose_to_tf = fleet_bringup.pose_to_tf:main',
             'scan_frame_relay = fleet_bringup.scan_frame_relay:main',
+            'slam_localization_ready = fleet_bringup.slam_localization_ready:main',
             'sim_burger_scan_relay = fleet_bringup.sim_burger_scan_relay:main',
             'sim_burger_tf_relay = fleet_bringup.sim_burger_tf_relay:main',
             'tf_pose_publisher = fleet_bringup.tf_pose_publisher:main',
+            'tracked_cmd_vel_adapter = fleet_bringup.tracked_cmd_vel_adapter:main',
+            'tracked_waffle_calibration = fleet_bringup.tracked_waffle_calibration:main',
         ],
     },
 )

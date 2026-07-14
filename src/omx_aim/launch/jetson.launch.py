@@ -12,6 +12,8 @@ debug_stream:=true 이면 yolo_node 가 기존 in-process Flask MJPEG 스트림�
     브라우저에서 http://<jetson-ip>:<debug_port>/ 로 확인
 """
 import os
+import sys
+from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -31,8 +33,30 @@ def _is_true(value):
     return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
 
 
+def _with_virtualenv_site_packages(env):
+    virtual_env = os.environ.get('VIRTUAL_ENV', '').strip()
+    if not virtual_env:
+        return env
+
+    version = f'python{sys.version_info.major}.{sys.version_info.minor}'
+    candidates = [
+        Path(virtual_env) / 'lib' / version / 'site-packages',
+        Path(virtual_env) / 'lib64' / version / 'site-packages',
+    ]
+    existing = [str(path) for path in candidates if path.is_dir()]
+    if not existing:
+        return env
+
+    current = os.environ.get('PYTHONPATH', '').strip()
+    parts = existing + ([current] if current else [])
+    updated = dict(env)
+    updated['PYTHONPATH'] = os.pathsep.join(parts)
+    return updated
+
+
 def launch_setup(context, *args, **kwargs):
     debug_stream = _is_true(LaunchConfiguration('debug_stream').perform(context))
+    omx_dry_run = _is_true(LaunchConfiguration('omx_dry_run').perform(context))
     start_yolo_server = _is_true(
         LaunchConfiguration('start_yolo_server').perform(context)
     )
@@ -40,11 +64,23 @@ def launch_setup(context, *args, **kwargs):
         LaunchConfiguration('start_patrol_planner').perform(context)
     )
     debug_port = LaunchConfiguration('debug_port').perform(context)
+    debug_fps = LaunchConfiguration('debug_fps').perform(context)
+    debug_quality = LaunchConfiguration('debug_quality').perform(context)
+    debug_width = LaunchConfiguration('debug_width').perform(context)
+    debug_height = LaunchConfiguration('debug_height').perform(context)
     yolo_node_delay = float(
         LaunchConfiguration('yolo_node_delay_sec').perform(context)
     )
     yolo_node_model_path = LaunchConfiguration('yolo_node_model_path').perform(context)
     omx_camera_index = LaunchConfiguration('omx_camera_index').perform(context)
+    omx_camera_device = LaunchConfiguration('omx_camera_device').perform(context)
+    omx_camera_backend = LaunchConfiguration('omx_camera_backend').perform(context)
+    omx_camera_reconnect_period_sec = LaunchConfiguration(
+        'omx_camera_reconnect_period_sec'
+    ).perform(context)
+    omx_camera_required = LaunchConfiguration('omx_camera_required').perform(context)
+    require_start_motion = LaunchConfiguration('require_start_motion').perform(context)
+    start_motion_topic = LaunchConfiguration('start_motion_topic').perform(context)
     yolo_server_device = LaunchConfiguration('yolo_server_device').perform(context)
     patrol_delay = float(
         LaunchConfiguration('patrol_planner_delay_sec').perform(context)
@@ -52,8 +88,19 @@ def launch_setup(context, *args, **kwargs):
 
     # yolo_node CLI 인자 조립
     yolo_args = ['--no-display']
+    if omx_dry_run:
+        # Leave all Dynamixel traffic untouched while validating the camera,
+        # TensorRT inference, and MJPEG dashboard path.
+        yolo_args.append('--dry-run')
     if debug_stream:
-        yolo_args += ['--debug-stream', '--debug-port', debug_port]
+        yolo_args += [
+            '--debug-stream',
+            '--debug-port', debug_port,
+            '--debug-fps', debug_fps,
+            '--debug-quality', debug_quality,
+            '--debug-width', debug_width,
+            '--debug-height', debug_height,
+        ]
 
     actions = []
 
@@ -80,16 +127,21 @@ def launch_setup(context, *args, **kwargs):
         arguments=yolo_args,
         parameters=[{
             'waffle_frame_candidates': ['base_link', 'base_footprint'],
-            'require_localization_ready': True,
+            'require_localization_ready': False,
             'localization_ready_topic': '/localization_ready',
         }],
-        additional_env={
+        additional_env=_with_virtualenv_site_packages({
             'OMX_YOLO_MODEL_PATH': yolo_node_model_path,
             'OMX_YOLO_CAMERA_INDEX': omx_camera_index,
+            'OMX_YOLO_LAUNCH_CAMERA_DEVICE': omx_camera_device,
+            'OMX_YOLO_CAMERA_BACKEND': omx_camera_backend,
+            'OMX_YOLO_CAMERA_RECONNECT_PERIOD_SEC': omx_camera_reconnect_period_sec,
+            'OMX_YOLO_CAMERA_REQUIRED': omx_camera_required,
             # Keep OMX and the Flask server on the same explicitly selected
-            # backend; ``cpu`` is required for the current Orin torch wheel.
+            # device -- both fall back to CPU automatically if this torch
+            # build lacks the requested CUDA kernel.
             'OMX_YOLO_DEVICE': yolo_server_device,
-        },
+        }),
         respawn=True,
         respawn_delay=3.0,
     )
@@ -104,9 +156,13 @@ def launch_setup(context, *args, **kwargs):
                 # gate on a separately-computed AMCL covariance check here,
                 # or the two can disagree.
                 'require_amcl_ready': False,
-                'require_localization_ready': True,
+                'require_localization_ready': False,
                 'localization_ready_topic': '/localization_ready',
+                'require_start_motion': _is_true(require_start_motion),
+                'start_motion_topic': start_motion_topic,
                 'max_pending_goal_age_sec': 300.0,
+                'goal_ack_timeout_sec': 5.0,
+                'cancel_timeout_sec': 3.0,
             }],
         ),
         Node(
@@ -159,6 +215,18 @@ def launch_setup(context, *args, **kwargs):
             'max_candidate_cells': int(
                 LaunchConfiguration('patrol_max_candidate_cells').perform(context)
             ),
+            'view_standoff_distance_m': float(
+                LaunchConfiguration('patrol_view_standoff_distance_m').perform(context)
+            ),
+            'view_candidate_count': int(
+                LaunchConfiguration('patrol_view_candidate_count').perform(context)
+            ),
+            'require_clear_view': _is_true(
+                LaunchConfiguration('patrol_require_clear_view').perform(context)
+            ),
+            'publish_period_sec': float(
+                LaunchConfiguration('patrol_publish_period_sec').perform(context)
+            ),
         }],
     )
     if start_patrol_planner:
@@ -193,8 +261,8 @@ def generate_launch_description():
             'yolo_server_port', default_value='5005',
             description='flask_yolo_server HTTP port.'),
         DeclareLaunchArgument(
-            'yolo_server_model_path', default_value='yolo11n.pt',
-            description='YOLO model path for flask_yolo_server.'),
+            'yolo_server_model_path', default_value='model/target_v3.engine',
+            description='YOLO TensorRT engine for flask_yolo_server.'),
         DeclareLaunchArgument(
             'yolo_server_device', default_value='0',
             description='YOLO device for flask_yolo_server.'),
@@ -210,21 +278,53 @@ def generate_launch_description():
             'yolo_node_delay_sec', default_value='14.0',
             description='Delay heavy OMX YOLO/camera/model startup on constrained Jetson hardware.'),
         DeclareLaunchArgument(
-            'yolo_node_model_path', default_value='yolo11n.pt',
+            'yolo_node_model_path', default_value='model/target_v3.engine',
             description=(
-                'Model used by omx_yolo_node. Pass an absolute best.pt path '
-                'only when that file exists on this Jetson.'
+                'YOLO TensorRT engine used by omx_yolo_node. Pass an '
+                'absolute path only when the file lives outside the '
+                'workspace on this Jetson.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'omx_dry_run', default_value='false', choices=['true', 'false'],
+            description=(
+                'Run OMX camera/YOLO/dashboard without opening the Dynamixel '
+                'bus or moving the arm. Useful while diagnosing motor faults.'
             ),
         ),
         DeclareLaunchArgument(
             'omx_camera_index', default_value='0',
-            description='OpenCV camera index used by OMX debug/YOLO video.',
+            description='Legacy OpenCV integer camera index used when no device path is set.',
+        ),
+        DeclareLaunchArgument(
+            'omx_camera_device', default_value='/dev/video0',
+            description='Preferred V4L2 camera path, including /dev/v4l/by-id symlinks.',
+        ),
+        DeclareLaunchArgument(
+            'omx_camera_backend', default_value='v4l2', choices=['v4l2', 'auto'],
+            description='OpenCV backend for the OMX camera.',
+        ),
+        DeclareLaunchArgument(
+            'omx_camera_reconnect_period_sec', default_value='1.0',
+            description='Minimum retry period after camera loss.',
+        ),
+        DeclareLaunchArgument(
+            'omx_camera_required', default_value='false', choices=['true', 'false'],
+            description='Diagnostic policy only; false keeps Nav2 running without a camera.',
+        ),
+        DeclareLaunchArgument(
+            'require_start_motion', default_value='true', choices=['true', 'false'],
+            description='Hold Waffle Nav2 movement until the leader motion barrier is true.',
+        ),
+        DeclareLaunchArgument(
+            'start_motion_topic', default_value='/fleet/start_motion',
+            description='Latched leader-owned final motion permission topic.',
         ),
         DeclareLaunchArgument(
             'patrol_planner_delay_sec', default_value='6.0',
             description='Small grace before starting patrol_planner.'),
         DeclareLaunchArgument(
-            'patrol_min_risk', default_value='40',
+            'patrol_min_risk', default_value='8',
             description='Absolute 0-100 risk cutoff for patrol candidate extraction.'),
         DeclareLaunchArgument(
             'patrol_relative_threshold_ratio', default_value='0.55',
@@ -236,11 +336,36 @@ def generate_launch_description():
             'patrol_max_candidate_cells', default_value='2000',
             description='Maximum top-risk cells evaluated by patrol_planner NMS per cycle.'),
         DeclareLaunchArgument(
+            'patrol_view_standoff_distance_m', default_value='1.2',
+            description='Nav2 standoff distance from each risk hotspot so OMX can look at it.'),
+        DeclareLaunchArgument(
+            'patrol_view_candidate_count', default_value='16',
+            description='Number of radial free-cell candidates around each risk hotspot.'),
+        DeclareLaunchArgument(
+            'patrol_require_clear_view', default_value='true',
+            choices=['true', 'false'],
+            description='Require line-of-sight from patrol goal to the risk hotspot.'),
+        DeclareLaunchArgument(
+            'patrol_publish_period_sec', default_value='3.0',
+            description='How often risk patrol goals are refreshed.'),
+        DeclareLaunchArgument(
             'debug_stream', default_value='true',
             description='yolo_node 의 Flask MJPEG 디버그 스트림 켜기'),
         DeclareLaunchArgument(
             'debug_port', default_value='8080',
             description='디버그 스트림 포트'),
+        DeclareLaunchArgument(
+            'debug_fps', default_value='10',
+            description='디버그 스트림 FPS 제한'),
+        DeclareLaunchArgument(
+            'debug_quality', default_value='52',
+            description='디버그 스트림 JPEG quality'),
+        DeclareLaunchArgument(
+            'debug_width', default_value='640',
+            description='디버그 스트림 출력 width'),
+        DeclareLaunchArgument(
+            'debug_height', default_value='360',
+            description='디버그 스트림 출력 height'),
         DeclareLaunchArgument(
             'fire_start_disabled', default_value='true',
             choices=['true', 'false'],

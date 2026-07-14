@@ -5,16 +5,47 @@ from __future__ import annotations
 import argparse
 import logging
 import queue
+import statistics
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
+
+from flask_yolo_bridge.observation_contract import echo_observation_metadata
 
 
 class InferenceBusyError(RuntimeError):
     pass
+
+
+class MetricWindow:
+    def __init__(self, maxlen=600):
+        self.values = deque(maxlen=maxlen)
+
+    def add(self, value):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return
+        if value >= 0.0:
+            self.values.append((time.time(), value))
+
+    def summary(self, now=None, window_sec=5.0):
+        now = time.time() if now is None else now
+        recent = [v for t, v in self.values if now - t <= window_sec]
+        if not recent:
+            return {'p50': -1.0, 'p95': -1.0, 'max': -1.0}
+        ordered = sorted(recent)
+        p50 = statistics.median(ordered)
+        p95_index = min(len(ordered) - 1, int(round(0.95 * (len(ordered) - 1))))
+        return {
+            'p50': float(p50),
+            'p95': float(ordered[p95_index]),
+            'max': float(max(ordered)),
+        }
 
 
 DEBUG_PAGE = """<!doctype html>
@@ -73,7 +104,7 @@ DEBUG_PAGE = """<!doctype html>
     .stale .dot { background: var(--warn); }
     .dead .dot { background: var(--bad); }
     main { display: grid; grid-template-columns: minmax(0, 2fr) minmax(320px, 0.9fr); gap: 12px; padding: 12px; }
-    .video-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    .video-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }
     section, aside {
       background: rgba(21, 27, 36, 0.94);
       border: 1px solid var(--line);
@@ -116,13 +147,12 @@ DEBUG_PAGE = """<!doctype html>
   </header>
   <main>
     <div class="video-grid">
-      <section><h2>Camera input</h2><img src="/stream/raw.mjpg" alt="raw camera stream"></section>
       <section><h2>YOLO overlay</h2><img src="/stream/yolo.mjpg" alt="YOLO stream"></section>
     </div>
     <aside>
       <h2>Live status</h2>
       <div class="cards">
-        <div class="card"><div class="label">Teddy bears</div><div id="people" class="value">—</div></div>
+        <div class="card"><div class="label">Targets</div><div id="people" class="value">—</div></div>
         <div class="card"><div class="label">FPS</div><div id="fps" class="value">—</div></div>
         <div class="card"><div class="label">YOLO</div><div id="latency" class="value">—</div></div>
         <div class="card"><div class="label">Capture age</div><div id="captureAge" class="value">—</div></div>
@@ -178,12 +208,12 @@ DEBUG_PAGE = """<!doctype html>
         const root = document.getElementById('detections');
         const detections = Array.isArray(s.detections) ? s.detections : [];
         if (!detections.length) {
-          root.innerHTML = '<div class="muted">No teddy bear in latest frame.</div>';
+          root.innerHTML = '<div class="muted">No target in latest frame.</div>';
         } else {
           root.innerHTML = detections.map((d, i) => {
             const conf = Number(d.conf ?? d.confidence ?? 0);
             const box = Array.isArray(d.bbox) ? d.bbox.map(v => Number(v).toFixed(0)).join(', ') : 'bbox unavailable';
-            return `<div class="det"><div><b>${i + 1}. ${d.label ?? 'teddy bear'}</b><div class="muted mono">${box}</div></div><div class="mono">${(conf * 100).toFixed(0)}%</div></div>`;
+            return `<div class="det"><div><b>${i + 1}. ${d.label ?? 'target'}</b><div class="muted mono">${box}</div></div><div class="mono">${(conf * 100).toFixed(0)}%</div></div>`;
           }).join('');
         }
       } catch (_) {
@@ -201,12 +231,11 @@ DEBUG_PAGE = """<!doctype html>
 @dataclass
 class DebugState:
     condition: threading.Condition = field(default_factory=threading.Condition)
-    raw_jpeg: bytes | None = None
     yolo_jpeg: bytes | None = None
-    raw_version: int = 0
     yolo_version: int = 0
-    raw_frames: int = 0
+    capture_frames: int = 0
     yolo_frames: int = 0
+    inference_frames: int = 0
     people: int = 0
     latency_ms: float = 0.0
     decode_ms: float = 0.0
@@ -215,27 +244,52 @@ class DebugState:
     image_width: int = 0
     image_height: int = 0
     capture_age_ms: float = -1.0
-    last_raw_wall_sec: float = 0.0
+    last_capture_wall_sec: float = 0.0
     last_yolo_wall_sec: float = 0.0
+    last_inference_wall_sec: float = 0.0
+    last_status: str = 'waiting for first frame'
+    last_error: str = ''
+    last_error_wall_sec: float = 0.0
     detections: list = field(default_factory=list)
-    raw_wall_times: deque = field(default_factory=lambda: deque(maxlen=90))
+    latest_payload: dict = field(default_factory=dict)
+    dropped_capture_frames: int = 0
+    dropped_inference_frames: int = 0
+    dropped_stream_frames: int = 0
+    yolo_stream_clients: int = 0
+    stream_disconnects: int = 0
+    metrics: dict = field(default_factory=lambda: {
+        name: MetricWindow()
+        for name in (
+            'capture_age_ms',
+            'server_decode_ms',
+            'queue_wait_ms',
+            'tensorrt_predict_ms',
+            'gpu_sync_ms',
+            'postprocess_ms',
+            'overlay_draw_ms',
+            'server_jpeg_encode_ms',
+            'response_ms',
+            'end_to_end_frame_age_ms',
+        )
+    })
+    capture_wall_times: deque = field(default_factory=lambda: deque(maxlen=90))
     yolo_wall_times: deque = field(default_factory=lambda: deque(maxlen=90))
+    inference_wall_times: deque = field(default_factory=lambda: deque(maxlen=90))
 
-    def update_raw(self, raw_jpeg, width, height, capture_age_ms):
+    def record_capture(self, width, height, capture_age_ms):
         with self.condition:
-            self.raw_jpeg = raw_jpeg
-            self.raw_version += 1
-            self.raw_frames += 1
+            self.capture_frames += 1
             self.image_width = width
             self.image_height = height
             self.capture_age_ms = capture_age_ms
-            self.last_raw_wall_sec = time.time()
-            self.raw_wall_times.append(self.last_raw_wall_sec)
+            self.last_capture_wall_sec = time.time()
+            self.capture_wall_times.append(self.last_capture_wall_sec)
             self.condition.notify_all()
 
     def update_yolo(
         self, yolo_jpeg, people, latency_ms, width, height, capture_age_ms,
         detections=None, decode_ms=0.0, predict_ms=0.0, post_ms=0.0,
+        inference_ok=False, status_text='', payload=None,
     ):
         with self.condition:
             self.yolo_jpeg = yolo_jpeg
@@ -252,32 +306,75 @@ class DebugState:
             self.last_yolo_wall_sec = time.time()
             self.detections = list(detections or [])
             self.yolo_wall_times.append(self.last_yolo_wall_sec)
+            if status_text:
+                self.last_status = status_text
+            if inference_ok:
+                self.inference_frames += 1
+                self.last_inference_wall_sec = self.last_yolo_wall_sec
+                self.inference_wall_times.append(self.last_inference_wall_sec)
+                self.last_error = ''
+            if payload is not None:
+                self.latest_payload = dict(payload)
+            self.condition.notify_all()
+
+    def record(self, name, value):
+        metric = self.metrics.get(name)
+        if metric is not None:
+            metric.add(value)
+
+    def mark_inference_drop(self):
+        with self.condition:
+            self.dropped_inference_frames += 1
+
+    def stream_opened(self):
+        with self.condition:
+            self.yolo_stream_clients += 1
+
+    def stream_closed(self):
+        with self.condition:
+            self.stream_disconnects += 1
+            self.yolo_stream_clients = max(0, self.yolo_stream_clients - 1)
+
+    def set_error(self, message):
+        with self.condition:
+            self.last_status = message
+            self.last_error = message
+            self.last_error_wall_sec = time.time()
             self.condition.notify_all()
 
     def status(self):
         with self.condition:
             now = time.time()
-            raw_age = now - self.last_raw_wall_sec if self.last_raw_wall_sec else -1.0
+            capture_age = now - self.last_capture_wall_sec if self.last_capture_wall_sec else -1.0
             yolo_age = now - self.last_yolo_wall_sec if self.last_yolo_wall_sec else -1.0
-            raw_fps = 0.0
-            if len(self.raw_wall_times) >= 2:
-                dt = self.raw_wall_times[-1] - self.raw_wall_times[0]
+            capture_fps = 0.0
+            if len(self.capture_wall_times) >= 2:
+                dt = self.capture_wall_times[-1] - self.capture_wall_times[0]
                 if dt > 1e-6:
-                    raw_fps = (len(self.raw_wall_times) - 1) / dt
+                    capture_fps = (len(self.capture_wall_times) - 1) / dt
             yolo_fps = 0.0
             if len(self.yolo_wall_times) >= 2:
                 dt = self.yolo_wall_times[-1] - self.yolo_wall_times[0]
                 if dt > 1e-6:
                     yolo_fps = (len(self.yolo_wall_times) - 1) / dt
+            inference_fps = 0.0
+            if len(self.inference_wall_times) >= 2:
+                dt = self.inference_wall_times[-1] - self.inference_wall_times[0]
+                if dt > 1e-6:
+                    inference_fps = (len(self.inference_wall_times) - 1) / dt
+            inference_age = now - self.last_inference_wall_sec if self.last_inference_wall_sec else -1.0
+            error_age = now - self.last_error_wall_sec if self.last_error_wall_sec else -1.0
             return {
-                'ok': self.raw_frames > 0,
-                'frames': self.raw_frames,
-                'raw_frames': self.raw_frames,
+                'ok': self.capture_frames > 0,
+                'frames': self.capture_frames,
+                'capture_frames': self.capture_frames,
                 'yolo_frames': self.yolo_frames,
+                'inference_frames': self.inference_frames,
                 'people': self.people,
-                'fps': raw_fps,
-                'raw_fps': raw_fps,
+                'fps': capture_fps,
+                'capture_fps': capture_fps,
                 'yolo_fps': yolo_fps,
+                'inference_fps': inference_fps,
                 'latency_ms': self.latency_ms,
                 'decode_ms': self.decode_ms,
                 'predict_ms': self.predict_ms,
@@ -285,30 +382,41 @@ class DebugState:
                 'image_width': self.image_width,
                 'image_height': self.image_height,
                 'capture_age_ms': self.capture_age_ms,
-                'frame_age_sec': raw_age,
-                'raw_frame_age_sec': raw_age,
+                'frame_age_sec': capture_age,
+                'capture_frame_age_sec': capture_age,
                 'yolo_frame_age_sec': yolo_age,
+                'inference_frame_age_sec': inference_age,
+                'last_status': self.last_status,
+                'last_error': self.last_error,
+                'last_error_age_sec': error_age,
                 'detections': self.detections,
+                'latest_result_sequence': self.latest_payload.get('sequence'),
+                'dropped_capture_frames': self.dropped_capture_frames,
+                'dropped_inference_frames': self.dropped_inference_frames,
+                'dropped_stream_frames': self.dropped_stream_frames,
+                'yolo_stream_clients': self.yolo_stream_clients,
+                'stream_clients': self.yolo_stream_clients,
+                'stream_disconnects': self.stream_disconnects,
+                'metrics_5s': {
+                    name: metric.summary(now=now, window_sec=5.0)
+                    for name, metric in self.metrics.items()
+                },
             }
 
-    def latest_frame(self, kind):
+    def latest_frame(self):
         with self.condition:
-            frame = self.raw_jpeg if kind == 'raw' else self.yolo_jpeg
-            version = self.raw_version if kind == 'raw' else self.yolo_version
-            return version, frame
+            return self.yolo_version, self.yolo_jpeg
 
-    def wait_for_frame(self, kind, previous_version):
+    def wait_for_frame(self, previous_version):
         with self.condition:
             self.condition.wait_for(
                 lambda: (
-                    self.raw_version if kind == 'raw' else self.yolo_version
-                ) != previous_version
-                and (self.raw_jpeg if kind == 'raw' else self.yolo_jpeg) is not None,
+                    self.yolo_version != previous_version
+                    and self.yolo_jpeg is not None
+                ),
                 timeout=1.0,
             )
-            frame = self.raw_jpeg if kind == 'raw' else self.yolo_jpeg
-            version = self.raw_version if kind == 'raw' else self.yolo_version
-            return version, frame
+            return self.yolo_version, self.yolo_jpeg
 
 
 def _decode_image(file_storage):
@@ -347,28 +455,34 @@ def _draw_yolo_overlay(frame, detections, latency_ms):
         )
     cv2.putText(
         output,
-        f'teddy_bears={len(detections)} inference={latency_ms:.1f}ms',
+        f'targets={len(detections)} inference={latency_ms:.1f}ms',
         (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 255), 2,
     )
     if not detections:
         cv2.putText(
-            output, 'NO TEDDY BEAR', (10, 55),
+            output, 'NO TARGET', (10, 55),
             cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 180, 255), 2,
         )
     return output
 
 
-def _mjpeg_stream(state, kind):
+def _mjpeg_stream(state):
     version = -1
-    while True:
-        version, frame = state.wait_for_frame(kind, version)
-        if frame is None:
-            continue
-        yield (
-            b'--frame\r\n'
-            b'Content-Type: image/jpeg\r\n'
-            b'Cache-Control: no-cache\r\n\r\n' + frame + b'\r\n'
-        )
+    state.stream_opened()
+    try:
+        while True:
+            version, frame = state.wait_for_frame(version)
+            if frame is None:
+                continue
+            yield (
+                b'--frame\r\n'
+                b'Content-Type: image/jpeg\r\n'
+                b'Cache-Control: no-cache\r\n\r\n' + frame + b'\r\n'
+            )
+    except GeneratorExit:
+        raise
+    finally:
+        state.stream_closed()
 
 
 def _normalize_device(device):
@@ -378,7 +492,24 @@ def _normalize_device(device):
     return text
 
 
-def _resolve_inference_device(requested):
+def _validate_model_path(model_path):
+    path = Path(str(model_path)).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f'YOLO model not found: {path}')
+    suffix = path.suffix.lower()
+    if suffix == '.pt':
+        raise ValueError(
+            f'PyTorch YOLO checkpoints are not allowed at runtime: {path}. '
+            'Export and launch with model/target_v3.engine instead.'
+        )
+    if suffix not in ('.engine', '.plan'):
+        raise ValueError(
+            f'YOLO runtime model must be a TensorRT .engine/.plan file, got: {path}'
+        )
+    return path
+
+
+def _resolve_inference_device(requested, model_path):
     """Return a CUDA device only when this torch build supports its CC.
 
     Jetson Orin is compute capability 8.7.  A PyTorch build lacking ``sm_87``
@@ -387,6 +518,11 @@ def _resolve_inference_device(requested):
     keeps the HTTP stream and dashboard responsive.
     """
     requested = _normalize_device(requested)
+    suffix = Path(str(model_path)).suffix.lower()
+    if suffix in ('.engine', '.plan'):
+        if requested.lower() in ('cpu', 'none', ''):
+            raise ValueError('TensorRT YOLO engines require a CUDA device, not cpu.')
+        return requested, None
     if requested.lower() in ('cpu', 'none', ''):
         return 'cpu', None
     if not requested.lower().startswith('cuda'):
@@ -435,93 +571,89 @@ def _request_capture_age_sec(req):
     return -1.0
 
 
+def _request_capture_age_sec_from_meta(meta):
+    try:
+        capture_wall_sec = float(meta.get('capture_wall_sec') or 0.0)
+    except (TypeError, ValueError, AttributeError):
+        capture_wall_sec = 0.0
+    if capture_wall_sec > 0.0:
+        wall_delta_sec = time.time() - capture_wall_sec
+        if 0.0 <= wall_delta_sec <= 60.0:
+            return wall_delta_sec
+    try:
+        robot_frame_age_ms_at_send = float(
+            meta.get('robot_frame_age_ms_at_send') or -1.0
+        )
+    except (TypeError, ValueError, AttributeError):
+        robot_frame_age_ms_at_send = -1.0
+    if robot_frame_age_ms_at_send >= 0.0:
+        return robot_frame_age_ms_at_send / 1000.0
+    return -1.0
+
+
 def build_app(args):
     from flask import Flask, Response, jsonify, request
     from ultralytics import YOLO
 
     app = Flask(__name__)
-    args.device, cpu_fallback_reason = _resolve_inference_device(args.device)
+    model_path = _validate_model_path(args.model_path)
+    model_suffix = model_path.suffix.lower()
+    args.device, cpu_fallback_reason = _resolve_inference_device(
+        args.device,
+        args.model_path,
+    )
     if cpu_fallback_reason:
-        print(
-            '[flask_yolo_server] CUDA_FALLBACK_CPU | '
-            f'{cpu_fallback_reason}', flush=True,
-        )
-    model = YOLO(args.model_path)
+        raise RuntimeError(f'CUDA fallback is not allowed for TensorRT runtime: {cpu_fallback_reason}')
+    model = YOLO(args.model_path, task='detect')
     use_half = bool(args.half) and str(args.device).lower() not in ('cpu', 'none', '')
-    use_fast_forward = bool(args.fast_forward)
-    fast_net = None
-    letterbox = None
-    non_max_suppression = None
-    scale_boxes = None
-    torch = None
-    class_names = getattr(model, 'names', {}) or {}
-    if use_fast_forward:
-        try:
-            import torch as _torch
-            from ultralytics.data.augment import LetterBox
-            from ultralytics.utils.nms import non_max_suppression as _nms
-            from ultralytics.utils.ops import scale_boxes as _scale_boxes
-
-            torch = _torch
-            fast_net = model.model.to(args.device).eval()
-            if use_half:
-                fast_net = fast_net.half()
-            letterbox = LetterBox(new_shape=(int(args.imgsz), int(args.imgsz)), auto=False, stride=32)
-            non_max_suppression = _nms
-            scale_boxes = _scale_boxes
-            class_names = getattr(model.model, 'names', class_names) or class_names
-        except Exception as exc:
-            print(f'[flask_yolo_server] fast forward setup failed; falling back to model.predict: {exc}', flush=True)
-            use_fast_forward = False
     warmup_ms = -1.0
     try:
-        if 'cuda' in str(args.device).lower():
-            torch.backends.cudnn.benchmark = True
-            try:
-                torch.set_float32_matmul_precision('high')
-            except Exception:
-                pass
         dummy = np.zeros((max(32, int(args.imgsz)), max(32, int(args.imgsz)), 3), dtype=np.uint8)
         t_warmup = time.perf_counter()
-        if use_fast_forward:
-            im = letterbox(image=dummy)
-            im = im[..., ::-1].transpose(2, 0, 1)
-            im = np.ascontiguousarray(im)
-            tensor = torch.from_numpy(im).to(args.device, non_blocking=True)
-            tensor = tensor.half() if use_half else tensor.float()
-            tensor = tensor.unsqueeze(0) / 255.0
-            with torch.inference_mode():
-                pred = fast_net(tensor)
-                if isinstance(pred, (tuple, list)):
-                    pred = pred[0]
-                non_max_suppression(
-                    pred,
-                    conf_thres=args.conf,
-                    iou_thres=args.iou,
-                    classes=[args.target_class] if args.target_class is not None else None,
-                    max_det=args.max_det,
-                )
-        else:
-            model.predict(
-                source=dummy,
-                imgsz=args.imgsz,
-                conf=args.conf,
-                classes=[args.target_class] if args.target_class is not None else None,
-                device=args.device,
-                half=use_half,
-                verbose=False,
-            )
+        model.predict(
+            source=dummy,
+            imgsz=args.imgsz,
+            conf=args.conf,
+            classes=[args.target_class] if args.target_class is not None else None,
+            device=args.device,
+            half=use_half,
+            verbose=False,
+        )
         _cuda_synchronize_if_needed(args.device)
         warmup_ms = (time.perf_counter() - t_warmup) * 1000.0
         print(
             f'[flask_yolo_server] model ready | device={args.device} half={use_half} '
-            f'imgsz={args.imgsz} fast_forward={use_fast_forward} warmup_ms={warmup_ms:.1f}',
+            f'imgsz={args.imgsz} warmup_ms={warmup_ms:.1f}',
             flush=True,
         )
     except Exception as exc:
         print(f'[flask_yolo_server] warmup failed: {exc}', flush=True)
+        if model_suffix in ('.engine', '.plan'):
+            raise
     state = DebugState()
     runtime = {'warmup_ms': warmup_ms}
+
+    def runtime_status():
+        return {
+            'model_path': args.model_path,
+            'model_suffix': model_suffix,
+            'backend': 'tensorrt' if model_suffix in ('.engine', '.plan') else 'ultralytics',
+            'device': args.device,
+            'cuda_device': str(args.device).lower().startswith('cuda'),
+            'cpu_fallback': False,
+            'half': use_half,
+            'imgsz': args.imgsz,
+            'conf': args.conf,
+            'iou': args.iou,
+            'max_det': args.max_det,
+            'target_class': args.target_class,
+            'all_classes': args.target_class is None,
+            'max_capture_age_sec': args.max_capture_age_sec,
+            'max_queue_wait_sec': args.max_queue_wait_sec,
+            'async_latest': bool(args.async_latest),
+            'warmup_ms': runtime.get('warmup_ms', -1.0),
+            'debug_url': f'http://127.0.0.1:{args.port}/',
+        }
 
     def update_debug_overlay(frame, width, height, capture_age_ms, status_text):
         """Keep the overlay MJPEG stream live before/without inference."""
@@ -536,6 +668,8 @@ def build_app(args):
             _encode_jpeg(overlay, args.debug_jpeg_quality),
             0, 0.0, width, height, capture_age_ms,
             detections=[],
+            inference_ok=False,
+            status_text=status_text,
         )
 
     class InferenceWorker:
@@ -558,7 +692,7 @@ def build_app(args):
             runtime['warmup_ms'] = (time.perf_counter() - t_warmup) * 1000.0
             print(
                 f'[flask_yolo_server] inference worker ready | device={args.device} half={use_half} '
-                f'imgsz={args.imgsz} fast_forward={use_fast_forward} worker_warmup_ms={runtime["warmup_ms"]:.1f}',
+                f'imgsz={args.imgsz} worker_warmup_ms={runtime["warmup_ms"]:.1f}',
                 flush=True,
             )
 
@@ -571,11 +705,34 @@ def build_app(args):
                 self.ready.set()
 
             while True:
-                frame, result_queue = self.jobs.get()
+                job = self.jobs.get()
                 try:
-                    result_queue.put((True, self.run_predict(frame)))
+                    if job.get('mode') == 'sync':
+                        job['result_queue'].put((True, self.run_predict(job['frame'])))
+                    else:
+                        self.process_async_job(job)
                 except Exception as exc:
-                    result_queue.put((False, exc))
+                    result_queue = job.get('result_queue')
+                    if result_queue is not None:
+                        result_queue.put((False, exc))
+                    else:
+                        state.set_error(f'YOLO inference worker failed: {exc}')
+
+        def submit_latest(self, job):
+            dropped = 0
+            while True:
+                try:
+                    self.jobs.put_nowait(job)
+                    break
+                except queue.Full:
+                    try:
+                        self.jobs.get_nowait()
+                        dropped += 1
+                    except queue.Empty:
+                        break
+            for _ in range(dropped):
+                state.mark_inference_drop()
+            return dropped
 
         def infer(self, frame):
             if args.max_queue_wait_sec > 0.0:
@@ -588,7 +745,11 @@ def build_app(args):
             result_queue = queue.Queue(maxsize=1)
             try:
                 try:
-                    self.jobs.put_nowait((frame, result_queue))
+                    self.jobs.put_nowait({
+                        'mode': 'sync',
+                        'frame': frame,
+                        'result_queue': result_queue,
+                    })
                 except queue.Full as exc:
                     raise InferenceBusyError('inference job queue full; dropped request') from exc
                 ok, payload = result_queue.get()
@@ -598,41 +759,97 @@ def build_app(args):
             finally:
                 self.inflight_lock.release()
 
+        def process_async_job(self, job):
+            frame = job['frame']
+            width = int(job['width'])
+            height = int(job['height'])
+            capture_age_ms = float(job['capture_age_ms'])
+            decode_ms = float(job.get('decode_ms', 0.0))
+            observation_meta = dict(job.get('observation_meta') or {})
+            queued_at = float(job.get('queued_at', time.perf_counter()))
+            queue_wait_ms = (time.perf_counter() - queued_at) * 1000.0
+            state.record('queue_wait_ms', queue_wait_ms)
+            results, predict_ms, gpu_sync_ms = self.run_predict(frame)
+
+            t_post0 = time.perf_counter()
+            detections = []
+            if results and results[0].boxes is not None:
+                boxes = results[0].boxes
+                xyxy = boxes.xyxy.cpu().numpy()
+                confs = boxes.conf.cpu().numpy()
+                clss = boxes.cls.cpu().numpy() if boxes.cls is not None else np.zeros(len(confs), dtype=np.float32)
+                names = getattr(results[0], 'names', {}) or {}
+                for box, conf, cls in zip(xyxy, confs, clss):
+                    class_id = int(cls)
+                    detections.append({
+                        'bbox': [float(v) for v in box],
+                        'conf': float(conf),
+                        'class_id': class_id,
+                        'label': str(names.get(class_id, class_id)),
+                    })
+            post_ms = (time.perf_counter() - t_post0) * 1000.0
+
+            t_overlay0 = time.perf_counter()
+            overlay = _draw_yolo_overlay(frame, detections, predict_ms)
+            overlay_draw_ms = (time.perf_counter() - t_overlay0) * 1000.0
+            t_encode0 = time.perf_counter()
+            annotated_jpeg = _encode_jpeg(overlay, args.debug_jpeg_quality)
+            encode_ms = (time.perf_counter() - t_encode0) * 1000.0
+            end_age_sec = _request_capture_age_sec_from_meta(observation_meta)
+            end_to_end_ms = max(0.0, end_age_sec * 1000.0) if end_age_sec >= 0.0 else capture_age_ms
+            latency_ms = decode_ms + queue_wait_ms + predict_ms + gpu_sync_ms + post_ms + overlay_draw_ms + encode_ms
+
+            payload = {
+                'ok': True,
+                'async_result': True,
+                'stamp_wall_sec': time.time(),
+                'latency_ms': latency_ms,
+                'decode_ms': decode_ms,
+                'queue_wait_ms': queue_wait_ms,
+                'predict_ms': predict_ms,
+                'gpu_sync_ms': gpu_sync_ms,
+                'post_ms': post_ms,
+                'overlay_draw_ms': overlay_draw_ms,
+                'server_jpeg_encode_ms': encode_ms,
+                'capture_age_ms': end_to_end_ms,
+                'image_width': width,
+                'image_height': height,
+                'detections': detections,
+                'debug_url': f'http://127.0.0.1:{args.port}/',
+            }
+            payload.update(observation_meta)
+            state.update_yolo(
+                annotated_jpeg, len(detections),
+                latency_ms, width, height, end_to_end_ms, detections,
+                decode_ms=decode_ms, predict_ms=predict_ms, post_ms=post_ms,
+                inference_ok=True, status_text='YOLO OK', payload=payload,
+            )
+            for name, value in (
+                ('tensorrt_predict_ms', predict_ms),
+                ('gpu_sync_ms', gpu_sync_ms),
+                ('postprocess_ms', post_ms),
+                ('overlay_draw_ms', overlay_draw_ms),
+                ('server_jpeg_encode_ms', encode_ms),
+                ('end_to_end_frame_age_ms', end_to_end_ms),
+            ):
+                state.record(name, value)
+
         def run_predict(self, frame):
             t_predict0 = time.perf_counter()
-            if use_fast_forward:
-                im = letterbox(image=frame)
-                im = im[..., ::-1].transpose(2, 0, 1)
-                im = np.ascontiguousarray(im)
-                tensor = torch.from_numpy(im).to(args.device, non_blocking=True)
-                tensor = tensor.half() if use_half else tensor.float()
-                tensor = tensor.unsqueeze(0) / 255.0
-                with torch.inference_mode():
-                    pred = fast_net(tensor)
-                    if isinstance(pred, (tuple, list)):
-                        pred = pred[0]
-                    results = non_max_suppression(
-                        pred,
-                        conf_thres=args.conf,
-                        iou_thres=args.iou,
-                        classes=[args.target_class] if args.target_class is not None else None,
-                        max_det=args.max_det,
-                    )
-                input_shape = tensor.shape[2:]
-            else:
-                results = model.predict(
-                    source=frame,
-                    imgsz=args.imgsz,
-                    conf=args.conf,
-                    classes=[args.target_class] if args.target_class is not None else None,
-                    device=args.device,
-                    half=use_half,
-                    verbose=False,
-                )
-                input_shape = None
-            _cuda_synchronize_if_needed(args.device)
+            results = model.predict(
+                source=frame,
+                imgsz=args.imgsz,
+                conf=args.conf,
+                classes=[args.target_class] if args.target_class is not None else None,
+                device=args.device,
+                half=use_half,
+                verbose=False,
+            )
             predict_ms = (time.perf_counter() - t_predict0) * 1000.0
-            return results, input_shape, predict_ms
+            t_sync0 = time.perf_counter()
+            _cuda_synchronize_if_needed(args.device)
+            gpu_sync_ms = (time.perf_counter() - t_sync0) * 1000.0
+            return results, predict_ms, gpu_sync_ms
 
     inference_worker = InferenceWorker()
 
@@ -646,36 +863,31 @@ def build_app(args):
 
     @app.get('/health')
     def health():
-        return jsonify({
-            'ok': True,
-            'model_path': args.model_path,
-            'device': args.device,
-            'half': use_half,
-            'imgsz': args.imgsz,
-            'fast_forward': use_fast_forward,
-            'warmup_ms': runtime.get('warmup_ms', -1.0),
-            'debug_url': f'http://127.0.0.1:{args.port}/',
-        })
+        payload = runtime_status()
+        payload['ok'] = True
+        return jsonify(payload)
 
     @app.get('/api/status')
     def status():
-        return jsonify(state.status())
+        payload = state.status()
+        payload.update(runtime_status())
+        return jsonify(payload)
 
     @app.get('/stream/<kind>.mjpg')
     def stream(kind):
-        if kind not in ('raw', 'yolo'):
-            return jsonify({'ok': False, 'error': 'kind must be raw or yolo'}), 404
+        if kind != 'yolo':
+            return jsonify({'ok': False, 'error': 'kind must be yolo'}), 404
         return Response(
-            _mjpeg_stream(state, kind),
+            _mjpeg_stream(state),
             mimetype='multipart/x-mixed-replace; boundary=frame',
             headers={'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0'},
         )
 
     @app.get('/frame/<kind>.jpg')
     def latest_frame(kind):
-        if kind not in ('raw', 'yolo'):
-            return jsonify({'ok': False, 'error': 'kind must be raw or yolo'}), 404
-        version, frame = state.latest_frame(kind)
+        if kind != 'yolo':
+            return jsonify({'ok': False, 'error': 'kind must be yolo'}), 404
+        version, frame = state.latest_frame()
         if frame is None:
             return jsonify({'ok': False, 'error': 'waiting for first frame'}), 503
         return Response(
@@ -696,7 +908,7 @@ def build_app(args):
 
         try:
             t_decode0 = time.perf_counter()
-            original_jpeg, frame = _decode_image(request.files['image'])
+            _encoded_jpeg, frame = _decode_image(request.files['image'])
             decode_ms = (time.perf_counter() - t_decode0) * 1000.0
         except Exception as exc:
             return jsonify({'ok': False, 'error': str(exc)}), 400
@@ -705,15 +917,17 @@ def build_app(args):
         capture_ros_sec = float(request.form.get('capture_ros_sec') or 0.0)
         capture_wall_sec = float(request.form.get('capture_wall_sec') or 0.0)
         robot_frame_age_ms_at_send = float(request.form.get('robot_frame_age_ms_at_send') or -1.0)
-        raw_age_sec = _request_capture_age_sec(request)
-        capture_age_ms = max(0.0, raw_age_sec * 1000.0) if raw_age_sec >= 0.0 else -1.0
+        observation_meta = echo_observation_metadata(request.form)
+        capture_age_sec = _request_capture_age_sec(request)
+        capture_age_ms = max(0.0, capture_age_sec * 1000.0) if capture_age_sec >= 0.0 else -1.0
 
-        # Keep the debug camera view live even when this frame is too old or YOLO is busy.
-        state.update_raw(original_jpeg, int(w), int(h), capture_age_ms)
-        update_debug_overlay(frame, int(w), int(h), capture_age_ms, 'YOLO QUEUED')
+        state.record('capture_age_ms', capture_age_ms)
+        state.record('server_decode_ms', decode_ms)
 
-        if args.max_capture_age_sec > 0.0 and raw_age_sec > args.max_capture_age_sec:
-            update_debug_overlay(frame, int(w), int(h), capture_age_ms, 'YOLO STALE FRAME')
+        state.record_capture(int(w), int(h), capture_age_ms)
+
+        if args.max_capture_age_sec > 0.0 and capture_age_sec > args.max_capture_age_sec:
+            state.set_error('stale frame rejected before inference')
             return jsonify({
                 'ok': False,
                 'stale': True,
@@ -723,11 +937,57 @@ def build_app(args):
                 'detections': [],
             })
 
+        if args.async_latest:
+            update_debug_overlay(
+                frame,
+                int(w),
+                int(h),
+                capture_age_ms,
+                'queued for YOLO',
+            )
+            observation_meta.update({
+                'capture_ros_sec': f'{capture_ros_sec:.9f}' if capture_ros_sec > 0.0 else '',
+                'capture_wall_sec': f'{capture_wall_sec:.9f}' if capture_wall_sec > 0.0 else '',
+                'robot_frame_age_ms_at_send': f'{robot_frame_age_ms_at_send:.3f}',
+            })
+            dropped = inference_worker.submit_latest({
+                'mode': 'async',
+                'frame': frame,
+                'width': int(w),
+                'height': int(h),
+                'capture_age_ms': capture_age_ms,
+                'decode_ms': decode_ms,
+                'observation_meta': observation_meta,
+                'queued_at': time.perf_counter(),
+            })
+            response_ms = (time.perf_counter() - t0) * 1000.0
+            state.record('response_ms', response_ms)
+            latest = dict(state.latest_payload)
+            if not latest:
+                latest = {
+                    'ok': True,
+                    'async_ack': True,
+                    'detections': [],
+                    'image_width': int(w),
+                    'image_height': int(h),
+                    'capture_age_ms': capture_age_ms,
+                }
+                latest.update(observation_meta)
+            latest.update({
+                'ok': True,
+                'async_ack': True,
+                'accepted_frame': True,
+                'queued_inference_drop_count': dropped,
+                'response_ms': response_ms,
+                'capture_frame_age_ms': capture_age_ms,
+            })
+            return jsonify(latest)
+
         try:
-            results, input_shape, predict_ms = inference_worker.infer(frame)
+            results, predict_ms, gpu_sync_ms = inference_worker.infer(frame)
         except InferenceBusyError as exc:
             busy_age_sec = _request_capture_age_sec(request)
-            update_debug_overlay(frame, int(w), int(h), capture_age_ms, 'YOLO BUSY - RETRYING')
+            state.set_error(str(exc))
             return jsonify({
                 'ok': False,
                 'stale': True,
@@ -737,26 +997,12 @@ def build_app(args):
                 'detections': [],
             })
         except Exception as exc:
-            update_debug_overlay(frame, int(w), int(h), capture_age_ms, 'YOLO INFERENCE ERROR')
+            state.set_error(f'YOLO inference failed: {exc}')
             return jsonify({'ok': False, 'error': f'YOLO inference failed: {exc}'}), 500
 
         t_post0 = time.perf_counter()
         detections = []
-        if use_fast_forward:
-            det = results[0] if results else None
-            if det is not None and len(det):
-                det = det.clone()
-                det[:, :4] = scale_boxes(input_shape, det[:, :4], frame.shape).round()
-                for row in det.detach().float().cpu().numpy():
-                    x1, y1, x2, y2, conf, cls = row[:6]
-                    class_id = int(cls)
-                    detections.append({
-                        'bbox': [float(x1), float(y1), float(x2), float(y2)],
-                        'conf': float(conf),
-                        'class_id': class_id,
-                        'label': str(class_names.get(class_id, class_id)),
-                    })
-        elif results and results[0].boxes is not None:
+        if results and results[0].boxes is not None:
             boxes = results[0].boxes
             xyxy = boxes.xyxy.cpu().numpy()
             confs = boxes.conf.cpu().numpy()
@@ -779,6 +1025,7 @@ def build_app(args):
             and capture_age_ms >= 0.0
             and capture_age_ms > args.max_capture_age_sec * 1000.0
         ):
+            state.set_error('stale frame rejected after inference')
             return jsonify({
                 'ok': False,
                 'stale': True,
@@ -796,14 +1043,16 @@ def build_app(args):
             annotated_jpeg, len(detections),
             inference_ms, w, h, capture_age_ms, detections,
             decode_ms=decode_ms, predict_ms=predict_ms, post_ms=post_ms,
+            inference_ok=True, status_text='YOLO OK',
         )
 
-        return jsonify({
+        response_payload = {
             'ok': True,
             'stamp_wall_sec': time.time(),
             'latency_ms': inference_ms,
             'decode_ms': decode_ms,
             'predict_ms': predict_ms,
+            'gpu_sync_ms': gpu_sync_ms,
             'post_ms': post_ms,
             'capture_age_ms': capture_age_ms,
             'capture_ros_sec': capture_ros_sec,
@@ -813,7 +1062,9 @@ def build_app(args):
             'image_height': int(h),
             'detections': detections,
             'debug_url': f'http://127.0.0.1:{args.port}/',
-        })
+        }
+        response_payload.update(observation_meta)
+        return jsonify(response_payload)
 
     return app
 
@@ -827,10 +1078,9 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--port', type=int, default=5005)
-    parser.add_argument('--model-path', default='yolo11n.pt')
+    parser.add_argument('--model-path', default='model/target_v3.engine')
     parser.add_argument('--device', default='0')
     parser.add_argument('--half', type=as_bool, default=True)
-    parser.add_argument('--fast-forward', type=as_bool, default=True)
     parser.add_argument('--conf', type=float, default=0.20)
     parser.add_argument('--iou', type=float, default=0.45)
     parser.add_argument('--max-det', type=int, default=64)
@@ -839,8 +1089,14 @@ def parse_args():
     parser.add_argument('--max-capture-age-sec', type=float, default=0.8)
     parser.add_argument('--max-queue-wait-sec', type=float, default=0.0)
     parser.add_argument(
-        '--target-class', type=int, default=77,
-        help='Only infer this class. COCO teddy bear target class is 77.',
+        '--async-latest',
+        type=as_bool,
+        default=True,
+        help='ACK uploads immediately and let one latest-frame inference worker update streams/results.',
+    )
+    parser.add_argument(
+        '--target-class', type=int, default=0,
+        help='Only infer this class. model/target_v3 target class is 0.',
     )
     # Backward-compatible aliases for older launch commands.  New launches use
     # --target-class, so the server no longer hard-codes COCO person (class 0).

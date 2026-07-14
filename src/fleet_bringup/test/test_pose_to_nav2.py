@@ -1,3 +1,5 @@
+import time
+
 import rclpy
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseStamped
@@ -105,6 +107,28 @@ def test_latest_goal_is_retained_until_action_server_is_ready():
         node._try_send_pending()
         assert node.pending_goal is None
         assert len(client.sent) == 1
+    finally:
+        destroy_node(node)
+
+
+def test_goal_response_timeout_retries_latest_goal_generation():
+    node = make_node()
+    try:
+        client = FakeActionClient(ready=True)
+        node.client = client
+
+        node._on_goal_pose(goal(1.0, 2.0))
+        assert len(client.sent) == 1
+        node.inflight_goal_meta[1] = (
+            node.inflight_goal_meta[1][0],
+            time.monotonic() - 3.0,
+        )
+
+        node._try_send_pending()
+
+        assert len(client.sent) == 2
+        assert node.goal_count == 3
+        assert 1 not in node.inflight_goal_ids
     finally:
         destroy_node(node)
 

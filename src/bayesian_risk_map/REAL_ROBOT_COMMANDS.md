@@ -20,7 +20,7 @@ ros2 launch bayesian_risk_map robot_risk_source_stack.launch.py \
   start_robot_bringup:=false \
   start_camera_sender:=false \
   start_risk_map:=true \
-  model_path:=$PWD/yolo11n.pt \
+  model_path:=$PWD/model/target_v3.engine \
   camera_device:=/dev/video0 \
   camera_width:=640 \
   camera_height:=480 \

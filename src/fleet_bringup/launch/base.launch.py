@@ -12,6 +12,7 @@ fleet coordination instead).
 
 import os
 
+import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (
@@ -26,6 +27,18 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 from fleet_bringup.launch_utils import clean_process_environment, launch_bool
+
+
+def _tracked_cmd_vel_adapter_enabled(param_file: str) -> bool:
+    if not param_file:
+        return False
+    try:
+        with open(param_file, 'r', encoding='utf-8') as handle:
+            data = yaml.safe_load(handle) or {}
+    except OSError:
+        return False
+    params = data.get('tracked_cmd_vel_adapter', {}).get('ros__parameters', {})
+    return bool(params.get('enabled', False))
 
 
 def generate_launch_description():
@@ -48,6 +61,10 @@ def generate_launch_description():
     goal_delay_sec = LaunchConfiguration('goal_delay_sec')
     require_localization_ready = LaunchConfiguration('require_localization_ready')
     localization_ready_topic = LaunchConfiguration('localization_ready_topic')
+    require_system_ready = LaunchConfiguration('require_system_ready')
+    system_ready_topic = LaunchConfiguration('system_ready_topic')
+    require_start_motion = LaunchConfiguration('require_start_motion')
+    start_motion_topic = LaunchConfiguration('start_motion_topic')
 
     def make_stack(context):
         process_env = clean_process_environment(domain_id.perform(context))
@@ -58,6 +75,13 @@ def generate_launch_description():
                 'resolved Nav2 parameters YAML) -- the caller decides '
                 'which localization params (AMCL vs Cartographer) apply.'
             )
+        hardware_params_file = hardware_param_file.perform(context).strip()
+        adapter_enabled = _tracked_cmd_vel_adapter_enabled(hardware_params_file)
+        command_remappings = (
+            [('cmd_vel', '/cmd_vel_nav'), ('/cmd_vel', '/cmd_vel_nav')]
+            if adapter_enabled
+            else []
+        )
 
         navigation = [
             Node(
@@ -66,6 +90,7 @@ def generate_launch_description():
                 name='controller_server',
                 output='screen',
                 parameters=[params_file],
+                remappings=command_remappings,
                 env=process_env,
             ),
             Node(
@@ -82,6 +107,7 @@ def generate_launch_description():
                 name='behavior_server',
                 output='screen',
                 parameters=[params_file],
+                remappings=command_remappings,
                 env=process_env,
             ),
             Node(
@@ -114,17 +140,36 @@ def generate_launch_description():
                     require_localization_ready.perform(context)
                 ),
                 'localization_ready_topic': localization_ready_topic.perform(context),
+                'require_system_ready': launch_bool(
+                    require_system_ready.perform(context)
+                ),
+                'system_ready_topic': system_ready_topic.perform(context),
+                'require_start_motion': launch_bool(
+                    require_start_motion.perform(context)
+                ),
+                'start_motion_topic': start_motion_topic.perform(context),
             }],
             env=process_env,
         )
 
         actions = []
+        if adapter_enabled:
+            actions.append(Node(
+                package='fleet_bringup',
+                executable='tracked_cmd_vel_adapter',
+                name='tracked_cmd_vel_adapter',
+                output='screen',
+                parameters=[hardware_params_file],
+                env=process_env,
+                respawn=True,
+                respawn_delay=1.0,
+            ))
         if launch_bool(start_robot_bringup.perform(context)):
             robot_launch_args = {
                 'use_sim_time': 'false',
                 'namespace': '',
             }
-            param_file = hardware_param_file.perform(context)
+            param_file = hardware_params_file
             if param_file:
                 # Overrides turtlebot3_bringup's own default hardware
                 # params, e.g. to disable the wheel odometry's own
@@ -240,6 +285,28 @@ def generate_launch_description():
             'localization_ready_topic',
             default_value='/localization_ready',
             description='Latched Bool topic published by global_localize_kickstart.',
+        ),
+        DeclareLaunchArgument(
+            'require_system_ready',
+            default_value='false',
+            choices=['true', 'false'],
+            description='Drop goals until the leader-owned /system/ready latch is true.',
+        ),
+        DeclareLaunchArgument(
+            'system_ready_topic',
+            default_value='/system/ready',
+            description='Latched global startup barrier topic.',
+        ),
+        DeclareLaunchArgument(
+            'require_start_motion',
+            default_value='false',
+            choices=['true', 'false'],
+            description='Drop/cancel goals until the leader-owned motion latch is true.',
+        ),
+        DeclareLaunchArgument(
+            'start_motion_topic',
+            default_value='/fleet/start_motion',
+            description='Latched leader-owned final motion permission topic.',
         ),
         OpaqueFunction(function=make_stack),
     ])

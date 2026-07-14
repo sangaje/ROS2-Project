@@ -2,16 +2,16 @@
   "source_of_truth": {
     "training_runner": "run_train_v132_clean.sh",
     "train_module": "turtlebot3_rl_training.train_sac",
-    "model_path": "rl_models/pure_velocity_sac_map64_lidar60_h8_deltatcn_domain22_nopriority_gsde_v022_dt02_b128_obs63/sac_turtlebot3_burger_emergency.zip"
+    "model_path": "model/sac_turtlebot3_burger_emergency.zip"
   },
   "runtime": {
     "control_dt_sec": 0.2,
     "map_substeps_per_action": 2,
-    "max_scan_age_sec": 0.5,
-    "max_map_age_sec": 3.0,
+    "max_scan_age_sec": 2.0,
+    "max_map_age_sec": 5.0,
     "max_tf_age_sec": 0.5,
-    "max_inference_sec": 1.0,
-    "command_timeout_sec": 1.5,
+    "max_inference_sec": 2.0,
+    "command_timeout_sec": 3.0,
     "topics": {
       "scan": "/scan",
       "map": "/map",

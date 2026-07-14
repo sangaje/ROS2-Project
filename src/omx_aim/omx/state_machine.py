@@ -60,6 +60,7 @@ class StateMachine:
         self.cooldown_home_sent: bool = False
         self.fire_start_t: float = 0.0     # 격발 펄스 시작 시각 (home 지연용)
         self.lost_start_t: float = 0.0
+        self.last_track_error: Optional[tuple] = None
 
         self.armed = cfg.autotrack.default_armed if cfg.autotrack else False
         self.last_processed: Optional[tuple] = None
@@ -432,7 +433,7 @@ class StateMachine:
 
     # ----- update() 메인 -----
 
-    def update(self, detected: bool, error_norm, now: float) -> dict:
+    def update(self, detected: bool, error_norm, now: float, *, vision_valid: bool = True) -> dict:
         action = {
             'action': 'wait',
             'state': self.state,
@@ -446,6 +447,10 @@ class StateMachine:
             'focus_is_boundary': False,     # H2: 시각화용
             'target_not_found_coord': None, # H3
             'scan_sweep': False,
+            'cancel_navigation': False,
+            'cancel_reason': '',
+            'auto_armed': False,
+            'stale_track': False,
         }
 
         # 1. nav_result 처리
@@ -470,21 +475,31 @@ class StateMachine:
                 self._handle_nav_result(result, action, now)
 
         detection_preempted_nav = (
+            vision_valid
+            and
             detected
             and error_norm is not None
-            and self._is_waffle_navigating()
-            and self.state not in (State.FIRING, State.COOLDOWN)
+            and self.state
+            not in (State.TRACKING, State.CONFIRMING, State.FIRING, State.COOLDOWN)
         )
         if detection_preempted_nav:
+            if not self.armed:
+                self.armed = True
+                action['auto_armed'] = True
+                self._log("카메라 탐지: 자동 ARM")
             self.boundary_queue.clear()
             self.current_focus = None
             self.nav_waypoints = []
             self.nav_final_view_pose = None
-            self.pending_cancel_for_preempt = True
+            self.pending_cancel_for_preempt = self._is_waffle_navigating()
+            action['cancel_navigation'] = True
+            action['cancel_reason'] = 'target_detected_track'
+            self.confirm_progress = 0.0
+            self.lost_start_t = 0.0
             action['action'] = 'track'
             action['error'] = error_norm
             self.transition(State.TRACKING)
-            self._log("카메라 탐지: Nav 작업 중단 -> 즉시 TRACKING")
+            self._log("카메라 탐지: 기존 작업 중단 -> 즉시 PD TRACKING")
 
         # 2. State 분기
         elif self.state == State.IDLE:
@@ -512,13 +527,19 @@ class StateMachine:
                 action['scan_sweep'] = True
 
         elif self.state == State.SCANNING:
-            self._on_scanning(detected, error_norm, now, action)
+            if vision_valid:
+                self._on_scanning(detected, error_norm, now, action)
+            else:
+                action['action'] = 'scan_sweep'
+                action['scan_sweep'] = True
 
         elif self.state == State.TRACKING:
-            self._on_tracking(detected, error_norm, now, action)
+            if vision_valid:
+                self._on_tracking(detected, error_norm, now, action)
 
         elif self.state == State.CONFIRMING:
-            self._on_confirming(detected, error_norm, now, action)
+            if vision_valid:
+                self._on_confirming(detected, error_norm, now, action)
 
         elif self.state == State.FIRING:
             action['action'] = 'fire'
@@ -696,6 +717,11 @@ class StateMachine:
         elif self.armed and detected:
             self._log("Autonomous detection -> TRACKING")
             self.current_focus = None  # autotrack 은 focus 없음
+            action['cancel_navigation'] = True
+            action['cancel_reason'] = 'target_detected_idle'
+            if error_norm is not None:
+                action['action'] = 'track'
+                action['error'] = error_norm
             self.transition(State.TRACKING)
 
         else:
@@ -703,6 +729,9 @@ class StateMachine:
                 action['patrol_complete'] = True
                 self.patrol_complete_sent = True
                 self._log("정찰 완료 - main_queue 비었음")
+            if self.armed:
+                action['action'] = 'scan_sweep'
+                action['scan_sweep'] = True
 
     # ----- 핸들러: WAITING_NAV -----
 
@@ -897,6 +926,7 @@ class StateMachine:
     def _on_tracking(self, detected, error_norm, now, action):
         if detected:
             self.lost_start_t = 0.0
+            self.last_track_error = error_norm
             ex, ey = error_norm
             db_x = self.cfg.ibvs.deadband_x
             db_y = self.cfg.ibvs.deadband_y
@@ -921,14 +951,26 @@ class StateMachine:
                     action['lost_coord_map'] = self.current_focus.coord_map
                 action['action'] = 'target_lost'
                 self.lost_start_t = 0.0
+                self.last_track_error = None
                 self._on_focus_done()
+            elif self.last_track_error is not None:
+                action['action'] = 'track'
+                action['error'] = self.last_track_error
+                action['stale_track'] = True
 
     def _on_confirming(self, detected, error_norm, now, action):
         if not detected:
             self._log("CONFIRMING 중 표적 사라짐 -> TRACKING")
             self.transition(State.TRACKING)
             self.confirm_progress = 0.0
+            if self.lost_start_t == 0.0:
+                self.lost_start_t = now
+            if self.last_track_error is not None:
+                action['action'] = 'track'
+                action['error'] = self.last_track_error
+                action['stale_track'] = True
         else:
+            self.last_track_error = error_norm
             ex, ey = error_norm
             scale = self.cfg.fire.confirm_deadband_scale
             confirm_db_x = self.cfg.ibvs.deadband_x * scale
@@ -937,6 +979,8 @@ class StateMachine:
                 self._log("CONFIRMING 중 이탈 -> TRACKING")
                 self.transition(State.TRACKING)
                 self.confirm_progress = 0.0
+                action['action'] = 'track'
+                action['error'] = error_norm
             else:
                 elapsed = now - self.confirm_start_t
                 self.confirm_progress = min(
@@ -982,6 +1026,8 @@ class StateMachine:
         is_boundary = (self.current_focus.target_type == TargetType.BOUNDARY)
         self.current_focus = None
         self.confirm_progress = 0.0
+        self.lost_start_t = 0.0
+        self.last_track_error = None
 
         if is_boundary:
             # boundary 처리 끝. parent 아직 이동 중이면 WAITING_NAV 복귀.

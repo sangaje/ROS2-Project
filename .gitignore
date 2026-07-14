@@ -27,6 +27,12 @@ rl_*/
 *.pth
 *.onnx
 
+# Curated runtime model assets live here and should be versionable.
+!model/
+!model/README.md
+!model/*.zip
+!model/*.pt
+
 # ROS2 build outputs
 build/
 install/

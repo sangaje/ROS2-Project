@@ -40,10 +40,14 @@ setup(
     license='Apache-2.0',
     entry_points={
         'console_scripts': [
+            'active_field_source_mux = system_bringup.active_field_source_mux:main',
             'leader_unified_dashboard = system_bringup.leader_unified_dashboard:main',
             'leader_shadow_follow = system_bringup.leader_shadow_follow:main',
             'scout_failover_coordinator = system_bringup.scout_failover_coordinator:main',
             'scout_rl_policy_worker = system_bringup.scout_rl_policy_worker:main',
+            'system_readiness_monitor = system_bringup.system_readiness_monitor:main',
+            'takeover_map_exporter = system_bringup.takeover_map_exporter:main',
+            'takeover_stack_manager = system_bringup.takeover_stack_manager:main',
             'unified_field_robot = system_bringup.unified_field_robot:main',
         ],
     },

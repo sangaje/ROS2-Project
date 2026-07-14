@@ -78,12 +78,27 @@ keyboard:
 # ===========================================================
 ibvs:
   camera_index: 0
+  # A stable /dev/v4l/by-id/... path is preferred when available. Empty keeps
+  # the legacy integer camera_index behavior.
+  camera_device: ""
+  camera_backend: "v4l2"
+  camera_reconnect_period_sec: 1.0
+  camera_required: false
+  camera_width: 1280
+  camera_height: 720
+  camera_fps: 15.0
+  camera_fourcc: "MJPG"
+  camera_buffer_size: 1
   kp_yaw:   0.05            # 비례 게인 (rad / normalized error)
   kp_pitch: 0.03
   sign_vs_x: -1             # 카메라 마운팅에 따른 부호
   sign_vs_y: -1
-  deadband_x:  0.03        # 화면 폭의 3%
-  deadband_y:  0.09         # ← 신규 (위아래 3배 여유)
+  deadband_x:  0.015       # 화면 폭의 1.5%; 너무 크면 PD가 멈춘다
+  deadband_y:  0.015       # x축과 동일 (정사각형 데드밴드)
+  # 조준 기준점을 화면 정중앙보다 아래/오른쪽으로 둔다.
+  # 0.20은 720p 기준 약 72px 아래, 0.08은 1280p 폭 기준 약 51px 오른쪽.
+  aim_target_offset_y_norm: 0.20
+  aim_target_offset_x_norm: 0.08
   control_hz:  25.0         # 제어 주기
   # ----- 움직이는 표적 추적 (Phase B) -----
   # 0 = 순수 P (정적 표적, 기존 동작과 동일)
@@ -99,22 +114,22 @@ ibvs:
   derivative_reset_gap_sec: 0.5
 
 yolo:
-  # COCO teddy bear 표적용 경량 기본값. 별도 학습 가중치는 런치의
+  # model/target_v3.engine 표적용 고속 기본값. 별도 학습 가중치는 런치의
   # yolo_node_model_path로 명시적으로 지정한다.
-  model_path: yolo11n.pt
+  model_path: model/target_v3.engine
   device: 0                 # Jetson CUDA device. cpu로 강제하려면 "cpu"
   half: true                # CUDA에서 FP16 사용
-  target_class: 77          # COCO teddy bear class
+  target_class: 0           # target_v3 클래스 0 = 표적 (실기 테스트로 확인됨)
   conf_threshold: 0.5        # 0.0~1.0. 낮을수록 더 많이 검출 (오검출 늘어남)
-  imgsz: 640                 # 추론 해상도. 320 = 빠름, 640 = 기본, 1280 = 정확
+  imgsz: 640                 # target_v3.engine 고정 입력 해상도와 반드시 일치
 
 # ===========================================================
 # 격발 & 상태 머신
 # ===========================================================
 fire:
   # 격발 직전 확인 (CONFIRMING 상태)
-  hold_time_sec: 0.5            # deadband 안 유지 시간
-  confirm_deadband_scale: 1.0   # IBVS deadband 의 N배 (1.0 = 같음, 더 좁게 하려면 0.5)
+  hold_time_sec: 0.35           # deadband 안 유지 시간
+  confirm_deadband_scale: 1.8   # 확인 중 잔진동 허용 폭
   aim_settle_sec: 0.7
 
   # 격발 펄스 동안 조준 유지 시간 (fire_node 의 fire_duration_sec 와 일치 권장)
@@ -131,26 +146,23 @@ fire:
   # 격발 후 cooldown (FIRING 진입 후 총 휴지 시간)
   # 흐름: fire_pulse_sec 동안 조준 유지 → home 이동 → 나머지 시간 휴지 → IDLE
   cooldown_sec: 3.0
-  lost_timeout_sec: 1.5
+  # 표적이 잠깐 사라져도 바로 scan_sweep 로 복귀하지 않고, 현재 조준 자세를
+  # 유지하며 재검출을 기다린다.
+  lost_timeout_sec: 3.0
 
-  # 적 식별 즉시 격발. Boundary scan/Nav2 이동 중이어도 적 탐지가 최우선.
-  # immediate_requires_armed 는 반드시 true 여야 한다 -- false 면 DISARMED
-  # 상태에서도 탐지 즉시 force_fire_now()가 COOLDOWN 으로 강제 진입시켜서
-  # (a) 화면상 "DISARMED"가 실제 안전 상태와 무관해지고, (b) COOLDOWN 동안
-  # yolo_node.loop() 가 detect() 자체를 스킵하므로 표적이 화면에 그대로
-  # 있어도 한 프레임만 잡히고 그 뒤로는 안 잡히는 것처럼 보인다.
-  immediate_on_detection: true
-  immediate_during_nav: true
-  immediate_cancel_nav: true
-  immediate_min_interval_sec: 1.0
-  immediate_requires_armed: true
+  # 탐지 즉시 격발 경로는 사용하지 않는다. 표적이 보이면 TRACKING 으로 들어가
+  # IBVS 로 조준하고, deadband 안에서 hold_time_sec 동안 유지된 뒤
+  # CONFIRMING -> FIRING 으로만 격발한다.
 # ===========================================================
 # Auto-track (자율 검출)
 # ===========================================================
 autotrack:
   # IDLE 상태에서 카메라가 표적 검출 시 자율 추적 시작?
-  # 안전: 기본 비활성, /omx/arm_enable 또는 'a' 키로 활성화
-  default_armed: false
+  # true: 별도 무장 없이 부팅 즉시 armed 상태로 시작.
+  # 탐지 시 바로 TRACKING/PD 조준에 들어가며, 격발 경로는
+  # CONFIRMING/FIRING 상태에서만 열린다.
+  # /omx/arm_enable 로 언제든 false 로 다시 잠글 수 있음.
+  default_armed: true
   
   # 중복 표적 방지: 처리한 표적 좌표와 비교
   duplicate_threshold_m: 0.5    # 이 거리 안 표적은 중복 간주
@@ -165,13 +177,18 @@ patrol:
   target_scan_timeout_sec: 5.0
   boundary_scan_timeout_sec: 0.35
   boundary_aim_settle_sec: 0.05
-  # scan_sweep 는 매 half_period(=period_sec/2) 마다 목표 각도를 반대쪽
-  # 끝으로 그냥 뒤집는다 -- 서보가 실제로 그 끝까지 물리적으로 다 이동하기
-  # 전에 목표가 또 뒤집히면 중간에 방향이 꺾여서 절대 끝까지 못 간다.
-  # period_sec 를 넉넉하게 잡아야 좌우 끝까지 실제로 도달한다(실기에서
-  # 여전히 안 끝까지 가면 더 늘릴 것).
+  # scan_sweep 는 continuous triangle-wave 목표를 써서 좌우로 천천히 훑는다.
+  # period_sec 를 늘리면 더 느리게 왕복한다.
   scan_sweep_half_angle_deg: 60.0
   scan_sweep_period_sec: 5.0
+  # 남아있는 risk map을 리더 OMX 시야로 지우기 위해, 스캔 중심을 가장
+  # 높은 risk 방향으로 끌고 간다. target/focus가 없으면 정면으로 폴백.
+  risk_scan_enabled: true
+  risk_map_topic: "/risk/risk_map"
+  risk_scan_min_value: 8
+  risk_scan_max_distance_m: 4.0
+  risk_scan_center_yaw_limit_deg: 80.0
+  risk_scan_sample_stride: 4
   max_queue_size: 20
   duplicate_threshold_m: 0.3
   los_check_enabled: true

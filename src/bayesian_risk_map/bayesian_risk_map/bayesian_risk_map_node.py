@@ -1,11 +1,13 @@
 
 import json
+import hashlib
 import math
 import os
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -147,28 +149,67 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         # YOLO
         self.detection_source = str(self.declare_parameter('detection_source', 'local_yolo').value).strip().lower()
         self.external_detection_topic = self.declare_parameter('external_detection_topic', '/risk/yolo_detections').value
-        # Target model contract: COCO yolo11n.pt uses class 77 for teddy bear.
+        observation_topics_raw = self.declare_parameter(
+            'observation_topics',
+            [],
+        ).value
+        if isinstance(observation_topics_raw, str):
+            self.observation_topics = [
+                item.strip() for item in observation_topics_raw.split(',')
+                if item.strip()
+            ]
+        else:
+            self.observation_topics = [
+                str(item).strip() for item in (observation_topics_raw or [])
+                if str(item).strip()
+            ]
+        self.require_active_observation_source = self.declare_bool_parameter(
+            'require_active_observation_source',
+            True,
+        )
+        self.active_scout_id = str(
+            self.declare_parameter('active_scout_id', 'scout22').value
+        ).strip()
+        self.scout_epoch = int(self.declare_parameter('scout_epoch', 0).value)
+        self.active_scout_id_topic = str(
+            self.declare_parameter('active_scout_id_topic', '/failover/active_scout_id').value
+        ).strip()
+        self.scout_epoch_topic = str(
+            self.declare_parameter('scout_epoch_topic', '/failover/scout_epoch').value
+        ).strip()
+        # Target model contract: model/target_v3 class 0 is the target.
         # Keep external_person_only declared for backwards-compatible old launch files,
         # but select detections exclusively by the explicit target class below.
         self.external_person_only = self.declare_bool_parameter('external_person_only', False)
-        self.target_class = int(self.declare_parameter('target_class', 77).value)
+        self.target_class = int(self.declare_parameter('target_class', 0).value)
         self.target_label = normalize_label(
-            self.declare_parameter('target_label', 'teddy bear').value
+            self.declare_parameter('target_label', 'enemy').value
         )
         alias_value = self.declare_parameter(
             'target_label_aliases',
-            ['teddy bear', 'teddy_bear', 'bear'],
+            ['enemy', 'doll', 'target'],
         ).value
         self.target_labels = parse_label_aliases(alias_value)
         self.target_labels.add(self.target_label)
         self.debug_image_topic = self.declare_parameter('debug_image_topic', '/risk/debug_yolo_image').value
         self.enable_yolo = self.declare_bool_parameter('enable_yolo', True)
         self.model_path = self.declare_parameter(
-            'model_path', 'yolo11n.pt'
+            'model_path', 'model/target_v3.engine'
         ).value
-        self.device = self.declare_parameter('device', 'cpu').value
+        model_suffix = Path(str(self.model_path)).suffix.lower()
+        if model_suffix == '.pt':
+            raise ValueError(
+                'PyTorch YOLO checkpoints are not allowed at runtime. '
+                'Use model/target_v3.engine.'
+            )
+        if model_suffix not in ('.engine', '.plan'):
+            raise ValueError(
+                'YOLO runtime model must be a TensorRT .engine/.plan file, '
+                f'got: {self.model_path}'
+            )
+        self.device = self.declare_parameter('device', '0').value
         self.conf_threshold = float(self.declare_parameter('conf_threshold', 0.20).value)
-        self.yolo_imgsz = int(self.declare_parameter('yolo_imgsz', 640).value)
+        self.yolo_imgsz = int(self.declare_parameter('yolo_imgsz', 960).value)
         self.yolo_max_rate_hz = float(self.declare_parameter('yolo_max_rate_hz', 3.0).value)
         self.yolo_async = self.declare_bool_parameter('yolo_async', True)
         self.detection_timeout_sec = float(self.declare_parameter('detection_timeout_sec', 0.8).value)
@@ -177,6 +218,14 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         )
         self.external_detection_max_count = int(
             self.declare_parameter('external_detection_max_count', 64).value
+        )
+        self.external_accept_any_detection = self.declare_bool_parameter(
+            'external_accept_any_detection',
+            True,
+        )
+        self.external_pose_fallback_to_current = self.declare_bool_parameter(
+            'external_pose_fallback_to_current',
+            True,
         )
         self.opencv_camera_device = self.declare_parameter('opencv_camera_device', '/dev/video0').value
         self.opencv_camera_width = int(self.declare_parameter('opencv_camera_width', 640).value)
@@ -225,7 +274,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         #
         # A small target can make bbox-height range estimation noisy.
         # In bearing_consensus mode, each spatially distinct robot viewpoint votes along the
-        # detected teddy bear's line of sight. Risk is created only where multiple
+        # detected target's line of sight. Risk is created only where multiple
         # independent viewpoint maps agree, so moving the robot triangulates the target.
         self.positive_projection_mode = str(
             self.declare_parameter('positive_projection_mode', 'bearing_consensus').value
@@ -407,24 +456,43 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.leader_detected_topic = str(
             self.declare_parameter('leader_detected_topic', '/omx/target_detected').value
         )
+        self.leader_observation_topic = str(
+            self.declare_parameter(
+                'leader_observation_topic', '/omx/observation_status'
+            ).value
+        )
+        self.leader_observation_max_age_sec = float(
+            self.declare_parameter('leader_observation_max_age_sec', 2.5).value
+        )
         # The leader's actual camera is the OMX pan/tilt head, not the
         # robot's own front -- narrower FOV than the scout's own camera,
         # and it looks wherever the arm is currently pointed, not
         # wherever the robot base happens to be facing.
         self.leader_camera_hfov_deg = float(
-            self.declare_parameter('leader_camera_hfov_deg', 35.0).value
+            self.declare_parameter('leader_camera_hfov_deg', 62.0).value
         )
         self.leader_camera_yaw_topic = str(
             self.declare_parameter('leader_camera_yaw_topic', '/omx/camera_yaw').value
         )
         self.leader_camera_yaw_max_age_sec = float(
-            self.declare_parameter('leader_camera_yaw_max_age_sec', 1.0).value
+            self.declare_parameter('leader_camera_yaw_max_age_sec', 2.5).value
         )
         self.leader_pose_max_age_sec = float(
             self.declare_parameter('leader_pose_max_age_sec', 2.0).value
         )
         self.leader_detected_max_age_sec = float(
             self.declare_parameter('leader_detected_max_age_sec', 1.0).value
+        )
+        self.leader_first_miss_dt_sec = float(
+            self.declare_parameter('leader_first_miss_dt_sec', 0.5).value
+        )
+        self.leader_person_bayes_miss_log_odds_per_sec = float(
+            self.declare_parameter(
+                'leader_person_bayes_miss_log_odds_per_sec', 1.2
+            ).value
+        )
+        self.leader_visible_risk_decay_per_sec = float(
+            self.declare_parameter('leader_visible_risk_decay_per_sec', 2.0).value
         )
 
         # Occupancy policy
@@ -495,6 +563,10 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.leader_detected_wall = None
         self.leader_camera_yaw = None
         self.leader_camera_yaw_wall = None
+        self.leader_observation = None
+        self.leader_observation_wall = None
+        self.last_leader_observation_sequence = None
+        self.last_leader_miss_capture_sec = None
 
         self.visual_seen_map = None
         self.region_id_map = None
@@ -506,6 +578,10 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.last_region_debug_wall_sec = 0.0
         self.last_diagnostic_publish_ros_ns = 0
         self.last_risk_publish_ros_ns = 0
+        self.risk_publish_seq = 0
+        self.last_risk_publish_wall_sec = None
+        self.last_detection_pipeline: Dict[str, int] = {}
+        self._published_layer_signatures: Dict[str, Tuple] = {}
 
         self.latest_detections: List[Detection2D] = []
         self.latest_detection_seq = 0
@@ -519,6 +595,10 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.latest_detection_pose = None
         self.latest_detection_capture_sec = None
         self.latest_detection_delay_ms = -1.0
+        self.latest_detection_image_delay_ms = -1.0
+        self.latest_detection_yolo_latency_ms = -1.0
+        self.latest_detection_http_roundtrip_ms = -1.0
+        self.latest_detection_capture_source = 'none'
         self.detection_lock = threading.Lock()
         self.pose_lock = threading.Lock()
         self.yolo_condition = threading.Condition()
@@ -528,6 +608,11 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.yolo_drop_count = 0
 
         self.external_detection_rx_count = 0
+        self.external_observation_missing_pose_dropped = 0
+        self.external_observation_duplicate_dropped = 0
+        self.external_observation_out_of_order_dropped = 0
+        self.external_observation_boot_id_by_robot = {}
+        self.external_observation_seq_by_robot = {}
         self.image_rx_count = 0
         self.yolo_frame_count = 0
         self.yolo_det_count = 0
@@ -617,6 +702,18 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         # IO
         self.map_sub = self.create_subscription(OccupancyGrid, self.map_topic, self.on_map, self.qos_map_sub)
         self.pose_sub = None
+        self.active_scout_sub = self.create_subscription(
+            String,
+            self.active_scout_id_topic,
+            self.on_active_scout_id,
+            self.qos_latest_reliable,
+        ) if self.active_scout_id_topic else None
+        self.scout_epoch_sub = self.create_subscription(
+            String,
+            self.scout_epoch_topic,
+            self.on_scout_epoch,
+            self.qos_latest_reliable,
+        ) if self.scout_epoch_topic else None
         if self.pose_source in ('topic', 'pose_topic', 'pose'):
             self.pose_sub = self.create_subscription(
                 PoseStamped,
@@ -626,18 +723,22 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             )
         self.image_sub = None
         self.external_detection_sub = None
+        self.external_detection_subs = []
         self.use_opencv_camera = False
         if self.detection_source in ('local_yolo', 'ros_image', 'image'):
             self.image_sub = self.create_subscription(Image, self.image_topic, self.on_image, self.qos_sensor_sub)
         elif self.detection_source in ('opencv_camera', 'direct_camera', 'cv2_camera', 'cv2'):
             self.use_opencv_camera = True
         elif self.detection_source in ('flask_topic', 'external', 'json'):
-            self.external_detection_sub = self.create_subscription(
-                String,
-                self.external_detection_topic,
-                self.on_external_detections,
-                self.qos_latest_best_effort,
-            )
+            topics = self.observation_topics or [self.external_detection_topic]
+            for topic_name in topics:
+                self.external_detection_subs.append(self.create_subscription(
+                    String,
+                    topic_name,
+                    self.on_external_detections,
+                    self.qos_latest_best_effort,
+                ))
+            self.external_detection_sub = self.external_detection_subs[0]
             self.enable_yolo = False
         elif self.detection_source in ('none', 'fake'):
             self.enable_yolo = False
@@ -645,12 +746,15 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             self.get_logger().warn(
                 f'unknown detection_source={self.detection_source}; falling back to flask_topic on {self.external_detection_topic}'
             )
-            self.external_detection_sub = self.create_subscription(
-                String,
-                self.external_detection_topic,
-                self.on_external_detections,
-                self.qos_latest_best_effort,
-            )
+            topics = self.observation_topics or [self.external_detection_topic]
+            for topic_name in topics:
+                self.external_detection_subs.append(self.create_subscription(
+                    String,
+                    topic_name,
+                    self.on_external_detections,
+                    self.qos_latest_best_effort,
+                ))
+            self.external_detection_sub = self.external_detection_subs[0]
             self.enable_yolo = False
         self.clear_point_sub = self.create_subscription(PointStamped, '/risk/clear_point', self.on_clear_point, 10)
         self.clear_all_sub = self.create_subscription(Bool, '/risk/clear_all', self.on_clear_all, 10)
@@ -658,11 +762,17 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             self.leader_pose_sub = self.create_subscription(
                 PoseStamped, self.leader_pose_topic, self.on_leader_pose, 10
             )
-            self.leader_detected_sub = self.create_subscription(
-                Bool, self.leader_detected_topic, self.on_leader_detected, 10
+            self.leader_observation_sub = self.create_subscription(
+                String,
+                self.leader_observation_topic,
+                self.on_leader_observation,
+                self.qos_latest_best_effort,
             )
             self.leader_camera_yaw_sub = self.create_subscription(
-                Float32, self.leader_camera_yaw_topic, self.on_leader_camera_yaw, 10
+                Float32,
+                self.leader_camera_yaw_topic,
+                self.on_leader_camera_yaw,
+                self.qos_latest_best_effort,
             )
 
         self.pub_risk = self.create_publisher(OccupancyGrid, '/risk/risk_map', self.qos_grid_pub)
@@ -1169,11 +1279,24 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         self.leader_detected = bool(msg.data)
         self.leader_detected_wall = self.get_clock().now().nanoseconds * 1e-9
 
+    def on_leader_observation(self, msg: String) -> None:
+        try:
+            payload = json.loads(msg.data)
+        except (json.JSONDecodeError, TypeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        self.leader_observation = payload
+        self.leader_observation_wall = self.get_clock().now().nanoseconds * 1e-9
+
     def on_leader_camera_yaw(self, msg: Float32) -> None:
         self.leader_camera_yaw = float(msg.data)
         self.leader_camera_yaw_wall = self.get_clock().now().nanoseconds * 1e-9
 
-    def get_leader_pose(self) -> Optional[Tuple[float, float, float]]:
+    def get_leader_pose(
+        self,
+        observation: Optional[dict] = None,
+    ) -> Optional[Tuple[float, float, float]]:
         """Leader's (x, y, yaw) for visibility raycasting -- yaw is where
         the OMX camera is actually pointed, not the robot base heading.
         /leader_pose only gives the base pose; the camera pans
@@ -1191,14 +1314,61 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         p = self.leader_pose_msg.pose.position
         q = self.leader_pose_msg.pose.orientation
         base_yaw = yaw_from_quaternion(q)
-        camera_offset = 0.0
-        if (
+        camera_offset = None
+        if isinstance(observation, dict):
+            try:
+                value = float(observation.get('camera_yaw_rad'))
+                if math.isfinite(value):
+                    camera_offset = value
+            except (TypeError, ValueError):
+                pass
+        if camera_offset is None and (
             self.leader_camera_yaw is not None
             and self.leader_camera_yaw_wall is not None
             and now - self.leader_camera_yaw_wall <= self.leader_camera_yaw_max_age_sec
         ):
             camera_offset = self.leader_camera_yaw
+        if camera_offset is None:
+            camera_offset = 0.0
         return (float(p.x), float(p.y), base_yaw + camera_offset)
+
+    def consume_leader_observation(self):
+        """Return one fresh valid OMX observation, otherwise UNKNOWN/None.
+
+        A Bool false is not evidence: only a completed inference on a fresh
+        frame can produce a Bayesian miss.  Sequence consumption prevents a
+        slow risk timer from applying one frame repeatedly.
+        """
+        payload = self.leader_observation
+        wall = self.leader_observation_wall
+        if payload is None or wall is None:
+            return None
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if now - wall > self.leader_observation_max_age_sec:
+            return None
+        sequence = payload.get('sequence')
+        if isinstance(sequence, bool):
+            return None
+        try:
+            sequence = int(sequence)
+        except (TypeError, ValueError):
+            return None
+        if sequence == self.last_leader_observation_sequence:
+            return None
+        if not (
+            payload.get('camera_ready') is True
+            and payload.get('frame_valid') is True
+            and payload.get('inference_ran') is True
+            and isinstance(payload.get('detected'), bool)
+        ):
+            return None
+        # This topic crosses Jetson -> Burger DDS domains. Source wall clocks
+        # are not guaranteed to be synchronized, so capture_stamp cannot be
+        # compared with this node's clock. Receipt time is local, fresh, and
+        # sequence-scoped, which preserves one-miss-per-frame semantics.
+        capture_sec = wall
+        self.last_leader_observation_sequence = sequence
+        return bool(payload['detected']), capture_sec
 
     def leader_currently_detecting(self) -> bool:
         if self.leader_detected_wall is None:
@@ -1322,7 +1492,55 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         x1, y1, x2, y2 = bbox
         cx = 0.5 * (x1 + x2)
         fx = (image_w / 2.0) / math.tan(math.radians(self.camera_hfov_deg) / 2.0)
-        return math.atan2(cx - image_w / 2.0, fx)
+        # Image x grows to the right, while ROS base +y and positive yaw point
+        # left. A non-mirrored forward camera therefore maps right-side pixels
+        # to a negative bearing.
+        return math.atan2(image_w / 2.0 - cx, fx)
+
+    def log_risk_projection_debug(
+        self,
+        *,
+        bbox,
+        image_w,
+        bearing_rad,
+        robot_pose,
+        range_m,
+    ) -> None:
+        try:
+            x1, _, x2, _ = bbox
+            cx = 0.5 * (float(x1) + float(x2))
+            width = max(1.0, float(image_w))
+            normalized_x = cx / width - 0.5
+            side = 'CENTER'
+            if normalized_x > 0.05:
+                side = 'RIGHT'
+            elif normalized_x < -0.05:
+                side = 'LEFT'
+            rx, ry, ryaw = robot_pose
+            global_bearing = wrap_angle(float(ryaw) + float(bearing_rad))
+            risk_x = float(rx) + float(range_m) * math.cos(global_bearing)
+            risk_y = float(ry) + float(range_m) * math.sin(global_bearing)
+            grid = self.world_to_grid(risk_x, risk_y)
+            gx, gy = grid if grid is not None else (-1, -1)
+            self.get_logger().warning(
+                'RISK_PROJECTION_DEBUG | '
+                f'image_width={int(width)} '
+                f'bbox_center_x={cx:.1f} '
+                f'image_side={side} '
+                f'normalized_x={normalized_x:.4f} '
+                f'bearing_camera_deg={math.degrees(float(bearing_rad)):.2f} '
+                'camera_mirrored=false '
+                'camera_yaw_offset_deg=0.00 '
+                f'robot_yaw_deg={math.degrees(float(ryaw)):.2f} '
+                f'global_bearing_deg={math.degrees(global_bearing):.2f} '
+                f'robot_x={float(rx):.3f} robot_y={float(ry):.3f} '
+                f'range_m={float(range_m):.3f} '
+                f'risk_world_x={risk_x:.3f} risk_world_y={risk_y:.3f} '
+                f'grid_x={gx} grid_y={gy}',
+                throttle_duration_sec=1.0,
+            )
+        except Exception:  # noqa: BLE001
+            return
 
     def bbox_height_to_range(self, bbox, image_h):
         x1, y1, x2, y2 = bbox
@@ -1503,6 +1721,16 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         except Exception:
             return None
 
+    @staticmethod
+    def payload_float(payload, key, default=-1.0):
+        try:
+            value = payload.get(key, default)
+            if value in (None, ''):
+                return float(default)
+            return float(value)
+        except Exception:
+            return float(default)
+
     def update_detection_capture_pose(self, header=None, capture_sec=None):
         now_ros_sec = self.get_clock().now().nanoseconds * 1e-9
         if capture_sec is None:
@@ -1529,7 +1757,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                 source=frame,
                 imgsz=self.yolo_imgsz,
                 conf=self.conf_threshold,
-                classes=[self.target_class],
+                classes=[self.target_class] if self.target_class >= 0 else None,
                 device=self.device,
                 verbose=False,
             )
@@ -1558,6 +1786,10 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             self.latest_detection_seq += 1
             self.last_yolo_ros_sec = self.get_clock().now().nanoseconds * 1e-9
             self.update_detection_capture_pose(header, capture_sec)
+            self.latest_detection_image_delay_ms = self.latest_detection_delay_ms
+            self.latest_detection_yolo_latency_ms = -1.0
+            self.latest_detection_http_roundtrip_ms = -1.0
+            self.latest_detection_capture_source = 'local_camera'
 
         overlay = self.make_overlay(frame, detections)
         if overlay is None:
@@ -1570,13 +1802,72 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             self.publish_debug_frame(overlay, header)
             self.debug_output_image(overlay)
 
+    def on_active_scout_id(self, msg: String):
+        scout_id = str(msg.data).strip()
+        if scout_id and scout_id != self.active_scout_id:
+            self.active_scout_id = scout_id
+            self.get_logger().warn(
+                f'RISK_ACTIVE_SOURCE_CHANGED | active_scout_id={self.active_scout_id} '
+                f'epoch={self.scout_epoch}'
+            )
+
+    def on_scout_epoch(self, msg: String):
+        try:
+            epoch = int(str(msg.data).strip())
+        except (TypeError, ValueError):
+            return
+        if epoch < self.scout_epoch:
+            return
+        if epoch != self.scout_epoch:
+            self.scout_epoch = epoch
+            self.get_logger().warn(
+                f'RISK_ACTIVE_EPOCH_CHANGED | active_scout_id={self.active_scout_id} '
+                f'epoch={self.scout_epoch}'
+            )
+
+    def observation_source_allowed(self, payload: dict, robot_id: str) -> bool:
+        if not self.require_active_observation_source:
+            return True
+        role = str(payload.get('role', '')).strip().upper()
+        if role and role not in ('ACTIVE_SCOUT', 'SCOUT', 'RECOVERING'):
+            self.get_logger().warn(
+                'OBSERVATION_INACTIVE_ROLE_DROPPED | '
+                f'robot_id={robot_id} role={role} active={self.active_scout_id}',
+                throttle_duration_sec=2.0,
+            )
+            return False
+        if robot_id != self.active_scout_id:
+            self.get_logger().warn(
+                'OBSERVATION_INACTIVE_SOURCE_DROPPED | '
+                f'robot_id={robot_id} active={self.active_scout_id}',
+                throttle_duration_sec=2.0,
+            )
+            return False
+        try:
+            epoch = int(payload.get('role_epoch', payload.get('epoch', 0)) or 0)
+        except (TypeError, ValueError):
+            epoch = -1
+        if epoch != self.scout_epoch:
+            self.get_logger().warn(
+                'OBSERVATION_STALE_EPOCH_DROPPED | '
+                f'robot_id={robot_id} epoch={epoch} active_epoch={self.scout_epoch}',
+                throttle_duration_sec=2.0,
+            )
+            return False
+        return True
+
     def on_external_detections(self, msg: String):
         self.external_detection_rx_count += 1
+        pipeline = self._new_detection_pipeline()
+        pipeline['observation_rx'] = int(self.external_detection_rx_count)
         try:
             payload = json.loads(msg.data)
         except Exception as e:
+            pipeline['json_parse_success'] = 0
+            self._log_detection_pipeline(pipeline)
             self.get_logger().warn(f'external detection JSON parse failed: {e}', throttle_duration_sec=2.0)
             return
+        pipeline['json_parse_success'] = 1
 
         image_w = int(payload.get('image_width') or payload.get('width') or 0)
         image_h = int(payload.get('image_height') or payload.get('height') or 0)
@@ -1585,12 +1876,56 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             image_w = int(meta.get('width') or 0)
             image_h = int(meta.get('height') or 0)
         if image_w <= 0 or image_h <= 0:
+            pipeline['rejected_schema'] += 1
+            self._log_detection_pipeline(pipeline)
             self.get_logger().warn('external detection ignored: missing image_width/image_height', throttle_duration_sec=2.0)
             return
 
         raw_dets = payload.get('detections', [])
         if not isinstance(raw_dets, list):
+            pipeline['rejected_schema'] += 1
+            self._log_detection_pipeline(pipeline)
             self.get_logger().warn('external detection ignored: detections is not a list', throttle_duration_sec=2.0)
+            return
+        pipeline['raw_detection_count'] = len(raw_dets)
+        robot_id = str(payload.get('robot_id', payload.get('robot', 'unknown'))).strip() or 'unknown'
+        if not self.observation_source_allowed(payload, robot_id):
+            pipeline['rejected_source'] = len(raw_dets)
+            self._log_detection_pipeline(pipeline)
+            return
+        pipeline['active_source_valid_count'] = len(raw_dets)
+        boot_id = str(payload.get('boot_id', '')).strip()
+        try:
+            observation_seq = int(payload.get('sequence', payload.get('observation_id', -1)))
+        except (TypeError, ValueError):
+            observation_seq = -1
+        if boot_id:
+            previous_boot = self.external_observation_boot_id_by_robot.get(robot_id)
+            if previous_boot and previous_boot != boot_id:
+                self.external_observation_seq_by_robot[robot_id] = -1
+            self.external_observation_boot_id_by_robot[robot_id] = boot_id
+        previous_seq = self.external_observation_seq_by_robot.get(robot_id, -1)
+        if observation_seq >= 0 and observation_seq == previous_seq:
+            self.external_observation_duplicate_dropped += 1
+            pipeline['rejected_stale'] = len(raw_dets)
+            self._log_detection_pipeline(pipeline)
+            self.get_logger().warn(
+                'OBSERVATION_DUPLICATE_DROPPED | '
+                f'robot_id={robot_id} boot_id={boot_id or "unknown"} '
+                f'sequence={observation_seq}',
+                throttle_duration_sec=2.0,
+            )
+            return
+        if observation_seq >= 0 and observation_seq < previous_seq:
+            self.external_observation_out_of_order_dropped += 1
+            pipeline['rejected_stale'] = len(raw_dets)
+            self._log_detection_pipeline(pipeline)
+            self.get_logger().warn(
+                'OBSERVATION_OUT_OF_ORDER_DROPPED | '
+                f'robot_id={robot_id} boot_id={boot_id or "unknown"} '
+                f'sequence={observation_seq} latest={previous_seq}',
+                throttle_duration_sec=2.0,
+            )
             return
         max_count = max(1, int(self.external_detection_max_count))
         if len(raw_dets) > max_count:
@@ -1603,40 +1938,133 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         detections: List[Detection2D] = []
         for item in raw_dets:
             if not isinstance(item, dict):
+                pipeline['rejected_schema'] += 1
                 continue
-            conf = float(item.get('conf', item.get('confidence', 0.0)))
-            if conf < self.conf_threshold:
+            try:
+                conf = float(item.get('conf', item.get('confidence', 0.0)))
+            except (TypeError, ValueError):
+                pipeline['rejected_schema'] += 1
                 continue
             label = normalize_label(item.get('label', item.get('name', '')))
             cls = item.get('class_id', item.get('class', item.get('cls', None)))
-            is_target = (
-                label in self.target_labels
+            class_ok = (
+                self.target_class < 0
                 or cls == self.target_class
                 or str(cls) == str(self.target_class)
             )
+            label_ok = label in self.target_labels
+            if class_ok:
+                pipeline['class_match_count'] += 1
+            if label_ok:
+                pipeline['label_match_count'] += 1
+            is_target = class_ok or label_ok or self.external_accept_any_detection
             if not is_target:
+                pipeline['rejected_class'] += 1
+                if label:
+                    pipeline['rejected_label'] += 1
                 continue
+            if self.external_accept_any_detection and not (class_ok or label_ok):
+                pipeline['class_match_count'] += 1
+                pipeline['label_match_count'] += 1
+            if conf < self.conf_threshold:
+                pipeline['rejected_confidence'] += 1
+                continue
+            pipeline['confidence_pass_count'] += 1
 
             bbox_raw = item.get('bbox', item.get('xyxy', None))
             if bbox_raw is None and all(k in item for k in ('x1', 'y1', 'x2', 'y2')):
                 bbox_raw = [item['x1'], item['y1'], item['x2'], item['y2']]
             if not isinstance(bbox_raw, (list, tuple)) or len(bbox_raw) != 4:
+                pipeline['rejected_schema'] += 1
                 continue
-            bbox = tuple(float(v) for v in bbox_raw)
+            try:
+                bbox = tuple(float(v) for v in bbox_raw)
+            except (TypeError, ValueError):
+                pipeline['rejected_schema'] += 1
+                continue
+            if (
+                len(bbox) != 4
+                or not all(math.isfinite(v) for v in bbox)
+                or bbox[2] <= bbox[0]
+                or bbox[3] <= bbox[1]
+            ):
+                pipeline['rejected_schema'] += 1
+                continue
+            pipeline['schema_valid_count'] += 1
             bearing = item.get('bearing_rad', None)
             range_hat = item.get('range_hat_m', item.get('range_m', None))
+            try:
+                bearing_value = (
+                    float(bearing) if bearing is not None
+                    else self.bbox_center_to_bearing(bbox, image_w)
+                )
+                range_value = (
+                    float(range_hat) if range_hat is not None
+                    else self.bbox_height_to_range(bbox, image_h)
+                )
+            except (TypeError, ValueError):
+                pipeline['rejected_range'] += 1
+                continue
+            if (
+                not math.isfinite(bearing_value)
+                or not math.isfinite(range_value)
+                or range_value < self.min_range_m
+                or range_value > self.max_range_m
+            ):
+                pipeline['rejected_range'] += 1
+                continue
+            pipeline['range_valid_count'] += 1
             detections.append(Detection2D(
                 bbox=bbox,
                 conf=conf,
-                bearing_rad=float(bearing) if bearing is not None else self.bbox_center_to_bearing(bbox, image_w),
-                range_hat_m=float(range_hat) if range_hat is not None else self.bbox_height_to_range(bbox, image_h),
+                bearing_rad=bearing_value,
+                range_hat_m=range_value,
             ))
 
-        capture_sec = float(
-            payload.get('capture_ros_sec')
-            or payload.get('capture_wall_sec')
-            or 0.0
+        capture_ros_sec = self.payload_float(payload, 'capture_ros_sec', 0.0)
+        capture_wall_sec = self.payload_float(payload, 'capture_wall_sec', 0.0)
+        if capture_ros_sec > 0.0:
+            capture_sec = capture_ros_sec
+            capture_source = 'capture_ros_sec'
+        elif capture_wall_sec > 0.0:
+            capture_sec = capture_wall_sec
+            capture_source = 'capture_wall_sec'
+        else:
+            capture_sec = 0.0
+            capture_source = 'receipt'
+        image_delay_candidates = [
+            self.payload_float(payload, 'capture_age_ms', -1.0),
+            self.payload_float(payload, 'robot_frame_age_ms', -1.0),
+            self.payload_float(payload, 'robot_frame_age_ms_at_send', -1.0),
+        ]
+        image_delay_ms = max(
+            (value for value in image_delay_candidates if value >= 0.0),
+            default=-1.0,
         )
+        yolo_latency_ms = self.payload_float(payload, 'latency_ms', -1.0)
+        http_roundtrip_ms = self.payload_float(payload, 'http_roundtrip_ms', -1.0)
+        capture_pose = self._external_capture_pose_or_fallback(payload)
+        if capture_pose is None:
+            self.external_observation_missing_pose_dropped += 1
+            pipeline['rejected_pose'] = len(detections)
+            self._log_detection_pipeline(pipeline)
+            self.get_logger().warn(
+                'OBSERVATION_MISSING_POSE_DROPPED | '
+                f'robot_id={robot_id} boot_id={boot_id or "unknown"} '
+                f'sequence={observation_seq} capture_source={capture_source}',
+                throttle_duration_sec=2.0,
+            )
+            return
+        pipeline['pose_match_count'] = len(detections)
+        pipeline['evidence_created_count'] = len(detections)
+        for detection in detections:
+            self.log_risk_projection_debug(
+                bbox=detection.bbox,
+                image_w=image_w,
+                bearing_rad=detection.bearing_rad,
+                robot_pose=capture_pose,
+                range_m=detection.range_hat_m,
+            )
         with self.detection_lock:
             self.yolo_frame_count += 1
             self.yolo_det_count += len(detections)
@@ -1644,17 +2072,122 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             self.latest_detection_seq += 1
             self.last_yolo_ros_sec = self.get_clock().now().nanoseconds * 1e-9
             self.latest_detection_capture_sec = capture_sec if capture_sec > 0.0 else None
-            self.latest_detection_pose = self.lookup_pose_at(capture_sec)
-            if self.latest_detection_pose is None:
-                self.latest_detection_pose = self.get_robot_pose()
+            self.latest_detection_pose = capture_pose
             if capture_sec > 0.0:
                 self.latest_detection_delay_ms = max(
                     0.0, (self.last_yolo_ros_sec - capture_sec) * 1000.0
                 )
             else:
                 self.latest_detection_delay_ms = -1.0
+            self.latest_detection_image_delay_ms = image_delay_ms
+            self.latest_detection_yolo_latency_ms = yolo_latency_ms
+            self.latest_detection_http_roundtrip_ms = http_roundtrip_ms
+            self.latest_detection_capture_source = f'{capture_source}:{robot_id}'
+            if observation_seq >= 0:
+                self.external_observation_seq_by_robot[robot_id] = observation_seq
         self.last_image_shape = f'{image_w}x{image_h} flask_json'
         self.last_image_encoding = 'external_json'
+        self._log_detection_pipeline(pipeline)
+
+    @staticmethod
+    def _new_detection_pipeline() -> Dict[str, int]:
+        return {
+            'observation_rx': 0,
+            'json_parse_success': 0,
+            'raw_detection_count': 0,
+            'schema_valid_count': 0,
+            'active_source_valid_count': 0,
+            'class_match_count': 0,
+            'label_match_count': 0,
+            'confidence_pass_count': 0,
+            'pose_match_count': 0,
+            'range_valid_count': 0,
+            'evidence_created_count': 0,
+            'rejected_schema': 0,
+            'rejected_source': 0,
+            'rejected_class': 0,
+            'rejected_label': 0,
+            'rejected_confidence': 0,
+            'rejected_pose': 0,
+            'rejected_stale': 0,
+            'rejected_range': 0,
+        }
+
+    def _log_detection_pipeline(self, pipeline: Dict[str, int]) -> None:
+        self.last_detection_pipeline = dict(pipeline)
+        self.get_logger().warning(
+            'RISK_DETECTION_PIPELINE | '
+            + ' | '.join(
+                f'{key}={int(pipeline.get(key, 0))}'
+                for key in (
+                    'observation_rx',
+                    'json_parse_success',
+                    'raw_detection_count',
+                    'schema_valid_count',
+                    'active_source_valid_count',
+                    'class_match_count',
+                    'label_match_count',
+                    'confidence_pass_count',
+                    'pose_match_count',
+                    'range_valid_count',
+                    'evidence_created_count',
+                    'rejected_schema',
+                    'rejected_source',
+                    'rejected_class',
+                    'rejected_label',
+                    'rejected_confidence',
+                    'rejected_pose',
+                    'rejected_stale',
+                    'rejected_range',
+                )
+            ),
+            throttle_duration_sec=1.0,
+        )
+
+    def parse_payload_capture_pose(self, payload):
+        pose = payload.get('capture_pose')
+        if isinstance(pose, dict):
+            try:
+                return (
+                    float(pose['x']),
+                    float(pose['y']),
+                    float(pose.get('yaw', 0.0)),
+                )
+            except (KeyError, TypeError, ValueError):
+                return None
+        try:
+            return (
+                float(payload['capture_pose_x']),
+                float(payload['capture_pose_y']),
+                float(payload.get('capture_pose_yaw', 0.0)),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _external_capture_pose_or_fallback(self, payload):
+        pose = self.parse_payload_capture_pose(payload)
+        pose_time_error_ms = self.payload_float(payload, 'pose_time_error_ms', -1.0)
+        bridge_default_pose = False
+        if pose is not None:
+            bridge_default_pose = (
+                abs(float(pose[0])) < 1.0e-6
+                and abs(float(pose[1])) < 1.0e-6
+                and pose_time_error_ms < 0.0
+            )
+        if pose is not None and not bridge_default_pose:
+            return pose
+        if not self.external_pose_fallback_to_current:
+            return pose
+        fallback = self.get_robot_pose()
+        if fallback is None:
+            return pose
+        self.get_logger().warning(
+            'RISK_EXTERNAL_POSE_FALLBACK | '
+            f'parsed_pose={pose} bridge_default_pose={bridge_default_pose} '
+            'using=current_pose',
+            throttle_duration_sec=2.0,
+        )
+        return fallback
 
     def maybe_make_fake_detection(self):
         if not self.enable_fake_detection:
@@ -1680,7 +2213,7 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             for det in detections:
                 x1, y1, x2, y2 = [int(v) for v in det.bbox]
                 cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                label = f'teddy bear {det.conf:.2f} r~{det.range_hat_m:.1f}m b={math.degrees(det.bearing_rad):.1f}'
+                label = f'target {det.conf:.2f} r~{det.range_hat_m:.1f}m b={math.degrees(det.bearing_rad):.1f}'
                 cv2.putText(img, label, (x1, max(15, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
             return img
         except Exception:
@@ -1722,6 +2255,10 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             f'risk_max={float(np.max(self.risk_map)) if self.risk_map is not None else 0.0:.3f} | '
             f'last_shape={self.last_image_shape} | enc={self.last_image_encoding} | '
             f'capture_delay_ms={self.latest_detection_delay_ms:.1f} | '
+            f'image_delay_ms={self.latest_detection_image_delay_ms:.1f} | '
+            f'yolo_latency_ms={self.latest_detection_yolo_latency_ms:.1f} | '
+            f'http_roundtrip_ms={self.latest_detection_http_roundtrip_ms:.1f} | '
+            f'capture_source={self.latest_detection_capture_source} | '
             f'history_pose={self.latest_detection_pose is not None} | '
             f'bearing_obs={len(self.bearing_observations)} views={bearing_view_count} '
             f'consensus_peaks={len(self.bearing_consensus_peaks)} | '
@@ -2338,6 +2875,9 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         visibility,
         had_detection: bool,
         now_ros_sec: float,
+        *,
+        dt_override: Optional[float] = None,
+        decay_per_sec_override: Optional[float] = None,
     ) -> bool:
         if (
             not self.enable_visible_risk_decay
@@ -2345,7 +2885,8 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             or visibility is None
             or had_detection
         ):
-            self.last_visible_risk_decay_ros_sec = now_ros_sec
+            if dt_override is None:
+                self.last_visible_risk_decay_ros_sec = now_ros_sec
             return False
 
         last_detection = getattr(self, 'last_person_detection_ros_sec', None)
@@ -2354,25 +2895,34 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             and now_ros_sec - float(last_detection)
             < max(0.0, float(self.visible_risk_decay_grace_sec))
         ):
-            self.last_visible_risk_decay_ros_sec = now_ros_sec
+            if dt_override is None:
+                self.last_visible_risk_decay_ros_sec = now_ros_sec
             return False
 
         h, w = self.occ_grid.shape
         if visibility.shape != (h, w):
             return False
 
-        last_update = getattr(self, 'last_visible_risk_decay_ros_sec', None)
-        if last_update is None:
-            dt = 0.0
+        if dt_override is None:
+            last_update = getattr(self, 'last_visible_risk_decay_ros_sec', None)
+            if last_update is None:
+                dt = 0.0
+            else:
+                dt = clamp(now_ros_sec - float(last_update), 0.0, 1.0)
+            self.last_visible_risk_decay_ros_sec = now_ros_sec
         else:
-            dt = clamp(now_ros_sec - float(last_update), 0.0, 1.0)
-        self.last_visible_risk_decay_ros_sec = now_ros_sec
+            dt = clamp(float(dt_override), 0.0, 1.0)
         if dt <= 0.0:
             return False
 
         visible = np.clip(visibility, 0.0, 1.0).astype(np.float32)
         visible[~self.valid_free_mask()] = 0.0
-        decay = max(0.0, float(self.visible_risk_decay_per_sec)) * dt * visible
+        decay_rate = (
+            float(decay_per_sec_override)
+            if decay_per_sec_override is not None
+            else float(self.visible_risk_decay_per_sec)
+        )
+        decay = max(0.0, decay_rate) * dt * visible
         changed = False
 
         for layer_name in (
@@ -2409,6 +2959,108 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         if changed:
             self.risk_dirty = True
         return changed
+
+    def apply_leader_valid_no_detection(
+        self,
+        visibility,
+        capture_sec: float,
+        now_ros_sec: float,
+    ) -> bool:
+        """Apply one leader-camera miss without sharing the local timer state.
+
+        The leader's observation sequence is consumed exactly once. Its capture
+        timestamps determine the integration interval, so a delayed or stale
+        bridge message cannot repeatedly clear the same visible cells.
+        """
+        previous_capture = self.last_leader_miss_capture_sec
+        self.last_leader_miss_capture_sec = capture_sec
+        self.update_observed_empty(visibility, False)
+        if previous_capture is None:
+            dt = clamp(float(self.leader_first_miss_dt_sec), 0.0, 1.0)
+        else:
+            dt = clamp(capture_sec - float(previous_capture), 0.0, 1.0)
+        if dt <= 0.0:
+            return False
+
+        changed = False
+        if (
+            getattr(self, 'enable_person_probability_map', True)
+            and self.person_log_odds_map is not None
+            and visibility is not None
+            and visibility.shape == self.person_log_odds_map.shape
+        ):
+            last_detection = getattr(self, 'last_person_detection_ros_sec', None)
+            grace_elapsed = (
+                last_detection is None
+                or now_ros_sec - float(last_detection)
+                >= max(0.0, float(self.person_bayes_decay_grace_sec))
+            )
+            if grace_elapsed:
+                previous = self.person_log_odds_map.copy()
+                visible = np.clip(visibility, 0.0, 1.0).astype(np.float32)
+                visible[~self.risk_memory_mask()] = 0.0
+                miss_rate = max(
+                    0.0,
+                    float(self.leader_person_bayes_miss_log_odds_per_sec),
+                )
+                self.person_log_odds_map = np.maximum(
+                    0.0,
+                    self.person_log_odds_map - miss_rate * dt * visible,
+                ).astype(np.float32)
+                if np.any(self.person_log_odds_map < previous - 1e-6):
+                    self.refresh_person_probability_map()
+                    self.risk_dirty = True
+                    changed = True
+
+        return self.apply_visible_no_detection_risk_decay(
+            visibility,
+            False,
+            now_ros_sec,
+            dt_override=dt,
+            decay_per_sec_override=self.leader_visible_risk_decay_per_sec,
+        ) or changed
+
+    def leader_positive_candidate(self, observation, leader_pose):
+        """Project a valid leader detection into the shared map, if complete."""
+        bbox = observation.get('bbox_xyxy')
+        image_w = observation.get('image_width')
+        image_h = observation.get('image_height')
+        confidence = observation.get('confidence')
+        if not (
+            isinstance(bbox, (list, tuple))
+            and len(bbox) == 4
+            and image_w is not None
+            and image_h is not None
+            and confidence is not None
+        ):
+            return None
+        try:
+            bbox = tuple(float(value) for value in bbox)
+            image_w = int(image_w)
+            image_h = int(image_h)
+            confidence = float(confidence)
+        except (TypeError, ValueError):
+            return None
+        if (
+            image_w <= 0
+            or image_h <= 0
+            or not all(math.isfinite(value) for value in (*bbox, confidence))
+        ):
+            return None
+        detection = Detection2D(
+            bbox=bbox,
+            conf=clamp(confidence, 0.0, 1.0),
+            bearing_rad=self.bbox_center_to_bearing(bbox, image_w),
+            range_hat_m=self.bbox_height_to_range(bbox, image_h),
+        )
+        self.log_risk_projection_debug(
+            bbox=detection.bbox,
+            image_w=image_w,
+            bearing_rad=detection.bearing_rad,
+            robot_pose=leader_pose,
+            range_m=detection.range_hat_m,
+        )
+        return self.build_detection_candidate_map(leader_pose, [detection])
 
     # ---------------- Live SLAM region segmentation / priority ----------------
 
@@ -2876,12 +3528,18 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             if math.hypot(dx, dy) > max(0.0, self.detection_reuse_max_distance_m):
                 can_reuse_detection = False
 
+        has_latest_detections = bool(latest_detections)
+        process_new_positive_batch = (
+            has_new_detection_batch and has_latest_detections
+        )
         new_detections = list(fake_detections)
-        if has_new_detection_batch and can_reuse_detection:
+        if has_new_detection_batch and (
+            can_reuse_detection or process_new_positive_batch
+        ):
             new_detections.extend(latest_detections)
         currently_detecting_person = bool(fake_detections) or (
             can_reuse_detection and bool(latest_detections)
-        )
+        ) or process_new_positive_batch
         bayes_positive_candidate = None
 
         if new_detections:
@@ -2939,40 +3597,71 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
                 else robot_pose
             )
             self.visibility_map = self.compute_visibility_map(visibility_pose)
-            combined_visibility = self.visibility_map
-            combined_had_detection = currently_detecting_person
+            leader_observation = None
+            leader_pose = None
+            leader_valid_detection = False
 
-            # Fold in the leader's own view of the shared map: cells it can
-            # see (and isn't currently seeing a person in) count as
-            # observed-empty and decay risk the same as the scout's own
-            # look would, using np.maximum fusion so this never has to
-            # duplicate apply_visible_no_detection_risk_decay's rate-limit
-            # bookkeeping -- it just enriches the one existing call below.
+            # Consume before the local miss update. A valid leader hit is
+            # positive evidence, never permission to decay either camera's
+            # view during this tick.
             if self.enable_leader_visibility_tracking:
-                leader_pose = self.get_leader_pose()
-                if leader_pose is not None:
+                leader_observation = self.consume_leader_observation()
+                leader_pose = self.get_leader_pose(self.leader_observation)
+                leader_valid_detection = bool(
+                    leader_observation is not None
+                    and leader_pose is not None
+                    and leader_observation[0]
+                )
+
+            self.update_visual_seen_map(self.visibility_map)
+            self.update_observed_empty(
+                self.visibility_map,
+                currently_detecting_person or leader_valid_detection,
+            )
+            self.apply_visible_no_detection_risk_decay(
+                self.visibility_map,
+                currently_detecting_person or leader_valid_detection,
+                now_ros_sec,
+            )
+
+            # A leader Bool is intentionally not used here. Only a fresh OMX
+            # status carrying a completed inference can add evidence. A unique
+            # sequence is consumed once, so bridge latency or stale data cannot
+            # repeatedly clear the same map cells.
+            if self.enable_leader_visibility_tracking:
+                if leader_observation is not None and leader_pose is not None:
+                    leader_detected, capture_sec = leader_observation
                     leader_visibility = self.compute_visibility_map(
                         leader_pose, hfov_deg=self.leader_camera_hfov_deg
                     )
-                    combined_visibility = np.maximum(
-                        combined_visibility, leader_visibility
-                    )
-                    combined_had_detection = (
-                        combined_had_detection or self.leader_currently_detecting()
-                    )
-
-            self.update_visual_seen_map(combined_visibility)
-            self.update_observed_empty(combined_visibility, combined_had_detection)
-            self.apply_visible_no_detection_risk_decay(
-                combined_visibility,
-                combined_had_detection,
-                now_ros_sec,
-            )
+                    self.update_visual_seen_map(leader_visibility)
+                    if leader_detected:
+                        candidate = self.leader_positive_candidate(
+                            self.leader_observation,
+                            leader_pose,
+                        )
+                        if candidate is not None:
+                            self.update_positive_memory(candidate)
+                            if bayes_positive_candidate is None:
+                                bayes_positive_candidate = candidate
+                            else:
+                                bayes_positive_candidate = np.maximum(
+                                    bayes_positive_candidate,
+                                    candidate,
+                                )
+                    else:
+                        self.apply_leader_valid_no_detection(
+                            leader_visibility,
+                            capture_sec,
+                            now_ros_sec,
+                        )
 
         self.update_person_bayesian_memory(
             bayes_positive_candidate,
             self.visibility_map if self.enable_visibility_tracking else None,
-            currently_detecting_person,
+            currently_detecting_person or (
+                self.enable_visibility_tracking and leader_valid_detection
+            ),
             now_ros_sec,
         )
 
@@ -3072,6 +3761,140 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         msg.data = np.rint(np.clip(arr, 0.0, 1.0) * 100.0).astype(np.int8).flatten().tolist()
         return msg
 
+    def _grid_geometry_signature(self):
+        info = self.latest_map_msg.info
+        origin = info.origin
+        return (
+            self.map_frame,
+            int(info.width),
+            int(info.height),
+            round(float(info.resolution), 9),
+            round(float(origin.position.x), 6),
+            round(float(origin.position.y), 6),
+            round(float(origin.position.z), 6),
+            round(float(origin.orientation.x), 6),
+            round(float(origin.orientation.y), 6),
+            round(float(origin.orientation.z), 6),
+            round(float(origin.orientation.w), 6),
+        )
+
+    def _layer_signature(self, data: np.ndarray):
+        contiguous = np.ascontiguousarray(data)
+        digest = hashlib.blake2b(contiguous.view(np.uint8), digest_size=16).hexdigest()
+        return (
+            self._grid_geometry_signature(),
+            tuple(int(v) for v in contiguous.shape),
+            str(contiguous.dtype),
+            digest,
+        )
+
+    def _make_occgrid_from_int8(self, data: np.ndarray, stamp):
+        msg = OccupancyGrid()
+        msg.header.frame_id = self.map_frame
+        msg.header.stamp = stamp
+        msg.info = self.latest_map_msg.info
+        msg.data = np.ascontiguousarray(data, dtype=np.int8).ravel().tolist()
+        return msg
+
+    def _risk_publish_stats(self, data: np.ndarray) -> Dict[str, float]:
+        flat = np.asarray(data, dtype=np.int16).ravel()
+        valid = flat >= 0
+        positive = flat > 0
+        positive_values = flat[positive]
+        return {
+            'data_length': int(flat.size),
+            'unknown_count': int(np.count_nonzero(flat < 0)),
+            'zero_count': int(np.count_nonzero(valid & (flat == 0))),
+            'positive_count': int(np.count_nonzero(positive)),
+            'min_value': int(np.min(flat)) if flat.size else 0,
+            'max_value': int(np.max(flat)) if flat.size else 0,
+            'mean_positive': (
+                float(np.mean(positive_values)) if positive_values.size else 0.0
+            ),
+        }
+
+    def _safe_graph_count(self, fn_name: str, topic: str) -> int:
+        try:
+            return int(getattr(self, fn_name)(topic))
+        except Exception:  # noqa: BLE001
+            return -1
+
+    def _publish_array_layer(self, key: str, publisher, arr, stamp, *, force: bool = False) -> bool:
+        if publisher is None:
+            return False
+        if arr is None:
+            if self.occ_grid is None:
+                return False
+            arr = np.zeros_like(self.occ_grid, dtype=np.float32)
+        data = np.rint(np.clip(arr, 0.0, 1.0) * 100.0).astype(np.int8, copy=False)
+        signature = self._layer_signature(data)
+        if not force and self._published_layer_signatures.get(key) == signature:
+            return False
+        publisher.publish(self._make_occgrid_from_int8(data, stamp))
+        self._published_layer_signatures[key] = signature
+        if key == 'risk':
+            self.risk_publish_seq = int(getattr(self, 'risk_publish_seq', 0)) + 1
+            now_wall = time.time()
+            previous_wall = getattr(self, 'last_risk_publish_wall_sec', None)
+            self.last_risk_publish_wall_sec = now_wall
+            publish_rate = (
+                1.0 / max(1e-6, now_wall - previous_wall)
+                if previous_wall is not None else 0.0
+            )
+            stats = self._risk_publish_stats(data)
+            info = self.latest_map_msg.info
+            grid_state = (
+                'positive_grid'
+                if stats['positive_count'] > 0 else 'empty_grid'
+            )
+            try:
+                self.get_logger().warning(
+                    'RISK_MAP_PUBLISH_DEBUG | '
+                    'topic=/risk/risk_map '
+                    f'seq={self.risk_publish_seq} '
+                    f'state={grid_state} '
+                    f'frame_id={self.map_frame} '
+                    f'width={int(info.width)} '
+                    f'height={int(info.height)} '
+                    f'resolution={float(info.resolution):.6f} '
+                    f'data_length={int(stats["data_length"])} '
+                    f'unknown_count={int(stats["unknown_count"])} '
+                    f'zero_count={int(stats["zero_count"])} '
+                    f'positive_count={int(stats["positive_count"])} '
+                    f'min_value={int(stats["min_value"])} '
+                    f'max_value={int(stats["max_value"])} '
+                    f'mean_positive={float(stats["mean_positive"]):.3f} '
+                    f'publisher_count={self._safe_graph_count("count_publishers", "/risk/risk_map")} '
+                    f'subscriber_count={self._safe_graph_count("count_subscribers", "/risk/risk_map")} '
+                    f'publish_rate_hz={publish_rate:.2f}',
+                    throttle_duration_sec=1.0,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        return True
+
+    def _publish_region_id_layer(self, key: str, publisher, stamp) -> bool:
+        if publisher is None:
+            return False
+        if self.region_id_map is None:
+            if self.occ_grid is None:
+                return False
+            data = np.zeros_like(self.occ_grid, dtype=np.int8)
+        else:
+            rid = self.region_id_map
+            data16 = np.zeros(rid.shape, dtype=np.int16)
+            data16[rid == -1] = -1
+            data16[rid == -2] = 0
+            pos = rid > 0
+            data16[pos] = ((rid[pos] * 17) % 97) + 3
+            data = np.clip(data16, -1, 100).astype(np.int8)
+        signature = self._layer_signature(data)
+        if self._published_layer_signatures.get(key) == signature:
+            return False
+        publisher.publish(self._make_occgrid_from_int8(data, stamp))
+        self._published_layer_signatures[key] = signature
+        return True
+
     def region_id_to_occgrid(self, stamp):
         msg = OccupancyGrid()
         msg.header.frame_id = self.map_frame
@@ -3106,15 +3929,21 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
             if self.risk_publish_rate_hz > 0.0 else 0
         )
         if risk_period_ns <= 0 or now_ros_ns - self.last_risk_publish_ros_ns >= risk_period_ns:
-            self.pub_risk.publish(self.array_to_occgrid(self.risk_map, stamp))
-            self.pub_bearing_consensus.publish(
-                self.array_to_occgrid(self.bearing_consensus_map, stamp)
+            self._publish_array_layer('risk', self.pub_risk, self.risk_map, stamp, force=True)
+            self._publish_array_layer(
+                'bearing_consensus',
+                self.pub_bearing_consensus,
+                self.bearing_consensus_map,
+                stamp,
             )
             if self.enable_person_probability_map and self.person_probability_map is not None:
                 # Publish the absolute Bayesian confidence, not a per-frame normalized
                 # image. Otherwise a decaying peak would misleadingly remain at 100.
-                self.pub_person_probability.publish(
-                    self.array_to_occgrid(self.person_probability_map, stamp)
+                self._publish_array_layer(
+                    'person_probability',
+                    self.pub_person_probability,
+                    self.person_probability_map,
+                    stamp,
                 )
             self.last_risk_publish_ros_ns = now_ros_ns
         diagnostic_period_ns = (
@@ -3132,16 +3961,16 @@ class RoomAwareRiskMapNode(FlexibleParameterNodeMixin, Node):
         if not self.publish_diagnostic_maps:
             return
 
-        self.pub_detection_candidate.publish(self.array_to_occgrid(self.detection_candidate_map, stamp))
-        self.pub_positive_memory.publish(self.array_to_occgrid(self.positive_memory_map, stamp))
-        self.pub_visibility.publish(self.array_to_occgrid(self.visibility_map, stamp))
-        self.pub_observed_empty.publish(self.array_to_occgrid(self.observed_empty_map, stamp))
-        self.pub_room_probability.publish(self.array_to_occgrid(self.room_probability_map, stamp))
-        self.pub_visual_seen.publish(self.array_to_occgrid(self.visual_seen_map, stamp))
-        self.pub_region_id.publish(self.region_id_to_occgrid(stamp))
-        self.pub_region_priority.publish(self.array_to_occgrid(self.region_priority_map, stamp))
-        self.pub_region_checked.publish(self.array_to_occgrid(self.region_checked_map, stamp))
-        self.pub_combined_priority.publish(self.array_to_occgrid(self.combined_priority_map(), stamp))
+        self._publish_array_layer('detection_candidate', self.pub_detection_candidate, self.detection_candidate_map, stamp)
+        self._publish_array_layer('positive_memory', self.pub_positive_memory, self.positive_memory_map, stamp)
+        self._publish_array_layer('visibility', self.pub_visibility, self.visibility_map, stamp)
+        self._publish_array_layer('observed_empty', self.pub_observed_empty, self.observed_empty_map, stamp)
+        self._publish_array_layer('room_probability', self.pub_room_probability, self.room_probability_map, stamp)
+        self._publish_array_layer('visual_seen', self.pub_visual_seen, self.visual_seen_map, stamp)
+        self._publish_region_id_layer('region_id', self.pub_region_id, stamp)
+        self._publish_array_layer('region_priority', self.pub_region_priority, self.region_priority_map, stamp)
+        self._publish_array_layer('region_checked', self.pub_region_checked, self.region_checked_map, stamp)
+        self._publish_array_layer('combined_priority', self.pub_combined_priority, self.combined_priority_map(), stamp)
 
     def publish_markers(self, robot_pose):
         stamp = self.get_clock().now().to_msg()

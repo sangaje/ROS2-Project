@@ -1,5 +1,7 @@
 import math
+from types import SimpleNamespace
 
+from geometry_msgs.msg import PoseStamped
 import numpy as np
 
 from bayesian_risk_map.bayesian_risk_map_node import (
@@ -10,6 +12,9 @@ from bayesian_risk_map.bayesian_risk_map_node import (
 
 def make_node():
     node = RoomAwareRiskMapNode.__new__(RoomAwareRiskMapNode)
+    node.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(nanoseconds=1_000_000_000)
+    )
     node.occ_grid = np.zeros((120, 120), dtype=np.int16)
     node.map_resolution = 0.05
     node.map_origin_x = 0.0
@@ -23,10 +28,30 @@ def make_node():
     node.camera_hfov_deg = 62.0
     node.visibility_num_rays = 97
     node.source_min_value = 0.03
+    node.bearing_sigma_deg = 8.0
+    node.angular_sample_step_deg = 1.0
+    node.range_sigma_m = 0.20
+    node.use_bbox_range_prior = True
     node.evidence_distribution_radius_m = 0.45
     node.positive_projection_mode = 'bearing_consensus'
     node.positive_memory_alpha = 0.85
     node.positive_memory_map = np.zeros_like(node.occ_grid, dtype=np.float32)
+    node.bearing_consensus_map = np.zeros_like(node.occ_grid, dtype=np.float32)
+    node.detection_candidate_map = np.zeros_like(node.occ_grid, dtype=np.float32)
+    node.evidence_points = []
+    node.next_evidence_id = 1
+    node.enable_visible_risk_decay = True
+    node.visible_risk_decay_per_sec = 0.20
+    node.visible_risk_decay_grace_sec = 1.0
+    node.visible_evidence_clear_threshold = 0.5
+    node.last_visible_risk_decay_ros_sec = None
+    node.last_leader_miss_capture_sec = None
+    node.leader_first_miss_dt_sec = 0.5
+    node.leader_person_bayes_miss_log_odds_per_sec = 1.0
+    node.leader_visible_risk_decay_per_sec = 1.0
+    node.enable_empty_observation_map = True
+    node.observed_empty_alpha = 1.0
+    node.observed_empty_map = np.zeros_like(node.occ_grid, dtype=np.float32)
     node.risk_persist_in_unknown = True
     node.risk_dirty = False
     node.enable_person_probability_map = True
@@ -100,6 +125,61 @@ def test_one_viewpoint_creates_low_gain_directional_corridor():
     assert node.bearing_consensus_peaks == []
     assert node.update_positive_memory(candidate)
     assert float(np.max(node.positive_memory_map)) > 0.12
+
+
+def test_bbox_bearing_matches_ros_left_right_convention():
+    node = make_node()
+
+    center = node.bbox_center_to_bearing((300.0, 0.0, 340.0, 40.0), 640)
+    right = node.bbox_center_to_bearing((560.0, 0.0, 620.0, 40.0), 640)
+    left = node.bbox_center_to_bearing((20.0, 0.0, 80.0, 40.0), 640)
+
+    assert abs(center) < math.radians(1.0)
+    assert right < 0.0
+    assert left > 0.0
+
+
+def test_detection_projection_puts_image_right_on_robot_right():
+    node = make_node()
+    node.map_origin_y = -3.0
+    robot_pose = (1.0, 0.0, 0.0)
+
+    center = Detection2D(
+        bbox=(300.0, 0.0, 340.0, 100.0),
+        conf=1.0,
+        bearing_rad=node.bbox_center_to_bearing((300.0, 0.0, 340.0, 100.0), 640),
+        range_hat_m=1.0,
+    )
+    right = Detection2D(
+        bbox=(560.0, 0.0, 620.0, 100.0),
+        conf=1.0,
+        bearing_rad=node.bbox_center_to_bearing((560.0, 0.0, 620.0, 100.0), 640),
+        range_hat_m=1.0,
+    )
+    left = Detection2D(
+        bbox=(20.0, 0.0, 80.0, 100.0),
+        conf=1.0,
+        bearing_rad=node.bbox_center_to_bearing((20.0, 0.0, 80.0, 100.0), 640),
+        range_hat_m=1.0,
+    )
+
+    center_map = node.build_detection_candidate_map(robot_pose, [center])
+    right_map = node.build_detection_candidate_map(robot_pose, [right])
+    left_map = node.build_detection_candidate_map(robot_pose, [left])
+
+    center_y, center_x = np.unravel_index(int(np.argmax(center_map)), center_map.shape)
+    right_y, right_x = np.unravel_index(int(np.argmax(right_map)), right_map.shape)
+    left_y, left_x = np.unravel_index(int(np.argmax(left_map)), left_map.shape)
+    center_world = node.grid_to_world(int(center_x), int(center_y))
+    right_world = node.grid_to_world(int(right_x), int(right_y))
+    left_world = node.grid_to_world(int(left_x), int(left_y))
+
+    assert center_world[0] > robot_pose[0]
+    assert abs(center_world[1] - robot_pose[1]) < 0.10
+    assert right_world[0] > robot_pose[0]
+    assert right_world[1] < robot_pose[1]
+    assert left_world[0] > robot_pose[0]
+    assert left_world[1] > robot_pose[1]
 
 
 def test_distinct_viewpoints_localize_bearing_intersection():
@@ -250,3 +330,94 @@ def test_wall_and_unknown_cells_occlude_visibility_and_protect_memory():
             initial_occluded,
             rel_tol=1e-6,
         )
+
+
+def test_leader_valid_miss_is_consumed_once_and_only_decays_visible_cells():
+    node = make_node()
+    visible_cell = (60, 60)
+    hidden_cell = (60, 70)
+    visibility = np.zeros_like(node.occ_grid, dtype=np.float32)
+    visibility[visible_cell] = 1.0
+
+    candidate = np.zeros_like(node.person_log_odds_map)
+    candidate[visible_cell] = 0.25
+    candidate[hidden_cell] = 0.25
+    node.update_person_bayesian_memory(candidate, None, True, 1.0)
+    node.last_person_detection_ros_sec = None
+    before_visible = float(node.person_probability_map[visible_cell])
+    before_hidden = float(node.person_probability_map[hidden_cell])
+
+    assert node.apply_leader_valid_no_detection(visibility, 10.0, 10.0)
+    after_visible = float(node.person_probability_map[visible_cell])
+    after_hidden = float(node.person_probability_map[hidden_cell])
+
+    assert 0.0 < after_visible < before_visible
+    assert math.isclose(after_hidden, before_hidden, rel_tol=1e-6)
+
+    # Replaying the same bridge frame cannot apply the miss a second time.
+    assert not node.apply_leader_valid_no_detection(visibility, 10.0, 10.1)
+    assert math.isclose(
+        float(node.person_probability_map[visible_cell]), after_visible, rel_tol=1e-6
+    )
+
+
+def test_leader_observation_uses_local_receipt_time_across_robot_clocks():
+    class Clock:
+        class Now:
+            nanoseconds = 20_000_000_000
+
+        def now(self):
+            return self.Now()
+
+    node = make_node()
+    node.get_clock = lambda: Clock()
+    node.leader_observation_max_age_sec = 1.0
+    node.last_leader_observation_sequence = None
+    node.leader_observation_wall = 20.0
+    node.leader_observation = {
+        'sequence': 7,
+        'capture_stamp': 20.0,
+        'camera_ready': True,
+        'frame_valid': True,
+        'inference_ran': True,
+        'detected': False,
+    }
+
+    assert node.consume_leader_observation() == (False, 20.0)
+    assert node.consume_leader_observation() is None
+
+    node.leader_observation = {
+        'sequence': 8,
+        'capture_stamp': 18.0,
+        'camera_ready': True,
+        'frame_valid': True,
+        'inference_ran': True,
+        'detected': False,
+    }
+    # The leader and scout clocks may differ. A freshly received, sequenced
+    # frame must still contribute a single visibility miss.
+    node.leader_observation_wall = 20.0
+    assert node.consume_leader_observation() == (False, 20.0)
+
+
+def test_leader_pose_falls_back_to_base_heading_without_fresh_camera_yaw():
+    class Clock:
+        class Now:
+            nanoseconds = 20_000_000_000
+
+        def now(self):
+            return self.Now()
+
+    node = make_node()
+    node.get_clock = lambda: Clock()
+    node.leader_pose_max_age_sec = 2.0
+    node.leader_camera_yaw = None
+    node.leader_camera_yaw_wall = None
+    pose = PoseStamped()
+    pose.pose.position.x = 1.0
+    pose.pose.position.y = 2.0
+    pose.pose.orientation.w = 1.0
+    node.leader_pose_msg = pose
+    node.leader_pose_wall = 20.0
+
+    assert node.get_leader_pose({}) == (1.0, 2.0, 0.0)

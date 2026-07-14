@@ -1,5 +1,6 @@
 import rclpy
 from nav_msgs.msg import OccupancyGrid
+from std_msgs.msg import String
 
 from fleet_bringup.map_relay import MapRelay
 
@@ -37,9 +38,9 @@ def invalid_grid() -> OccupancyGrid:
 def test_relay_stays_silent_while_a_primary_publisher_is_active():
     node = make_node()
     try:
+        assert node._own_output_publishers == 1
         published = []
         node._pub.publish = lambda msg: published.append(msg)
-        node._volatile_pub.publish = lambda msg: None
         node.count_publishers = (
             lambda topic: node._own_output_publishers + 1
         )
@@ -58,7 +59,6 @@ def test_relay_takes_over_after_grace_period_once_primary_disappears():
     try:
         published = []
         node._pub.publish = lambda msg: published.append(msg)
-        node._volatile_pub.publish = lambda msg: None
         node.count_publishers = lambda topic: node._own_output_publishers
         now = [0.0]
         node._now_sec = lambda: now[0]
@@ -83,7 +83,6 @@ def test_zero_grace_takes_over_on_first_missing_primary_check():
         published = []
         node.takeover_grace = 0.0
         node._pub.publish = lambda msg: published.append(msg)
-        node._volatile_pub.publish = lambda msg: None
         node.count_publishers = lambda topic: node._own_output_publishers
         node._now_sec = lambda: 0.0
         node._on_bridged_map(grid(20))
@@ -101,7 +100,6 @@ def test_takeover_prefers_the_primarys_own_last_output_over_the_bridged_map():
     try:
         published = []
         node._pub.publish = lambda msg: published.append(msg)
-        node._volatile_pub.publish = lambda msg: None
         node.count_publishers = lambda topic: node._own_output_publishers
         now = [0.0]
         node._now_sec = lambda: now[0]
@@ -122,7 +120,6 @@ def test_relay_stands_down_only_after_primary_confirmed_stable():
     try:
         published = []
         node._pub.publish = lambda msg: published.append(msg)
-        node._volatile_pub.publish = lambda msg: None
         now = [0.0]
         node._now_sec = lambda: now[0]
         node.count_publishers = lambda topic: node._own_output_publishers
@@ -156,7 +153,6 @@ def test_flickering_primary_presence_does_not_flap_the_relay_down():
     try:
         published = []
         node._pub.publish = lambda msg: published.append(msg)
-        node._volatile_pub.publish = lambda msg: None
         now = [0.0]
         node._now_sec = lambda: now[0]
         node.count_publishers = lambda topic: node._own_output_publishers
@@ -191,7 +187,6 @@ def test_zero_standby_confirm_preserves_instant_standdown():
         published = []
         node.standby_confirm_sec = 0.0
         node._pub.publish = lambda msg: published.append(msg)
-        node._volatile_pub.publish = lambda msg: None
         now = [0.0]
         node._now_sec = lambda: now[0]
         node.count_publishers = lambda topic: node._own_output_publishers
@@ -215,8 +210,8 @@ def test_new_bridged_maps_are_republished_immediately_while_relaying():
     node = make_node()
     try:
         published = []
+        node.min_publish_period_sec = 0.0
         node._pub.publish = lambda msg: published.append(msg)
-        node._volatile_pub.publish = lambda msg: None
         now = [0.0]
         node._now_sec = lambda: now[0]
         node.count_publishers = lambda topic: node._own_output_publishers
@@ -234,12 +229,11 @@ def test_new_bridged_maps_are_republished_immediately_while_relaying():
         destroy_node(node)
 
 
-def test_relay_republishes_cached_map_while_active_for_volatile_subscribers():
+def test_relay_skips_unchanged_cached_map_while_active():
     node = make_node()
     try:
         published = []
         node._pub.publish = lambda msg: published.append(msg)
-        node._volatile_pub.publish = lambda msg: None
         now = [0.0]
         node._now_sec = lambda: now[0]
         node.count_publishers = lambda topic: node._own_output_publishers
@@ -252,8 +246,89 @@ def test_relay_republishes_cached_map_while_active_for_volatile_subscribers():
 
         now[0] += node.check_period
         node._check_primary()
+        assert len(published) == 1
+    finally:
+        destroy_node(node)
+
+
+def test_relay_publishes_when_map_payload_changes():
+    node = make_node()
+    try:
+        published = []
+        node.min_publish_period_sec = 0.0
+        node._pub.publish = lambda msg: published.append(msg)
+        now = [0.0]
+        node._now_sec = lambda: now[0]
+        node.count_publishers = lambda topic: node._own_output_publishers
+        first = grid(10)
+        second = grid(10)
+        second.data[0] = 42
+
+        node._on_bridged_map(first)
+        node._check_primary()
+        now[0] += node.takeover_grace + 0.1
+        node._check_primary()
+        assert len(published) == 1
+
+        node._on_bridged_map(second)
         assert len(published) == 2
-        assert published[-1].info.width == 10
+        assert published[-1].data[0] == 42
+    finally:
+        destroy_node(node)
+
+
+def test_relay_selects_follower_map_after_active_scout_takeover():
+    node = make_node()
+    try:
+        node.follower_input_topic = '/follower21/map_bridge'
+        node.follower_scout_id = 'follower21'
+        published = []
+        node.min_publish_period_sec = 0.0
+        node._pub.publish = lambda msg: published.append(msg)
+        node.relay_without_primary = True
+        node._relaying = True
+
+        node._on_bridged_map(grid(22))
+        assert published[-1].info.width == 22
+
+        follower = String()
+        follower.data = 'follower21'
+        node._on_follower_map(grid(21))
+        node._on_active_scout_id(follower)
+
+        assert node._selected_input_topic() == '/follower21/map_bridge'
+        assert published[-1].info.width == 21
+
+        # Late scout22 maps must not overwrite the selected follower map.
+        node._on_bridged_map(grid(23))
+        assert published[-1].info.width == 21
+    finally:
+        destroy_node(node)
+
+
+def test_external_mode_republishes_cached_map_as_keepalive():
+    node = make_node()
+    try:
+        published = []
+        node.relay_without_primary = True
+        node.cached_republish_period_sec = 1.0
+        node.min_publish_period_sec = 0.0
+        now = [10.0]
+        node._now_mono_sec = lambda: now[0]
+        node._pub.publish = lambda msg: published.append(msg)
+
+        node._on_bridged_map(grid(24))
+        node._check_primary()
+        assert len(published) == 1
+
+        now[0] += 0.5
+        node._check_primary()
+        assert len(published) == 1
+
+        now[0] += 0.5
+        node._check_primary()
+        assert len(published) == 2
+        assert published[-1].info.width == 24
     finally:
         destroy_node(node)
 
@@ -271,13 +346,13 @@ def test_relay_does_not_republish_its_own_stale_output_over_fresh_bridge():
     node = make_node()
     try:
         published = []
+        node.min_publish_period_sec = 0.0
 
         def publish(msg):
             published.append(msg)
             node._on_output_seen(msg)
 
         node._pub.publish = publish
-        node._volatile_pub.publish = lambda msg: None
         now = [0.0]
         node._now_sec = lambda: now[0]
         node.count_publishers = lambda topic: node._own_output_publishers

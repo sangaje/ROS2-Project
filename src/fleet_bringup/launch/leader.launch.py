@@ -24,13 +24,104 @@ from launch.actions import (
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import Node
-from nav2_common.launch import RewrittenYaml
 
 from fleet_bringup.launch_utils import (
     clean_process_environment,
     dds_launch_environment,
     launch_bool,
 )
+
+
+def _tracked_cmd_vel_adapter_enabled(param_file: str) -> bool:
+    if not param_file:
+        return False
+    try:
+        with open(param_file, 'r', encoding='utf-8') as handle:
+            data = yaml.safe_load(handle) or {}
+    except OSError:
+        return False
+    params = data.get('tracked_cmd_vel_adapter', {}).get('ros__parameters', {})
+    return bool(params.get('enabled', False))
+
+
+def _rewrite_common_nav2_params(value, *, simulation: bool) -> None:
+    if not isinstance(value, dict):
+        return
+    for key, child in value.items():
+        if key == 'use_sim_time':
+            value[key] = simulation
+        elif key == 'odom_topic':
+            value[key] = '/odom'
+        elif key == 'enable_stamped_cmd_vel':
+            value[key] = True
+        else:
+            _rewrite_common_nav2_params(child, simulation=simulation)
+
+
+def _set_nested(data: dict, keys: list[str], value) -> None:
+    current = data
+    for key in keys[:-1]:
+        current = current.setdefault(key, {})
+    current[keys[-1]] = value
+
+
+def _leader_nav2_params_file(
+    *,
+    package_share: str,
+    domain: str,
+    source_name: str,
+    simulation: bool,
+    amcl_scan_topic: str,
+    costmap_scan_topic: str,
+) -> str:
+    source_path = os.path.join(package_share, 'config', source_name)
+    with open(source_path, 'r', encoding='utf-8') as handle:
+        data = yaml.safe_load(handle) or {}
+
+    _rewrite_common_nav2_params(data, simulation=simulation)
+    _set_nested(data, ['amcl', 'ros__parameters', 'scan_topic'], amcl_scan_topic)
+    _set_nested(data, ['amcl', 'ros__parameters', 'map_topic'], '/map')
+    _set_nested(
+        data,
+        [
+            'local_costmap',
+            'local_costmap',
+            'ros__parameters',
+            'obstacle_layer',
+            'scan',
+            'topic',
+        ],
+        costmap_scan_topic,
+    )
+    _set_nested(
+        data,
+        [
+            'global_costmap',
+            'global_costmap',
+            'ros__parameters',
+            'obstacle_layer',
+            'scan',
+            'topic',
+        ],
+        costmap_scan_topic,
+    )
+    _set_nested(
+        data,
+        [
+            'global_costmap',
+            'global_costmap',
+            'ros__parameters',
+            'static_layer',
+            'map_topic',
+        ],
+        '/map',
+    )
+
+    output_path = Path(tempfile.gettempdir()) / (
+        f'leader_{domain}_nav2_{source_name}'
+    )
+    output_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding='utf-8')
+    return str(output_path)
 
 
 def generate_launch_description():
@@ -45,7 +136,13 @@ def generate_launch_description():
     enable_cartographer = LaunchConfiguration('enable_cartographer')
     auto_localize = LaunchConfiguration('auto_localize')
     localization_scan_topic = LaunchConfiguration('localization_scan_topic')
+    amcl_scan_topic = LaunchConfiguration('amcl_scan_topic')
+    costmap_scan_topic = LaunchConfiguration('costmap_scan_topic')
     hardware_param_file = LaunchConfiguration('hardware_param_file')
+    active_scout_id_topic = LaunchConfiguration('active_scout_id_topic')
+    active_scout_robot_name = LaunchConfiguration('active_scout_robot_name')
+    follower_robot_name = LaunchConfiguration('follower_robot_name')
+    follower_map_bridge_topic = LaunchConfiguration('follower_map_bridge_topic')
     initial_x = LaunchConfiguration('leader_initial_x')
     initial_y = LaunchConfiguration('leader_initial_y')
     initial_yaw = LaunchConfiguration('leader_initial_yaw')
@@ -59,10 +156,18 @@ def generate_launch_description():
         cartographer_owned = simulation or launch_bool(
             enable_cartographer.perform(context)
         )
-        scan_topic_value = (
+        legacy_localization_scan = localization_scan_topic.perform(context).strip()
+        amcl_scan_topic_value = (
             '/scan'
             if simulation
-            else localization_scan_topic.perform(context).strip() or '/scan'
+            else amcl_scan_topic.perform(context).strip()
+            or legacy_localization_scan
+            or '/scan'
+        )
+        costmap_scan_topic_value = (
+            '/scan'
+            if simulation
+            else costmap_scan_topic.perform(context).strip() or '/scan'
         )
         auto_localize_enabled = (
             not cartographer_owned
@@ -73,35 +178,35 @@ def generate_launch_description():
             leader_hardware_param_file = os.path.join(
                 package_share,
                 'config',
-                'turtlebot3_waffle_pi_stamped_cmd_vel.yaml',
+                'tracked_waffle_kinematics.yaml',
             )
+        tracked_adapter_enabled = _tracked_cmd_vel_adapter_enabled(
+            leader_hardware_param_file
+        )
+        leader_cmd_vel_topic = (
+            '/cmd_vel_nav' if tracked_adapter_enabled else '/cmd_vel'
+        )
 
-        nav2_params = RewrittenYaml(
-            source_file=os.path.join(
-                package_share,
-                'config',
-                (
-                    'leader_nav2.yaml'
-                    if cartographer_owned
-                    else 'leader_waffle_pi_nav2.yaml'
-                ),
+        nav2_params = _leader_nav2_params_file(
+            package_share=package_share,
+            domain=domain,
+            source_name=(
+                'leader_nav2.yaml'
+                if cartographer_owned
+                else 'leader_waffle_pi_nav2.yaml'
             ),
-            param_rewrites={
-                'use_sim_time': str(simulation).lower(),
-                'odom_topic': '/odom',
-                'scan_topic': scan_topic_value,
-                'map_topic': '/map',
-                'topic': scan_topic_value,
-                'enable_stamped_cmd_vel': 'true',
-            },
-            convert_types=True,
+            simulation=simulation,
+            amcl_scan_topic=amcl_scan_topic_value,
+            costmap_scan_topic=costmap_scan_topic_value,
         )
 
         cartographer = None
         amcl = None
         localization_lifecycle = None
         map_relay = None
+        confidence_map_relay = None
         kickstart_node = None
+        fixed_seed_ready = None
         if cartographer_owned:
             cartographer_launch = os.path.join(
                 get_package_share_directory('turtlebot3_cartographer'),
@@ -128,11 +233,42 @@ def generate_launch_description():
                 output='screen',
                 parameters=[{
                     'use_sim_time': False,
-                    'input_topic': '/map_bridge',
+                    'input_topic': f'/field/{active_scout_robot_name.perform(context)}/map',
                     'output_topic': '/map',
                     'check_period_sec': 0.2,
                     'takeover_grace_sec': 0.0,
                     'relay_without_primary': True,
+                    'max_publish_rate_hz': 1.0,
+                    'cached_republish_period_sec': 1.0,
+                    'active_scout_id_topic': active_scout_id_topic,
+                    'primary_scout_id': active_scout_robot_name,
+                    'follower_scout_id': follower_robot_name,
+                    'follower_input_topic': follower_map_bridge_topic,
+                }],
+                env=process_env,
+                respawn=True,
+                respawn_delay=3.0,
+            )
+            confidence_map_relay = Node(
+                package='fleet_bringup',
+                executable='map_relay',
+                name='leader_confidence_map_relay',
+                output='screen',
+                parameters=[{
+                    'use_sim_time': False,
+                    'input_topic': f'/{active_scout_robot_name.perform(context)}/rl_confidence_map',
+                    'output_topic': '/rl_confidence_map',
+                    'check_period_sec': 0.2,
+                    'takeover_grace_sec': 0.0,
+                    'relay_without_primary': True,
+                    'max_publish_rate_hz': 1.0,
+                    'cached_republish_period_sec': 1.0,
+                    'active_scout_id_topic': active_scout_id_topic,
+                    'primary_scout_id': active_scout_robot_name,
+                    'follower_scout_id': follower_robot_name,
+                    'follower_input_topic': (
+                        f'/field/{follower_robot_name.perform(context)}/rl_confidence_map'
+                    ),
                 }],
                 env=process_env,
                 respawn=True,
@@ -172,10 +308,11 @@ def generate_launch_description():
                 ' | odom_frame=odom',
                 ' | base_frame=base_footprint',
                 ' | map_topic=/map',
-                ' | scan_topic=', scan_topic_value,
+                ' | amcl_scan_topic=', amcl_scan_topic_value,
+                ' | costmap_scan_topic=', costmap_scan_topic_value,
                 ' | tf_broadcast=true',
                 ' | initial_pose_mode=',
-                'seeded_global_localize' if auto else 'fixed_seed',
+                'fixed_seed_spin' if auto else 'fixed_seed',
                 ' | x=', str(initial_pose['x']),
                 ' | y=', str(initial_pose['y']),
                 ' | yaw=', str(initial_pose['yaw']),
@@ -197,13 +334,11 @@ def generate_launch_description():
                     name='leader_global_localize',
                     output='screen',
                     parameters=[{
-                        'scan_topic': scan_topic_value,
-                        # Seed AMCL's initial pose from the active scout's
-                        # known map-frame pose before spinning, instead of
-                        # blindly scattering particles across a still-sparse
-                        # shared map -- falls back to blind reinit if no
-                        # scout pose is available in time.
-                        'enable_scout_pose_seed': True,
+                        'scan_topic': amcl_scan_topic_value,
+                        # The leader Waffle must localize from its own
+                        # initial pose, scan and odom. A scout pose is a pose
+                        # on the same map, not the Waffle's pose.
+                        'enable_scout_pose_seed': False,
                         'active_scout_id_topic': '/failover/active_scout_id',
                         'active_scout_robot_name': 'scout22',
                         'follower_robot_name': 'follower21',
@@ -234,15 +369,36 @@ def generate_launch_description():
                         'require_amcl_before_spin': True,
                         'max_scan_age_sec': 1.2,
                         'max_odom_age_sec': 1.2,
-                        'cmd_vel_topic': '/cmd_vel',
+                        'cmd_vel_topic': leader_cmd_vel_topic,
                         'use_stamped_cmd_vel': True,
                         'amcl_pose_topic': '/amcl_pose',
                         'localization_cov_xy_threshold': 1.0,
                         'localization_cov_yaw_threshold': 0.8,
                         'localization_stable_duration_sec': 2.5,
                         'localization_check_timeout_sec': 9.0,
-                        'max_spin_retries': 0,
+                        'max_spin_retries': 2,
                         'force_spin_after_sec': 14.0,
+                    }],
+                    env=process_env,
+                    respawn=True,
+                    respawn_delay=3.0,
+                )
+            else:
+                fixed_seed_ready = Node(
+                    package='fleet_bringup',
+                    executable='amcl_fixed_seed_ready',
+                    name='leader_amcl_fixed_seed_ready',
+                    output='screen',
+                    parameters=[{
+                        'map_topic': '/map',
+                        'scan_topic': amcl_scan_topic_value,
+                        'odom_topic': '/odom',
+                        'amcl_pose_topic': '/amcl_pose',
+                        'amcl_get_state_service': '/amcl/get_state',
+                        'global_frame': 'map',
+                        'base_frame': 'base_footprint',
+                        'ready_topic': '/localization_ready',
+                        'fixed_seed_initial_pose_applied': True,
                     }],
                     env=process_env,
                     respawn=True,
@@ -261,6 +417,17 @@ def generate_launch_description():
                 'source_frame': 'base_footprint',
                 'source_frame_candidates': ['base_footprint', 'base_link'],
                 'publish_rate_hz': 10.0,
+                # Do not export AMCL/map->odom corrections as physical leader
+                # teleports while wheel odom says the robot barely moved.
+                'freeze_when_stationary': True,
+                'stationary_target_frame': 'odom',
+                'stationary_linear_threshold_m': 0.006,
+                'stationary_angular_threshold_rad': 0.015,
+                'stationary_freeze_warmup_sec': 2.0,
+                'map_jump_filter_enabled': True,
+                'map_jump_min_allowed_m': 0.20,
+                'map_jump_odom_scale': 4.0,
+                'map_jump_slop_m': 0.12,
                 'log_every_n': 100,
             }],
             env=process_env,
@@ -283,7 +450,7 @@ def generate_launch_description():
             name='leader_fleet_scan_relay',
             output='screen',
             parameters=[{
-                'input_topic': scan_topic_value,
+                'input_topic': amcl_scan_topic_value,
                 'output_topic': '/leader/scan',
                 'output_frame': 'base_scan',
                 'input_reliability': 'best_effort',
@@ -354,6 +521,10 @@ def generate_launch_description():
                         'use_sim_time': simulation,
                         'goal_pose_topic': '/fleet/leader_coord_goal',
                         'cancel_topic': '/fleet/leader_nav_cancel',
+                        'require_system_ready': False,
+                        'system_ready_topic': '/system/ready',
+                        'require_start_motion': False,
+                        'start_motion_topic': '/fleet/start_motion',
                     }],
                     env=process_env,
                 ),
@@ -386,9 +557,13 @@ def generate_launch_description():
                     'lifecycle_delay_sec': lifecycle_delay_sec,
                     'goal_delay_sec': goal_delay_sec,
                     'require_localization_ready': (
-                        'true' if auto_localize_enabled else 'false'
+                        'true' if not cartographer_owned else 'false'
                     ),
                     'localization_ready_topic': '/localization_ready',
+                    'require_system_ready': 'false',
+                    'system_ready_topic': '/system/ready',
+                    'require_start_motion': 'false',
+                    'start_motion_topic': '/fleet/start_motion',
                 }.items(),
             )
 
@@ -405,7 +580,9 @@ def generate_launch_description():
                 # External-map AMCL must physically spin first. Holding the
                 # coordinator prevents it from publishing leader/member goals
                 # while global_localize_kickstart owns /cmd_vel.
-                'require_localization_ready': auto_localize_enabled,
+                'require_localization_ready': not cartographer_owned,
+                'require_system_ready': True,
+                'system_ready_topic': '/system/ready',
             }],
             env=process_env,
             respawn=True,
@@ -500,16 +677,52 @@ def generate_launch_description():
                         ],
                     )
                 )
+                # global_localize_kickstart never runs in this branch (its
+                # whole state machine is AMCL-specific), so nothing else
+                # would ever publish ready_topic here -- a downstream
+                # bootstrap gate (e.g. scout_failover_coordinator) would
+                # wait forever. Watch Cartographer's own map/TF/scan
+                # instead.
+                actions.append(
+                    TimerAction(
+                        period=6.0,
+                        actions=[
+                            LogInfo(msg=[
+                                'LEADER_STAGE | starting SLAM localization '
+                                'ready watcher',
+                            ]),
+                            Node(
+                                package='fleet_bringup',
+                                executable='slam_localization_ready',
+                                name='leader_slam_localization_ready',
+                                output='screen',
+                                parameters=[{
+                                    'map_topic': '/map',
+                                    'scan_topic': amcl_scan_topic_value,
+                                    'global_frame': 'map',
+                                    'base_frame': 'base_footprint',
+                                    'ready_topic': '/localization_ready',
+                                }],
+                                env=process_env,
+                                respawn=True,
+                                respawn_delay=3.0,
+                            ),
+                        ],
+                    )
+                )
             else:
+                relay_actions = [
+                    LogInfo(msg=[
+                        'LEADER_STAGE | starting bridged-map relay',
+                    ]),
+                    map_relay,
+                ]
+                if confidence_map_relay is not None:
+                    relay_actions.append(confidence_map_relay)
                 actions.append(
                     TimerAction(
                         period=0.2,
-                        actions=[
-                            LogInfo(msg=[
-                                'LEADER_STAGE | starting bridged-map relay',
-                            ]),
-                            map_relay,
-                        ],
+                        actions=relay_actions,
                     )
                 )
                 actions.append(
@@ -543,6 +756,19 @@ def generate_launch_description():
                                     'localize kickstart',
                                 ]),
                                 kickstart_node,
+                            ],
+                        )
+                    )
+                if fixed_seed_ready is not None:
+                    actions.append(
+                        TimerAction(
+                            period=4.0,
+                            actions=[
+                                LogInfo(msg=[
+                                    'LEADER_STAGE | starting fixed-seed AMCL ',
+                                    'ready watcher',
+                                ]),
+                                fixed_seed_ready,
                             ],
                         )
                     )
@@ -601,23 +827,38 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'auto_localize',
-            default_value='true',
+            default_value='false',
             choices=['true', 'false'],
             description=(
-                'Only used when enable_cartographer:=false. Let AMCL '
-                'start from a one-shot scout-pose /initialpose seed when '
-                'available, then refine via verified in-place spin.'
+                'Only used when enable_cartographer:=false. Start AMCL from '
+                'leader_initial_x/y/yaw. Default false uses fixed-seed '
+                'readiness without global localization or in-place spin. '
+                'When true, refine via verified in-place spin. Scout pose '
+                'seeding is disabled because scout pose != leader pose.'
             ),
         ),
         DeclareLaunchArgument(
             'localization_scan_topic',
+            default_value='',
+            description=(
+                'Deprecated compatibility alias for amcl_scan_topic. Leave '
+                'empty and use amcl_scan_topic/costmap_scan_topic.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'amcl_scan_topic',
             default_value='/scan',
             description=(
-                'Real external-map leader mode: LaserScan topic consumed by '
-                'AMCL/Nav2. Defaults to raw /scan so localization does not '
-                'deadlock when optional OMX scan_processor (/scan_filtered) '
-                'is not running. Pass /scan_filtered only after verifying it '
-                'is publishing.'
+                'Real external-map leader mode: raw LaserScan consumed by '
+                'AMCL and global localization spin.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'costmap_scan_topic',
+            default_value='/scan',
+            description=(
+                'Real external-map leader mode: local Leader LaserScan consumed '
+                'by Nav2 obstacle layers. Defaults to the same /scan topic as AMCL.'
             ),
         ),
         DeclareLaunchArgument(
@@ -625,11 +866,31 @@ def generate_launch_description():
             default_value='',
             description=(
                 'Optional TurtleBot3 hardware params. Empty uses the '
-                'fleet_bringup Waffle Pi stamped /cmd_vel override.'
+                'tracked Waffle kinematics profile.'
             ),
         ),
+        DeclareLaunchArgument(
+            'active_scout_id_topic',
+            default_value='/failover/active_scout_id',
+            description='Latched active scout id used to select the shared map source.',
+        ),
+        DeclareLaunchArgument(
+            'active_scout_robot_name',
+            default_value='scout22',
+            description='Initial active scout id that owns /map_bridge.',
+        ),
+        DeclareLaunchArgument(
+            'follower_robot_name',
+            default_value='follower21',
+            description='Follower id that may take over as ACTIVE_SCOUT.',
+        ),
+        DeclareLaunchArgument(
+            'follower_map_bridge_topic',
+            default_value='/field/follower21/map',
+            description='Leader-domain follower SLAM map input selected after takeover.',
+        ),
         DeclareLaunchArgument('leader_initial_x', default_value='0.0'),
-        DeclareLaunchArgument('leader_initial_y', default_value='0.0'),
+        DeclareLaunchArgument('leader_initial_y', default_value='0.10'),
         DeclareLaunchArgument('leader_initial_yaw', default_value='0.0'),
         *dds_launch_environment(domain_id),
         OpaqueFunction(function=make_stack),

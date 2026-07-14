@@ -8,30 +8,29 @@
 amcl:
   ros__parameters:
     use_sim_time: true
-    # 좌우 바퀴 응답이 비대칭(한쪽이 회전 시 훨씬 느림)이라 odom 의 회전
-    # 추정이 실제 회전량과 어긋난다. alpha1(회전->회전 오차)/alpha4(회전
-    # ->이동 오차)를 크게 잡아서 AMCL 이 odom 의 회전 성분을 덜 믿고
-    # 스캔 매칭으로 더 많이 보정하게 함.
-    alpha1: 0.22
-    alpha2: 0.10
-    alpha3: 0.12
-    alpha4: 0.16
-    alpha5: 0.03
+    # The leader Waffle Pi is heavier/slower than the nominal TB3 model.  Its
+    # commanded rotation/acceleration can lag the odom model, so let AMCL trust
+    # odom a little less and smooth corrections over real scan evidence.
+    alpha1: 0.38
+    alpha2: 0.18
+    alpha3: 0.23
+    alpha4: 0.32
+    alpha5: 0.08
     base_frame_id: "base_footprint"
     beam_skip_distance: 0.35
     beam_skip_error_threshold: 0.9
     beam_skip_threshold: 0.3
-    do_beamskip: true
+    do_beamskip: false
     first_map_only: false
     global_frame_id: "map"
     lambda_short: 0.1
-    laser_likelihood_max_dist: 2.0
-    laser_max_range: 3.5
+    laser_likelihood_max_dist: 2.5
+    laser_max_range: 4.0
     laser_min_range: 0.12
     laser_model_type: "likelihood_field"
-    max_beams: 120
-    max_particles: 6000
-    min_particles: 1500
+    max_beams: 180
+    max_particles: 8000
+    min_particles: 2000
     odom_frame_id: "odom"
     pf_err: 0.015
     pf_z: 0.99
@@ -40,14 +39,14 @@ amcl:
     resample_interval: 1
     robot_model_type: "nav2_amcl::DifferentialMotionModel"
     save_pose_rate: 5.0
-    sigma_hit: 0.10
+    sigma_hit: 0.08
     tf_broadcast: true
     transform_tolerance: 1.0
     update_min_a: 0.025
     update_min_d: 0.025
-    z_hit: 0.82
+    z_hit: 0.86
     z_max: 0.03
-    z_rand: 0.12
+    z_rand: 0.09
     z_short: 0.03
     scan_topic: scan
     map_topic: map
@@ -69,15 +68,15 @@ lifecycle_manager_localization:
 controller_server:
   ros__parameters:
     use_sim_time: true
-    # 좌우 바퀴 비대칭 때문에 DWB 가 가정하는 이상적인 미분구동 모델과
-    # 실제 거동(회전 중 호를 그림)이 어긋난다. 더 자주(controller_frequency
-    # 상향) 더 짧게(sim_time 아래 하향) 재평가해서 모델 오차가 누적되기
-    # 전에 자주 보정하게 함.
-    controller_frequency: 20.0
+    # The leader is a loaded Waffle Pi, not a fresh nominal model.  Use slower
+    # accelerations and longer trajectory rollout so DWB chooses commands the
+    # hardware can actually realize instead of constantly asking for impossible
+    # catch-up motion.
+    controller_frequency: 15.0
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.001
     min_theta_velocity_threshold: 0.001
-    failure_tolerance: 2.0
+    failure_tolerance: 4.0
     odom_topic: "/odom"
     enable_stamped_cmd_vel: true
     progress_checker_plugins: ["progress_checker"]
@@ -86,56 +85,55 @@ controller_server:
 
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      required_movement_radius: 0.03
-      movement_time_allowance: 45.0
+      required_movement_radius: 0.025
+      movement_time_allowance: 80.0
 
     goal_checker:
       stateful: true
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.25
-      yaw_goal_tolerance: 0.25
+      xy_goal_tolerance: 0.35
+      yaw_goal_tolerance: 0.60
 
     FollowPath:
       plugin: "dwb_core::DWBLocalPlanner"
       debug_trajectory_details: true
-      min_vel_x: 0.0
+      min_vel_x: -0.08
       min_vel_y: 0.0
-      max_vel_x: 0.45
+      max_vel_x: 0.20
       max_vel_y: 0.0
-      # 좌우 바퀴 응답 비대칭이 커질수록(고속 회전일수록) 더 벌어지는
-      # 것으로 보여서 회전 속도/가감속 한계를 낮춤 -- 더 낮고 꾸준한
-      # 회전 속도 구간에서 실제 거동이 명령과 덜 어긋난다.
-      max_vel_theta: 0.9
+      # Keep rotation below the range where the loaded chassis arcs wide and
+      # diverges from the differential-drive model.
+      max_vel_theta: 0.75
       min_speed_xy: 0.0
-      max_speed_xy: 0.45
+      max_speed_xy: 0.20
       min_speed_theta: 0.0
-      acc_lim_x: 3.5
+      acc_lim_x: 0.70
       acc_lim_y: 0.0
-      acc_lim_theta: 2.4
-      decel_lim_x: -3.0
+      acc_lim_theta: 1.40
+      decel_lim_x: -0.90
       decel_lim_y: 0.0
-      decel_lim_theta: -2.4
+      decel_lim_theta: -1.60
       vx_samples: 20
       vy_samples: 1
-      vtheta_samples: 40
-      sim_time: 1.0
+      vtheta_samples: 32
+      sim_time: 1.2
       linear_granularity: 0.05
       angular_granularity: 0.025
       transform_tolerance: 0.5
-      xy_goal_tolerance: 0.25
+      xy_goal_tolerance: 0.35
       trans_stopped_velocity: 0.03
       short_circuit_trajectory_evaluation: true
       stateful: true
       critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
-      BaseObstacle.scale: 0.02
-      PathAlign.scale: 32.0
+      BaseObstacle.scale: 0.10
+      PathAlign.scale: 20.0
       PathAlign.forward_point_distance: 0.1
       GoalAlign.scale: 24.0
       GoalAlign.forward_point_distance: 0.1
-      PathDist.scale: 32.0
+      PathDist.scale: 20.0
       GoalDist.scale: 24.0
-      RotateToGoal.scale: 32.0
-      RotateToGoal.slowing_factor: 5.0
+      RotateToGoal.scale: 10.0
+      RotateToGoal.slowing_factor: 2.0
       RotateToGoal.lookahead_time: -1.0
 
 planner_server:
@@ -174,9 +172,9 @@ behavior_server:
     transform_tolerance: 0.5
     transform_timeout: 0.1
     simulate_ahead_time: 2.0
-    max_rotational_vel: 1.0
-    min_rotational_vel: 0.4
-    rotational_acc_lim: 3.2
+    max_rotational_vel: 0.75
+    min_rotational_vel: 0.12
+    rotational_acc_lim: 1.40
     enable_stamped_cmd_vel: true
 
 bt_navigator:
@@ -219,20 +217,19 @@ local_costmap:
       global_frame: "odom"
       robot_base_frame: "base_footprint"
       rolling_window: true
-      width: 3
-      height: 3
+      width: 4
+      height: 4
       resolution: 0.05
-      robot_radius: 0.15
-      plugins: ["obstacle_layer", "voxel_layer", "inflation_layer"]
+      footprint: "[[-0.24, -0.19], [0.10, -0.19], [0.10, 0.19], [-0.24, 0.19]]"
+      plugins: ["obstacle_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        # 로컬 costmap은 DWB 가 실시간으로 쓰는 값이라 여기를 너무 넓게/
-        # 완만하게 잡으면(예: 0.4/4.0) 실제 좁은 방/가구 사이에서 로봇이
-        # 트래젝토리를 못 찾고 멈춰서는 증상이 났다. 원래 값으로 되돌림 --
-        # "맵이 아직 안 끝남" 안전 마진은 global costmap(아래)과
-        # allow_unknown:false 쪽에서 담당.
-        inflation_radius: 0.3
-        cost_scaling_factor: 5.0
+        # The tracked Waffle must leave more side clearance than the nominal
+        # TB3 footprint. Keep local inflation firm enough that DWB does not
+        # choose wall-hugging trajectories, but still smaller than global
+        # inflation so narrow rooms remain traversable.
+        inflation_radius: 0.45
+        cost_scaling_factor: 3.0
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: true
@@ -243,29 +240,10 @@ local_costmap:
           clearing: true
           marking: true
           data_type: "LaserScan"
+          inf_is_valid: true
           raytrace_max_range: 3.0
           raytrace_min_range: 0.0
-          obstacle_max_range: 2.5
-          obstacle_min_range: 0.0
-      voxel_layer:
-        plugin: "nav2_costmap_2d::VoxelLayer"
-        enabled: true
-        publish_voxel_map: true
-        origin_z: 0.0
-        z_resolution: 0.05
-        z_voxels: 16
-        max_obstacle_height: 2.0
-        mark_threshold: 0
-        observation_sources: scan
-        scan:
-          topic: "/scan_filtered"
-          max_obstacle_height: 2.0
-          clearing: true
-          marking: true
-          data_type: "LaserScan"
-          raytrace_max_range: 3.0
-          raytrace_min_range: 0.0
-          obstacle_max_range: 2.5
+          obstacle_max_range: 3.0
           obstacle_min_range: 0.0
       always_send_full_costmap: true
 
@@ -278,10 +256,10 @@ global_costmap:
       global_frame: "map"
       robot_base_frame: "base_footprint"
       transform_tolerance: 0.5
-      robot_radius: 0.15
+      footprint: "[[-0.24, -0.19], [0.10, -0.19], [0.10, 0.19], [-0.24, 0.19]]"
       resolution: 0.05
       track_unknown_space: true
-      plugins: ["static_layer", "obstacle_layer", "voxel_layer", "inflation_layer"]
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_topic: "/map"
@@ -297,34 +275,15 @@ global_costmap:
           clearing: true
           marking: true
           data_type: "LaserScan"
+          inf_is_valid: true
           raytrace_max_range: 3.0
           raytrace_min_range: 0.0
-          obstacle_max_range: 2.5
-          obstacle_min_range: 0.0
-      voxel_layer:
-        plugin: "nav2_costmap_2d::VoxelLayer"
-        enabled: true
-        publish_voxel_map: true
-        origin_z: 0.0
-        z_resolution: 0.05
-        z_voxels: 16
-        max_obstacle_height: 2.0
-        mark_threshold: 0
-        observation_sources: scan
-        scan:
-          topic: "/scan_filtered"
-          max_obstacle_height: 2.0
-          clearing: true
-          marking: true
-          data_type: "LaserScan"
-          raytrace_max_range: 3.0
-          raytrace_min_range: 0.0
-          obstacle_max_range: 2.5
+          obstacle_max_range: 3.0
           obstacle_min_range: 0.0
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        inflation_radius: 0.55
-        cost_scaling_factor: 3.0
+        inflation_radius: 0.70
+        cost_scaling_factor: 2.0
       always_send_full_costmap: true
 
 lifecycle_manager_navigation:

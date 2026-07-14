@@ -44,7 +44,7 @@ def destroy_node(node: FleetFollower) -> None:
         rclpy.shutdown()
 
 
-def test_default_target_is_seventy_centimetres_behind_leader():
+def test_default_target_is_fifty_centimetres_behind_leader():
     node = make_node()
     try:
         leader = PoseStamped()
@@ -55,7 +55,7 @@ def test_default_target_is_seventy_centimetres_behind_leader():
         node._leader_pose_callback(leader)
 
         target = node._target_behind_leader()
-        assert abs(target.pose.position.x - 0.30) < 1.0e-6
+        assert abs(target.pose.position.x - 0.50) < 1.0e-6
         assert abs(target.pose.position.y - 2.0) < 1.0e-6
     finally:
         destroy_node(node)
@@ -86,5 +86,15 @@ def test_stale_follow_action_response_cannot_replace_latest_handle():
         node._goal_response_callback(FakeFuture(latest_handle), 2)
         assert node.active_goal_handle is latest_handle
         assert node.active_goal_id == 2
+    finally:
+        destroy_node(node)
+
+
+def test_minimal_follower_has_no_start_motion_or_scan_slot_gates():
+    node = make_node()
+    try:
+        assert not hasattr(node, 'require_start_motion')
+        assert not hasattr(node, 'latest_scan')
+        assert not hasattr(node, 'formation_candidate_angles')
     finally:
         destroy_node(node)

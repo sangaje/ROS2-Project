@@ -9,6 +9,7 @@ role:=leader -> fleet bringup (default fleet_role=leader) + shared-map
 
 import os
 
+import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (
@@ -33,6 +34,18 @@ from fleet_bringup.launch_utils import (
     clean_process_environment,
     dds_launch_environment,
     launch_bool,
+    with_virtualenv_site_packages,
+)
+from system_bringup.launch_defaults import (
+    DEFAULT_ACTIVE_SCOUT,
+    DEFAULT_CMD_VEL_TOPIC,
+    DEFAULT_FOLLOWER,
+    DEFAULT_ROLE_TOPIC_TEMPLATE,
+)
+from system_bringup.fleet_registry import (
+    build_legacy_registry,
+    load_registry_file,
+    registry_to_json,
 )
 
 
@@ -46,18 +59,34 @@ DEFAULT_FLEET_ROLE = {
     'leader': 'leader',
 }
 
+
+def _tracked_cmd_vel_adapter_enabled(param_file: str) -> bool:
+    if not param_file:
+        return False
+    try:
+        with open(param_file, 'r', encoding='utf-8') as handle:
+            data = yaml.safe_load(handle) or {}
+    except OSError:
+        return False
+    params = data.get('tracked_cmd_vel_adapter', {}).get('ros__parameters', {})
+    return bool(params.get('enabled', False))
+
+
 def generate_launch_description():
     role = LaunchConfiguration('role')
     domain_id = LaunchConfiguration('domain_id')
     main_domain_id = LaunchConfiguration('main_domain_id')
     fleet_role = LaunchConfiguration('fleet_role')
+    leader_hardware_param_file = LaunchConfiguration('leader_hardware_param_file')
     start_robot_bringup = LaunchConfiguration('start_robot_bringup')
     start_nav2 = LaunchConfiguration('start_nav2')
     require_follower_pose = LaunchConfiguration('require_follower_pose')
     enable_cartographer = LaunchConfiguration('enable_cartographer')
     auto_localize = LaunchConfiguration('auto_localize')
+    leader_auto_localize = LaunchConfiguration('leader_auto_localize')
     enable_amcl = LaunchConfiguration('enable_amcl')
     start_risk_map = LaunchConfiguration('start_risk_map')
+    start_leader_risk_map = LaunchConfiguration('start_leader_risk_map')
     start_cartographer = LaunchConfiguration('start_cartographer')
     cartographer_configuration_basename = LaunchConfiguration(
         'cartographer_configuration_basename'
@@ -65,6 +94,7 @@ def generate_launch_description():
     start_camera = LaunchConfiguration('start_camera')
     start_teleop = LaunchConfiguration('start_teleop')
     risk_model_path = LaunchConfiguration('risk_model_path')
+    risk_target_class = LaunchConfiguration('risk_target_class')
     detection_source = LaunchConfiguration('detection_source')
     enable_yolo = LaunchConfiguration('enable_yolo')
     external_detection_topic = LaunchConfiguration('external_detection_topic')
@@ -80,29 +110,59 @@ def generate_launch_description():
     enable_pc_visualization_bridge = LaunchConfiguration(
         'enable_pc_visualization_bridge'
     )
+    forward_field_map_to_main = LaunchConfiguration('forward_field_map_to_main')
     member_domain_id = LaunchConfiguration('member_domain_id')
     follower_domain_id = LaunchConfiguration('follower_domain_id')
+    fleet_registry_file = LaunchConfiguration('fleet_registry_file')
     enable_scout_failover = LaunchConfiguration('enable_scout_failover')
     leader_robot_name = LaunchConfiguration('leader_robot_name')
     active_scout_robot_name = LaunchConfiguration('active_scout_robot_name')
     follower_robot_name = LaunchConfiguration('follower_robot_name')
+    require_video_ready = LaunchConfiguration('require_video_ready')
+    video_ready_topic = LaunchConfiguration('video_ready_topic')
+    leader_initial_x = LaunchConfiguration('leader_initial_x')
+    leader_initial_y = LaunchConfiguration('leader_initial_y')
+    leader_initial_yaw = LaunchConfiguration('leader_initial_yaw')
+    scout_initial_x = LaunchConfiguration('scout_initial_x')
+    scout_initial_y = LaunchConfiguration('scout_initial_y')
+    scout_initial_yaw = LaunchConfiguration('scout_initial_yaw')
+    follower_initial_x = LaunchConfiguration('follower_initial_x')
+    follower_initial_y = LaunchConfiguration('follower_initial_y')
+    follower_initial_yaw = LaunchConfiguration('follower_initial_yaw')
     scout_liveness_topic = LaunchConfiguration('scout_liveness_topic')
     scout_liveness_timeout_sec = LaunchConfiguration('scout_liveness_timeout_sec')
     scout_failure_confirm_sec = LaunchConfiguration('scout_failure_confirm_sec')
     scout_pose_topic = LaunchConfiguration('scout_pose_topic')
     scout_pose_timeout_sec = LaunchConfiguration('scout_pose_timeout_sec')
     enable_leader_shadow_follow = LaunchConfiguration('enable_leader_shadow_follow')
+    leader_follow_backend = LaunchConfiguration('leader_follow_backend')
+    leader_shadow_direct_cmd_vel = LaunchConfiguration('leader_shadow_direct_cmd_vel')
     leader_shadow_follow_distance_m = LaunchConfiguration('leader_shadow_follow_distance_m')
     leader_shadow_stop_distance_m = LaunchConfiguration('leader_shadow_stop_distance_m')
     leader_shadow_resume_distance_m = LaunchConfiguration('leader_shadow_resume_distance_m')
     leader_shadow_far_distance_m = LaunchConfiguration('leader_shadow_far_distance_m')
     leader_shadow_max_linear_vel = LaunchConfiguration('leader_shadow_max_linear_vel')
+    leader_shadow_catchup_max_linear_vel = LaunchConfiguration(
+        'leader_shadow_catchup_max_linear_vel'
+    )
     leader_shadow_max_angular_vel = LaunchConfiguration('leader_shadow_max_angular_vel')
     leader_shadow_goal_update_period_sec = LaunchConfiguration(
         'leader_shadow_goal_update_period_sec'
     )
     leader_shadow_goal_min_change_m = LaunchConfiguration(
         'leader_shadow_goal_min_change_m'
+    )
+    leader_shadow_cmd_linear_scale = LaunchConfiguration(
+        'leader_shadow_cmd_linear_scale'
+    )
+    leader_shadow_cmd_angular_scale = LaunchConfiguration(
+        'leader_shadow_cmd_angular_scale'
+    )
+    leader_shadow_cmd_max_linear_vel = LaunchConfiguration(
+        'leader_shadow_cmd_max_linear_vel'
+    )
+    leader_shadow_cmd_max_angular_vel = LaunchConfiguration(
+        'leader_shadow_cmd_max_angular_vel'
     )
     leader_shadow_heading_min_motion_m = LaunchConfiguration(
         'leader_shadow_heading_min_motion_m'
@@ -125,16 +185,28 @@ def generate_launch_description():
         'enable_localization_spin_on_takeover'
     )
     enable_exploration = LaunchConfiguration('enable_exploration')
+    rl_backend = LaunchConfiguration('rl_backend')
+    start_rl_worker = LaunchConfiguration('start_rl_worker')
+    rl_initial_role_active = LaunchConfiguration('rl_initial_role_active')
     start_omx_aim = LaunchConfiguration('start_omx_aim')
+    omx_dry_run = LaunchConfiguration('omx_dry_run')
     start_yolo_server = LaunchConfiguration('start_yolo_server')
     yolo_server_delay_sec = LaunchConfiguration('yolo_server_delay_sec')
     yolo_server_host = LaunchConfiguration('yolo_server_host')
     yolo_server_port = LaunchConfiguration('yolo_server_port')
     yolo_server_model_path = LaunchConfiguration('yolo_server_model_path')
+    yolo_server_target_class = LaunchConfiguration('yolo_server_target_class')
+    yolo_server_conf = LaunchConfiguration('yolo_server_conf')
     yolo_server_device = LaunchConfiguration('yolo_server_device')
     yolo_server_half = LaunchConfiguration('yolo_server_half')
     omx_yolo_node_delay_sec = LaunchConfiguration('omx_yolo_node_delay_sec')
     omx_camera_index = LaunchConfiguration('omx_camera_index')
+    omx_camera_device = LaunchConfiguration('omx_camera_device')
+    omx_camera_backend = LaunchConfiguration('omx_camera_backend')
+    omx_camera_reconnect_period_sec = LaunchConfiguration(
+        'omx_camera_reconnect_period_sec'
+    )
+    omx_camera_required = LaunchConfiguration('omx_camera_required')
     start_patrol_planner = LaunchConfiguration('start_patrol_planner')
     patrol_planner_delay_sec = LaunchConfiguration('patrol_planner_delay_sec')
     patrol_min_risk = LaunchConfiguration('patrol_min_risk')
@@ -145,9 +217,15 @@ def generate_launch_description():
     patrol_max_candidate_cells = LaunchConfiguration('patrol_max_candidate_cells')
     debug_stream = LaunchConfiguration('debug_stream')
     debug_port = LaunchConfiguration('debug_port')
+    debug_fps = LaunchConfiguration('debug_fps')
+    debug_quality = LaunchConfiguration('debug_quality')
+    debug_width = LaunchConfiguration('debug_width')
+    debug_height = LaunchConfiguration('debug_height')
     unified_dashboard = LaunchConfiguration('unified_dashboard')
     dashboard_host = LaunchConfiguration('dashboard_host')
     dashboard_port = LaunchConfiguration('dashboard_port')
+    require_scout_video_ready = LaunchConfiguration('require_scout_video_ready')
+    require_omx_video_ready = LaunchConfiguration('require_omx_video_ready')
 
     def make_stack(context):
         role_value = role.perform(context).strip().lower()
@@ -157,47 +235,98 @@ def generate_launch_description():
             )
 
         domain = int(domain_id.perform(context))
-        process_env = clean_process_environment(str(domain))
+        process_env = with_virtualenv_site_packages(
+            clean_process_environment(str(domain))
+        )
 
         fleet_role_value = fleet_role.perform(context).strip().lower()
         if not fleet_role_value:
             fleet_role_value = DEFAULT_FLEET_ROLE[role_value]
+
+        registry_file_value = fleet_registry_file.perform(context).strip()
+        if registry_file_value:
+            field_registry = load_registry_file(registry_file_value)
+        else:
+            field_registry = build_legacy_registry(
+                active_scout_robot_name=active_scout_robot_name.perform(context),
+                risk_domain_id=risk_domain_id.perform(context),
+                follower_robot_name=follower_robot_name.perform(context),
+                follower_domain_id=follower_domain_id.perform(context),
+            )
+        field_registry_json = registry_to_json(field_registry)
         if fleet_role_value not in FLEET_LAUNCH_FILES:
             raise ValueError(
                 f"fleet_role must be one of {sorted(FLEET_LAUNCH_FILES)}, "
                 f'got {fleet_role_value!r}'
             )
+        if role_value == 'leader' and fleet_role_value != 'leader':
+            raise ValueError(
+                'role:=leader must use fleet_role:=leader; a member/follower '
+                'stack publishes a different robot pose topic.'
+            )
+        rl_backend_value = rl_backend.perform(context).strip().lower()
+        if rl_backend_value not in ('disabled', 'in_process', 'external_worker'):
+            raise ValueError(
+                'rl_backend must be one of disabled, in_process, external_worker; '
+                f'got {rl_backend_value!r}'
+            )
+        start_rl_worker_value = launch_bool(start_rl_worker.perform(context))
+        if rl_backend_value == 'in_process' and start_rl_worker_value:
+            raise ValueError(
+                'rl_backend:=in_process conflicts with start_rl_worker:=true; '
+                'choose exactly one RL runtime backend.'
+            )
+        if rl_backend_value == 'disabled' and start_rl_worker_value:
+            raise ValueError(
+                'rl_backend:=disabled conflicts with start_rl_worker:=true.'
+            )
+        if (
+            rl_backend_value == 'external_worker'
+            and launch_bool(rl_initial_role_active.perform(context))
+        ):
+            raise ValueError(
+                'external_worker must start role-gated; '
+                'set rl_initial_role_active:=false.'
+            )
 
         main_domain_value = main_domain_id.perform(context).strip()
         main_domain = domain
         if fleet_role_value in ('follower', 'member'):
-            if not main_domain_value:
-                raise ValueError(
-                    'main_domain_id is required for scout/member/follower '
-                    'bridging. Pass the launch option '
-                    'main_domain_id:=<leader_domain>.'
-                )
-            main_domain = int(main_domain_value)
+            if main_domain_value:
+                main_domain = int(main_domain_value)
 
         fleet_share = get_package_share_directory('fleet_bringup')
         fleet_launch_path = os.path.join(
             fleet_share, 'launch', FLEET_LAUNCH_FILES[fleet_role_value]
         )
+        leader_hardware_file = ''
+        leader_cmd_vel_topic = '/cmd_vel'
+        if fleet_role_value == 'leader':
+            leader_hardware_file = leader_hardware_param_file.perform(context).strip()
+            if not leader_hardware_file:
+                leader_hardware_file = os.path.join(
+                    fleet_share, 'config', 'tracked_waffle_kinematics.yaml'
+                )
+            if _tracked_cmd_vel_adapter_enabled(leader_hardware_file):
+                leader_cmd_vel_topic = '/cmd_vel_nav'
 
-        # Will this scout end up owning its own SLAM (risk map's
-        # Cartographer, via start_cartographer:=true + enable_amcl:=false)?
-        # Applies whether the scout is currently in member or follower
-        # fleet_role -- a follower is just a scout temporarily tailing the
-        # leader instead of exploring (RL suspended above), and its risk
-        # map/camera/Cartographer keep running regardless. If so it needs
-        # the wheel odometry's own odom->base_footprint TF broadcast
-        # disabled, or Cartographer's map->odom(->base_footprint) fights
-        # it and TF splits into two disconnected trees.
+        follower_initial_role = (
+            role_value == 'scout' and fleet_role_value == 'follower'
+        )
+        cartographer_requested = launch_bool(start_cartographer.perform(context))
+        risk_map_requested = launch_bool(start_risk_map.perform(context))
+        if follower_initial_role:
+            cartographer_requested = False
+            risk_map_requested = False
+
+        # Only the initial ACTIVE_SCOUT/member stack may own local SLAM at
+        # startup. A FOLLOWER uses the Leader shared map for AMCL/Nav2; its
+        # outbound map bridge can still be pre-created so takeover SLAM has
+        # a live route back to the Leader as soon as it starts.
         scout_owns_slam = (
             role_value == 'scout'
-            and fleet_role_value in ('member', 'follower')
-            and launch_bool(start_risk_map.perform(context))
-            and launch_bool(start_cartographer.perform(context))
+            and fleet_role_value == 'member'
+            and cartographer_requested
             and not launch_bool(enable_amcl.perform(context))
         )
         scout_rl_owns_cmd_vel = (
@@ -213,13 +342,38 @@ def generate_launch_description():
             fleet_launch_args['require_follower_pose'] = (
                 require_follower_pose.perform(context)
             )
+            fleet_launch_args['leader_initial_x'] = leader_initial_x.perform(context)
+            fleet_launch_args['leader_initial_y'] = leader_initial_y.perform(context)
+            fleet_launch_args['leader_initial_yaw'] = leader_initial_yaw.perform(context)
             fleet_launch_args['enable_cartographer'] = (
                 enable_cartographer.perform(context)
             )
-        if fleet_role_value in ('follower', 'member', 'leader'):
+            fleet_launch_args['auto_localize'] = (
+                leader_auto_localize.perform(context)
+            )
+            fleet_launch_args['hardware_param_file'] = leader_hardware_file
+            fleet_launch_args['active_scout_id_topic'] = '/failover/active_scout_id'
+            fleet_launch_args['active_scout_robot_name'] = (
+                active_scout_robot_name.perform(context)
+            )
+            fleet_launch_args['follower_robot_name'] = (
+                follower_robot_name.perform(context)
+            )
+            fleet_launch_args['follower_map_bridge_topic'] = (
+                f'/field/{follower_robot_name.perform(context)}/map'
+            )
+        if fleet_role_value in ('follower', 'member'):
             fleet_launch_args['auto_localize'] = (
                 auto_localize.perform(context)
             )
+        if fleet_role_value == 'member':
+            fleet_launch_args['member_initial_x'] = scout_initial_x.perform(context)
+            fleet_launch_args['member_initial_y'] = scout_initial_y.perform(context)
+            fleet_launch_args['member_initial_yaw'] = scout_initial_yaw.perform(context)
+        if fleet_role_value == 'follower':
+            fleet_launch_args['follower_initial_x'] = follower_initial_x.perform(context)
+            fleet_launch_args['follower_initial_y'] = follower_initial_y.perform(context)
+            fleet_launch_args['follower_initial_yaw'] = follower_initial_yaw.perform(context)
         if (
             role_value == 'scout'
             and fleet_role_value == 'follower'
@@ -229,7 +383,11 @@ def generate_launch_description():
         if fleet_role_value in ('follower', 'member'):
             fleet_launch_args['main_domain_id'] = str(main_domain)
             fleet_launch_args['forward_map_to_main'] = (
-                'true' if scout_owns_slam else 'false'
+                forward_field_map_to_main.perform(context)
+            )
+        if fleet_role_value == 'member':
+            fleet_launch_args['receive_leader_map'] = (
+                'false' if scout_owns_slam else 'true'
             )
         if fleet_role_value in ('leader', 'member'):
             nav2_value = start_nav2.perform(context)
@@ -251,8 +409,14 @@ def generate_launch_description():
         # leader.launch.py can each give SLAM up (enable_amcl:=false /
         # enable_cartographer:=false).
         if fleet_role_value in ('member', 'follower'):
-            fleet_launch_args['enable_amcl'] = enable_amcl.perform(context)
-            fleet_stack_owns_slam = launch_bool(enable_amcl.perform(context))
+            fleet_launch_args['enable_amcl'] = (
+                'true' if follower_initial_role else enable_amcl.perform(context)
+            )
+            fleet_stack_owns_slam = (
+                True
+                if follower_initial_role
+                else launch_bool(enable_amcl.perform(context))
+            )
         else:  # leader
             fleet_stack_owns_slam = launch_bool(
                 enable_cartographer.perform(context)
@@ -269,6 +433,29 @@ def generate_launch_description():
                 launch_arguments=fleet_launch_args.items(),
             ),
         ]
+        if fleet_role_value in ('member', 'follower') and not main_domain_value:
+            actions.append(LogInfo(msg=[
+                'SYSTEM_BRINGUP | main_domain_id not set; running ',
+                fleet_role_value,
+                ' standalone on domain ', str(domain),
+                ' without cross-domain fleet bridge.',
+            ]))
+        if follower_initial_role:
+            actions.append(LogInfo(msg=[
+                'FOLLOWER_CAPABILITY_STATUS | robot=',
+                follower_robot_name.perform(context),
+                ' role=FOLLOWER active_scout_id=',
+                active_scout_robot_name.perform(context),
+                ' follow_enabled=true amcl_enabled=true nav2_enabled=true ',
+                'cartographer_enabled=false rl_initial_active=false ',
+                'takeover_rl_standby=',
+                str(launch_bool(enable_exploration.perform(context))).lower(),
+                ' ',
+                'confidence_enabled=false map_authority=false ',
+                'local_map_outbound=',
+                forward_field_map_to_main.perform(context),
+                ' blocking_reason=waiting_for_takeover',
+            ]))
         if scout_rl_owns_cmd_vel and launch_bool(start_nav2.perform(context)):
             actions.append(LogInfo(msg=[
                 'SYSTEM_BRINGUP | scout member RL owns /cmd_vel; forcing ',
@@ -286,19 +473,25 @@ def generate_launch_description():
             if role_value == 'scout' and fleet_role_value == 'follower'
             else active_scout_robot_name.perform(context)
         )
+        field_observation_topic = f'/field/{scout_robot_name}/risk_observation'
 
         if (
             role_value == 'scout'
             and (
                 fleet_role_value == 'member'
-                or launch_bool(enable_scout_failover.perform(context))
+                or fleet_role_value == 'follower'
             )
         ):
             local_exploration = launch_bool(enable_exploration.perform(context))
-            if local_exploration:
+            if local_exploration and rl_backend_value == 'external_worker':
                 actions.append(LogInfo(msg=[
-                    'SYSTEM_BRINGUP | ACTIVE_SCOUT RL is in-process in '
-                    'unified_field_robot; no eval_policy subprocess is started.',
+                    'SYSTEM_BRINGUP | ACTIVE_SCOUT RL backend=external_worker; '
+                    'unified_field_robot publishes only role/status/nav state.',
+                ]))
+            elif local_exploration and rl_backend_value == 'in_process':
+                actions.append(LogInfo(msg=[
+                    'SYSTEM_BRINGUP | ACTIVE_SCOUT RL backend=in_process; '
+                    'external worker is disabled by mutual exclusion.',
                 ]))
             else:
                 actions.append(LogInfo(msg=[
@@ -316,9 +509,7 @@ def generate_launch_description():
             self_pose_topic = (
                 '/burger_pose' if fleet_role_value == 'follower' else '/member_pose'
             )
-            actions.append(TimerAction(
-                period=2.5,
-                actions=[Node(
+            actions.append(Node(
                     package='system_bringup',
                     executable='unified_field_robot',
                     name='unified_field_robot',
@@ -335,11 +526,29 @@ def generate_launch_description():
                             enable_localization_spin_on_takeover.perform(context)
                         ),
                         'enable_exploration': local_exploration,
+                        'rl_backend': rl_backend_value,
                         'leader_pose_topic': '/leader_pose',
                         'self_pose_topic': self_pose_topic,
-                        'require_localization_ready': not scout_owns_slam,
+                        'require_localization_ready': (
+                            False if follower_initial_role else not scout_owns_slam
+                        ),
+                        'require_follow_localization_ready': (
+                            False if follower_initial_role else not scout_owns_slam
+                        ),
                         'localization_ready_topic': '/localization_ready',
-                        'follow_distance_m': 0.70,
+                        'require_system_ready': False,
+                        'system_ready_topic': '/system/ready',
+                        'require_start_motion': False,
+                        'start_motion_topic': '/fleet/start_motion',
+                        'follow_distance_m': 0.50,
+                        'follow_stop_distance_m': 0.35,
+                        'follow_resume_distance_m': 0.55,
+                        'follow_goal_period_sec': 0.5,
+                        'follow_goal_update_distance_m': 0.10,
+                        'follow_startup_leader_motion_m': 0.0,
+                        'follow_startup_close_distance_m': 0.55,
+                        'follow_startup_timeout_sec': 4.0,
+                        'self_pose_timeout_sec': 0.5,
                         'recovery_arrival_tolerance_m': float(
                             scout_takeover_arrival_tolerance_m.perform(context)
                         ),
@@ -350,16 +559,114 @@ def generate_launch_description():
                         'spin_timeout_sec': 42.0,
                         'settle_duration_sec': 3.0,
                         'max_spin_retries': 3,
-                        'cmd_vel_topic': '/cmd_vel',
+                        'cmd_vel_topic': DEFAULT_CMD_VEL_TOPIC,
+                        'external_rl_cmd_topic': '/fleet/active_scout_rl_cmd',
                         'use_stamped_cmd_vel': True,
                     }],
                     env=process_env,
                     respawn=True,
                     respawn_delay=3.0,
-                )],
             ))
+            if (
+                local_exploration
+                and rl_backend_value == 'external_worker'
+                and start_rl_worker_value
+            ):
+                scout_rl_launch = os.path.join(
+                    get_package_share_directory('system_bringup'),
+                    'launch',
+                    'scout_rl_inference.launch.py',
+                )
+                actions.append(IncludeLaunchDescription(
+                        PythonLaunchDescriptionSource(scout_rl_launch),
+                        launch_arguments={
+                            'domain_id': str(domain),
+                            'robot_name': local_robot_name,
+                            'role_topic': DEFAULT_ROLE_TOPIC_TEMPLATE.format(
+                                robot_name=local_robot_name
+                            ),
+                            'initial_role_active': (
+                                'true' if fleet_role_value == 'member' else 'false'
+                            ),
+                            'require_failover_activation': 'true',
+                            'require_localization_ready': (
+                                'false'
+                                if (scout_owns_slam or follower_initial_role)
+                                else 'true'
+                            ),
+                            'require_video_ready': 'false',
+                            'video_ready_topic': '/fleet/start_motion',
+                            'require_start_motion': 'false',
+                            'start_motion_topic': '/fleet/start_motion',
+                            'require_system_ready': 'false',
+                            'system_ready_topic': '/system/ready',
+                            'direct_rl_start': (
+                                'true' if fleet_role_value == 'member' else 'false'
+                            ),
+                            'load_model_on_start': 'true',
+                            'cmd_vel_topic': DEFAULT_CMD_VEL_TOPIC,
+                            'odom_topic': '/odom',
+                            'max_odom_age_sec': '2.0',
+                            'use_stamped_cmd_vel': 'true',
+                            'enable_velocity_safety_filter': 'true',
+                        }.items(),
+                ))
+            if follower_initial_role and launch_bool(enable_scout_failover.perform(context)):
+                actions.append(Node(
+                    package='system_bringup',
+                    executable='takeover_stack_manager',
+                    name='takeover_stack_manager',
+                    output='screen',
+                    parameters=[{
+                        'robot_name': local_robot_name,
+                        'role_topic': DEFAULT_ROLE_TOPIC_TEMPLATE.format(
+                            robot_name=local_robot_name
+                        ),
+                        'enabled': True,
+                        'start_cartographer': True,
+                        'start_risk_map': True,
+                        'start_map_exporter': True,
+                        'map_export_input_topic': '/map',
+                        'map_export_output_topic': '/local_slam_map',
+                        'map_export_keepalive_sec': 1.0,
+                        'cartographer_configuration_basename': (
+                            'turtlebot3_lds_2d_risk_safe_no_odom.lua'
+                        ),
+                        'detection_source': 'flask_topic',
+                        'external_detection_topic': field_observation_topic,
+                        'enable_yolo': False,
+                        'start_camera': False,
+                        'start_rviz': False,
+                        'pre_shutdown_lifecycle_nodes': ['/amcl'],
+                    }],
+                    env=process_env,
+                    respawn=True,
+                    respawn_delay=3.0,
+                ))
 
         if role_value == 'leader':
+            leader_localization_ready_gate = (
+                not launch_bool(enable_cartographer.perform(context))
+            )
+            if field_registry:
+                actions.append(Node(
+                    package='system_bringup',
+                    executable='active_field_source_mux',
+                    name='active_field_source_mux',
+                    output='screen',
+                    parameters=[{
+                        'fleet_registry_json': field_registry_json,
+                        'active_scout_robot_name': active_scout_robot_name.perform(context),
+                        'risk_domain_id': risk_domain_id.perform(context),
+                        'follower_robot_name': follower_robot_name.perform(context),
+                        'follower_domain_id': follower_domain_id.perform(context),
+                        'active_scout_id_topic': '/failover/active_scout_id',
+                        'scout_epoch_topic': '/failover/scout_epoch',
+                    }],
+                    env=process_env,
+                    respawn=True,
+                    respawn_delay=3.0,
+                ))
             risk_domain_value = risk_domain_id.perform(context).strip()
             if (
                 launch_bool(enable_risk_to_leader_bridge.perform(context))
@@ -374,6 +681,14 @@ def generate_launch_description():
                         risk_domain,
                         domain,
                         include_map=not leader_owns_map,
+                        map_source_topic=(
+                            f'/field/{active_scout_robot_name.perform(context)}/map_out'
+                        ),
+                        include_identity_topics=False,
+                        include_rl_confidence_map=True,
+                        include_risk_outputs=not launch_bool(
+                            start_leader_risk_map.perform(context)
+                        ),
                     )
                     if leader_owns_map:
                         actions.append(LogInfo(msg=[
@@ -413,6 +728,91 @@ def generate_launch_description():
                         'SYSTEM_BRINGUP | risk_domain_id equals leader '
                         'domain; risk->leader bridge skipped.'
                     ]))
+
+            if launch_bool(start_leader_risk_map.perform(context)):
+                risk_share = get_package_share_directory('bayesian_risk_map')
+                risk_config = os.path.join(
+                    risk_share, 'config', 'bayesian_risk_map.yaml'
+                )
+                actions.append(TimerAction(
+                    period=2.0,
+                    actions=[Node(
+                        package='bayesian_risk_map',
+                        executable='bayesian_risk_map_node',
+                        name='leader_bayesian_risk_map_node',
+                        output='screen',
+                        parameters=[
+                            risk_config,
+                            {
+                                'use_sim_time': False,
+                                'map_topic': '/map',
+                                'map_qos_durability': 'transient_local',
+                                'map_frame': 'map',
+                                'base_frame': 'base_footprint',
+                                'pose_source': 'topic',
+                                'pose_topic': scout_pose_topic.perform(context),
+                                'pose_topic_stale_sec': (
+                                    scout_pose_timeout_sec.perform(context)
+                                ),
+                                'detection_source': 'flask_topic',
+                                'external_detection_topic': (
+                                    f'/field/{active_scout_robot_name.perform(context)}/risk_observation'
+                                ),
+                                'observation_topics': [
+                                    f'/field/{active_scout_robot_name.perform(context)}/risk_observation',
+                                    f'/field/{follower_robot_name.perform(context)}/risk_observation',
+                                ],
+                                'require_active_observation_source': False,
+                                'external_accept_any_detection': True,
+                                'external_pose_fallback_to_current': True,
+                                'active_scout_id': active_scout_robot_name.perform(context),
+                                'active_scout_id_topic': '/failover/active_scout_id',
+                                'scout_epoch_topic': '/failover/scout_epoch',
+                                'enable_yolo': False,
+                                'publish_overlay': False,
+                                'publish_debug_image': False,
+                                'publish_debug_compressed_image': False,
+                                'publish_diagnostic_maps': False,
+                                'debug_show_opencv': False,
+                                'teleop_mode': True,
+                                'risk_publish_rate_hz': 1.0,
+                                'diagnostic_publish_rate_hz': 1.0,
+                                'region_update_period_sec': 1.5,
+                                'enable_room_probability': False,
+                                'enable_region_segmentation': False,
+                                'enable_visibility_tracking': True,
+                                'target_class': '-1',
+                                'model_path': risk_model_path.perform(context),
+                                'camera_hfov_deg': leader_scan_fov_deg.perform(context),
+                                'leader_camera_hfov_deg': leader_scan_fov_deg.perform(context),
+                                'positive_projection_mode': 'range_cone',
+                                'use_bbox_range_prior': True,
+                                'source_min_value': 0.01,
+                                'positive_memory_alpha': 0.95,
+                                'person_bayes_candidate_power': 0.35,
+                                'detection_timeout_sec': 6.0,
+                                'detection_reuse_max_distance_m': 2.5,
+                                'leader_observation_max_age_sec': 4.0,
+                                'leader_camera_yaw_max_age_sec': 4.0,
+                                'leader_visible_risk_decay_per_sec': 3.5,
+                                'visible_risk_decay_per_sec': 0.8,
+                            },
+                        ],
+                        env=process_env,
+                        respawn=True,
+                        respawn_delay=3.0,
+                    )],
+                ))
+                actions.append(LogInfo(msg=[
+                    'SYSTEM_BRINGUP | leader Jetson owns Bayesian risk map; ',
+                    'source pose=', scout_pose_topic.perform(context),
+                    ' observations=/field/',
+                    active_scout_robot_name.perform(context),
+                    '/risk_observation,/field/',
+                    follower_robot_name.perform(context),
+                    '/risk_observation',
+                    ' map=/map',
+                ]))
 
             actions.append(TimerAction(
                 period=3.0,
@@ -472,29 +872,38 @@ def generate_launch_description():
                     ]))
 
             if launch_bool(start_yolo_server.perform(context)):
-                flask_yolo_exe = PathJoinSubstitution([
-                    FindPackagePrefix('flask_yolo_bridge'),
-                    'lib',
-                    'flask_yolo_bridge',
-                    'flask_yolo_server',
-                ])
+                virtual_env = os.environ.get('VIRTUAL_ENV', '').strip()
+                python_exe = (
+                    os.path.join(virtual_env, 'bin', 'python3')
+                    if virtual_env else 'python3'
+                )
+                yolo_model_path = yolo_server_model_path.perform(context)
+                if yolo_model_path and not os.path.isabs(yolo_model_path):
+                    yolo_model_path = os.path.abspath(yolo_model_path)
+                target_class_value = yolo_server_target_class.perform(context).strip().lower()
+                target_class_args = (
+                    ['--all-classes']
+                    if target_class_value in ('', 'all', 'none', '-1')
+                    else ['--target-class', target_class_value]
+                )
                 flask_yolo_server = ExecuteProcess(
                     cmd=[
-                        flask_yolo_exe,
+                        python_exe,
+                        '-m', 'flask_yolo_bridge.flask_yolo_server',
                         '--host', yolo_server_host.perform(context),
                         '--port', yolo_server_port.perform(context),
-                        '--model-path', yolo_server_model_path.perform(context),
-                        '--target-class', '1',
+                        '--model-path', yolo_model_path,
+                        *target_class_args,
                         '--device', yolo_server_device.perform(context),
                         '--half', yolo_server_half.perform(context),
-                        '--fast-forward', 'true',
-                        '--conf', '0.20',
+                        '--conf', yolo_server_conf.perform(context),
                         '--iou', '0.45',
                         '--max-det', '64',
-                        '--imgsz', '960',
-                        '--debug-jpeg-quality', '75',
+                        '--imgsz', '640',
+                        '--debug-jpeg-quality', '52',
                         '--max-capture-age-sec', '1.5',
                         '--max-queue-wait-sec', '0.05',
+                        '--async-latest', 'true',
                     ],
                     output='screen',
                     name='flask_yolo_server',
@@ -542,7 +951,16 @@ def generate_launch_description():
                         'yolo_node_model_path': (
                             yolo_server_model_path.perform(context)
                         ),
+                        'omx_dry_run': omx_dry_run.perform(context),
                         'omx_camera_index': omx_camera_index.perform(context),
+                        'omx_camera_device': omx_camera_device.perform(context),
+                        'omx_camera_backend': omx_camera_backend.perform(context),
+                        'omx_camera_reconnect_period_sec': (
+                            omx_camera_reconnect_period_sec.perform(context)
+                        ),
+                        'omx_camera_required': omx_camera_required.perform(context),
+                        'require_start_motion': 'false',
+                        'start_motion_topic': '/fleet/start_motion',
                         'start_patrol_planner': (
                             start_patrol_planner.perform(context)
                         ),
@@ -561,12 +979,21 @@ def generate_launch_description():
                         ),
                         'debug_stream': debug_stream.perform(context),
                         'debug_port': debug_port.perform(context),
+                        'debug_fps': debug_fps.perform(context),
+                        'debug_quality': debug_quality.perform(context),
+                        'debug_width': debug_width.perform(context),
+                        'debug_height': debug_height.perform(context),
                     }.items(),
                 ))
             if launch_bool(enable_leader_shadow_follow.perform(context)):
-                actions.append(TimerAction(
-                    period=9.0,
-                    actions=[Node(
+                follow_backend_value = leader_follow_backend.perform(context).strip().lower()
+                if not follow_backend_value:
+                    follow_backend_value = (
+                        'direct'
+                        if launch_bool(leader_shadow_direct_cmd_vel.perform(context))
+                        else 'nav2'
+                    )
+                actions.append(Node(
                         package='system_bringup',
                         executable='leader_shadow_follow',
                         name='leader_shadow_follow',
@@ -577,18 +1004,37 @@ def generate_launch_description():
                             'active_scout_pose_topic': scout_pose_topic.perform(context),
                             'follower_scout_pose_topic': '/burger_pose',
                             'leader_goal_topic': '/fleet/leader_coord_goal',
+                            'navigate_action': '/navigate_to_pose',
                             'leader_cancel_topic': '/fleet/leader_nav_cancel',
+                            'cmd_vel_topic': leader_cmd_vel_topic,
+                            'use_stamped_cmd_vel': True,
+                            'leader_follow_backend': follow_backend_value,
+                            'leader_path_topic': '/plan',
+                            'odom_topic': '/odom',
+                            'direct_shadow_cmd_vel': follow_backend_value == 'direct',
                             'map_topic': '/map',
+                            'risk_topic': '/risk/risk_map',
+                            'enable_risk_priority_follow': True,
+                            'risk_min_value': 1,
                             'failover_state_topic': '/failover/state',
                             'active_scout_id_topic': '/failover/active_scout_id',
                             'active_scout_robot_name': active_scout_robot_name.perform(context),
                             'follower_robot_name': follower_robot_name.perform(context),
-                            'require_localization_ready': True,
+                            'require_localization_ready': leader_localization_ready_gate,
                             'localization_ready_topic': '/localization_ready',
+                            'require_video_ready': False,
+                            'video_ready_topic': '/fleet/video_ready',
+                            'target_memory_hold_sec': 5.0,
+                            'target_reacquire_publish_period_sec': 0.5,
+                            'target_processed_topic': '/omx/target_processed',
+                            'target_lost_topic': '/omx/target_lost',
+                            'target_reacquire_topic': '/omx/target_in_map',
+                            'require_system_ready': False,
+                            'system_ready_topic': '/system/ready',
                             'scout_pose_timeout_sec': float(
                                 scout_pose_timeout_sec.perform(context)
                             ),
-                            'startup_grace_sec': 8.0,
+                            'startup_grace_sec': 0.0,
                             'leader_shadow_follow_distance_m': float(
                                 leader_shadow_follow_distance_m.perform(context)
                             ),
@@ -604,6 +1050,9 @@ def generate_launch_description():
                             'leader_shadow_max_linear_vel': float(
                                 leader_shadow_max_linear_vel.perform(context)
                             ),
+                            'leader_shadow_catchup_max_linear_vel': float(
+                                leader_shadow_catchup_max_linear_vel.perform(context)
+                            ),
                             'leader_shadow_max_angular_vel': float(
                                 leader_shadow_max_angular_vel.perform(context)
                             ),
@@ -613,6 +1062,19 @@ def generate_launch_description():
                             'leader_shadow_goal_min_change_m': float(
                                 leader_shadow_goal_min_change_m.perform(context)
                             ),
+                            'leader_shadow_cmd_linear_scale': float(
+                                leader_shadow_cmd_linear_scale.perform(context)
+                            ),
+                            'leader_shadow_cmd_angular_scale': float(
+                                leader_shadow_cmd_angular_scale.perform(context)
+                            ),
+                            'leader_shadow_cmd_max_linear_vel': float(
+                                leader_shadow_cmd_max_linear_vel.perform(context)
+                            ),
+                            'leader_shadow_cmd_max_angular_vel': float(
+                                leader_shadow_cmd_max_angular_vel.perform(context)
+                            ),
+                            'enable_controller_speed_limit': False,
                             'leader_shadow_heading_min_motion_m': float(
                                 leader_shadow_heading_min_motion_m.perform(context)
                             ),
@@ -633,7 +1095,6 @@ def generate_launch_description():
                         env=process_env,
                         respawn=True,
                         respawn_delay=3.0,
-                    )],
                 ))
             if launch_bool(unified_dashboard.perform(context)):
                 actions.append(Node(
@@ -648,7 +1109,6 @@ def generate_launch_description():
                         'omx_stream_path': '/stream.mjpg',
                         'omx_state_path': '/state.json',
                         'yolo_server_port': int(yolo_server_port.perform(context)),
-                        'yolo_raw_stream_path': '/stream/raw.mjpg',
                         'yolo_overlay_stream_path': '/stream/yolo.mjpg',
                         'yolo_status_path': '/api/status',
                         'map_topic': '/map',
@@ -660,6 +1120,7 @@ def generate_launch_description():
                         'second_follower_pose_topic': '/member_pose',
                         'second_follower_name': 'scout22',
                         'second_follower_role': 'scout',
+                        'fleet_registry_json': field_registry_json,
                         'fleet_poses_topic': '/fleet/robot_poses',
                         'fleet_status_topic': '/fleet/coordination_status',
                         'collision_warning_topic': '/fleet/collision_warning',
@@ -668,11 +1129,55 @@ def generate_launch_description():
                         'follower_nav_path_topic': '/burger_plan',
                         'member_nav_path_topic': '/member_plan',
                         'omx_waypoint_route_topic': '/omx/waypoint_route',
+                        'video_ready_topic': video_ready_topic.perform(context),
+                        'start_motion_topic': '/fleet/start_motion',
+                        'readiness_detail_topic': '/fleet/readiness_detail',
+                        'start_motion_detail_topic': '/fleet/start_motion_detail',
+                        'system_ready_topic': '/system/ready',
+                        'system_readiness_detail_topic': '/system/readiness_detail',
+                        'video_ready_max_age_sec': 5.0,
+                        'require_scout_video_ready': launch_bool(
+                            require_scout_video_ready.perform(context)
+                        ),
+                        'require_omx_video_ready': launch_bool(
+                            require_omx_video_ready.perform(context)
+                        ),
                     }],
                     env=process_env,
                     respawn=True,
                     respawn_delay=3.0,
                 ))
+            actions.append(TimerAction(
+                period=3.0,
+                actions=[Node(
+                    package='system_bringup',
+                    executable='system_readiness_monitor',
+                    name='system_readiness_monitor',
+                    output='screen',
+                    parameters=[{
+                        'map_topic': '/map',
+                        'leader_pose_topic': '/leader_pose',
+                        'scout_pose_topic': scout_pose_topic.perform(context),
+                        'follower_pose_topic': '/burger_pose',
+                        'field_robot_status_topic': '/fleet/field_robot_status',
+                        'fleet_registry_json': field_registry_json,
+                        'active_scout_id_topic': '/failover/active_scout_id',
+                        'scout_epoch_topic': '/failover/scout_epoch',
+                        'leader_localization_ready_topic': '/localization_ready',
+                        'video_ready_topic': video_ready_topic.perform(context),
+                        'require_scout': True,
+                        'require_follower': launch_bool(
+                            require_follower_pose.perform(context)
+                        ),
+                        'ready_topic': '/system/ready',
+                        'readiness_topic': '/system/readiness',
+                        'detail_topic': '/system/readiness_detail',
+                    }],
+                    env=process_env,
+                    respawn=True,
+                    respawn_delay=3.0,
+                )],
+            ))
             if launch_bool(enable_scout_failover.perform(context)):
                 actions.append(Node(
                     package='system_bringup',
@@ -695,7 +1200,7 @@ def generate_launch_description():
                         'scout_pose_timeout_sec': float(
                             scout_pose_timeout_sec.perform(context)
                         ),
-                        'require_bootstrap_complete': True,
+                        'require_bootstrap_complete': False,
                         'bootstrap_ready_topic': '/localization_ready',
                         'leader_recovery_standoff_m': float(
                             leader_recovery_standoff_m.perform(context)
@@ -726,12 +1231,12 @@ def generate_launch_description():
 
         camera_sender_on = launch_bool(start_camera_sender.perform(context))
 
-        if launch_bool(start_risk_map.perform(context)):
+        if risk_map_requested or cartographer_requested:
             risk_share = get_package_share_directory('bayesian_risk_map')
             risk_launch_path = os.path.join(
                 risk_share, 'launch', 'real_robot_risk_slam.launch.py'
             )
-            cartographer_on = launch_bool(start_cartographer.perform(context))
+            cartographer_on = cartographer_requested
             if cartographer_on and fleet_stack_owns_slam:
                 if fleet_role_value in ('member', 'follower'):
                     hint = 'Set enable_amcl:=false when turning start_cartographer on.'
@@ -781,10 +1286,14 @@ def generate_launch_description():
                     'start_cartographer': (
                         'true' if cartographer_on else 'false'
                     ),
+                    'start_risk_map': (
+                        'true' if risk_map_requested else 'false'
+                    ),
                     'cartographer_configuration_basename': configured_lua,
                     'start_camera': risk_start_camera,
                     'start_teleop': start_teleop.perform(context),
                     'model_path': risk_model_path.perform(context),
+                    'target_class': risk_target_class.perform(context),
                     'detection_source': risk_detection_source,
                     'enable_yolo': risk_enable_yolo,
                     'external_detection_topic': (
@@ -794,6 +1303,27 @@ def generate_launch_description():
                     'start_rviz': 'false',
                 }.items(),
             ))
+            if scout_owns_slam:
+                actions.append(TimerAction(
+                    period=2.0,
+                    actions=[Node(
+                        package='fleet_bringup',
+                        executable='map_relay',
+                        name='scout_map_gateway',
+                        output='screen',
+                        parameters=[{
+                            'use_sim_time': False,
+                            'input_topic': '/map',
+                            'output_topic': f'/field/{scout_robot_name}/map_out',
+                            'check_period_sec': 0.2,
+                            'relay_without_primary': True,
+                            'max_publish_rate_hz': 0.75,
+                        }],
+                        env=process_env,
+                        respawn=True,
+                        respawn_delay=3.0,
+                    )],
+                ))
 
         if camera_sender_on:
             sender_share = get_package_share_directory('flask_yolo_bridge')
@@ -806,29 +1336,50 @@ def generate_launch_description():
                 launch_arguments={
                     'device': camera_sender_device.perform(context),
                     'server_url': flask_server_url.perform(context),
-                    'output_topic': external_detection_topic.perform(context),
-                    'width': '1920',
-                    'height': '1080',
-                    'send_width': '960',
-                    'send_height': '540',
-                    'camera_fps': '15.0',
+                    'output_topic': field_observation_topic,
+                    'width': '640',
+                    'height': '480',
+                    'send_width': '640',
+                    'send_height': '480',
+                    'camera_fps': '5.0',
                     'max_rate_hz': '5.0',
+                    'active_max_rate_hz': '5.0',
+                    'standby_max_rate_hz': '1.0',
+                    'active_max_upload_mbps': '2.5',
+                    'standby_max_upload_mbps': '0.8',
                     'http_worker_count': '1',
                     'jpeg_quality': '65',
                     'timeout_sec': '1.0',
                     'connect_timeout_sec': '0.3',
-                    'read_timeout_sec': '1.2',
-                    'max_http_roundtrip_sec': '1.5',
-                    'max_frame_age_sec': '1.0',
+                    'read_timeout_sec': '1.8',
+                    'max_http_roundtrip_sec': '2.0',
+                    'max_frame_age_sec': '1.5',
                     'enable_role_gating': 'true' if role_gating_on else 'false',
                     'robot_name': scout_robot_name,
+                    'initial_role': (
+                        'FOLLOWER' if fleet_role_value == 'follower'
+                        else 'ACTIVE_SCOUT'
+                    ),
                     'role_topic': f'/{scout_robot_name}/role',
+                    'pose_topic': (
+                        '/burger_pose' if fleet_role_value == 'follower'
+                        else '/member_pose'
+                    ),
+                    'require_capture_pose': 'true',
+                    'camera_hfov_deg': leader_scan_fov_deg.perform(context),
                     'initial_role_active': (
+                        # FOLLOWER must not start with camera/upload/publish
+                        # capability -- it has no scout authority until an
+                        # actual takeover. Only "no role gating at all" or
+                        # genuinely being the member/ACTIVE_SCOUT stack
+                        # starts active.
                         'true'
                         if (not role_gating_on or fleet_role_value == 'member')
                         else 'false'
                     ),
-                    'active_roles': 'ACTIVE_SCOUT,SCOUT',
+                    'active_roles': 'ACTIVE_SCOUT,SCOUT,RECOVERING',
+                    'standby_roles': 'FOLLOWER,IDLE,TAKEOVER_PENDING',
+                    'publish_roles': 'ACTIVE_SCOUT,SCOUT,RECOVERING',
                 }.items(),
             ))
 
@@ -861,9 +1412,10 @@ def generate_launch_description():
             'main_domain_id',
             default_value='',
             description=(
-                'Leader DDS domain used by domain_bridge. Required for '
-                'scout/member/follower bridging; optional '
-                'for role:=leader. Pass as main_domain_id:=<leader_domain>.'
+                'Leader DDS domain used by domain_bridge. Leave empty for '
+                'single-robot scout/member testing; optional for '
+                'role:=leader. Pass as main_domain_id:=<leader_domain> '
+                'when bridging to a leader.'
             ),
         ),
         DeclareLaunchArgument(
@@ -878,6 +1430,15 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'start_robot_bringup', default_value='true',
             choices=['true', 'false'],
+        ),
+        DeclareLaunchArgument(
+            'leader_hardware_param_file',
+            default_value='',
+            description=(
+                'Leader hardware parameter YAML. Empty uses '
+                'fleet_bringup/config/tracked_waffle_kinematics.yaml; pass '
+                'the stock Waffle YAML only to roll back tracked kinematics.'
+            ),
         ),
         DeclareLaunchArgument(
             'start_nav2', default_value='true',
@@ -909,12 +1470,20 @@ def generate_launch_description():
             ),
         ),
         DeclareLaunchArgument(
-            'auto_localize', default_value='true',
+            'auto_localize', default_value='false',
             choices=['true', 'false'],
             description=(
                 'Passed through to follower/member AMCL global '
-                'localization, and to leader AMCL when '
-                'enable_cartographer:=false.'
+                'localization. Leader uses leader_auto_localize so a '
+                'stationary leader does not drift by default.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'leader_auto_localize', default_value='false',
+            choices=['true', 'false'],
+            description=(
+                'Leader fleet_role only: enable verified in-place spin after '
+                'fixed AMCL seed. Default false uses fixed-seed readiness.'
             ),
         ),
         DeclareLaunchArgument(
@@ -928,13 +1497,23 @@ def generate_launch_description():
             ),
         ),
         DeclareLaunchArgument(
-            'start_risk_map', default_value='true',
+            'start_risk_map', default_value='false',
             choices=['true', 'false'],
             description=(
-                'Scout only: turn on the Bayesian risk map stack. Default '
-                'true restores Scout-owned Cartographer/risk processing; '
-                'local YOLO/camera capture remain disabled when '
-                'start_camera_sender:=true.'
+                'Deprecated Field Robot local Bayesian risk map switch. '
+                'Default false: Bayesian risk map is centralized on the '
+                'Leader domain; Field Robots may still run Cartographer.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'start_leader_risk_map', default_value='true',
+            choices=['true', 'false'],
+            description=(
+                'Leader role only: run the Bayesian risk map on the leader '
+                'Jetson from bridged Scout /map, /member_pose and '
+                '/risk/yolo_detections. When true, the risk-domain bridge '
+                'excludes Scout-owned risk outputs so the leader has one '
+                'authoritative /risk/risk_map publisher.'
             ),
         ),
         DeclareLaunchArgument(
@@ -975,7 +1554,16 @@ def generate_launch_description():
                 'needs an interactive terminal.'
             ),
         ),
-        DeclareLaunchArgument('risk_model_path', default_value='yolo11n.pt'),
+        DeclareLaunchArgument('risk_model_path', default_value='model/target_v3.engine'),
+        DeclareLaunchArgument(
+            'risk_target_class',
+            default_value='0',
+            description=(
+                'Scout only: target class accepted by the risk map. '
+                'model/target_v3 class 0 is the target. Use -1 to '
+                'accept all YOLO classes.'
+            ),
+        ),
         DeclareLaunchArgument(
             'detection_source', default_value='flask_topic',
             description=(
@@ -1073,6 +1661,19 @@ def generate_launch_description():
             description='Leader role only: bridge selected visualization/debug topics to pc_domain_id.',
         ),
         DeclareLaunchArgument(
+            'forward_field_map_to_main',
+            default_value='false',
+            choices=['true', 'false'],
+            description=(
+                'Field robot only: allow the member/follower bridge to send '
+                'its local /map to the leader. Default false; ACTIVE_SCOUT '
+                'maps use the dedicated rate-limited risk->leader map '
+                'gateway. For FOLLOWER takeover, the field_robot wrapper '
+                'pre-opens this route while local SLAM remains off until '
+                'ACTIVE_SCOUT handoff.'
+            ),
+        ),
+        DeclareLaunchArgument(
             'member_domain_id',
             default_value='',
             description='Leader debug marker label for a member/scout domain.',
@@ -1083,14 +1684,91 @@ def generate_launch_description():
             description='Leader debug marker label for a follower domain.',
         ),
         DeclareLaunchArgument(
+            'fleet_registry_file',
+            default_value='',
+            description=(
+                'Optional YAML registry for all non-leader Field Robots. '
+                'When empty, risk_domain_id/follower_domain_id are converted '
+                'to a backward-compatible registry.'
+            ),
+        ),
+        DeclareLaunchArgument(
             'enable_scout_failover',
             default_value='true',
             choices=['true', 'false'],
             description='Enable active-scout liveness watchdog and follower takeover orchestration.',
         ),
         DeclareLaunchArgument('leader_robot_name', default_value='leader'),
-        DeclareLaunchArgument('active_scout_robot_name', default_value='scout22'),
-        DeclareLaunchArgument('follower_robot_name', default_value='follower21'),
+        DeclareLaunchArgument('active_scout_robot_name', default_value=DEFAULT_ACTIVE_SCOUT),
+        DeclareLaunchArgument('follower_robot_name', default_value=DEFAULT_FOLLOWER),
+        DeclareLaunchArgument(
+            'require_video_ready',
+            default_value='true',
+            choices=['true', 'false'],
+            description=(
+                'Require dashboard/video readiness before publishing the '
+                'leader-owned /fleet/start_motion motion barrier.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'video_ready_topic',
+            default_value='/fleet/video_ready',
+            description='Latched dashboard video readiness topic shared across robot domains.',
+        ),
+        DeclareLaunchArgument(
+            'leader_initial_x',
+            default_value='0.0',
+            description='Leader AMCL initial x in the shared map frame.',
+        ),
+        DeclareLaunchArgument(
+            'leader_initial_y',
+            default_value='0.0',
+            description=(
+                'Leader AMCL initial y. Default is the centerline of the '
+                'waffle/leader-based three-robot formation.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'leader_initial_yaw',
+            default_value='0.0',
+            description='Leader AMCL initial yaw radians; 0 means facing +x.',
+        ),
+        DeclareLaunchArgument(
+            'scout_initial_x',
+            default_value='0.0',
+            description='Active scout/member AMCL initial x in the shared map frame.',
+        ),
+        DeclareLaunchArgument(
+            'scout_initial_y',
+            default_value='0.20',
+            description=(
+                'Active scout/member AMCL initial y. Default is 20 cm left '
+                'of the waffle/leader when all robots face +x.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'scout_initial_yaw',
+            default_value='0.0',
+            description='Active scout/member AMCL initial yaw radians.',
+        ),
+        DeclareLaunchArgument(
+            'follower_initial_x',
+            default_value='0.0',
+            description='Follower AMCL initial x in the shared map frame.',
+        ),
+        DeclareLaunchArgument(
+            'follower_initial_y',
+            default_value='-0.20',
+            description=(
+                'Follower AMCL initial y. Default is 20 cm right of the '
+                'waffle/leader when all robots face +x.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'follower_initial_yaw',
+            default_value='0.0',
+            description='Follower AMCL initial yaw radians; 0 means facing +x.',
+        ),
         DeclareLaunchArgument(
             'scout_liveness_topic',
             default_value='/scout/signal',
@@ -1113,54 +1791,100 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'scout_pose_timeout_sec',
-            default_value='5.0',
+            default_value='0.5',
             description='Maximum age of scout pose allowed for failure target freeze.',
         ),
         DeclareLaunchArgument(
             'enable_leader_shadow_follow',
             default_value='true',
             choices=['true', 'false'],
-            description='Leader role only: move slowly behind the active scout during normal operation.',
+            description='Leader role only: move behind the active scout during normal operation.',
+        ),
+        DeclareLaunchArgument(
+            'leader_follow_backend',
+            default_value='nav2',
+            choices=['nav2', 'direct'],
+            description=(
+                'Leader shadow follow backend. nav2 publishes NavigateToPose '
+                'goals only; direct publishes cmd_vel only.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'leader_shadow_direct_cmd_vel',
+            default_value='false',
+            choices=['true', 'false'],
+            description=(
+                'Leader role only: use continuous /cmd_vel for normal '
+                'shadow follow instead of repeatedly preempting Nav2 goals.'
+            ),
         ),
         DeclareLaunchArgument(
             'leader_shadow_follow_distance_m',
-            default_value='2.8',
-            description='Leader shadow target distance behind active scout movement direction.',
+            default_value='0.40',
+            description='Leader Nav2 target distance behind the active scout yaw direction.',
         ),
         DeclareLaunchArgument(
             'leader_shadow_stop_distance_m',
-            default_value='2.2',
+            default_value='0.30',
             description='Leader stops shadow goal updates when closer than this to the active scout.',
         ),
         DeclareLaunchArgument(
             'leader_shadow_resume_distance_m',
-            default_value='3.0',
+            default_value='0.46',
             description='Leader resumes shadow follow when scout distance reaches this hysteresis threshold.',
         ),
         DeclareLaunchArgument(
             'leader_shadow_far_distance_m',
-            default_value='4.5',
+            default_value='0.80',
             description='Distance where shadow follow permits catch-up speed limits.',
         ),
         DeclareLaunchArgument(
             'leader_shadow_max_linear_vel',
-            default_value='0.12',
+            default_value='0.20',
             description='Best-effort DWB linear velocity cap while shadow following.',
         ),
         DeclareLaunchArgument(
+            'leader_shadow_catchup_max_linear_vel',
+            default_value='0.20',
+            description='Best-effort DWB linear velocity cap when the leader is far behind the active scout.',
+        ),
+        DeclareLaunchArgument(
             'leader_shadow_max_angular_vel',
-            default_value='0.35',
+            default_value='0.80',
             description='Best-effort DWB angular velocity cap while shadow following.',
         ),
         DeclareLaunchArgument(
             'leader_shadow_goal_update_period_sec',
-            default_value='1.0',
+            default_value='0.5',
             description='Minimum time between leader shadow Nav2 goal updates.',
         ),
         DeclareLaunchArgument(
             'leader_shadow_goal_min_change_m',
-            default_value='0.5',
+            default_value='0.12',
             description='Minimum shadow target displacement before sending another leader goal.',
+        ),
+        DeclareLaunchArgument(
+            'leader_shadow_cmd_linear_scale',
+            default_value='1.0',
+            description=(
+                'Application-level shadow controller scale. Keep at 1.0; '
+                'tracked chassis compensation belongs in tracked_waffle_kinematics.yaml.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'leader_shadow_cmd_angular_scale',
+            default_value='1.0',
+            description='Direct /cmd_vel angular compensation scale.',
+        ),
+        DeclareLaunchArgument(
+            'leader_shadow_cmd_max_linear_vel',
+            default_value='0.20',
+            description='Hard cap for direct shadow-follow linear.x before tracked adapter.',
+        ),
+        DeclareLaunchArgument(
+            'leader_shadow_cmd_max_angular_vel',
+            default_value='0.80',
+            description='Hard cap for compensated direct /cmd_vel angular.z.',
         ),
         DeclareLaunchArgument(
             'leader_shadow_heading_min_motion_m',
@@ -1200,8 +1924,8 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'follower_recovery_standoff_m',
-            default_value='0.15',
-            description='Follower goal offset behind failed scout pose.',
+            default_value='0.0',
+            description='Follower goal offset behind failed scout pose. Default drives to the failed scout pose.',
         ),
         DeclareLaunchArgument(
             'scout_takeover_arrival_tolerance_m',
@@ -1210,18 +1934,41 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'enable_localization_spin_on_takeover',
-            default_value='true',
+            default_value='false',
             choices=['true', 'false'],
-            description='Follower-side takeover agent performs 360deg AMCL spin when covariance is poor.',
+            description='Debug-only follower AMCL spin when covariance is poor.',
         ),
         DeclareLaunchArgument(
             'enable_exploration',
             default_value='true',
             choices=['true', 'false'],
             description=(
-                'Enable the deterministic in-process ACTIVE_SCOUT SAC runtime. '
-                'It is role-gated and never starts a remote or eval_policy '
-                'subprocess; false leaves ACTIVE_SCOUT motion stopped.'
+                'Allow this robot to perform ACTIVE_SCOUT RL exploration. '
+                'Execution location is selected independently by rl_backend.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'rl_backend',
+            default_value='external_worker',
+            choices=['disabled', 'in_process', 'external_worker'],
+            description=(
+                'RL runtime backend. external_worker is the canonical '
+                'role-gated local inference process for Burger robots.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'start_rl_worker',
+            default_value='true',
+            choices=['true', 'false'],
+            description='Start the external local scout_rl_policy_worker backend.',
+        ),
+        DeclareLaunchArgument(
+            'rl_initial_role_active',
+            default_value='false',
+            choices=['true', 'false'],
+            description=(
+                'Reserved manual-debug switch. external_worker requires false '
+                'so role/epoch ownership always gates activation.'
             ),
         ),
         DeclareLaunchArgument(
@@ -1229,6 +1976,15 @@ def generate_launch_description():
             default_value='true',
             choices=['true', 'false'],
             description='Leader role only: include Jetson/OMX AIM component launch.',
+        ),
+        DeclareLaunchArgument(
+            'omx_dry_run',
+            default_value='false',
+            choices=['true', 'false'],
+            description=(
+                'Leader role only: run OMX camera/YOLO/dashboard without '
+                'Dynamixel motor communication or arm motion.'
+            ),
         ),
         DeclareLaunchArgument(
             'start_yolo_server',
@@ -1253,8 +2009,29 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'yolo_server_model_path',
-            default_value='yolo11n.pt',
-            description='Leader role only: YOLO model path for flask_yolo_server.',
+            default_value='model/target_v3.engine',
+            description=(
+                'Leader role only: YOLO TensorRT engine for '
+                'flask_yolo_server. Create model/target_v3.engine on the '
+                'Jetson before launching.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'yolo_server_target_class',
+            default_value='0',
+            description=(
+                'Leader role only: class id for flask_yolo_server. '
+                'model/target_v3 class 0 is the target. Use "all" to '
+                'disable class filtering.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'yolo_server_conf',
+            default_value='0.20',
+            description=(
+                'Leader role only: YOLO confidence threshold for '
+                'flask_yolo_server. Lower this only while debugging misses.'
+            ),
         ),
         DeclareLaunchArgument(
             'yolo_server_device',
@@ -1274,7 +2051,23 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'omx_camera_index', default_value='0',
-            description='Leader role only: OpenCV camera index for OMX debug/YOLO video.',
+            description='Leader role only: legacy OMX integer camera index.',
+        ),
+        DeclareLaunchArgument(
+            'omx_camera_device', default_value='/dev/video0',
+            description='Leader role only: preferred OMX V4L2 device path.',
+        ),
+        DeclareLaunchArgument(
+            'omx_camera_backend', default_value='v4l2', choices=['v4l2', 'auto'],
+            description='Leader role only: OMX OpenCV capture backend.',
+        ),
+        DeclareLaunchArgument(
+            'omx_camera_reconnect_period_sec', default_value='1.0',
+            description='Leader role only: OMX camera reconnect interval.',
+        ),
+        DeclareLaunchArgument(
+            'omx_camera_required', default_value='false', choices=['true', 'false'],
+            description='Leader role only: false leaves Nav2 active when OMX vision is unavailable.',
         ),
         DeclareLaunchArgument(
             'start_patrol_planner',
@@ -1322,6 +2115,26 @@ def generate_launch_description():
             description='Leader role only: OMX MJPEG debug stream port.',
         ),
         DeclareLaunchArgument(
+            'debug_fps',
+            default_value='10',
+            description='Leader role only: OMX dashboard stream FPS.',
+        ),
+        DeclareLaunchArgument(
+            'debug_quality',
+            default_value='52',
+            description='Leader role only: OMX dashboard JPEG quality.',
+        ),
+        DeclareLaunchArgument(
+            'debug_width',
+            default_value='640',
+            description='Leader role only: OMX dashboard stream width.',
+        ),
+        DeclareLaunchArgument(
+            'debug_height',
+            default_value='360',
+            description='Leader role only: OMX dashboard stream height.',
+        ),
+        DeclareLaunchArgument(
             'unified_dashboard',
             default_value='true',
             choices=['true', 'false'],
@@ -1336,6 +2149,28 @@ def generate_launch_description():
             'dashboard_port',
             default_value='8091',
             description='Leader role only: integrated dashboard HTTP port.',
+        ),
+        DeclareLaunchArgument(
+            'require_scout_video_ready',
+            default_value='true',
+            choices=['true', 'false'],
+            description=(
+                'Leader role only: require a fresh scout YOLO stream before '
+                '/fleet/start_motion can go true.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'require_omx_video_ready',
+            default_value='true',
+            choices=['true', 'false'],
+            description=(
+                'Leader role only: require a fresh leader OMX camera stream '
+                'before /fleet/start_motion can go true. There was previously '
+                'no way to turn this off from system.launch.py -- a leader '
+                'run without OMX/arm hardware attached could never satisfy '
+                'this and would block RL motion forever. Set false when '
+                'testing without OMX hardware attached.'
+            ),
         ),
         *dds_launch_environment(domain_id),
         OpaqueFunction(function=make_stack),

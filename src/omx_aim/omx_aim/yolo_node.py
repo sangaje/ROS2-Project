@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import sys
 import heapq
+import json
 import math
 import time
 from typing import Optional
@@ -115,12 +116,15 @@ class OmxYoloNode(Node):
     def __init__(self, dry_run: bool = False, no_display: bool = False,
                 debug_stream: bool = False,
                 debug_port: int = 8080,
-                debug_fps: int = 15,
-                debug_quality: int = 70):
+                debug_fps: int = 10,
+                debug_quality: int = 52,
+                debug_width: int = 640,
+                debug_height: int = 360):
         super().__init__('omx_yolo_node')
 
         self.cfg = load_config()
         self.dry_run = dry_run
+        self._control_video_only = bool(dry_run)
         self.no_display = no_display
         self.get_logger().info(f"Config loaded. port={self.cfg.motor.port}")
 
@@ -177,6 +181,12 @@ class OmxYoloNode(Node):
         # Costmap
         self.costmap: Optional[OccupancyGrid] = None
         self._costmap_logged = False
+        self.risk_map: Optional[OccupancyGrid] = None
+        self.risk_map_wall_sec: Optional[float] = None
+        self._risk_map_logged = False
+        self._risk_scan_center_yaw: Optional[float] = None
+        self._risk_scan_center_wall_sec = 0.0
+        self._last_risk_scan_log_t = 0.0
 
         # 내부 모듈
         self.detector = YoloDetector(self.cfg, logger=self.get_logger())
@@ -219,9 +229,7 @@ class OmxYoloNode(Node):
                 'OMX_CONTROL_FALLBACK_VIDEO_ONLY | '
                 f'controller_error={type(exc).__name__}: {exc}'
             )
-            self.ctrl = OmxController(self.cfg, dry_run=True,
-                                      logger=self.get_logger())
-            self.ctrl.connect()
+            self._replace_controller_with_video_only(yaw=0.0, pitch=0.0)
             self.ctrl.go_home()
 
         self.paused = False
@@ -232,22 +240,47 @@ class OmxYoloNode(Node):
         self.fps_disp = 0.0
 
         # Publishers
+        self.qos_observation = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=5,
+        )
         self.pub_status = self.create_publisher(String, '/omx/status', 10)
         self.pub_state = self.create_publisher(String, '/omx/state', 10)
-        self.pub_detected = self.create_publisher(Bool, '/omx/target_detected', 10)
+        self.pub_detected = self.create_publisher(
+            Bool, '/omx/target_detected', self.qos_observation
+        )
+        self.pub_camera_ready = self.create_publisher(
+            Bool, '/omx/camera_ready', self.qos_observation
+        )
+        self.pub_observation_status = self.create_publisher(
+            String, '/omx/observation_status', self.qos_observation
+        )
         self.pub_error = self.create_publisher(Point, '/omx/error_norm', 10)
         self.pub_joint = self.create_publisher(JointState, '/omx/joint_state', 10)
         self.pub_fire = self.create_publisher(Empty, '/omx/fire', 10)
-        self.pub_fire_disable = self.create_publisher(Bool, '/omx/fire_disable', 10)
+        fire_disable_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+        self.pub_fire_disable = self.create_publisher(
+            Bool, '/omx/fire_disable', fire_disable_qos
+        )
         self.pub_processed = self.create_publisher(PointStamped, '/omx/target_processed', 10)
         self.pub_target_lost = self.create_publisher(PointStamped, '/omx/target_lost', 10)
         self.pub_target_blocked = self.create_publisher(PointStamped, '/omx/target_blocked', 10)
         self.pub_progress = self.create_publisher(Float32, '/omx/aim_progress', 10)
+        self.pub_aim_debug = self.create_publisher(String, '/omx/aim_debug', 10)
         # 카메라(팬/틸트)가 로봇 base 정면 기준으로 지금 어느 방향을
         # 보고 있는지 -- risk map 의 leader-visibility fusion 등 다른
         # 도메인 소비자가 "젯슨의 시야 = 로봇 정면"으로 잘못 가정하지
         # 않도록 실제 조준 방향을 별도로 발행한다.
-        self.pub_camera_yaw = self.create_publisher(Float32, '/omx/camera_yaw', 10)
+        self.pub_camera_yaw = self.create_publisher(
+            Float32, '/omx/camera_yaw', self.qos_observation
+        )
         self.pub_queue_size = self.create_publisher(Int32, '/omx/queue_size', 10)
         self.pub_patrol_complete = self.create_publisher(Empty, '/omx/patrol_complete', 10)
         self.pub_queue_markers = self.create_publisher(
@@ -261,6 +294,16 @@ class OmxYoloNode(Node):
         # H3 신규
         self.pub_nav_cancel = self.create_publisher(
             Empty, '/omx/nav_cancel', 10)
+        self.pub_nav_goal_meta = self.create_publisher(
+            String, '/omx/nav_goal_meta', 10)
+        cancel_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+        self.pub_leader_nav_cancel = self.create_publisher(
+            Bool, '/fleet/leader_nav_cancel', cancel_qos)
         self.pub_target_not_found = self.create_publisher(
             PointStamped, '/omx/target_not_found', 10)
 
@@ -280,11 +323,20 @@ class OmxYoloNode(Node):
         self.create_subscription(
             OccupancyGrid, self.cfg.patrol.costmap_topic,
             self.on_costmap, 1)
+        if self.cfg.patrol.risk_scan_enabled:
+            self.create_subscription(
+                OccupancyGrid,
+                self.cfg.patrol.risk_map_topic,
+                self.on_risk_map,
+                1,
+            )
         # H2 신규
         self.create_subscription(String, '/waffle/nav_result',
                                  self.on_nav_result, 10)
         self.create_subscription(String, '/waffle/status',
                                  self.on_waffle_status, 10)
+        self.create_subscription(String, '/waffle/nav_goal_ack',
+                                 self.on_waffle_nav_goal_ack, 10)
         if self.require_localization_ready:
             latched_qos = QoSProfile(
                 depth=1,
@@ -305,11 +357,16 @@ class OmxYoloNode(Node):
         if debug_stream:
             from omx.debug_stream import DebugStream
             self.debug_stream = DebugStream(
-                port=debug_port, fps=debug_fps, quality=debug_quality)
+                port=debug_port,
+                fps=debug_fps,
+                quality=debug_quality,
+                width=debug_width,
+                height=debug_height,
+            )
             self.debug_stream.start()
             self.get_logger().info(
                 f"Debug stream ON: http://0.0.0.0:{debug_port}/ "
-                f"(fps={debug_fps}, q={debug_quality})")
+                f"(fps={debug_fps}, q={debug_quality}, size={debug_width}x{debug_height})")
         self.timer = self.create_timer(self.control_period, self.loop)
         self.status_timer = self.create_timer(1.0, self.publish_periodic)
 
@@ -317,12 +374,22 @@ class OmxYoloNode(Node):
         self._last_fire_enable_t = 0.0
         self._fire_enable_detection_active = False
         self._fire_enable_republish_sec = 1.0
-        self._last_immediate_fire_t = 0.0
-        self._immediate_fire_detection_active = False
+        self._last_fire_disable_pub: Optional[bool] = None
         self._detection_nav_stop_active = False
+        self._detection_streak = 0
+        self._last_detection_cancel_t = -1.0e9
+        self._detection_cancel_period_sec = 0.5
         self.waffle_status = "unknown"
+        self.waffle_state = "UNKNOWN"
+        self._nav_goal_seq = 0
+        self._nav_goal_epoch = 0
+        self._active_nav_goal_id = None
+        self._active_nav_publish_count = 0
+        self._active_nav_acked = False
         self._last_nav_retry_t = 0.0
         self._nav_retry_period_sec = 1.0
+        self._observation_sequence = 0
+        self._last_aim_debug_log_t = 0.0
 
         self.get_logger().info(
             f"Timer: 메인 {self.cfg.ibvs.control_hz} Hz, 상태 1 Hz")
@@ -332,6 +399,47 @@ class OmxYoloNode(Node):
             f"topic={self.localization_ready_topic}"
         )
         self.get_logger().info("=== Node ready (H4) ===")
+        self._publish_fire_disable(True, 'startup', force=True)
+
+    def _replace_controller_with_video_only(
+        self,
+        *,
+        yaw: Optional[float] = None,
+        pitch: Optional[float] = None,
+    ) -> None:
+        self.ctrl = OmxController(self.cfg, dry_run=True,
+                                  logger=self.get_logger())
+        self._control_video_only = True
+        self.ctrl.connect()
+        if yaw is not None:
+            self.ctrl.yaw = float(yaw)
+        if pitch is not None:
+            self.ctrl.pitch = float(pitch)
+        self.ctrl.reset_scan_sweep()
+
+    def _controller_call(self, command: str, fn, *args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            old_ctrl = getattr(self, 'ctrl', None)
+            yaw = float(getattr(old_ctrl, 'yaw', 0.0))
+            pitch = float(getattr(old_ctrl, 'pitch', 0.0))
+            self.get_logger().error(
+                'OMX_CONTROL_RUNTIME_FALLBACK_VIDEO_ONLY | '
+                f'command={command} '
+                f'controller_error={type(exc).__name__}: {exc}'
+            )
+            try:
+                if old_ctrl is not None:
+                    old_ctrl.disconnect()
+            except Exception as disconnect_exc:  # noqa: BLE001
+                self.get_logger().warning(
+                    'OMX_CONTROL_RUNTIME_DISCONNECT_ERROR | '
+                    f'controller_error={type(disconnect_exc).__name__}: '
+                    f'{disconnect_exc}'
+                )
+            self._replace_controller_with_video_only(yaw=yaw, pitch=pitch)
+            return None
 
     # ----- Costmap -----
 
@@ -342,6 +450,167 @@ class OmxYoloNode(Node):
                 f"Costmap 수신: {msg.info.width}x{msg.info.height} "
                 f"cells @ {msg.info.resolution}m/cell")
             self._costmap_logged = True
+
+    def on_risk_map(self, msg: OccupancyGrid):
+        self.risk_map = msg
+        self.risk_map_wall_sec = time.time()
+        if not self._risk_map_logged:
+            self.get_logger().info(
+                f"Risk map 수신: {msg.info.width}x{msg.info.height} "
+                f"cells @ {msg.info.resolution}m/cell "
+                f"topic={self.cfg.patrol.risk_map_topic}")
+            self._risk_map_logged = True
+
+    @staticmethod
+    def _occgrid_origin_yaw(info) -> float:
+        q = info.origin.orientation
+        return math.atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z),
+        )
+
+    def _occgrid_cell_center_world(self, info, gx: int, gy: int):
+        resolution = float(info.resolution)
+        lx = (float(gx) + 0.5) * resolution
+        ly = (float(gy) + 0.5) * resolution
+        yaw = self._occgrid_origin_yaw(info)
+        c = math.cos(yaw)
+        s = math.sin(yaw)
+        ox = float(info.origin.position.x)
+        oy = float(info.origin.position.y)
+        return ox + c * lx - s * ly, oy + s * lx + c * ly
+
+    def _focus_scan_center_yaw(self) -> Optional[float]:
+        focus = self.sm.current_focus or self.sm.current_parent
+        if focus is None:
+            return None
+        coord_map = getattr(focus, 'coord_map', None)
+        if coord_map is None:
+            return None
+        arm = self.transform_map_to_arm_base(coord_map)
+        if arm is None:
+            return None
+        ax, ay, _ = arm
+        if math.hypot(ax, ay) < 1.0e-3:
+            return None
+        return math.atan2(ay, ax)
+
+    def _risk_map_scan_center_yaw(self, now: float) -> Optional[float]:
+        if not self.cfg.patrol.risk_scan_enabled:
+            return None
+        if self.risk_map is None or self.risk_map_wall_sec is None:
+            return None
+        if now - self.risk_map_wall_sec > 5.0:
+            return None
+        if now - self._risk_scan_center_wall_sec < 0.5:
+            return self._risk_scan_center_yaw
+
+        pose = self.get_waffle_xy_yaw()
+        if pose is None:
+            self._risk_scan_center_yaw = None
+            self._risk_scan_center_wall_sec = now
+            return None
+
+        rx, ry, ryaw = pose
+        msg = self.risk_map
+        info = msg.info
+        width = int(info.width)
+        height = int(info.height)
+        if width <= 0 or height <= 0 or info.resolution <= 0.0:
+            return None
+
+        min_value = int(self.cfg.patrol.risk_scan_min_value)
+        max_distance = float(self.cfg.patrol.risk_scan_max_distance_m)
+        yaw_limit = math.radians(float(self.cfg.patrol.risk_scan_center_yaw_limit_deg))
+        stride = max(1, int(self.cfg.patrol.risk_scan_sample_stride))
+        candidates = []
+
+        for gy in range(stride // 2, height, stride):
+            row = gy * width
+            for gx in range(stride // 2, width, stride):
+                idx = row + gx
+                if idx < 0 or idx >= len(msg.data):
+                    continue
+                value = int(msg.data[idx])
+                if value < min_value:
+                    continue
+                wx, wy = self._occgrid_cell_center_world(info, gx, gy)
+                dx = wx - rx
+                dy = wy - ry
+                distance = math.hypot(dx, dy)
+                if distance < 0.20 or distance > max_distance:
+                    continue
+                relative_yaw = wrap_angle(math.atan2(dy, dx) - ryaw)
+                if abs(relative_yaw) > yaw_limit:
+                    continue
+                score = float(value) / (1.0 + distance)
+                candidates.append((score, value, distance, relative_yaw, wx, wy))
+
+        candidates.sort(reverse=True)
+        if not candidates:
+            self._risk_scan_center_yaw = None
+            self._risk_scan_center_wall_sec = now
+            return None
+
+        selected = []
+        for candidate in candidates[:24]:
+            _, _, _, _, wx, wy = candidate
+            if self.costmap is not None:
+                los = self._los_between((rx, ry), (wx, wy))
+                if los == LOSResult.BLOCKED:
+                    continue
+            selected.append(candidate)
+            if len(selected) >= 8:
+                break
+
+        if not selected:
+            self._risk_scan_center_yaw = None
+            self._risk_scan_center_wall_sec = now
+            return None
+
+        sin_sum = 0.0
+        cos_sum = 0.0
+        total = 0.0
+        best = selected[0]
+        for score, value, _distance, relative_yaw, _wx, _wy in selected:
+            weight = max(1.0, score * max(1, value))
+            sin_sum += math.sin(relative_yaw) * weight
+            cos_sum += math.cos(relative_yaw) * weight
+            total += weight
+        center_yaw = math.atan2(sin_sum, cos_sum) if total > 0.0 else best[3]
+        center_yaw = max(-yaw_limit, min(yaw_limit, center_yaw))
+        self._risk_scan_center_yaw = center_yaw
+        self._risk_scan_center_wall_sec = now
+
+        if now - self._last_risk_scan_log_t > 2.0:
+            self._last_risk_scan_log_t = now
+            self.get_logger().info(
+                'OMX_RISK_SCAN_CENTER | '
+                f'yaw={math.degrees(center_yaw):+.1f}deg '
+                f'best_value={best[1]} best_dist={best[2]:.2f}m '
+                f'candidates={len(candidates)} selected={len(selected)}'
+            )
+        return center_yaw
+
+    def scan_sweep_center_yaw(self, now: float) -> Optional[float]:
+        risk_center = self._risk_map_scan_center_yaw(now)
+        if risk_center is not None:
+            return risk_center
+        focus_center = self._focus_scan_center_yaw()
+        if focus_center is not None:
+            limit = math.radians(float(self.cfg.patrol.risk_scan_center_yaw_limit_deg))
+            return max(-limit, min(limit, focus_center))
+        return 0.0
+
+    def execute_scan_sweep(self, now: float) -> None:
+        self._controller_call(
+            'scan_sweep',
+            self.ctrl.scan_sweep,
+            now,
+            self.cfg.patrol.scan_sweep_half_angle_deg,
+            self.cfg.patrol.scan_sweep_period_sec,
+            self.scan_sweep_center_yaw(now),
+        )
 
     # ----- TF helpers -----
 
@@ -995,7 +1264,7 @@ class OmxYoloNode(Node):
     def on_control_mode(self, msg):
         if msg.data == "idle":
             self.sm.on_abort()
-            self.ctrl.go_home()
+            self._controller_call('go_home', self.ctrl.go_home)
 
     def on_target_in_map(self, msg: PointStamped):
         coord = (msg.point.x, msg.point.y, msg.point.z)
@@ -1015,14 +1284,38 @@ class OmxYoloNode(Node):
 
     def on_abort(self, msg):
         self.sm.on_abort()
-        self.ctrl.go_home()
+        self._controller_call('go_home', self.ctrl.go_home)
 
     def on_nav_result(self, msg: String):
         """H2: waffle_node 가 발행한 Nav2 액션 결과."""
+        self._active_nav_acked = False
+        self._active_nav_goal_id = None
         self.sm.on_nav_result(msg.data)
 
     def on_waffle_status(self, msg: String):
         self.waffle_status = msg.data
+        self.waffle_state = self._parse_waffle_state(msg.data)
+
+    def on_waffle_nav_goal_ack(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+        except (json.JSONDecodeError, TypeError):
+            return
+        goal_id = data.get('goal_id')
+        if goal_id == self._active_nav_goal_id:
+            self._active_nav_acked = True
+            self.waffle_state = str(data.get('state', self.waffle_state)).upper()
+
+    @staticmethod
+    def _parse_waffle_state(raw: str) -> str:
+        text = str(raw or '').strip()
+        if text.startswith('{'):
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                return 'UNKNOWN'
+            return str(data.get('state', 'UNKNOWN')).upper()
+        return text.upper()
 
     def on_localization_ready(self, msg: Bool):
         previous = self.localization_ready
@@ -1073,6 +1366,8 @@ class OmxYoloNode(Node):
     def publish_periodic(self):
         msg = String()
         prefix = "dry_run_" if self.dry_run else ""
+        if getattr(self, '_control_video_only', False) and not self.dry_run:
+            prefix = "video_only_"
         if self.paused:
             prefix = "paused_"
         msg.data = f"{prefix}{self.sm.state.value}"
@@ -1089,6 +1384,8 @@ class OmxYoloNode(Node):
             msg = String()
             msg.data = self.sm.state.value
             self.pub_state.publish(msg)
+            if self.sm.state == State.TRACKING:
+                self.ctrl.reset_ibvs_filter()
             self._last_state = self.sm.state
 
     def publish_detected(self, detected):
@@ -1096,12 +1393,117 @@ class OmxYoloNode(Node):
         msg.data = detected
         self.pub_detected.publish(msg)
 
+    def publish_observation_status(
+        self,
+        *,
+        frame_valid: bool,
+        inference_ran: bool,
+        detected,
+        confidence,
+        bbox=None,
+        reason: str = '',
+    ) -> None:
+        """Publish a validity-aware OMX observation without overloading Bool."""
+        self._observation_sequence += 1
+        now = time.time()
+        ready = bool(getattr(self.detector, 'camera_ready', False))
+        ready_msg = Bool()
+        ready_msg.data = ready
+        self.pub_camera_ready.publish(ready_msg)
+        payload = {
+            'sequence': self._observation_sequence,
+            'capture_stamp': now if frame_valid else None,
+            'publish_stamp': now,
+            'camera_ready': ready,
+            'frame_valid': bool(frame_valid),
+            'inference_ran': bool(inference_ran),
+            'detected': detected if inference_ran else None,
+            'confidence': float(confidence or 0.0) if inference_ran else None,
+            'camera_yaw_rad': float(self.ctrl.yaw),
+            'image_width': int(getattr(self.detector, 'frame_width', 0)),
+            'image_height': int(getattr(self.detector, 'frame_height', 0)),
+            'source': str(getattr(self.detector, 'camera_source', 'unknown')),
+            'aim_reference_offset_y_norm': float(
+                getattr(self.cfg.ibvs, 'aim_target_offset_y_norm', 0.0)
+            ),
+            'control_video_only': bool(getattr(self, '_control_video_only', False)),
+        }
+        if inference_ran and detected and bbox is not None:
+            payload['bbox_xyxy'] = [float(value) for value in bbox]
+        if reason:
+            payload['reason'] = reason
+        msg = String()
+        msg.data = json.dumps(payload, sort_keys=True)
+        self.pub_observation_status.publish(msg)
+
+    def publish_vision_safe_fire_lock(self) -> None:
+        """A missing/invalid frame must never leave the fire path enabled."""
+        self._publish_fire_disable(True, 'vision_not_valid')
+        self._fire_enable_detection_active = False
+
     def publish_error(self, ex, ey):
         msg = Point()
         msg.x = float(ex)
         msg.y = float(ey)
         msg.z = 0.0
         self.pub_error.publish(msg)
+
+    def publish_aim_debug(
+        self,
+        *,
+        detected: bool,
+        error_norm,
+        action: dict,
+        track_moved,
+        confidence,
+    ) -> None:
+        payload = {
+            'state': self.sm.state.value,
+            'armed': bool(self.sm.armed),
+            'auto_armed': bool(action.get('auto_armed', False)),
+            'paused': bool(self.paused),
+            'detected': bool(detected),
+            'confidence': float(confidence or 0.0) if confidence is not None else None,
+            'action': str(action.get('action', 'wait')),
+            'track_requested': action.get('action') == 'track',
+            'stale_track': bool(action.get('stale_track', False)),
+            'track_moved': None if track_moved is None else bool(track_moved),
+            'error_norm': (
+                [float(action['error'][0]), float(action['error'][1])]
+                if action.get('error') is not None
+                else (
+                    [float(error_norm[0]), float(error_norm[1])]
+                    if error_norm is not None else None
+                )
+            ),
+            'deadband': [
+                float(self.cfg.ibvs.deadband_x),
+                float(self.cfg.ibvs.deadband_y),
+            ],
+            'aim_reference_offset_y_norm': float(
+                getattr(self.cfg.ibvs, 'aim_target_offset_y_norm', 0.0)
+            ),
+            'yaw_rad': float(getattr(self.ctrl, 'yaw', 0.0)),
+            'pitch_rad': float(getattr(self.ctrl, 'pitch', 0.0)),
+            'control_video_only': bool(getattr(self, '_control_video_only', False)),
+        }
+        msg = String()
+        msg.data = json.dumps(payload, sort_keys=True)
+        self.pub_aim_debug.publish(msg)
+        now = time.time()
+        if now - self._last_aim_debug_log_t >= 1.0 and (
+            detected or action.get('action') == 'track'
+        ):
+            self._last_aim_debug_log_t = now
+            self.get_logger().info(
+                'OMX_AIM_DEBUG | '
+                f"state={payload['state']} action={payload['action']} "
+                f"detected={payload['detected']} error={payload['error_norm']} "
+                f"stale_track={payload['stale_track']} "
+                f"moved={payload['track_moved']} armed={payload['armed']} "
+                f"auto_armed={payload['auto_armed']} "
+                f"video_only={payload['control_video_only']}"
+            )
 
     def publish_joint_state(self):
         try:
@@ -1128,20 +1530,45 @@ class OmxYoloNode(Node):
     def publish_fire(self):
         self.pub_fire.publish(Empty())
 
-    def publish_fire_enable_if_detected(self, detected: bool, now: float):
-        """Enemy seen -> immediately clear fire_node safety disable.
+    def _publish_fire_disable(
+        self,
+        disabled: bool,
+        reason: str,
+        *,
+        force: bool = False,
+    ) -> bool:
+        disabled = bool(disabled)
+        if not force and self._last_fire_disable_pub is disabled:
+            return False
+        msg = Bool()
+        msg.data = disabled
+        self.pub_fire_disable.publish(msg)
+        self._last_fire_disable_pub = disabled
+        state = 'disabled' if disabled else 'armed'
+        self.get_logger().info(
+            f'[fire_enable] state={state} reason={reason}'
+        )
+        return True
 
-        fire_node's actual gate is /omx/fire_disable Bool:
-            false = armed/enabled, true = disabled.
-        Publish on the first frame of each detection streak, then republish
-        slowly while the target remains visible so a late/restarted fire_node
-        still gets armed without flooding its logs.
+    def publish_fire_enable_for_aim_state(self, action: dict, now: float):
+        """Clear fire_node safety only after the target is actually aimed.
+
+        Detection alone must not unlock the GPIO fire path.  The safety lock is
+        cleared while CONFIRMING/FIRING, then re-locked when that aimed window
+        ends.  This keeps the physical fire node aligned with the state machine:
+        TRACKING -> CONFIRMING -> FIRING, never "seen -> fire".
         """
-        if not detected or not self.sm.armed:
-            # Detection alone must never clear the safety lock -- only an
-            # operator-armed system may unlock fire_node. Without this check
-            # a mere YOLO detection would clear /omx/fire_disable even while
-            # DISARMED, making the on-screen arm state non-authoritative.
+        should_enable = (
+            self.sm.armed
+            and (
+                self.sm.state in (State.CONFIRMING, State.FIRING)
+                or action.get('action') == 'fire'
+            )
+        )
+
+        if not should_enable:
+            if self._fire_enable_detection_active:
+                self._publish_fire_disable(True, 'aim_window_closed')
             self._fire_enable_detection_active = False
             return
 
@@ -1152,69 +1579,44 @@ class OmxYoloNode(Node):
         if not should_publish:
             return
 
-        msg = Bool()
-        msg.data = False
-        self.pub_fire_disable.publish(msg)
+        self._publish_fire_disable(False, 'aim_confirmed')
         self._last_fire_enable_t = now
         self._fire_enable_detection_active = True
-        self.get_logger().info(
-            "[fire_enable] 적 식별 -> /omx/fire_disable=false 발행")
 
-    def maybe_fire_immediately_on_detection(self, detected: bool,
-                                            now: float) -> bool:
-        fire_cfg = self.cfg.fire
-        if not detected:
-            self._immediate_fire_detection_active = False
-            return False
-
-        if fire_cfg is None or not fire_cfg.immediate_on_detection:
-            return False
-        if self.paused:
-            return False
-        if fire_cfg.immediate_requires_armed and not self.sm.armed:
-            return False
-        if self.sm.state in (State.FIRING, State.COOLDOWN):
-            self._immediate_fire_detection_active = True
-            return False
-        if self._immediate_fire_detection_active:
-            return False
-        if now - self._last_immediate_fire_t < fire_cfg.immediate_min_interval_sec:
-            return False
-
-        navigating = self.sm._is_waffle_navigating()
-        if navigating and not fire_cfg.immediate_during_nav:
-            return False
-
-        if not self.sm.force_fire_now(
-                now,
-                cancel_nav=(navigating and fire_cfg.immediate_cancel_nav),
-                reason="immediate_detection"):
-            return False
-
-        self.publish_fire()
-        self.ctrl.fire()
-        self.publish_processed(None)
-        self._last_immediate_fire_t = now
-        self._immediate_fire_detection_active = True
-        self.get_logger().info(
-            "[immediate_fire] 적 식별 즉시 격발"
-            + (" (Nav2 cancel)" if navigating else ""))
-        return True
-
-    def maybe_stop_nav_on_detection(self, detected: bool) -> bool:
-        """카메라가 표적을 보면 Nav2 이동부터 멈춘다."""
+    def maybe_stop_nav_on_detection(
+        self,
+        detected: bool,
+        error_norm,
+        confidence,
+        now: float,
+    ) -> bool:
+        """Keep robot base motion cancelled while OMX tracks a target."""
         if not detected:
             self._detection_nav_stop_active = False
+            self._detection_streak = 0
             return False
-        if self._detection_nav_stop_active:
+        if error_norm is None:
+            self._detection_streak = 0
             return False
-        if not self.sm._is_waffle_navigating():
+        self._detection_streak += 1
+        if self.sm.state not in (State.TRACKING, State.CONFIRMING):
+            return False
+        if confidence is not None and confidence < float(self.cfg.yolo.conf_threshold):
+            return False
+        should_cancel = (
+            not self._detection_nav_stop_active
+            or now - self._last_detection_cancel_t >= self._detection_cancel_period_sec
+        )
+        if not should_cancel:
             return False
 
-        self.publish_nav_cancel()
+        if self._waffle_nav_busy():
+            self.publish_nav_cancel()
+        self.publish_leader_nav_cancel()
+        self._last_detection_cancel_t = now
         self._detection_nav_stop_active = True
         self.get_logger().warn(
-            "[detection_stop] 표적 식별 -> Nav2 이동 정지")
+            "[detection_stop] target tracking -> leader cancel")
         return True
 
     def _make_point_stamped(self, coord_map):
@@ -1246,9 +1648,30 @@ class OmxYoloNode(Node):
         self.pub_patrol_complete.publish(Empty())
         self.get_logger().info("[patrol_complete] 발행")
 
-    def publish_nav_goal(self, view_pose):
+    def publish_nav_goal(self, view_pose, *, retry: bool = False):
         """H2: VIEW_POSE 를 PoseStamped 로 발행."""
         x, y, yaw = view_pose
+        if retry and self._active_nav_goal_id is not None:
+            goal_id = self._active_nav_goal_id
+            self._active_nav_publish_count += 1
+        else:
+            self._nav_goal_seq += 1
+            self._nav_goal_epoch += 1
+            goal_id = self._nav_goal_seq
+            self._active_nav_goal_id = goal_id
+            self._active_nav_publish_count = 1
+            self._active_nav_acked = False
+        meta = {
+            'goal_id': goal_id,
+            'goal_epoch': self._nav_goal_epoch,
+            'created_at': time.time(),
+            'goal_type': 'OMX_VIEW_POSE',
+            'pose': {'x': x, 'y': y, 'yaw': yaw},
+            'publish_count': self._active_nav_publish_count,
+        }
+        meta_msg = String()
+        meta_msg.data = json.dumps(meta, sort_keys=True)
+        self.pub_nav_goal_meta.publish(meta_msg)
         msg = PoseStamped()
         msg.header.frame_id = 'map'
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -1261,8 +1684,12 @@ class OmxYoloNode(Node):
         self.pub_nav_goal.publish(msg)
         self._last_nav_retry_t = time.time()
         self.get_logger().info(
-            f"[nav_goal] 발행: ({x:+.2f}, {y:+.2f}) "
-            f"yaw={math.degrees(yaw):+.1f}°")
+            'OMX_NAV_GOAL_CREATED | '
+            f'id={goal_id} epoch={self._nav_goal_epoch} type=OMX_VIEW_POSE '
+            f'pose=({x:.3f},{y:.3f},{yaw:.3f})')
+        self.get_logger().info(
+            'OMX_NAV_GOAL_PUBLISHED | '
+            f'id={goal_id} topic=/omx/nav_goal count={self._active_nav_publish_count}')
         # H3.2: 새 nav 시작 → 옛 nav_result 폐기 (race 방지)
         if self.sm.nav_pending_result is not None:
             self.get_logger().warn(
@@ -1298,6 +1725,15 @@ class OmxYoloNode(Node):
         self.pub_nav_cancel.publish(Empty())
         self.get_logger().info("[nav_cancel] 발행 (preempt)")
 
+    def publish_leader_nav_cancel(self):
+        """Cancel leader Nav2/shadow goals while preserving the latched false state."""
+        msg = Bool()
+        msg.data = True
+        self.pub_leader_nav_cancel.publish(msg)
+        msg.data = False
+        self.pub_leader_nav_cancel.publish(msg)
+        self.get_logger().info("[leader_nav_cancel] 발행")
+
     def maybe_retry_waiting_nav_goal(self, now: float):
         """WAITING_NAV 인데 waffle 이 안 움직이면 현재 goal 을 다시 찌른다."""
         if self.sm.state != State.WAITING_NAV:
@@ -1312,8 +1748,11 @@ class OmxYoloNode(Node):
             )
             return
 
-        status = (self.waffle_status or "unknown").lower()
-        if "navigating" in status:
+        if self._waffle_nav_busy():
+            return
+        if self._active_nav_goal_id is not None and self._active_nav_acked:
+            return
+        if self._active_nav_publish_count >= 2:
             return
 
         vp = self.sm._next_hop_pose()
@@ -1324,7 +1763,23 @@ class OmxYoloNode(Node):
         self.get_logger().warn(
             f"[nav_retry] WAITING_NAV but waffle_status={self.waffle_status}; "
             "nav_goal 재발행")
-        self.publish_nav_goal(vp)
+        self.publish_nav_goal(vp, retry=True)
+
+    def _waffle_nav_busy(self) -> bool:
+        busy_states = {
+            'GOAL_RECEIVED',
+            'WAITING_SERVER',
+            'WAITING_LOCALIZATION',
+            'SENDING_GOAL',
+            'WAITING_ACCEPT',
+            'NAVIGATING',
+            'CANCELING',
+        }
+        state = self.waffle_state
+        if state in busy_states:
+            return True
+        status = (self.waffle_status or '').lower()
+        return any(token.lower() in status for token in busy_states)
 
     def publish_target_not_found(self, coord_map):
         """H3: TARGET 좌표에서 scan_timeout 안에 표적 못 찾음."""
@@ -1421,34 +1876,64 @@ class OmxYoloNode(Node):
     # ----- Main loop -----
 
     def loop(self):
-        frame = self.detector.read_frame()
-        if frame is None:
-            self.get_logger().warn(
-                "프레임 읽기 실패 - 카메라 재연결 시도 중",
+        now = time.time()
+        vision_reason = ''
+        try:
+            frame = self.detector.read_frame()
+        except Exception as exc:  # noqa: BLE001
+            frame = None
+            vision_reason = f'camera_read_failed:{type(exc).__name__}'
+            self.get_logger().error(
+                f'OMX_CAMERA_READ_ERROR | reason={vision_reason}: {exc}',
                 throttle_duration_sec=2.0,
             )
-            return
+            try:
+                reset_camera = getattr(self.detector, 'reset_camera', None)
+                if callable(reset_camera):
+                    reset_camera()
+                else:
+                    self.detector.release()
+                    self.detector._set_camera_health(False, 'read_exception')
+            except Exception:
+                pass
+        frame_valid = frame is not None
+        inference_ran = False
+        detected, error_norm, bbox, conf = False, None, None, None
+        if frame_valid and self.sm.state != State.COOLDOWN:
+            try:
+                detected, error_norm, bbox, conf = self.detector.detect(frame)
+                inference_ran = True
+            except Exception as exc:  # noqa: BLE001
+                vision_reason = f'inference_failed:{type(exc).__name__}'
+                self.get_logger().error(
+                    f'OMX_VISION_UNAVAILABLE | reason={vision_reason}: {exc}',
+                    throttle_duration_sec=2.0,
+                )
+        elif not frame_valid and not vision_reason:
+            vision_reason = str(
+                getattr(self.detector, 'camera_failure_reason', 'camera_unavailable')
+            )
 
-        # 격발 후 COOLDOWN 동안엔 YOLO detect 스킵.
-        # 화면/스트림(read_frame·visualize·debug_stream)은 계속 흐르되,
-        # 재검출로 인한 조기 재격발을 막는다.
-        # COOLDOWN 은 detect 결과(detected·error_norm)를 쓰지 않으므로 안전.
-        if self.sm.state == State.COOLDOWN:
-            detected, error_norm, bbox, conf = False, None, None, None
+        vision_valid = frame_valid and inference_ran
+        # Navigation/state progression is deliberately independent from vision.
+        # Invalid vision is UNKNOWN, never a no-target observation.
+        action = self.sm.update(
+            detected, error_norm, now, vision_valid=vision_valid
+        )
+        if action.get('cancel_navigation'):
+            self.publish_nav_cancel()
+            self.publish_leader_nav_cancel()
+        if vision_valid:
+            self.maybe_stop_nav_on_detection(detected, error_norm, conf, now)
+            self.publish_fire_enable_for_aim_state(action, now)
         else:
-            detected, error_norm, bbox, conf = self.detector.detect(frame)
-
-        now = time.time()
-        self.publish_fire_enable_if_detected(detected, now)
-        stopped_for_detection = self.maybe_stop_nav_on_detection(detected)
-        if not stopped_for_detection:
-            self.maybe_fire_immediately_on_detection(detected, now)
-        action = self.sm.update(detected, error_norm, now)
+            self.publish_vision_safe_fire_lock()
 
         # blocked entries 알림
         for entry in action.get('blocked_entries', []):
             self.publish_target_blocked(entry.coord_map, entry.type_name)
 
+        track_moved = None
         if not self.paused:
             if action['action'] == 'aim':
                 coord_map = action['coord_map']
@@ -1458,43 +1943,39 @@ class OmxYoloNode(Node):
                         f"TF 변환 실패, focus 종료: {coord_map}")
                     self.sm._on_focus_done()
                 else:
-                    self.ctrl.aim_at_coord(*coord_arm)
+                    self._controller_call(
+                        'aim_at_coord', self.ctrl.aim_at_coord, *coord_arm
+                    )
                     self.get_logger().info(
                         f"AIM: map{coord_map} -> arm{coord_arm}")
 
             elif action['action'] == 'track':
-                self.ctrl.step_ibvs(*action['error'])
-
-            elif action['action'] == 'scan_sweep':
-                self.ctrl.scan_sweep(
-                    now,
-                    self.cfg.patrol.scan_sweep_half_angle_deg,
-                    self.cfg.patrol.scan_sweep_period_sec,
+                track_moved = self._controller_call(
+                    'step_ibvs', self.ctrl.step_ibvs, *action['error']
                 )
 
-            elif action['action'] == 'fire':
+            elif action['action'] == 'scan_sweep':
+                self.execute_scan_sweep(now)
+
+            elif action['action'] == 'fire' and vision_valid:
                 processed_map = (self.sm.current_focus.coord_map
                                  if self.sm.current_focus else None)
                 self.publish_fire()
-                self.ctrl.fire()
+                self._controller_call('fire', self.ctrl.fire)
                 self.publish_processed(processed_map)
 
             elif action['action'] == 'target_lost':
                 self.publish_target_lost(action.get('lost_coord_map'))
 
             elif action['action'] == 'home':
-                self.ctrl.go_home()
+                self._controller_call('go_home', self.ctrl.go_home)
 
             elif action['action'] == 'nav_goal':
                 # H2 신규
                 vp = action['nav_goal_xyyaw']
                 if vp is not None:
                     self.publish_nav_goal(vp)
-                self.ctrl.scan_sweep(
-                    now,
-                    self.cfg.patrol.scan_sweep_half_angle_deg,
-                    self.cfg.patrol.scan_sweep_period_sec,
-                )
+                self.execute_scan_sweep(now)
 
         self.maybe_retry_waiting_nav_goal(now)
 
@@ -1516,8 +1997,23 @@ class OmxYoloNode(Node):
                 self.sm.on_boundary(coord)
 
         self.publish_detected(detected)
+        self.publish_observation_status(
+            frame_valid=frame_valid,
+            inference_ran=inference_ran,
+            detected=detected,
+            confidence=conf,
+            bbox=bbox,
+            reason=vision_reason,
+        )
         if error_norm is not None:
             self.publish_error(error_norm[0], error_norm[1])
+        self.publish_aim_debug(
+            detected=detected,
+            error_norm=error_norm,
+            action=action,
+            track_moved=track_moved,
+            confidence=conf,
+        )
         self.publish_joint_state()
         self.publish_camera_yaw()
         self.publish_progress(action.get('confirm_progress', 0.0))
@@ -1526,7 +2022,7 @@ class OmxYoloNode(Node):
 
         # 그리기: display 또는 stream 둘 중 하나라도 필요하면 호출
         need_viz = (not self.no_display) or (self.debug_stream is not None)
-        if need_viz:
+        if need_viz and frame_valid:
             self.visualize(frame, detected, error_norm, bbox, conf, action)
             if self.debug_stream is not None:
                 self.debug_stream.update(frame)
@@ -1578,7 +2074,7 @@ class OmxYoloNode(Node):
 
     def visualize(self, frame, detected, error_norm, bbox, conf, action):
         h, w = frame.shape[:2]
-        cx, cy = w / 2.0, h / 2.0
+        cx, cy = self.detector.aim_reference_pixel(w, h)
         deadband_x = self.cfg.ibvs.deadband_x
         deadband_y = self.cfg.ibvs.deadband_y
 
@@ -1715,14 +2211,23 @@ class OmxYoloNode(Node):
         elif key == ord('h'):
             self.get_logger().info("Home + 모든 큐 비움 (수동)")
             self.sm.on_abort()
-            self.ctrl.go_home()
+            self._controller_call('go_home', self.ctrl.go_home)
 
     def destroy_node(self):
         if hasattr(self, 'detector'):
             self.detector.release()
         cv2.destroyAllWindows()
         if hasattr(self, 'ctrl'):
-            self.ctrl.disconnect()
+            try:
+                self.ctrl.disconnect()
+            except Exception as exc:  # noqa: BLE001
+                # A latched Dynamixel hardware fault can reject Torque_Enable
+                # during shutdown.  The process is already stopping, so do
+                # not turn that actuator-side failure into a node crash.
+                self.get_logger().warning(
+                    'OMX_CONTROL_DISCONNECT_ERROR | '
+                    f'controller_error={type(exc).__name__}: {exc}'
+                )
         super().destroy_node()
 
 
@@ -1738,10 +2243,14 @@ def main(args=None):
                         help="Flask MJPEG 디버그 스트림 (http://host:port/)")
     parser.add_argument("--debug-port", type=int, default=8080,
                         help="--debug-stream 포트 (기본 8080)")
-    parser.add_argument("--debug-fps", type=int, default=15,
-                        help="--debug-stream FPS 제한 (기본 15)")
-    parser.add_argument("--debug-quality", type=int, default=70,
-                        help="--debug-stream JPEG quality 10~95 (기본 70)")
+    parser.add_argument("--debug-fps", type=int, default=10,
+                        help="--debug-stream FPS 제한 (기본 10)")
+    parser.add_argument("--debug-quality", type=int, default=52,
+                        help="--debug-stream JPEG quality 10~95 (기본 52)")
+    parser.add_argument("--debug-width", type=int, default=640,
+                        help="--debug-stream output width (기본 640)")
+    parser.add_argument("--debug-height", type=int, default=360,
+                        help="--debug-stream output height (기본 360)")
     cli_args, ros_args = parser.parse_known_args()
 
     rclpy.init(args=ros_args)
@@ -1752,7 +2261,9 @@ def main(args=None):
                    debug_stream=cli_args.debug_stream,
                    debug_port=cli_args.debug_port,
                    debug_fps=cli_args.debug_fps,
-                   debug_quality=cli_args.debug_quality)
+                   debug_quality=cli_args.debug_quality,
+                   debug_width=cli_args.debug_width,
+                   debug_height=cli_args.debug_height)
         try:
             rclpy.spin(node)
         finally:

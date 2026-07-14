@@ -1,4 +1,5 @@
 import os
+import sys
 from typing import Dict, List
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -41,6 +42,13 @@ def _cyclonedds_uri_to_path(uri: str) -> Path | None:
     if parsed.scheme:
         return None
     return Path(uri)
+
+
+def _prepare_process_environment(domain_id: str) -> Dict[str, str]:
+    env = os.environ.copy()
+    env['ROS_DOMAIN_ID'] = str(domain_id)
+    _validate_cyclonedds_socket_buffers(env)
+    return env
 
 
 def _bytes_from_cyclonedds_size(value: str) -> tuple[int | None, str | None]:
@@ -183,11 +191,40 @@ def validate_shell_environment(expected_domain_id: str | None = None) -> None:
 def clean_process_environment(domain_id: str) -> Dict[str, str]:
     """Return the current shell environment after validating it."""
     validate_shell_environment(str(domain_id))
-    return os.environ.copy()
+    return _prepare_process_environment(str(domain_id))
+
+
+def with_virtualenv_site_packages(env: Dict[str, str]) -> Dict[str, str]:
+    """Expose an activated venv's pip packages to ROS Python entry points.
+
+    ament_python console scripts keep the interpreter used at build/install time,
+    so activating a venv is not always enough for Node(...) actions to see pip
+    packages such as Flask or ultralytics.  Prepending the venv site-packages to
+    PYTHONPATH preserves the ROS entry point while still using the user's venv
+    dependencies.
+    """
+    virtual_env = env.get('VIRTUAL_ENV', '').strip()
+    if not virtual_env:
+        return env
+
+    version = f'python{sys.version_info.major}.{sys.version_info.minor}'
+    candidates = [
+        Path(virtual_env) / 'lib' / version / 'site-packages',
+        Path(virtual_env) / 'lib64' / version / 'site-packages',
+    ]
+    existing = [str(path) for path in candidates if path.is_dir()]
+    if not existing:
+        return env
+
+    updated = env.copy()
+    current = updated.get('PYTHONPATH', '').strip()
+    parts = existing + ([current] if current else [])
+    updated['PYTHONPATH'] = os.pathsep.join(parts)
+    return updated
 
 
 def dds_launch_environment(domain_id) -> List:
-    """Validate inherited DDS settings without mutating launch environment."""
+    """Validate DDS without rewriting the operator's shell DDS settings."""
 
     def _validate(context, *args, **kwargs):
         expected_domain_id = _perform_if_needed(domain_id, context)

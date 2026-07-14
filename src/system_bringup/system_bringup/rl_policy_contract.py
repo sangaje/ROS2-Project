@@ -38,11 +38,19 @@ class ActiveScoutPolicyConfig:
     control_dt_sec: float
     map_substeps_per_action: int
     max_scan_age_sec: float
+    max_odom_age_sec: float
     max_map_age_sec: float
     max_tf_age_sec: float
     max_inference_sec: float
     command_timeout_sec: float
+    # Derived, not part of the frozen training contract: how stale the
+    # internal MapSnapshot the RL observation is built from may be before
+    # activation must wait, and how often the heavy confidence-grid/publish
+    # pipeline is allowed to run. See active_scout_config() for the formula.
+    max_observation_snapshot_age_sec: float
+    confidence_update_period_sec: float
     scan_topic: str
+    odom_topic: str
     map_topic: str
     map_frame: str
     base_frame: str
@@ -217,11 +225,22 @@ def active_scout_config(
         control_dt_sec=float(runtime['control_dt_sec']),
         map_substeps_per_action=int(runtime['map_substeps_per_action']),
         max_scan_age_sec=float(runtime['max_scan_age_sec']),
+        max_odom_age_sec=float(runtime.get('max_odom_age_sec', runtime['max_scan_age_sec'])),
         max_map_age_sec=float(runtime['max_map_age_sec']),
         max_tf_age_sec=float(runtime['max_tf_age_sec']),
         max_inference_sec=float(runtime['max_inference_sec']),
         command_timeout_sec=float(runtime['command_timeout_sec']),
+        # Fast observation tick runs independently of the heavy confidence
+        # publish path. Treat the policy-facing MapSnapshot as its own
+        # freshness contract instead of hiding stalls behind scan timeout.
+        max_observation_snapshot_age_sec=5.0,
+        # Heavy confidence-grid update + external map publish: slowed down
+        # from ~2 Hz so it has real idle time between runs instead of racing
+        # back-to-back (its own cost can exceed 1s), which is what was
+        # driving the fast tick's lock-wait tail up in the first place.
+        confidence_update_period_sec=max(1.5, float(runtime['control_dt_sec']) * 7.5),
         scan_topic=str(topics['scan']),
+        odom_topic=str(topics.get('odom', '/odom')),
         map_topic=str(topics['map']),
         map_frame=str(topics['map_frame']),
         base_frame=str(topics['base_frame']),

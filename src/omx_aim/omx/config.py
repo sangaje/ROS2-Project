@@ -60,6 +60,23 @@ class IbvsConfig:
     deadband_x: float         # ← deadband → deadband_x
     deadband_y: float
     control_hz: float
+    # Positive values move the visual-servo reference point downward from the
+    # image center, in normalized half-height units. 0.14 is about 50 px on
+    # a 720p frame.
+    aim_target_offset_y_norm: float = 0.14
+    # Positive values move the visual-servo reference point rightward from
+    # the image center, in normalized half-width units (same convention as
+    # aim_target_offset_y_norm, just for x).
+    aim_target_offset_x_norm: float = 0.0
+    camera_device: str = ''
+    camera_backend: str = 'v4l2'
+    camera_reconnect_period_sec: float = 1.0
+    camera_required: bool = False
+    camera_width: int = 1280
+    camera_height: int = 720
+    camera_fps: float = 15.0
+    camera_fourcc: str = 'MJPG'
+    camera_buffer_size: int = 1
     # ----- 움직이는 표적 추적 (Phase B) -----
     # 미분 게인. 0 이면 순수 P (기존 동작 유지).
     # 권장 시작값: kp * 0.1 ~ 0.3 (예: kp=0.02 -> kd=0.002~0.006)
@@ -92,14 +109,15 @@ class FireConfig:
     gripper_close_duration: float
     gripper_open_duration: float
     cooldown_sec: float
-    lost_timeout_sec: float = 1.5
+    lost_timeout_sec: float = 4.0
     aim_settle_sec: float = 0.7
     # 격발 펄스 동안 조준 유지 시간. fire_node 의 fire_duration_sec 와 일치 권장.
     # COOLDOWN 진입 후 이 시간이 지나야 home 명령이 발사됨.
     # cooldown_sec 보다 작아야 home 이 실행됨.
     fire_pulse_sec: float = 1.5
-    # 카메라가 적을 식별한 즉시 격발한다. Boundary/Nav2 처리보다 우선한다.
-    immediate_on_detection: bool = True
+    # Legacy config compatibility only. Runtime ignores immediate fire and
+    # always requires TRACKING -> CONFIRMING -> FIRING.
+    immediate_on_detection: bool = False
     immediate_during_nav: bool = True
     immediate_cancel_nav: bool = True
     immediate_min_interval_sec: float = 1.0
@@ -130,6 +148,12 @@ class PatrolConfig:
     boundary_aim_settle_sec: float = 0.05
     scan_sweep_half_angle_deg: float = 60.0
     scan_sweep_period_sec: float = 5.0
+    risk_scan_enabled: bool = True
+    risk_map_topic: str = "/risk/risk_map"
+    risk_scan_min_value: int = 8
+    risk_scan_max_distance_m: float = 4.0
+    risk_scan_center_yaw_limit_deg: float = 80.0
+    risk_scan_sample_stride: int = 4
     
 @dataclass
 class ViewPoseConfig:
@@ -308,25 +332,58 @@ def load_config(path=None):
                     yolo_cfg.model_path = str(candidate.resolve())
                     break
             else:
-                # Keep known Ultralytics model names unresolved so the library
-                # can use its normal cache/download path. Custom models should
-                # fail early with a useful path list instead of dying later.
-                known_ultralytics = {
-                    "yolo11n.pt", "yolo11s.pt", "yolo11m.pt",
-                    "yolo11l.pt", "yolo11x.pt",
-                    "yolov8n.pt", "yolov8s.pt", "yolov8m.pt",
-                    "yolov8l.pt", "yolov8x.pt",
-                }
-                if model_path.name not in known_ultralytics:
-                    searched = "\n".join(f"  - {c}" for c in candidates)
-                    raise FileNotFoundError(
-                        "YOLO model file not found. Set OMX_YOLO_MODEL_PATH "
-                        f"to an absolute .pt path, or place {model_path.name} "
-                        f"in one of:\n{searched}"
-                    )
-                yolo_cfg.model_path = model_path.name
+                searched = "\n".join(f"  - {c}" for c in candidates)
+                raise FileNotFoundError(
+                    "YOLO TensorRT engine file not found. Set OMX_YOLO_MODEL_PATH "
+                    f"to an absolute .engine/.plan path, or place {model_path.name} "
+                    f"in one of:\n{searched}"
+                )
         else:
             yolo_cfg.model_path = str(model_path)
+
+        suffix = Path(str(yolo_cfg.model_path)).suffix.lower()
+        if suffix == ".pt":
+            raise ValueError(
+                "PyTorch YOLO checkpoints are not allowed at runtime. "
+                "Use model/target_v3.engine."
+            )
+        if suffix not in (".engine", ".plan"):
+            raise ValueError(
+                "YOLO runtime model must be a TensorRT .engine/.plan file, "
+                f"got: {yolo_cfg.model_path}"
+            )
+
+    camera_device_override = os.environ.get("OMX_YOLO_CAMERA_DEVICE", "").strip()
+    if not camera_device_override:
+        camera_device_override = os.environ.get(
+            "OMX_YOLO_LAUNCH_CAMERA_DEVICE", ""
+        ).strip()
+    if camera_device_override:
+        cfg.ibvs.camera_device = camera_device_override
+
+    camera_backend_override = os.environ.get("OMX_YOLO_CAMERA_BACKEND", "").strip()
+    if camera_backend_override:
+        cfg.ibvs.camera_backend = camera_backend_override
+    reconnect_override = os.environ.get(
+        "OMX_YOLO_CAMERA_RECONNECT_PERIOD_SEC", ""
+    ).strip()
+    if reconnect_override:
+        try:
+            cfg.ibvs.camera_reconnect_period_sec = float(reconnect_override)
+        except ValueError as exc:
+            raise ValueError(
+                'OMX_YOLO_CAMERA_RECONNECT_PERIOD_SEC must be numeric, got '
+                f'{reconnect_override!r}'
+            ) from exc
+
+    required_override = os.environ.get("OMX_YOLO_CAMERA_REQUIRED", "").strip()
+    if required_override:
+        if required_override.lower() not in ('true', 'false'):
+            raise ValueError(
+                'OMX_YOLO_CAMERA_REQUIRED must be true or false, got '
+                f'{required_override!r}'
+            )
+        cfg.ibvs.camera_required = required_override.lower() == 'true'
 
     camera_index_override = os.environ.get("OMX_YOLO_CAMERA_INDEX", "").strip()
     if camera_index_override:

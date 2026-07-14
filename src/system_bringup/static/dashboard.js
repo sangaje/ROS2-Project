@@ -2,6 +2,7 @@ const stateUrl = '/api/status';
 const yoloStatusUrl = '/api/yolo_status';
 const mapImg = new Image();
 const riskImg = new Image();
+const dashboardSessionId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 let latest = null;
 let latestYolo = null;
 let mapSeq = -1;
@@ -9,11 +10,31 @@ let riskSeq = -1;
 let mapReady = false;
 let riskReady = false;
 const gridLoad = {
-  map: {loading: false, requestedSeq: -1, pendingSeq: -1, latestSeq: -1},
-  risk: {loading: false, requestedSeq: -1, pendingSeq: -1, latestSeq: -1},
+  map: {loading: false, requestedSeq: -1, pendingSeq: -1, latestSeq: -1, lastRequestMs: 0, minIntervalMs: 1000},
+  risk: {loading: false, requestedSeq: -1, pendingSeq: -1, latestSeq: -1, lastRequestMs: 0, minIntervalMs: 250},
+};
+const gridRender = {
+  map: {drawn: false, error: null},
+  risk: {drawn: false, error: null},
 };
 let streamSources = {};
-const framePollTimers = {};
+const streamReconnectTimers = {};
+const streamReconnectDelayMs = {};
+const frameVersions = {
+  omxStream: 0,
+  scoutYoloStream: 0,
+};
+// MJPEG multipart connections can go silently idle (server stops sending
+// frames without ever closing the socket) -- the <img> tag then never
+// fires 'error', so it just freezes on the last frame forever unless the
+// user manually reloads the page. This watchdog forces a fresh connection
+// itself once a stream has gone stale, the same thing a manual refresh
+// used to be needed for.
+const lastFrameAtMs = {
+  omxStream: 0,
+  scoutYoloStream: 0,
+};
+const streamStaleTimeoutMs = 6000;
 const canvas = document.getElementById('mapCanvas');
 const ctx = canvas.getContext('2d');
 const roleColors = {leader: '#58a6ff', follower: '#63d297'};
@@ -70,17 +91,12 @@ function setStreamSource(id, url, force = false) {
   const img = document.getElementById(id);
   if (!force && img.dataset.baseSrc === url) return;
   img.dataset.baseSrc = url;
-  img.src = `${url}${url.includes('?') ? '&' : '?'}t=${Date.now()}`;
+  img.src = `${url}${url.includes('?') ? '&' : '?'}session=${dashboardSessionId}&t=${Date.now()}`;
 }
 
 function configureStream(s) {
-  // Use latest-JPEG polling, not long-lived MJPEG proxy connections.  This
-  // makes each panel independent and stable across browser reloads.
-  streamSources.omxStream = '/api/omx_frame.jpg';
-
-  const yolo = s.yolo_server || {};
-  streamSources.scoutRawStream = '/api/yolo_frame/raw.jpg';
-  streamSources.scoutYoloStream = '/api/yolo_frame/yolo.jpg';
+  streamSources.omxStream = '/api/omx_stream.mjpg';
+  streamSources.scoutYoloStream = '/api/yolo_stream/yolo.mjpg';
   refreshStreams(false);
 }
 
@@ -91,30 +107,49 @@ function refreshStreams(force = true) {
 }
 
 function reconnectStream(id) {
-  scheduleFramePoll(id, 750);
-}
-
-['omxStream', 'scoutRawStream', 'scoutYoloStream'].forEach(id => {
-  const image = document.getElementById(id);
-  // Poll only after the previous JPEG has completed.  A fixed interval can
-  // repeatedly cancel a slower first request and recreate the F5-dependent
-  // black panels that this dashboard is meant to avoid.
-  image.addEventListener('load', () => scheduleFramePoll(id, 220));
-  image.addEventListener('error', () => reconnectStream(id));
-});
-
-function scheduleFramePoll(id, delayMs) {
-  window.clearTimeout(framePollTimers[id]);
-  framePollTimers[id] = window.setTimeout(() => {
+  window.clearTimeout(streamReconnectTimers[id]);
+  const previous = streamReconnectDelayMs[id] || 500;
+  const delay = Math.min(8000, previous);
+  streamReconnectDelayMs[id] = Math.min(8000, Math.max(500, previous * 1.7));
+  streamReconnectTimers[id] = window.setTimeout(() => {
     const image = document.getElementById(id);
     const url = image.dataset.baseSrc;
     if (url) setStreamSource(id, url, true);
-  }, delayMs);
+  }, delay);
+}
+
+['omxStream', 'scoutYoloStream'].forEach(id => {
+  const image = document.getElementById(id);
+  image.addEventListener('load', () => {
+    if (image.naturalWidth > 0 && image.naturalHeight > 0) {
+      frameVersions[id] = (frameVersions[id] || 0) + 1;
+      lastFrameAtMs[id] = Date.now();
+    }
+    streamReconnectDelayMs[id] = 500;
+  });
+  image.addEventListener('error', () => reconnectStream(id));
+});
+
+function checkStreamFreshness() {
+  const now = Date.now();
+  Object.keys(streamSources).forEach(id => {
+    const last = lastFrameAtMs[id] || 0;
+    if (last > 0 && now - last > streamStaleTimeoutMs) {
+      const image = document.getElementById(id);
+      const url = image && image.dataset.baseSrc;
+      if (url) setStreamSource(id, url, true);
+      // One attempt per stale window instead of every tick -- give the
+      // fresh connection a fair chance before deciding to retry again.
+      lastFrameAtMs[id] = now;
+    }
+  });
 }
 
 function updateImages(s) {
   queueGridLoad('map', s.map.seq, s.map.status);
-  queueGridLoad('risk', s.risk.seq, s.risk.status);
+  if (s.risk.metadata_matches_map || !riskReady) {
+    queueGridLoad('risk', s.risk.seq, s.risk.status);
+  }
 }
 
 function queueGridLoad(kind, seq, status) {
@@ -127,8 +162,18 @@ function queueGridLoad(kind, seq, status) {
     state.pendingSeq = Math.max(state.pendingSeq, seq);
     return;
   }
+  const nowMs = Date.now();
+  if (nowMs - state.lastRequestMs < state.minIntervalMs) {
+    state.pendingSeq = Math.max(state.pendingSeq, seq);
+    window.setTimeout(
+      () => queueGridLoad(kind, state.pendingSeq, 'OK'),
+      Math.max(50, state.minIntervalMs - (nowMs - state.lastRequestMs)),
+    );
+    return;
+  }
   state.loading = true;
   state.requestedSeq = seq;
+  state.lastRequestMs = nowMs;
   const image = kind === 'map' ? mapImg : riskImg;
   image.src = `/api/${kind}.png?v=${seq}&t=${Date.now()}`;
 }
@@ -199,11 +244,50 @@ function worldToCell(meta, x, y) {
   };
 }
 
+function cellToWorld(meta, cellX, cellY) {
+  const o = meta.origin;
+  const yaw = o.yaw || 0.0;
+  const c = Math.cos(yaw);
+  const s = Math.sin(yaw);
+  const lx = cellX * meta.resolution;
+  const ly = cellY * meta.resolution;
+  return {
+    x: o.x + c * lx - s * ly,
+    y: o.y + s * lx + c * ly,
+  };
+}
+
 function cellToCanvas(meta, vp, cell) {
   return {
     x: vp.x + cell.x * vp.scale,
     y: vp.y + (meta.height - cell.y) * vp.scale,
   };
+}
+
+function gridCornerToCanvas(baseMeta, vp, overlayMeta, cellX, cellY) {
+  const world = cellToWorld(overlayMeta, cellX, cellY);
+  return cellToCanvas(baseMeta, vp, worldToCell(baseMeta, world.x, world.y));
+}
+
+function drawGridImage(img, overlayMeta, baseMeta, vp) {
+  if (!overlayMeta || !Number.isFinite(overlayMeta.width) || !Number.isFinite(overlayMeta.height)) return;
+  if (overlayMeta.width <= 0 || overlayMeta.height <= 0 || overlayMeta.resolution <= 0) return;
+
+  const topLeft = gridCornerToCanvas(baseMeta, vp, overlayMeta, 0, overlayMeta.height);
+  const topRight = gridCornerToCanvas(baseMeta, vp, overlayMeta, overlayMeta.width, overlayMeta.height);
+  const bottomLeft = gridCornerToCanvas(baseMeta, vp, overlayMeta, 0, 0);
+  const a = (topRight.x - topLeft.x) / overlayMeta.width;
+  const b = (topRight.y - topLeft.y) / overlayMeta.width;
+  const c = (bottomLeft.x - topLeft.x) / overlayMeta.height;
+  const d = (bottomLeft.y - topLeft.y) / overlayMeta.height;
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(vp.x, vp.y, vp.w, vp.h);
+  ctx.clip();
+  ctx.setTransform(a, b, c, d, topLeft.x, topLeft.y);
+  ctx.drawImage(img, 0, 0, overlayMeta.width, overlayMeta.height);
+  ctx.restore();
 }
 
 function drawRobot(meta, vp, robot) {
@@ -291,6 +375,7 @@ function formatPoint(p) {
 function updateOmxPanel(s) {
   const err = s.omx.aim_error_norm || {};
   const cmd = s.omx.leader_cmd_vel || {};
+  const navCmd = s.omx.leader_cmd_vel_nav || {};
   const detected = s.omx.target_detected === true;
   const fireDisabled = s.omx.fire_disabled;
   const cards = [
@@ -303,7 +388,8 @@ function updateOmxPanel(s) {
     ['Fire Lock', fireDisabled === true ? 'DISABLED' : fireDisabled === false ? 'ARMED' : '--', fireDisabled === false ? 'OK' : fireDisabled === true ? 'STALE' : 'NO DATA', ageText(topicAge(s, 'fire_disabled'))],
     ['Nav Result', s.omx.waffle_nav_result || '--', s.omx.waffle_nav_result ? 'OK' : 'NO DATA', ageText(topicAge(s, 'waffle_nav_result'))],
     ['Waffle', s.omx.waffle_status || '--', s.omx.waffle_status ? 'OK' : 'NO DATA', ageText(topicAge(s, 'waffle_status'))],
-    ['Cmd Vel', `x ${fmt(cmd.linear_x)} / z ${fmt(cmd.angular_z)}`, s.omx.leader_cmd_vel ? 'OK' : 'NO DATA', ageText(topicAge(s, 'leader_cmd_vel'))],
+    ['Cmd Final', `x ${fmt(cmd.linear_x)} / z ${fmt(cmd.angular_z)}`, s.omx.leader_cmd_vel ? 'OK' : 'NO DATA', ageText(topicAge(s, 'leader_cmd_vel'))],
+    ['Cmd Nav', `x ${fmt(navCmd.linear_x)} / z ${fmt(navCmd.angular_z)}`, s.omx.leader_cmd_vel_nav ? 'OK' : 'NO DATA', ageText(topicAge(s, 'leader_cmd_vel_nav'))],
   ];
   document.getElementById('omxCards').innerHTML = cards
     .map(([label, value, status, sub]) => metricCard(label, value, status, sub))
@@ -312,14 +398,23 @@ function updateOmxPanel(s) {
 
 function updateYoloPanel(y) {
   const data = y && y.data ? y.data : {};
+  const streams = latest && latest.video_streams ? latest.video_streams : {};
+  const scoutStream = streams.scout_yolo || {};
+  const omxStream = streams.omx || {};
   const detections = Array.isArray(data.detections) ? data.detections : [];
+  const target = data.all_classes ? 'all' : data.target_class ?? '--';
+  const statusText = data.last_error || data.last_status || '';
   const cards = [
     ['Server', y ? y.status : 'NO DATA', y ? y.status : 'NO DATA', y ? `${fmt(y.latency_ms, 0)} ms` : ''],
-    ['Raw FPS', fmt(data.raw_fps, 1), data.ok ? 'OK' : 'NO DATA', `${data.raw_frames ?? 0} frames`],
-    ['YOLO FPS', fmt(data.yolo_fps, 1), data.yolo_frames ? 'OK' : 'NO DATA', `${data.yolo_frames ?? 0} frames`],
-    ['People', data.people ?? '--', data.people > 0 ? 'OK' : 'NO DATA', `${detections.length} detections`],
-    ['Latency', `${fmt(data.latency_ms, 1)} ms`, data.yolo_frames ? 'OK' : 'NO DATA', `pred ${fmt(data.predict_ms, 1)} ms`],
-    ['Frame Age', `${fmt(data.raw_frame_age_sec, 2)} s`, data.raw_frame_age_sec < 2 ? 'OK' : 'STALE', `${data.image_width || '--'}x${data.image_height || '--'}`],
+    ['Upload FPS', fmt(data.capture_fps, 1), data.ok ? 'OK' : 'NO DATA', `${data.capture_frames ?? 0} frames`],
+    ['Infer FPS', fmt(data.inference_fps, 1), data.inference_frames ? 'OK' : 'NO DATA', `${data.inference_frames ?? 0} ok frames`],
+    ['Scout Stream', `${fmt(scoutStream.display_fps, 1)} fps`, scoutStream.upstream_connection_count === 1 ? 'OK' : 'NO DATA', `${fmt(scoutStream.upstream_mbps, 2)} Mbps / ${fmt(scoutStream.frame_age_ms, 0)} ms`],
+    ['OMX Stream', `${fmt(omxStream.display_fps, 1)} fps`, omxStream.upstream_connection_count === 1 ? 'OK' : 'NO DATA', `${fmt(omxStream.upstream_mbps, 2)} Mbps / ${fmt(omxStream.frame_age_ms, 0)} ms`],
+    ['Targets', data.people ?? '--', data.people > 0 ? 'OK' : 'NO DATA', `${detections.length} detections`],
+    ['Latency', `${fmt(data.latency_ms, 1)} ms`, data.inference_frames ? 'OK' : 'NO DATA', `pred ${fmt(data.predict_ms, 1)} ms`],
+    ['Frame Age', `${fmt(data.yolo_frame_age_sec, 2)} s`, data.yolo_frame_age_sec < 2 ? 'OK' : 'STALE', `${data.image_width || '--'}x${data.image_height || '--'}`],
+    ['Runtime', data.backend || data.device || '--', data.device === 'cpu' ? 'STALE' : 'OK', `${data.device || '--'} / conf ${fmt(data.conf, 2)} / cls ${target}`],
+    ['YOLO State', statusText || '--', data.last_error ? 'STALE' : data.inference_frames ? 'OK' : 'NO DATA', data.model_path || ''],
   ];
   document.getElementById('yoloCards').innerHTML = cards
     .map(([label, value, status, sub]) => metricCard(label, value, status, sub))
@@ -390,6 +485,8 @@ function updateNavPaths(s) {
 
 function draw() {
   resizeCanvas();
+  gridRender.map = {drawn: false, error: null};
+  gridRender.risk = {drawn: false, error: null};
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.fillStyle = '#08090a';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -402,12 +499,37 @@ function draw() {
   const meta = latest.map.metadata;
   const vp = mapViewport(meta);
   if (document.getElementById('layerMap').checked && mapReady) {
-    ctx.drawImage(mapImg, vp.x, vp.y, vp.w, vp.h);
+    try {
+      drawGridImage(mapImg, meta, meta, vp);
+      gridRender.map.drawn = true;
+    } catch (err) {
+      gridRender.map.error = String(err);
+    }
   }
-  if (document.getElementById('layerRisk').checked && riskReady && latest.risk.metadata_matches_map) {
+  if (document.getElementById('layerRisk').checked && riskReady && latest.risk.metadata) {
     ctx.save();
     ctx.globalAlpha = Number(document.getElementById('riskOpacity').value);
-    ctx.drawImage(riskImg, vp.x, vp.y, vp.w, vp.h);
+    try {
+      drawGridImage(riskImg, latest.risk.metadata, meta, vp);
+      gridRender.risk.drawn = true;
+    } catch (err) {
+      gridRender.risk.error = String(err);
+    }
+    ctx.restore();
+  }
+  if (latest.risk && latest.risk.status === 'EMPTY_RISK_MAP') {
+    ctx.save();
+    ctx.fillStyle = 'rgba(8, 9, 10, 0.70)';
+    ctx.fillRect(vp.x + 12, vp.y + 12, 270, 58);
+    ctx.fillStyle = '#d5dde5';
+    ctx.font = '14px ui-monospace, SFMono-Regular, Menlo, monospace';
+    ctx.fillText('No active risk evidence', vp.x + 24, vp.y + 36);
+    ctx.fillStyle = '#98a6b3';
+    ctx.fillText(
+      `Risk max: ${latest.risk.max_value || 0} | Positive cells: ${latest.risk.positive_count || 0}`,
+      vp.x + 24,
+      vp.y + 58,
+    );
     ctx.restore();
   }
   if (document.getElementById('layerNavPaths').checked) {
@@ -471,8 +593,85 @@ function updateTop(s) {
   rp.className = `pill ${online ? 'online' : 'no-data'}`;
   rp.innerHTML = `<span class="dot"></span>Robots ${online}/${s.robots.length}`;
   document.getElementById('mapWarning').textContent = (!s.risk.metadata_matches_map && s.risk.status !== 'NO DATA')
-    ? 'Risk overlay metadata does not match /map, so overlay rendering is suppressed.'
+    ? 'Risk overlay metadata is updating; holding the last available risk image.'
     : '';
+}
+
+function imagePanelReady(id) {
+  const img = document.getElementById(id);
+  return {
+    loaded: Boolean(img && img.complete && img.naturalWidth > 0 && img.naturalHeight > 0),
+    rendered: Boolean(img && img.complete && img.naturalWidth > 0 && img.naturalHeight > 0),
+    placeholder: false,
+    version: frameVersions[id] || 0,
+    naturalWidth: img ? img.naturalWidth : 0,
+    naturalHeight: img ? img.naturalHeight : 0,
+  };
+}
+
+function gridPanelReady(kind) {
+  const seq = kind === 'map' ? mapSeq : riskSeq;
+  const ready = kind === 'map' ? mapReady : riskReady;
+  const grid = latest && latest[kind === 'map' ? 'map' : 'risk']
+    ? latest[kind === 'map' ? 'map' : 'risk']
+    : {};
+  const meta = grid.metadata || null;
+  const backendSeq = Number.isFinite(grid.seq) ? grid.seq : 0;
+  const pngSeq = Number.isFinite(grid.png_seq) ? grid.png_seq : -1;
+  const pngBytes = Number.isFinite(grid.png_bytes) ? grid.png_bytes : 0;
+  const gridReceived = Boolean(grid.grid_received);
+  const versionMatches = seq > 0 && seq === backendSeq && pngSeq === backendSeq;
+  const loaded = Boolean(
+    ready && meta && meta.width > 0 && meta.height > 0
+    && (kind === 'map' || (gridReceived && pngBytes > 0 && versionMatches))
+  );
+  const rendered = Boolean(loaded && gridRender[kind].drawn);
+  return {
+    loaded,
+    rendered,
+    placeholder: !loaded,
+    version: Math.max(0, seq),
+    backend_seq: backendSeq,
+    png_seq: pngSeq,
+    grid_received: gridReceived,
+    png_bytes: pngBytes,
+    positive_count: grid.positive_count || 0,
+    max_value: grid.max_value || 0,
+    status: grid.status || 'NO DATA',
+    render_error: gridRender[kind].error,
+  };
+}
+
+async function publishDashboardReadiness() {
+  if (!latest) return;
+  const manifest = {
+    session_id: dashboardSessionId,
+    stamp: Date.now() / 1000.0,
+    panels: {
+      scout_yolo: imagePanelReady('scoutYoloStream'),
+      leader_omx: imagePanelReady('omxStream'),
+      map: gridPanelReady('map'),
+      risk_map: gridPanelReady('risk'),
+      fleet_state: {
+        loaded: Array.isArray(latest.robots) && latest.robots.length > 0,
+        rendered: Array.isArray(latest.robots) && latest.robots.length > 0,
+        placeholder: false,
+        version: Array.isArray(latest.robots) ? latest.robots.length : 0,
+        robots: Array.isArray(latest.robots) ? latest.robots.map(r => r.name) : [],
+      },
+    },
+  };
+  try {
+    await fetch('/api/dashboard_readiness', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(manifest),
+      cache: 'no-store',
+      keepalive: true,
+    });
+  } catch (err) {
+    console.warn('dashboard readiness publish failed', err);
+  }
 }
 
 async function refresh() {
@@ -494,6 +693,7 @@ async function refresh() {
     updateMapMeta(s);
     updateNavPaths(s);
     draw();
+    publishDashboardReadiness();
   } catch (err) {
     console.warn('dashboard refresh failed', err);
   }
@@ -506,3 +706,4 @@ async function refresh() {
 window.addEventListener('resize', draw);
 refresh();
 setInterval(refresh, 500);
+setInterval(checkStreamFreshness, 2000);

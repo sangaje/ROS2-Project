@@ -39,6 +39,8 @@ OMX yolo_node 가 발행한 /omx/nav_goal (VIEW_POSE) 을 Nav2 NavigateToPose
 from __future__ import annotations
 
 import sys
+import json
+import math
 import time
 from enum import Enum
 from functools import partial
@@ -70,8 +72,14 @@ from omx.config import load_config
 # ===========================================================
 
 class WaffleState(Enum):
-    IDLE = "idle"
-    NAVIGATING = "navigating"
+    IDLE = "IDLE"
+    GOAL_RECEIVED = "GOAL_RECEIVED"
+    WAITING_SERVER = "WAITING_SERVER"
+    WAITING_LOCALIZATION = "WAITING_LOCALIZATION"
+    SENDING_GOAL = "SENDING_GOAL"
+    WAITING_ACCEPT = "WAITING_ACCEPT"
+    NAVIGATING = "NAVIGATING"
+    CANCELING = "CANCELING"
 
 
 # ===========================================================
@@ -95,6 +103,14 @@ class WaffleNavNode(Node):
         self._amcl_ready = False
         self._amcl_cov_text = "no_amcl_pose"
         self._localization_ready_flag = False
+        self._last_nav_goal_meta = {}
+        self._current_goal_id = 0
+        self._current_goal_type = ''
+        self._current_goal_created_at = 0.0
+        self._cancel_requested_before_accept = False
+        self._last_error = ''
+        self._last_feedback_wall: Optional[float] = None
+        self._goal_accepted = False
 
         # Nav2 액션 핸들
         self.current_goal_handle = None
@@ -119,18 +135,27 @@ class WaffleNavNode(Node):
         self.declare_parameter('require_amcl_ready', False)
         self.declare_parameter('require_localization_ready', False)
         self.declare_parameter('localization_ready_topic', '/localization_ready')
+        self.declare_parameter('require_start_motion', True)
+        self.declare_parameter('start_motion_topic', '/fleet/start_motion')
         self.declare_parameter('amcl_pose_topic', '/amcl_pose')
         self.declare_parameter('max_amcl_pose_age_sec', 3.0)
         self.declare_parameter('max_xy_covariance', 2.00)
         self.declare_parameter('max_yaw_covariance', 1.50)
         self.declare_parameter('pending_goal_retry_period_sec', 0.5)
         self.declare_parameter('max_pending_goal_age_sec', 300.0)
+        self.declare_parameter('goal_ack_timeout_sec', 5.0)
+        self.declare_parameter('cancel_timeout_sec', 3.0)
         self.require_amcl_ready = bool(
             self.get_parameter('require_amcl_ready').value)
         self.require_localization_ready = bool(
             self.get_parameter('require_localization_ready').value)
         self.localization_ready_topic = str(
             self.get_parameter('localization_ready_topic').value)
+        self.require_start_motion = bool(
+            self.get_parameter('require_start_motion').value)
+        self.start_motion_topic = str(
+            self.get_parameter('start_motion_topic').value)
+        self._start_motion_flag = not self.require_start_motion
         self.amcl_pose_topic = str(
             self.get_parameter('amcl_pose_topic').value)
         self.max_amcl_pose_age_sec = float(
@@ -141,6 +166,10 @@ class WaffleNavNode(Node):
             self.get_parameter('max_yaw_covariance').value)
         self.max_pending_goal_age_sec = float(
             self.get_parameter('max_pending_goal_age_sec').value)
+        self.goal_ack_timeout_sec = max(
+            0.5, float(self.get_parameter('goal_ack_timeout_sec').value))
+        self.cancel_timeout_sec = max(
+            0.5, float(self.get_parameter('cancel_timeout_sec').value))
         pending_retry_period = float(
             self.get_parameter('pending_goal_retry_period_sec').value)
 
@@ -157,6 +186,8 @@ class WaffleNavNode(Node):
         # Subscribers
         self.create_subscription(PoseStamped, '/omx/nav_goal',
                                  self.on_nav_goal, 10)
+        self.create_subscription(String, '/omx/nav_goal_meta',
+                                 self.on_nav_goal_meta, 10)
         self.create_subscription(Empty, '/omx/nav_cancel',
                                  self.on_nav_cancel, 10)
         self.create_subscription(
@@ -178,6 +209,19 @@ class WaffleNavNode(Node):
                 self.on_localization_ready,
                 latched_qos,
             )
+        if self.require_start_motion:
+            latched_qos = QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                history=HistoryPolicy.KEEP_LAST,
+            )
+            self.create_subscription(
+                Bool,
+                self.start_motion_topic,
+                self.on_start_motion,
+                latched_qos,
+            )
 
         # Publishers
         self.pub_result = self.create_publisher(
@@ -186,6 +230,10 @@ class WaffleNavNode(Node):
             String, '/waffle/status', 10)
         self.pub_state = self.create_publisher(
             String, '/waffle/state', 10)
+        self.pub_goal_ack = self.create_publisher(
+            String, '/waffle/nav_goal_ack', 10)
+        self.pub_diagnostics = self.create_publisher(
+            String, '/waffle/nav_diagnostics', 10)
 
         # Status timer
         self.create_timer(1.0, self.publish_status)
@@ -205,6 +253,9 @@ class WaffleNavNode(Node):
         self.get_logger().info(
             f"Localization spin gate: require={self.require_localization_ready} "
             f"topic={self.localization_ready_topic}")
+        self.get_logger().info(
+            f"Start motion gate: require={self.require_start_motion} "
+            f"topic={self.start_motion_topic}")
         self.get_logger().info("입력:")
         self.get_logger().info("  /omx/nav_goal    PoseStamped")
         self.get_logger().info("  /omx/nav_cancel  Empty")
@@ -244,6 +295,8 @@ class WaffleNavNode(Node):
             msg = String()
             msg.data = new_state.value
             self.pub_state.publish(msg)
+            self.publish_status()
+            self._publish_ack(new_state.value)
 
     # ----- Subscribers -----
 
@@ -274,6 +327,29 @@ class WaffleNavNode(Node):
                 f"localization_ready 수신: {self.localization_ready_topic}=true")
             self._try_send_pending_goal()
 
+    def on_start_motion(self, msg: Bool):
+        previous = self._start_motion_flag
+        self._start_motion_flag = bool(msg.data)
+        if previous and not self._start_motion_flag:
+            self._pending_goal = None
+            self._pending_goal_received_wall = None
+            self._last_error = 'start_motion_false'
+            self._cancel_current_goal()
+        if self._start_motion_flag != previous:
+            self.get_logger().warn(
+                f"motion gate 수신: {self.start_motion_topic}={self._start_motion_flag}")
+        if self._start_motion_flag and not previous:
+            self._try_send_pending_goal()
+
+    def on_nav_goal_meta(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+        except (json.JSONDecodeError, TypeError):
+            self.get_logger().warn('OMX_NAV_GOAL_META_IGNORED | malformed')
+            return
+        if isinstance(data, dict):
+            self._last_nav_goal_meta = data
+
     def _localization_ready(self) -> bool:
         if self.dry_run:
             return True
@@ -286,24 +362,41 @@ class WaffleNavNode(Node):
         age = time.time() - self._last_amcl_pose_wall
         return age <= self.max_amcl_pose_age_sec
 
+    def _start_motion_ready(self) -> bool:
+        return self.dry_run or (not self.require_start_motion or self._start_motion_flag)
+
     def _queue_nav_goal(self, msg: PoseStamped, reason: str):
         self._pending_goal = msg
         self._pending_goal_received_wall = time.time()
+        self._last_error = reason
+        self.transition(
+            WaffleState.WAITING_LOCALIZATION
+            if 'localization' in reason.lower() or 'amcl' in reason.lower()
+            else WaffleState.WAITING_SERVER
+        )
         spin_text = (
             "ready"
             if (not self.require_localization_ready or self._localization_ready_flag)
             else "waiting_spin"
         )
         self.get_logger().warn(
-            f"nav_goal 보류: {reason}. localization={spin_text} "
-            f"AMCL={self._amcl_cov_text}",
+            'WAFFLE_NAV_HOLD | '
+            f'reason={reason} goal_id={self._current_goal_id} '
+            f'start_motion={self._start_motion_flag}/{self.require_start_motion} '
+            f'localization_flag={self._localization_ready_flag} '
+            f'localization={spin_text} AMCL={self._amcl_cov_text}',
             throttle_duration_sec=2.0,
         )
 
     def _try_send_pending_goal(self):
         if self._pending_goal is None:
             return
-        if self.state == WaffleState.NAVIGATING:
+        if self.state in (
+            WaffleState.SENDING_GOAL,
+            WaffleState.WAITING_ACCEPT,
+            WaffleState.NAVIGATING,
+            WaffleState.CANCELING,
+        ):
             return
 
         age = time.time() - (self._pending_goal_received_wall or time.time())
@@ -315,7 +408,18 @@ class WaffleNavNode(Node):
             self._publish_result("rejected")
             return
 
+        if not self._start_motion_ready():
+            self.transition(WaffleState.WAITING_SERVER)
+            self.get_logger().warn(
+                f"pending nav_goal 폐기: start_motion 준비 전 "
+                f"({self.start_motion_topic}=false)",
+                throttle_duration_sec=5.0,
+            )
+            self._pending_goal = None
+            self._pending_goal_received_wall = None
+            return
         if not self.action_client.server_is_ready():
+            self.transition(WaffleState.WAITING_SERVER)
             self.get_logger().warn(
                 f"pending nav_goal 대기: Nav2 액션 서버 '{self.action_name}' "
                 "아직 준비 안 됨",
@@ -323,6 +427,7 @@ class WaffleNavNode(Node):
             )
             return
         if not self._localization_ready():
+            self.transition(WaffleState.WAITING_LOCALIZATION)
             self.get_logger().warn(
                 "pending nav_goal 대기: localization/AMCL not ready "
                 f"(spin_ready={self._localization_ready_flag}, "
@@ -338,19 +443,101 @@ class WaffleNavNode(Node):
             f"pending nav_goal 전송: AMCL ready ({self._amcl_cov_text})")
         self._send_nav_goal(goal_msg)
 
+    def _capture_goal_meta(self):
+        data = self._last_nav_goal_meta if isinstance(self._last_nav_goal_meta, dict) else {}
+        goal_id = data.get('goal_id')
+        try:
+            self._current_goal_id = int(goal_id)
+        except (TypeError, ValueError):
+            self._goal_epoch += 1
+            self._current_goal_id = self._goal_epoch
+        self._current_goal_type = str(data.get('goal_type', 'OMX_VIEW_POSE'))
+        try:
+            self._current_goal_created_at = float(data.get('created_at', time.time()))
+        except (TypeError, ValueError):
+            self._current_goal_created_at = time.time()
+
+    @staticmethod
+    def _validate_goal(msg: PoseStamped) -> tuple[bool, str]:
+        frame = str(msg.header.frame_id or '').strip().lstrip('/')
+        if frame and frame != 'map':
+            return False, f'unsupported_frame_{frame}'
+        p = msg.pose.position
+        q = msg.pose.orientation
+        values = (p.x, p.y, p.z, q.x, q.y, q.z, q.w)
+        if not all(math.isfinite(float(value)) for value in values):
+            return False, 'non_finite_pose'
+        norm_sq = (
+            float(q.x) ** 2
+            + float(q.y) ** 2
+            + float(q.z) ** 2
+            + float(q.w) ** 2
+        )
+        if norm_sq <= 1.0e-12:
+            return False, 'invalid_quaternion'
+        return True, ''
+
+    def _publish_ack(self, state: str, *, accepted: bool = False, reason: str = ''):
+        msg = String()
+        msg.data = json.dumps({
+            'goal_id': self._current_goal_id,
+            'goal_epoch': self._goal_epoch,
+            'state': state,
+            'accepted': bool(accepted),
+            'reason': reason,
+        }, sort_keys=True)
+        self.pub_goal_ack.publish(msg)
+
+    def _diagnostics_payload(self) -> dict:
+        return {
+            'state': self.state.value,
+            'goal_id': self._current_goal_id,
+            'goal_epoch': self._goal_epoch,
+            'action_server_ready': bool(self.dry_run or self.action_client.server_is_ready()),
+            'localization_ready': bool(self._localization_ready()),
+            'start_motion': bool(self._start_motion_ready()),
+            'amcl_ready': bool(self._amcl_ready),
+            'goal_pending': self._pending_goal is not None,
+            'goal_accepted': bool(self._goal_accepted),
+            'cancel_pending': bool(self._cancel_requested_before_accept or self.state == WaffleState.CANCELING),
+            'last_error': self._last_error,
+        }
+
     def on_nav_goal(self, msg: PoseStamped):
         """yolo_node 가 발행한 와플 이동 목표 (VIEW_POSE)."""
         x = msg.pose.position.x
         y = msg.pose.position.y
         frame = msg.header.frame_id or "(none)"
+        replacing_active_goal = self.state in (
+            WaffleState.NAVIGATING,
+            WaffleState.WAITING_ACCEPT,
+            WaffleState.CANCELING,
+        )
+        self._capture_goal_meta()
         self.get_logger().info(
-            f"nav_goal 수신: ({x:+.2f}, {y:+.2f}) frame={frame}")
+            'WAFFLE_NAV_GOAL_RECEIVED | '
+            f'id={self._current_goal_id} pose=({x:+.2f},{y:+.2f}) frame={frame}')
+        self.transition(WaffleState.GOAL_RECEIVED)
+
+        valid, reason = self._validate_goal(msg)
+        if not valid:
+            self._last_error = reason
+            self.get_logger().error(
+                f'OMX_NAV_GOAL_REJECTED_LOCAL | reason={reason} '
+                f'goal_id={self._current_goal_id}')
+            self._publish_result("rejected")
+            self.transition(WaffleState.IDLE)
+            return
 
         # 이미 NAVIGATING 이면 이전 goal 취소 후 새 goal
-        if self.state == WaffleState.NAVIGATING:
+        if replacing_active_goal:
             self.get_logger().warn(
-                "이미 NAVIGATING - 이전 goal 취소 후 새 goal")
+                "active goal exists - queue replacement after cancel")
+            self._pending_goal = msg
+            self._pending_goal_received_wall = time.time()
             self._cancel_current_goal()
+            self._publish_ack(self.state.value, reason='queued_after_cancel')
+            return
 
         # frame_id 비어 있으면 보정
         if not msg.header.frame_id:
@@ -362,6 +549,14 @@ class WaffleNavNode(Node):
             self._dry_run_navigate()
             return
 
+        if not self._start_motion_ready():
+            self._last_error = 'start_motion_false'
+            self._publish_result("rejected")
+            self.transition(WaffleState.IDLE)
+            self.get_logger().warn(
+                f'WAFFLE_NAV_GOAL_REJECTED_START_MOTION_FALSE | topic={self.start_motion_topic}'
+            )
+            return
         if not self.action_client.server_is_ready():
             self._queue_nav_goal(
                 msg, f"Nav2 액션 서버 '{self.action_name}' 준비 전")
@@ -378,17 +573,28 @@ class WaffleNavNode(Node):
         goal.pose = msg
 
         self.nav_start_t = time.time()
-        self.transition(WaffleState.NAVIGATING)
+        self._last_feedback_wall = None
+        self._goal_accepted = False
+        self._cancel_requested_before_accept = False
+        self.transition(WaffleState.SENDING_GOAL)
 
         self._goal_epoch += 1
         epoch = self._goal_epoch
+        self.get_logger().info(
+            f'WAFFLE_NAV_GOAL_SENT | id={self._current_goal_id} '
+            f'action={self.action_name}')
         self.send_goal_future = self.action_client.send_goal_async(
             goal, feedback_callback=self._feedback_callback)
+        self.transition(WaffleState.WAITING_ACCEPT)
         self.send_goal_future.add_done_callback(
             partial(self._goal_response_callback, epoch=epoch))
 
     def on_nav_cancel(self, msg):
-        if self.state == WaffleState.NAVIGATING:
+        if self.state in (
+            WaffleState.WAITING_ACCEPT,
+            WaffleState.NAVIGATING,
+            WaffleState.SENDING_GOAL,
+        ):
             self.get_logger().info("nav_cancel 수신 - 이동 취소")
             self._cancel_current_goal()
         else:
@@ -398,29 +604,54 @@ class WaffleNavNode(Node):
 
     def _feedback_callback(self, feedback_msg):
         """Nav2 피드백 (남은 거리). 로그 너무 많아지지 않게 debug 로."""
+        self._last_feedback_wall = time.time()
         fb = feedback_msg.feedback
         if hasattr(fb, 'distance_remaining'):
             d = fb.distance_remaining
-            self.get_logger().debug(f"남은 거리: {d:.2f} m")
+            self.get_logger().debug(
+                f"WAFFLE_NAV_FEEDBACK | id={self._current_goal_id} "
+                f"distance_remaining={d:.2f}")
 
     def _goal_response_callback(self, future, epoch: int):
         """Nav2 가 goal accept/reject 응답."""
+        try:
+            goal_handle = future.result()
+        except Exception as exc:  # noqa: BLE001
+            if epoch == self._goal_epoch:
+                self._last_error = str(exc)
+                self._publish_result("rejected")
+                self.transition(WaffleState.IDLE)
+            self.get_logger().error(f'WAFFLE_NAV_GOAL_RESPONSE_ERROR | {exc}')
+            return
         if epoch != self._goal_epoch:
             # 이미 취소되고 그 뒤로 새 goal 이 전송된, 낡은 goal 의 응답 --
             # 지금 상태(state/current_goal_handle)를 건드리면 안 됨.
-            self.get_logger().debug(
+            self.get_logger().warn(
                 f"stale goal_response 무시 (epoch={epoch}, "
                 f"current={self._goal_epoch})")
+            if goal_handle.accepted:
+                goal_handle.cancel_goal_async()
+                self.get_logger().warn(
+                    f"WAFFLE_NAV_STALE_ACCEPTED_CANCEL | epoch={epoch}")
             return
-        goal_handle = future.result()
         if not goal_handle.accepted:
-            self.get_logger().error("Nav2 goal 거부됨")
+            self.get_logger().error(
+                f"WAFFLE_NAV_GOAL_REJECTED | id={self._current_goal_id}")
             self._publish_result("rejected")
             self.transition(WaffleState.IDLE)
             return
 
         self.current_goal_handle = goal_handle
-        self.get_logger().info("Nav2 goal accepted, 이동 시작")
+        self._goal_accepted = True
+        self.get_logger().info(
+            f"WAFFLE_NAV_GOAL_ACCEPTED | id={self._current_goal_id}")
+        if self._cancel_requested_before_accept:
+            self.get_logger().warn(
+                f"WAFFLE_NAV_CANCEL_AFTER_ACCEPT | id={self._current_goal_id}")
+            self._cancel_current_goal()
+            return
+        self.transition(WaffleState.NAVIGATING)
+        self._publish_ack(WaffleState.NAVIGATING.value, accepted=True)
 
         self.result_future = goal_handle.get_result_async()
         self.result_future.add_done_callback(
@@ -429,7 +660,7 @@ class WaffleNavNode(Node):
     def _result_callback(self, future, epoch: int):
         """Nav2 액션 종료."""
         if epoch != self._goal_epoch:
-            self.get_logger().debug(
+            self.get_logger().warn(
                 f"stale nav result 무시 (epoch={epoch}, "
                 f"current={self._goal_epoch})")
             return
@@ -443,17 +674,27 @@ class WaffleNavNode(Node):
         }.get(status, f"unknown_{status}")
 
         self.get_logger().info(
-            f"Nav2 결과: {status_str} ({elapsed:.1f}s 소요)")
+            f"WAFFLE_NAV_RESULT | id={self._current_goal_id} "
+            f"result={status_str} elapsed={elapsed:.1f}s")
 
         self._publish_result(status_str)
         self.current_goal_handle = None
         self.transition(WaffleState.IDLE)
+        self._try_send_pending_goal()
 
     def _cancel_current_goal(self):
         """현재 goal cancel 요청. 결과는 _result_callback 에서 CANCELED 로."""
+        if self.state == WaffleState.WAITING_ACCEPT and self.current_goal_handle is None:
+            self._cancel_requested_before_accept = True
+            self.transition(WaffleState.CANCELING)
+            self.get_logger().info(
+                f"WAFFLE_NAV_CANCEL_DEFERRED | id={self._current_goal_id}")
+            return
         if self.current_goal_handle is None:
             return
-        self.get_logger().info("Goal cancel 요청 보냄")
+        self.transition(WaffleState.CANCELING)
+        self.get_logger().info(
+            f"WAFFLE_NAV_CANCEL_SENT | id={self._current_goal_id}")
         self.current_goal_handle.cancel_goal_async()
 
     # ----- Dry-run 시뮬레이션 -----
@@ -486,8 +727,11 @@ class WaffleNavNode(Node):
     def publish_status(self):
         msg = String()
         prefix = "dry_" if self.dry_run else ""
-        msg.data = f"{prefix}{self.state.value}"
+        msg.data = f"{prefix}{self.state.value.lower()}"
         self.pub_status.publish(msg)
+        diag = String()
+        diag.data = json.dumps(self._diagnostics_payload(), sort_keys=True)
+        self.pub_diagnostics.publish(diag)
 
 
 # ===========================================================

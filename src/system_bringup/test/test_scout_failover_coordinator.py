@@ -62,6 +62,9 @@ def _bare_node(now=0.0):
     logger = _Logger()
     node._now = lambda: clock[0]
     node.get_logger = lambda: logger
+    node.get_clock = lambda: type('Clock', (), {
+        'now': lambda self: type('Now', (), {'to_msg': lambda self: None})()
+    })()
 
     node.enabled = True
     node.require_bootstrap_complete = True
@@ -209,7 +212,11 @@ def test_original_active_status_does_not_disarm_normal_watchdog():
     node._on_field_status(_string({
         'robot': 'scout22',
         'epoch': 0,
-        'status': 'ACTIVE_SCOUT',
+        'status': 'ACTIVE_SCOUT_READY',
+        'active_scout_ready': True,
+        'recovery_complete': True,
+        'localization_ready': True,
+        'motion_authority': 'NONE',
     }))
 
     assert node.state == FailoverState.NORMAL_OPERATION
@@ -224,28 +231,71 @@ def test_only_current_epoch_follower_completes_valid_takeover_once():
 
     # Reconnecting original scout, stale follower, and malformed status are ignored.
     node._on_field_status(_string({
-        'robot': 'scout22', 'epoch': 2, 'status': 'ACTIVE_SCOUT'
+        'robot': 'scout22', 'epoch': 2, 'status': 'ACTIVE_SCOUT_READY',
+        'active_scout_ready': True, 'recovery_complete': True,
+        'localization_ready': True, 'motion_authority': 'NONE',
     }))
     node._on_field_status(_string({
-        'robot': 'follower21', 'epoch': 1, 'status': 'ACTIVE_SCOUT'
+        'robot': 'follower21', 'epoch': 1, 'status': 'ACTIVE_SCOUT_READY',
+        'active_scout_ready': True, 'recovery_complete': True,
+        'localization_ready': True, 'motion_authority': 'NONE',
     }))
     node._on_field_status(_string({
-        'robot': 'follower21', 'epoch': 2.0, 'status': 'ACTIVE_SCOUT'
+        'robot': 'follower21', 'epoch': 2.0, 'status': 'ACTIVE_SCOUT_READY',
+        'active_scout_ready': True, 'recovery_complete': True,
+        'localization_ready': True, 'motion_authority': 'NONE',
     }))
     assert node.state == FailoverState.FOLLOWER_SCOUT_TAKEOVER
     assert node.active_scout_id == 'scout22'
 
     completion = _string({
-        'robot': 'follower21', 'epoch': 2, 'status': 'ACTIVE_SCOUT'
+        'robot': 'follower21',
+        'epoch': 2,
+        'status': 'ACTIVE_SCOUT_READY',
+        'active_scout_ready': True,
+        'recovery_complete': True,
+        'localization_ready': True,
+        'motion_authority': 'NONE',
+        'nav_goal_active': False,
+        'pending_goal_count': 0,
+        'active_goal_count': 0,
     })
     node._on_field_status(completion)
     node._on_field_status(completion)
 
     assert node.state == FailoverState.NEW_SCOUT_EXPLORING
     assert node.active_scout_id == 'follower21'
-    assert len(node.role_pub.messages) == 1
+    assert len(node.role_pub.messages) == 2
+    handoff = [message for _, message in logger.messages if 'ACTIVE_SCOUT_HANDOFF' in message]
+    assert len(handoff) == 1
     resumed = [message for _, message in logger.messages if 'EXPLORATION_RESUMED' in message]
     assert len(resumed) == 1
+
+
+def test_follower_active_role_hands_off_source_before_rl_ready():
+    node, _, logger = _bare_node()
+    node.state = FailoverState.FOLLOWER_SCOUT_TAKEOVER
+    node.scout_epoch = 3
+
+    node._on_field_status(_string({
+        'robot': 'follower21',
+        'epoch': 3,
+        'role': 'ACTIVE_SCOUT',
+        'status': 'LOCALIZING',
+        'active_scout_ready': False,
+        'recovery_complete': True,
+        'localization_ready': True,
+        'motion_authority': 'RECOVERY_NAV',
+        'nav_goal_active': False,
+        'pending_goal_count': 0,
+        'active_goal_count': 0,
+    }))
+
+    assert node.state == FailoverState.FOLLOWER_SCOUT_TAKEOVER
+    assert node.active_scout_id == 'follower21'
+    assert len(node.active_scout_pub.messages) >= 1
+    handoff = [message for _, message in logger.messages if 'ACTIVE_SCOUT_HANDOFF' in message]
+    assert len(handoff) == 1
 
 
 def test_follower_completion_is_rejected_before_takeover_state():
@@ -254,7 +304,13 @@ def test_follower_completion_is_rejected_before_takeover_state():
     node.state = FailoverState.RECOVERY_NAVIGATING
 
     node._on_field_status(_string({
-        'robot': 'follower21', 'epoch': 1, 'status': 'ACTIVE_SCOUT'
+        'robot': 'follower21',
+        'epoch': 1,
+        'status': 'ACTIVE_SCOUT_READY',
+        'active_scout_ready': True,
+        'recovery_complete': True,
+        'localization_ready': True,
+        'motion_authority': 'NONE',
     }))
 
     assert node.state == FailoverState.RECOVERY_NAVIGATING
@@ -374,3 +430,34 @@ def test_failure_pose_freeze_and_dead_edge_are_exactly_once():
     frozen = [message for _, message in logger.messages if 'LAST_POSE_FROZEN' in message]
     assert len(confirmed) == 1
     assert len(frozen) == 1
+
+
+def test_recovery_role_command_targets_exact_failed_scout_pose():
+    node, _, _ = _bare_node(now=10.0)
+    node.scout_epoch = 2
+    node.failure_pose = _pose(2.0, -1.0, 0.5)
+    node.follower_goal = _pose(1.5, -1.0, 0.5)
+
+    node._publish_recovery_role_command()
+
+    assert len(node.role_command_pub.messages) == 1
+    payload = json.loads(node.role_command_pub.messages[0].data)
+    assert payload['role'] == 'RECOVERY_NAVIGATING'
+    assert payload['target_pose']['x'] == 2.0
+    assert payload['target_pose']['y'] == -1.0
+    assert payload['failure_pose']['x'] == 2.0
+    assert payload['failure_pose']['y'] == -1.0
+
+
+def test_follower_recovery_goal_is_failed_scout_pose_not_standoff():
+    node, _, _ = _bare_node(now=10.0)
+    node.state = FailoverState.SCOUT_SUSPECTED_DEAD
+    node.last_scout_pose = _pose(2.0, -1.0, 0.5)
+    node.last_scout_pose_wall = 9.5
+    node.follower_standoff = 0.5
+    node._trigger_failover = lambda: None
+
+    node._confirm_dead(now=10.0)
+
+    assert node.follower_goal.pose.position.x == pytest.approx(2.0)
+    assert node.follower_goal.pose.position.y == pytest.approx(-1.0)

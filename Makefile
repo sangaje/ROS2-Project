@@ -1,6 +1,6 @@
 SHELL := /usr/bin/env bash
 
-MODEL_DIR := rl_models/pure_velocity_sac_map64_lidar60_h8_deltatcn_domain22_nopriority_gsde_v022_dt02_b128
+MODEL_DIR := model
 LOG_DIR   := rl_logs/pure_velocity_sac_map64_lidar60_h8_deltatcn_domain22_nopriority_gsde_v022_dt02_b128
 
 .PHONY: help gazebo train all clean clean-models clean-logs clean-shm

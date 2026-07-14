@@ -23,6 +23,8 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool, String
 
+from .motion_authority import MotionAuthority
+from .role_contract import parse_epoch
 
 class FailoverState(Enum):
     NORMAL_OPERATION = 'NORMAL_OPERATION'
@@ -43,19 +45,6 @@ def heartbeat_qos_profile() -> QoSProfile:
         durability=DurabilityPolicy.VOLATILE,
         history=HistoryPolicy.KEEP_LAST,
     )
-
-
-def parse_epoch(value) -> Optional[int]:
-    """Return a non-negative integer epoch without silently truncating values."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value if value >= 0 else None
-    if isinstance(value, str):
-        text = value.strip()
-        if text.isdigit():
-            return int(text)
-    return None
 
 
 def is_finite_map_pose(msg: PoseStamped) -> bool:
@@ -341,15 +330,63 @@ class ScoutFailoverCoordinator(Node):
             return
         if self.require_bootstrap_complete and not self.bootstrap_ready:
             return
-        status = str(data.get('status', '')).strip().upper()
         robot = str(data.get('robot', '')).strip()
-        if status != 'ACTIVE_SCOUT' or robot != self.follower_name:
+        if robot != self.follower_name:
             return
-        self.active_scout_id = robot
+        role = str(data.get('role', '')).strip().upper()
+        status = str(data.get('status', data.get('role', ''))).strip().upper()
+        motion_authority = str(data.get('motion_authority', '')).strip().upper()
+        ready = bool(
+            data.get('active_scout_ready', False)
+            or status == 'ACTIVE_SCOUT_READY'
+        )
+        recovery_complete = bool(data.get('recovery_complete', False))
+        localization_ready = bool(
+            data.get('localization_ok', data.get('localization_ready', False))
+        )
+        nav_goal_active = bool(data.get('nav_goal_active', False))
+        pending_goal_count = int(data.get('pending_goal_count', 0) or 0)
+        active_goal_count = int(data.get('active_goal_count', 0) or 0)
+        settled_at_failure_pose = (
+            recovery_complete
+            and localization_ready
+            and not nav_goal_active
+            and pending_goal_count == 0
+            and active_goal_count == 0
+        )
+        role_handoff_ready = (
+            settled_at_failure_pose
+            and (
+                role == 'ACTIVE_SCOUT'
+                or status == 'ACTIVE_SCOUT'
+                or status == 'ACTIVE_SCOUT_READY'
+            )
+        )
+        if role_handoff_ready:
+            self._handoff_active_scout(robot)
+        if not (
+            ready
+            and settled_at_failure_pose
+            and motion_authority in (
+                '', MotionAuthority.NONE.value, MotionAuthority.ACTIVE_SCOUT_RL.value
+            )
+        ):
+            return
         self._transition(FailoverState.NEW_SCOUT_EXPLORING)
         self._publish_role()
         self.get_logger().warning(
             '[FAILOVER] EXPLORATION_RESUMED | '
+            f'active_scout={self.active_scout_id} epoch={self.scout_epoch}'
+        )
+
+    def _handoff_active_scout(self, robot: str) -> None:
+        if self.active_scout_id == robot:
+            return
+        self.active_scout_id = robot
+        self._publish_state()
+        self._publish_role()
+        self.get_logger().warning(
+            '[FAILOVER] ACTIVE_SCOUT_HANDOFF | '
             f'active_scout={self.active_scout_id} epoch={self.scout_epoch}'
         )
 
@@ -456,13 +493,17 @@ class ScoutFailoverCoordinator(Node):
         self.failure_pose_pub.publish(self.failure_pose)
         self.scout_epoch += 1
         self.leader_goal = self._offset_pose(self.failure_pose, self.leader_standoff)
-        self.follower_goal = self._offset_pose(self.failure_pose, self.follower_standoff)
+        self.follower_goal = self._copy_pose(self.failure_pose)
         self.leader_recovery_position_reached = self._leader_already_near_failure()
         self.recovery_goal_publish_count = 0
         self.last_recovery_goal_wall = -1.0e9
         self.get_logger().warning(
             '[FAILOVER] SCOUT_DEAD_CONFIRMED | '
             f'epoch={self.scout_epoch} pose_age={pose_age:.2f}s'
+        )
+        self.get_logger().warning(
+            'SCOUT_FAILOVER_DETECTED | '
+            f'previous={self.original_scout_id} epoch={self.scout_epoch}'
         )
         self.get_logger().warning(
             '[FAILOVER] LAST_POSE_FROZEN | '
@@ -608,6 +649,7 @@ class ScoutFailoverCoordinator(Node):
     def _publish_recovery_role_command(self) -> None:
         if self.follower_goal is None or self.failure_pose is None:
             return
+        target = self.failure_pose
         data = {
             'role': 'RECOVERY_NAVIGATING',
             'epoch': self.scout_epoch,
@@ -615,9 +657,9 @@ class ScoutFailoverCoordinator(Node):
             'previous_scout': self.original_scout_id,
             'target_pose': {
                 'frame_id': 'map',
-                'x': self.follower_goal.pose.position.x,
-                'y': self.follower_goal.pose.position.y,
-                'yaw': yaw_from_quaternion(self.follower_goal.pose.orientation),
+                'x': target.pose.position.x,
+                'y': target.pose.position.y,
+                'yaw': yaw_from_quaternion(target.pose.orientation),
             },
             'failure_pose': {
                 'frame_id': 'map',

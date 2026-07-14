@@ -45,6 +45,8 @@ def generate_launch_description():
     start_nav2 = LaunchConfiguration('start_nav2')
     hardware_param_file = LaunchConfiguration('hardware_param_file')
     forward_map_to_main = LaunchConfiguration('forward_map_to_main')
+    forward_risk_to_main = LaunchConfiguration('forward_risk_to_main')
+    receive_leader_map = LaunchConfiguration('receive_leader_map')
     initial_x = LaunchConfiguration('member_initial_x')
     initial_y = LaunchConfiguration('member_initial_y')
     initial_yaw = LaunchConfiguration('member_initial_yaw')
@@ -54,12 +56,8 @@ def generate_launch_description():
     def make_stack(context):
         member_domain = int(domain_id.perform(context))
         main_domain_value = main_domain_id.perform(context).strip()
-        if not main_domain_value:
-            raise ValueError(
-                'main_domain_id is required for member.launch.py domain_bridge. '
-                'Pass the launch option main_domain_id:=<leader_domain>.'
-            )
-        main_domain = int(main_domain_value)
+        main_domain = int(main_domain_value) if main_domain_value else member_domain
+        standalone = main_domain == member_domain
         process_env = clean_process_environment(str(member_domain))
 
         # Reuses the follower's Burger Nav2/AMCL tuning; a plain member is
@@ -78,37 +76,41 @@ def generate_launch_description():
             convert_types=True,
         )
 
-        main_to_member, member_to_main = write_member_bridge_configs(
-            main_domain,
-            member_domain,
-            forward_map_to_main=launch_bool(forward_map_to_main.perform(context)),
-        )
-        bridges = [
-            Node(
-                package='domain_bridge',
-                executable='domain_bridge',
-                name='bridge_main_to_member',
-                output='screen',
-                arguments=[
-                    str(main_to_member), '--wait-for-publisher', 'false',
-                ],
-                env=process_env,
-                respawn=True,
-                respawn_delay=3.0,
-            ),
-            Node(
-                package='domain_bridge',
-                executable='domain_bridge',
-                name='bridge_member_to_main',
-                output='screen',
-                arguments=[
-                    str(member_to_main), '--wait-for-publisher', 'false',
-                ],
-                env=process_env,
-                respawn=True,
-                respawn_delay=3.0,
-            ),
-        ]
+        bridges = []
+        if not standalone:
+            main_to_member, member_to_main = write_member_bridge_configs(
+                main_domain,
+                member_domain,
+                forward_map_to_main=launch_bool(forward_map_to_main.perform(context)),
+                forward_risk_to_main=launch_bool(forward_risk_to_main.perform(context)),
+                include_leader_map=launch_bool(receive_leader_map.perform(context)),
+            )
+            bridges = [
+                Node(
+                    package='domain_bridge',
+                    executable='domain_bridge',
+                    name='bridge_main_to_member',
+                    output='screen',
+                    arguments=[
+                        str(main_to_member), '--wait-for-publisher', 'false',
+                    ],
+                    env=process_env,
+                    respawn=True,
+                    respawn_delay=3.0,
+                ),
+                Node(
+                    package='domain_bridge',
+                    executable='domain_bridge',
+                    name='bridge_member_to_main',
+                    output='screen',
+                    arguments=[
+                        str(member_to_main), '--wait-for-publisher', 'false',
+                    ],
+                    env=process_env,
+                    respawn=True,
+                    respawn_delay=3.0,
+                ),
+            ]
 
         map_relay = Node(
             package='fleet_bringup',
@@ -130,6 +132,13 @@ def generate_launch_description():
                 'output_topic': '/member_pose',
                 'publish_rate_hz': 10.0,
                 'log_every_n': 100,
+                # Do not export a Cartographer correction as a physical jump
+                # while the scout's wheel odometry says it is stationary.
+                'freeze_when_stationary': True,
+                'stationary_target_frame': 'odom',
+                'stationary_linear_threshold_m': 0.003,
+                'stationary_angular_threshold_rad': 0.008,
+                'stationary_freeze_warmup_sec': 8.0,
             }],
             env=process_env,
             respawn=True,
@@ -141,6 +150,7 @@ def generate_launch_description():
 
         amcl = None
         localization_lifecycle = None
+        fixed_seed_ready = None
         if amcl_enabled:
             # AMCL is the one TF source this stack owns by default (map->odom
             # over a shared, bridged map). It is deliberately the only thing
@@ -205,7 +215,7 @@ def generate_launch_description():
                 name='member_global_localize',
                 output='screen',
                 parameters=[{
-                    'enable_scout_pose_seed': True,
+                    'enable_scout_pose_seed': False,
                     'active_scout_id_topic': '/failover/active_scout_id',
                     'active_scout_robot_name': 'scout22',
                     'follower_robot_name': 'follower21',
@@ -246,6 +256,27 @@ def generate_launch_description():
                 respawn=True,
                 respawn_delay=3.0,
             )
+        elif amcl_enabled:
+            fixed_seed_ready = Node(
+                package='fleet_bringup',
+                executable='amcl_fixed_seed_ready',
+                name='member_amcl_fixed_seed_ready',
+                output='screen',
+                parameters=[{
+                    'map_topic': '/map',
+                    'scan_topic': '/scan',
+                    'odom_topic': '/odom',
+                    'amcl_pose_topic': '/amcl_pose',
+                    'amcl_get_state_service': '/amcl/get_state',
+                    'global_frame': 'map',
+                    'base_frame': 'base_footprint',
+                    'ready_topic': '/localization_ready',
+                    'fixed_seed_initial_pose_applied': True,
+                }],
+                env=process_env,
+                respawn=True,
+                respawn_delay=3.0,
+            )
 
         base = IncludeLaunchDescription(
             PythonLaunchDescriptionSource(base_launch),
@@ -267,9 +298,13 @@ def generate_launch_description():
                 'nav_delay_sec': '8.0',
                 'lifecycle_delay_sec': '12.0',
                 'require_localization_ready': (
-                    'true' if amcl_enabled and auto else 'false'
+                    'true' if amcl_enabled else 'false'
                 ),
                 'localization_ready_topic': '/localization_ready',
+                'require_system_ready': 'false',
+                'system_ready_topic': '/system/ready',
+                'require_start_motion': 'true',
+                'start_motion_topic': '/fleet/start_motion',
             }.items(),
         )
 
@@ -277,17 +312,33 @@ def generate_launch_description():
         bridge_t, relay_t, amcl_t, localization_t, kickstart_t = timing
         actions = [
             base,
-            LogInfo(msg=[
-                'LEADER_EGRESS_BRIDGE | source_domain=', str(main_domain),
-                ' | destination_domain=', str(member_domain),
-                ' | topics=/map,/leader_pose',
-                ' | bridge_topic=/map_bridge',
-                ' | map_type=nav_msgs/msg/OccupancyGrid',
-                ' | pose_type=geometry_msgs/msg/PoseStamped',
-            ]),
-            TimerAction(period=bridge_t, actions=bridges),
-            TimerAction(period=relay_t, actions=[map_relay, member_pose]),
         ]
+        if standalone:
+            actions.append(LogInfo(msg=[
+                'MEMBER_STANDALONE | domain=', str(member_domain),
+                ' | domain_bridge=false | map_relay=false',
+            ]))
+            actions.append(TimerAction(period=relay_t, actions=[member_pose]))
+        else:
+            actions.extend([
+                LogInfo(msg=[
+                    'LEADER_EGRESS_BRIDGE | source_domain=', str(main_domain),
+                    ' | destination_domain=', str(member_domain),
+                    ' | topics=/map,/leader_pose',
+                    ' | bridge_topic=/map_bridge',
+                    ' | map_type=nav_msgs/msg/OccupancyGrid',
+                    ' | pose_type=geometry_msgs/msg/PoseStamped',
+                ]),
+                TimerAction(period=bridge_t, actions=bridges),
+                TimerAction(
+                    period=relay_t,
+                    actions=(
+                        [map_relay, member_pose]
+                        if launch_bool(receive_leader_map.perform(context))
+                        else [member_pose]
+                    ),
+                ),
+            ])
         if amcl is not None:
             actions.append(TimerAction(
                 period=amcl_t, actions=[localization_config_log, amcl],
@@ -300,6 +351,16 @@ def generate_launch_description():
             actions.append(
                 TimerAction(period=kickstart_t, actions=[kickstart_node])
             )
+        if fixed_seed_ready is not None:
+            actions.append(TimerAction(
+                period=kickstart_t,
+                actions=[
+                    LogInfo(msg=[
+                        'MEMBER_STAGE | starting fixed-seed AMCL ready watcher',
+                    ]),
+                    fixed_seed_ready,
+                ],
+            ))
         return actions
 
     return LaunchDescription([
@@ -312,8 +373,8 @@ def generate_launch_description():
             'main_domain_id',
             default_value='',
             description=(
-                'Leader DDS domain used by domain_bridge. Required; pass '
-                'main_domain_id:=<leader_domain>.'
+                'Leader DDS domain used by domain_bridge. Leave empty, or '
+                'set equal to domain_id, for standalone member/scout testing.'
             ),
         ),
         DeclareLaunchArgument(
@@ -351,6 +412,27 @@ def generate_launch_description():
                 '/map_bridge. Enable only when this member/scout owns SLAM.'
             ),
         ),
+        DeclareLaunchArgument(
+            'forward_risk_to_main',
+            default_value='false',
+            choices=['true', 'false'],
+            description=(
+                'Bridge risk topics directly from this member to the leader. '
+                'Leave false when the leader runs its dedicated risk->leader '
+                'bridge, which is the normal three-robot topology.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'receive_leader_map',
+            default_value='true',
+            choices=['true', 'false'],
+            description=(
+                'Receive leader /map as /map_bridge and start map_relay. '
+                'Set false for an ACTIVE_SCOUT with local Cartographer; '
+                'that robot should export its own map, not consume the '
+                'leader copy of it.'
+            ),
+        ),
         DeclareLaunchArgument('member_initial_x', default_value='0.0'),
         DeclareLaunchArgument('member_initial_y', default_value='0.0'),
         DeclareLaunchArgument('member_initial_yaw', default_value='0.0'),
@@ -367,13 +449,13 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'auto_localize',
-            default_value='true',
+            default_value='false',
             choices=['true', 'false'],
             description=(
                 'Let AMCL search the whole map via '
                 'reinitialize_global_localization after seeding from '
-                'member_initial_x/y/yaw. Set false to use only the fixed '
-                'seed.'
+                'member_initial_x/y/yaw. Default false uses only the fixed '
+                'seed and amcl_fixed_seed_ready.'
             ),
         ),
         *dds_launch_environment(domain_id),
