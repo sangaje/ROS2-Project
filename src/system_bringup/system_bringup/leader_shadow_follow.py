@@ -97,6 +97,7 @@ class LeaderShadowFollow(Node):
         self.declare_parameter('target_detected_topic', '/omx/target_detected')
         self.declare_parameter('target_detected_stop_hold_sec', 3.0)
         self.declare_parameter('target_detected_cancel_period_sec', 0.25)
+        self.declare_parameter('target_base_stop_rate_hz', 25.0)
         self.declare_parameter('target_memory_hold_sec', 3.0)
         self.declare_parameter('target_reacquire_publish_period_sec', 0.5)
         self.declare_parameter('target_processed_topic', '/omx/target_processed')
@@ -186,6 +187,9 @@ class LeaderShadowFollow(Node):
         )
         self.target_cancel_period = max(
             0.05, float(get('target_detected_cancel_period_sec').value)
+        )
+        self.target_base_stop_rate = max(
+            5.0, float(get('target_base_stop_rate_hz').value)
         )
         self.target_memory_hold = max(0.0, float(get('target_memory_hold_sec').value))
         self.target_reacquire_period = max(
@@ -410,6 +414,7 @@ class LeaderShadowFollow(Node):
         self.speed_limit_pending = False
 
         self.create_timer(0.2, self._tick)
+        self.create_timer(1.0 / self.target_base_stop_rate, self._target_base_stop_tick)
         self.create_timer(1.0 / self.scan_rate, self._scan_tick)
         self._publish_cancel(False)
         self._publish_state('startup')
@@ -425,7 +430,8 @@ class LeaderShadowFollow(Node):
             f'controller_service={self.controller_set_parameters_service} '
             f'localization_gate={self.require_localization_ready}:{self.localization_ready_topic} '
             f'system_gate={self.require_system_ready}:{self.system_ready_topic} '
-            f'video_gate={self.require_video_ready}:{self.video_ready_topic}'
+            f'video_gate={self.require_video_ready}:{self.video_ready_topic} '
+            f'target_base_stop_rate={self.target_base_stop_rate:.1f}Hz'
         )
 
     def _now(self) -> float:
@@ -605,6 +611,13 @@ class LeaderShadowFollow(Node):
         ):
             return 'target_reacquire_memory'
         return None
+
+    def _target_base_stop_tick(self) -> None:
+        target_reason = self._target_hold_reason()
+        if target_reason is None:
+            return
+        self.target_hold_active = True
+        self._force_leader_stop_for_target(target_reason)
 
     def _hold_for_omx_target(self, reason: str) -> None:
         """Stop Nav2/base motion while leaving OMX PD tracking free to run."""

@@ -16,7 +16,10 @@ def test_detect_defaults_to_async_latest_frame_pipeline():
     assert 'submit_latest' in source
     assert "'async_ack': True" in source
     assert 'state.record_capture(' in source
-    assert 'update_debug_overlay(frame' not in source.split('@app.post')[1]
+    assert 'update_debug_overlay(' in source.split('if args.async_latest:', 1)[1].split(
+        'observation_meta.update',
+        1,
+    )[0]
 
 
 def test_video_pipeline_reports_latency_and_drop_metrics():

@@ -938,6 +938,13 @@ def build_app(args):
             })
 
         if args.async_latest:
+            update_debug_overlay(
+                frame,
+                int(w),
+                int(h),
+                capture_age_ms,
+                'queued for YOLO',
+            )
             observation_meta.update({
                 'capture_ros_sec': f'{capture_ros_sec:.9f}' if capture_ros_sec > 0.0 else '',
                 'capture_wall_sec': f'{capture_wall_sec:.9f}' if capture_wall_sec > 0.0 else '',
