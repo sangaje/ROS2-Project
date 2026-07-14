@@ -40,7 +40,7 @@ def generate_launch_description():
     field_enable_cartographer = LaunchConfiguration('field_enable_cartographer')
     field_enable_amcl = LaunchConfiguration('field_enable_amcl')
     map_authority_eligible = LaunchConfiguration('map_authority_eligible')
-    forward_field_map_to_main = LaunchConfiguration('forward_field_map_to_main')
+    field_forward_map_to_main = LaunchConfiguration('field_forward_map_to_main')
     camera_sender_device = LaunchConfiguration('camera_sender_device')
     flask_server_url = LaunchConfiguration('flask_server_url')
 
@@ -108,7 +108,7 @@ def generate_launch_description():
         # route pre-created so a takeover Cartographer/Risk stack can be seen
         # by the Leader immediately after ACTIVE_SCOUT handoff.
         requested_map_forward = _bool_text(
-            forward_field_map_to_main.perform(context),
+            field_forward_map_to_main.perform(context),
             is_follower,
         )
         if is_follower and requested_cartographer == 'true':
@@ -229,7 +229,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument('map_authority_eligible', default_value=''),
         DeclareLaunchArgument(
-            'forward_field_map_to_main',
+            'field_forward_map_to_main',
             default_value='',
             description=(
                 'Forward this field robot local /map through its member/'
