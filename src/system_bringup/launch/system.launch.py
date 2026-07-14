@@ -530,6 +530,9 @@ def generate_launch_description():
                         'leader_pose_topic': '/leader_pose',
                         'self_pose_topic': self_pose_topic,
                         'require_localization_ready': not scout_owns_slam,
+                        'require_follow_localization_ready': (
+                            False if follower_initial_role else not scout_owns_slam
+                        ),
                         'localization_ready_topic': '/localization_ready',
                         'require_system_ready': False,
                         'system_ready_topic': '/system/ready',
@@ -614,6 +617,10 @@ def generate_launch_description():
                         'enabled': True,
                         'start_cartographer': True,
                         'start_risk_map': True,
+                        'start_map_exporter': True,
+                        'map_export_input_topic': '/map',
+                        'map_export_output_topic': '/local_slam_map',
+                        'map_export_keepalive_sec': 1.0,
                         'cartographer_configuration_basename': (
                             'turtlebot3_lds_2d_risk_safe_no_odom.lua'
                         ),

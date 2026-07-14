@@ -44,6 +44,7 @@ def test_system_launch_routes_field_observations_to_robot_topics():
     ).read_text(encoding='utf-8')
 
     assert "field_observation_topic = f'/field/{scout_robot_name}/risk_observation'" in source
+    assert "'require_follow_localization_ready': (" in source
     assert "'output_topic': field_observation_topic" in source
     assert "'active_max_upload_mbps': '2.5'" in source
     assert "'standby_max_upload_mbps': '0.8'" in source

@@ -34,6 +34,10 @@ class TakeoverStackManager(Node):
         self.declare_parameter('enable_yolo', False)
         self.declare_parameter('start_camera', False)
         self.declare_parameter('start_rviz', False)
+        self.declare_parameter('start_map_exporter', True)
+        self.declare_parameter('map_export_input_topic', '/map')
+        self.declare_parameter('map_export_output_topic', '/local_slam_map')
+        self.declare_parameter('map_export_keepalive_sec', 1.0)
         self.declare_parameter('pre_shutdown_lifecycle_nodes', ['/amcl'])
         self.declare_parameter('lifecycle_command_timeout_sec', 3.0)
         self.declare_parameter('startup_cooldown_sec', 2.0)
@@ -52,6 +56,12 @@ class TakeoverStackManager(Node):
         self.enable_yolo = bool(get('enable_yolo').value)
         self.start_camera = bool(get('start_camera').value)
         self.start_rviz = bool(get('start_rviz').value)
+        self.start_map_exporter = bool(get('start_map_exporter').value)
+        self.map_export_input_topic = str(get('map_export_input_topic').value).strip()
+        self.map_export_output_topic = str(get('map_export_output_topic').value).strip()
+        self.map_export_keepalive_sec = max(
+            0.1, float(get('map_export_keepalive_sec').value)
+        )
         self.lifecycle_nodes = [
             str(name).strip()
             for name in get('pre_shutdown_lifecycle_nodes').value
@@ -71,6 +81,7 @@ class TakeoverStackManager(Node):
         self.create_subscription(String, self.role_topic, self._on_role, latched_qos)
 
         self.process: Optional[subprocess.Popen] = None
+        self.exporter_process: Optional[subprocess.Popen] = None
         self.started = False
         self.last_start_attempt_wall = -1.0e9
         self.get_logger().warning(
@@ -98,6 +109,7 @@ class TakeoverStackManager(Node):
         self.last_start_attempt_wall = now
 
         self._shutdown_previous_localization()
+        self._start_map_exporter()
         cmd = self._launch_command()
         self.get_logger().warning(
             'TAKEOVER_STACK_START | ' + ' '.join(cmd)
@@ -108,6 +120,32 @@ class TakeoverStackManager(Node):
             self.get_logger().error(f'TAKEOVER_STACK_START_FAILED | {exc}')
             return
         self.started = True
+
+    def _start_map_exporter(self) -> None:
+        if not self.start_map_exporter:
+            return
+        if self.exporter_process is not None and self.exporter_process.poll() is None:
+            return
+        cmd = [
+            'ros2',
+            'run',
+            'system_bringup',
+            'takeover_map_exporter',
+            '--ros-args',
+            '-p',
+            f'input_topic:={self.map_export_input_topic or "/map"}',
+            '-p',
+            f'output_topic:={self.map_export_output_topic or "/local_slam_map"}',
+            '-p',
+            f'keepalive_period_sec:={self.map_export_keepalive_sec}',
+            '-p',
+            'merge_with_baseline:=true',
+        ]
+        self.get_logger().warning('TAKEOVER_MAP_EXPORT_START | ' + ' '.join(cmd))
+        try:
+            self.exporter_process = subprocess.Popen(cmd, env=os.environ.copy())
+        except OSError as exc:
+            self.get_logger().error(f'TAKEOVER_MAP_EXPORT_START_FAILED | {exc}')
 
     def _shutdown_previous_localization(self) -> None:
         for node_name in self.lifecycle_nodes:
@@ -153,6 +191,12 @@ class TakeoverStackManager(Node):
         ]
 
     def destroy_node(self) -> bool:
+        if self.exporter_process is not None and self.exporter_process.poll() is None:
+            try:
+                self.exporter_process.send_signal(signal.SIGINT)
+                self.exporter_process.wait(timeout=3.0)
+            except Exception:
+                self.exporter_process.terminate()
         if self.process is not None and self.process.poll() is None:
             try:
                 self.process.send_signal(signal.SIGINT)

@@ -46,6 +46,7 @@ setup(
             'scout_failover_coordinator = system_bringup.scout_failover_coordinator:main',
             'scout_rl_policy_worker = system_bringup.scout_rl_policy_worker:main',
             'system_readiness_monitor = system_bringup.system_readiness_monitor:main',
+            'takeover_map_exporter = system_bringup.takeover_map_exporter:main',
             'takeover_stack_manager = system_bringup.takeover_stack_manager:main',
             'unified_field_robot = system_bringup.unified_field_robot:main',
         ],

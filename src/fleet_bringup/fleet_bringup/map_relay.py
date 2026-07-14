@@ -103,6 +103,12 @@ class MapRelay(Node):
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
         )
+        volatile_sub_qos = QoSProfile(
+            depth=5,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+        )
         output_sub_qos = QoSProfile(
             depth=5,
             reliability=ReliabilityPolicy.RELIABLE,
@@ -128,6 +134,9 @@ class MapRelay(Node):
         self._own_output_publishers = 1
         self._sub = self.create_subscription(
             OccupancyGrid, self.input_topic, self._on_bridged_map, bridge_sub_qos
+        )
+        self._volatile_sub = self.create_subscription(
+            OccupancyGrid, self.input_topic, self._on_bridged_map, volatile_sub_qos
         )
         self._follower_sub = None
         if self.follower_input_topic:

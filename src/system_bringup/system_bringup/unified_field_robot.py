@@ -71,6 +71,7 @@ class UnifiedFieldRobot(Node):
         self.declare_parameter('self_pose_topic', '/burger_pose')
         self.declare_parameter('localization_ready_topic', '/localization_ready')
         self.declare_parameter('require_localization_ready', True)
+        self.declare_parameter('require_follow_localization_ready', True)
         self.declare_parameter('system_ready_topic', '/system/ready')
         self.declare_parameter('require_system_ready', False)
         self.declare_parameter('start_motion_topic', '/fleet/start_motion')
@@ -132,6 +133,9 @@ class UnifiedFieldRobot(Node):
         self.self_pose_topic = str(get('self_pose_topic').value)
         self.localization_ready_topic = str(get('localization_ready_topic').value)
         self.require_localization_ready = bool(get('require_localization_ready').value)
+        self.require_follow_localization_ready = bool(
+            get('require_follow_localization_ready').value
+        )
         self.system_ready_topic = str(get('system_ready_topic').value)
         self.require_system_ready = bool(get('require_system_ready').value)
         self.start_motion_topic = str(get('start_motion_topic').value)
@@ -597,7 +601,7 @@ class UnifiedFieldRobot(Node):
         if self_frame != 'map':
             self._log_follow_gate('self_pose_stale')
             return
-        if self.require_localization_ready and not self.localization_ready:
+        if self.require_follow_localization_ready and not self.localization_ready:
             self._log_follow_gate('localization_not_ready')
             return
         if not self.nav_client.server_is_ready():
@@ -999,7 +1003,7 @@ class UnifiedFieldRobot(Node):
             return False
         if source == 'FOLLOW':
             return self.role == Role.FOLLOWER and (
-                not self.require_localization_ready or self.localization_ready
+                not self.require_follow_localization_ready or self.localization_ready
             )
         return source == 'RECOVERY' and self.role == Role.RECOVERY_NAVIGATING
 
