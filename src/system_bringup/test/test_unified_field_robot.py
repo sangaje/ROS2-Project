@@ -81,6 +81,14 @@ class _ServiceClient:
         return False
 
 
+class _ExplodingServiceClient:
+    def service_is_ready(self):
+        raise AssertionError('speed-limit service should not be queried')
+
+    def call_async(self, request):
+        raise AssertionError('speed-limit service should not be called')
+
+
 class _Runtime:
     active = True
 
@@ -633,6 +641,19 @@ def test_leader_shadow_republishes_when_nav2_pipeline_never_executes():
 
     assert len(node.nav_client.sent) == 2
     assert node.shadow_goal_active is True
+
+
+def test_leader_shadow_speed_limit_is_disabled_by_default():
+    node = LeaderShadowFollow.__new__(LeaderShadowFollow)
+    node.enable_controller_speed_limit = False
+    node.controller_client = _ExplodingServiceClient()
+    node.speed_limit_pending = False
+    node.speed_profile = None
+
+    node._set_controller_speed_limit(True)
+
+    assert node.speed_limit_pending is False
+    assert node.speed_profile is None
 
 
 def test_leader_shadow_reevaluates_immediately_when_gates_open():

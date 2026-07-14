@@ -1070,6 +1070,7 @@ def generate_launch_description():
                             'leader_shadow_cmd_max_angular_vel': float(
                                 leader_shadow_cmd_max_angular_vel.perform(context)
                             ),
+                            'enable_controller_speed_limit': False,
                             'leader_shadow_heading_min_motion_m': float(
                                 leader_shadow_heading_min_motion_m.perform(context)
                             ),

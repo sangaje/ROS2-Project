@@ -79,6 +79,7 @@ class LeaderShadowFollow(Node):
             'controller_set_parameters_service',
             '/controller_server/set_parameters',
         )
+        self.declare_parameter('enable_controller_speed_limit', False)
         self.declare_parameter('map_topic', '/map')
         self.declare_parameter('risk_topic', '/risk/risk_map')
         self.declare_parameter('enable_risk_priority_follow', True)
@@ -165,6 +166,9 @@ class LeaderShadowFollow(Node):
         self.odom_topic = str(get('odom_topic').value)
         self.controller_set_parameters_service = str(
             get('controller_set_parameters_service').value
+        )
+        self.enable_controller_speed_limit = bool(
+            get('enable_controller_speed_limit').value
         )
         self.map_topic = str(get('map_topic').value)
         self.risk_topic = str(get('risk_topic').value)
@@ -347,9 +351,11 @@ class LeaderShadowFollow(Node):
             )
             self.create_subscription(LaserScan, self.scan_topic, self._on_scan, scan_qos)
 
-        self.controller_client = self.create_client(
-            SetParameters, self.controller_set_parameters_service
-        )
+        self.controller_client = None
+        if self.enable_controller_speed_limit:
+            self.controller_client = self.create_client(
+                SetParameters, self.controller_set_parameters_service
+            )
 
         self.mode = LeaderMode.IDLE
         self.start_wall = self._now()
@@ -427,7 +433,8 @@ class LeaderShadowFollow(Node):
             f'navigate_action={self.navigate_action} '
             f'cmd_scale=lin{self.cmd_linear_scale:.2f}/ang{self.cmd_angular_scale:.2f} '
             f'cmd_cap=lin{self.cmd_max_linear_vel:.2f}/ang{self.cmd_max_angular_vel:.2f} '
-            f'controller_service={self.controller_set_parameters_service} '
+            f'controller_speed_limit={self.enable_controller_speed_limit}:'
+            f'{self.controller_set_parameters_service} '
             f'localization_gate={self.require_localization_ready}:{self.localization_ready_topic} '
             f'system_gate={self.require_system_ready}:{self.system_ready_topic} '
             f'video_gate={self.require_video_ready}:{self.video_ready_topic} '
@@ -1280,6 +1287,8 @@ class LeaderShadowFollow(Node):
         )
 
     def _set_controller_speed_limit(self, limited: bool, *, catchup: bool = False) -> None:
+        if not getattr(self, 'enable_controller_speed_limit', False):
+            return
         profile = 'restore'
         if limited:
             profile = 'catchup' if catchup else 'shadow'
@@ -1287,7 +1296,7 @@ class LeaderShadowFollow(Node):
             return
         if self.speed_profile == profile:
             return
-        if not self.controller_client.service_is_ready():
+        if self.controller_client is None or not self.controller_client.service_is_ready():
             self.get_logger().info(
                 '[LEADER_SHADOW] CONTROLLER_PARAM_SERVICE_WAIT | '
                 'shadow speed limit will be retried',
