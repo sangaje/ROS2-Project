@@ -145,9 +145,13 @@ def test_follower_startup_forces_slam_and_rl_off():
     assert 'risk_map_requested = False' in text
     assert "'true' if follower_initial_role else enable_amcl.perform(context)" in text
     assert "local_exploration = (\n                False\n                if follower_initial_role" in text
+    assert "takeover_exploration = bool(" in text
+    assert "rl_capability = bool(local_exploration or takeover_exploration)" in text
     assert "'false'\n                if follower_initial_role\n                else forward_field_map_to_main.perform(context)" in text
+    assert "fleet_role_value in ('member', 'follower')" in text
+    assert "'direct_rl_start': (" in text
     assert 'FOLLOWER_CAPABILITY_STATUS | robot=' in text
-    assert 'cartographer_enabled=false rl_enabled=false' in text
+    assert 'cartographer_enabled=false rl_worker_standby=true' in text
 
 
 def test_follower_map_forwarding_is_explicit_for_takeover_commit():
@@ -163,3 +167,10 @@ def test_follower_map_forwarding_is_explicit_for_takeover_commit():
     assert "f'/field/{follower_robot_name.perform(context)}/map'" in text
     assert "'active_scout_id_topic': active_scout_id_topic" in leader_launch
     assert "'follower_input_topic': follower_map_bridge_topic" in leader_launch
+
+
+def test_leader_map_bridge_can_fallback_to_member_domain_id():
+    text = SYSTEM_LAUNCH.read_text(encoding='utf-8')
+
+    assert 'risk_domain_id not set; using ' in text
+    assert 'risk_domain_value = member_domain_id.perform(context).strip()' in text
