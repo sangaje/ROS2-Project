@@ -86,6 +86,18 @@ class TfPosePublisher(Node):
         self.stationary_freeze_warmup_sec = max(
             0.0, float(_safe_declare(self, 'stationary_freeze_warmup_sec', 10.0))
         )
+        self.map_jump_filter_enabled = bool(
+            _safe_declare(self, 'map_jump_filter_enabled', False)
+        )
+        self.map_jump_min_allowed_m = max(
+            0.0, float(_safe_declare(self, 'map_jump_min_allowed_m', 0.20))
+        )
+        self.map_jump_odom_scale = max(
+            1.0, float(_safe_declare(self, 'map_jump_odom_scale', 4.0))
+        )
+        self.map_jump_slop_m = max(
+            0.0, float(_safe_declare(self, 'map_jump_slop_m', 0.12))
+        )
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -103,7 +115,8 @@ class TfPosePublisher(Node):
             f'V44_TF_POSE_PUBLISHER_READY | target={self.target_frame} '
             f'sources={self.source_frame_candidates} -> {self.output_topic} '
             f'rate={self.publish_rate_hz:.1f}Hz '
-            f'freeze_stationary={self.freeze_when_stationary}'
+            f'freeze_stationary={self.freeze_when_stationary} '
+            f'map_jump_filter={self.map_jump_filter_enabled}'
         )
 
     @staticmethod
@@ -222,8 +235,9 @@ class TfPosePublisher(Node):
         dx = motion_pose[0] - self._last_motion_pose[0]
         dy = motion_pose[1] - self._last_motion_pose[1]
         dyaw = _angle_delta(motion_pose[2], self._last_motion_pose[2])
+        odom_delta = math.hypot(dx, dy)
         stationary = (
-            math.hypot(dx, dy) <= self.stationary_linear_threshold_m
+            odom_delta <= self.stationary_linear_threshold_m
             and abs(dyaw) <= self.stationary_angular_threshold_rad
         )
         if stationary:
@@ -241,6 +255,32 @@ class TfPosePublisher(Node):
                 self._last_accepted_pose,
                 candidate.header,
             ), True
+
+        if self.map_jump_filter_enabled:
+            map_delta = math.hypot(
+                candidate.pose.position.x - self._last_accepted_pose.pose.position.x,
+                candidate.pose.position.y - self._last_accepted_pose.pose.position.y,
+            )
+            allowed_delta = max(
+                self.map_jump_min_allowed_m,
+                odom_delta * self.map_jump_odom_scale + self.map_jump_slop_m,
+            )
+            if map_delta > allowed_delta:
+                self._freeze_count += 1
+                now = time.monotonic()
+                if self._freeze_count <= 3 or now - self._last_freeze_log_wall > 5.0:
+                    self._last_freeze_log_wall = now
+                    self.get_logger().warn(
+                        'V44_TF_POSE_MAP_JUMP_REJECT | '
+                        f'topic={self.output_topic} count={self._freeze_count} '
+                        f'map_delta={map_delta:.3f}m '
+                        f'odom_delta={odom_delta:.3f}m '
+                        f'allowed_delta={allowed_delta:.3f}m'
+                    )
+                return self._copy_pose_with_header(
+                    self._last_accepted_pose,
+                    candidate.header,
+                ), True
 
         self._freeze_count = 0
         self._last_motion_pose = motion_pose

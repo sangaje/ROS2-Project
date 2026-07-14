@@ -28,6 +28,10 @@ def _bare_filter() -> TfPosePublisher:
     node.stationary_linear_threshold_m = 0.02
     node.stationary_angular_threshold_rad = 0.035
     node.stationary_freeze_warmup_sec = 0.0
+    node.map_jump_filter_enabled = False
+    node.map_jump_min_allowed_m = 0.20
+    node.map_jump_odom_scale = 4.0
+    node.map_jump_slop_m = 0.12
     node._start_wall = 0.0
     node._last_motion_pose = None
     node._last_accepted_pose = None
@@ -67,3 +71,32 @@ def test_stationary_filter_accepts_new_pose_after_odom_motion():
     assert not frozen
     assert second.pose.position.x == 1.35
     assert second.pose.position.y == 2.25
+
+
+def test_map_jump_filter_rejects_pose_teleport_larger_than_odom_motion():
+    node = _bare_filter()
+    node.map_jump_filter_enabled = True
+    node._select_pose_for_publish(_pose(1.0, 2.0), (0.0, 0.0, 0.0))
+
+    second, frozen = node._select_pose_for_publish(
+        _pose(1.80, 2.00),
+        (0.04, 0.0, 0.0),
+    )
+
+    assert frozen
+    assert second.pose.position.x == 1.0
+    assert second.pose.position.y == 2.0
+
+
+def test_map_jump_filter_accepts_pose_motion_consistent_with_odom():
+    node = _bare_filter()
+    node.map_jump_filter_enabled = True
+    node._select_pose_for_publish(_pose(1.0, 2.0), (0.0, 0.0, 0.0))
+
+    second, frozen = node._select_pose_for_publish(
+        _pose(1.15, 2.00),
+        (0.04, 0.0, 0.0),
+    )
+
+    assert not frozen
+    assert second.pose.position.x == 1.15

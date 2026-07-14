@@ -43,7 +43,8 @@ def test_leader_does_not_seed_from_scout_pose_by_default():
     text = (LAUNCH_DIR / 'leader.launch.py').read_text(encoding='utf-8')
     assert "'enable_scout_pose_seed': False" in text
     assert "'allow_blind_global_reinit': False" in text
-    assert "'freeze_when_stationary': False" in text
+    assert "'freeze_when_stationary': True" in text
+    assert "'map_jump_filter_enabled': True" in text
 
 
 def test_fixed_seed_defaults_do_not_global_localize_or_copy_other_robot_pose():
