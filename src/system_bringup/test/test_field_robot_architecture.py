@@ -60,11 +60,14 @@ def test_system_launch_routes_field_observations_to_robot_topics():
     assert "'width': '640'" in source
     assert "'height': '480'" in source
     assert "'pose_topic': (" in source
+    assert "'active_scout_id_topic': '/failover/active_scout_id'" in source
     assert "'active_roles': 'ACTIVE_SCOUT,SCOUT,RECOVERING'" in source
     assert "'standby_roles': 'FOLLOWER,IDLE,TAKEOVER_PENDING'" in source
     assert "'observation_topics': [" in source
     assert "f'/field/{active_scout_robot_name.perform(context)}/risk_observation'" in source
     assert "f'/field/{follower_robot_name.perform(context)}/risk_observation'" in source
+    assert "default_value='2.00'" in source
+    assert "within this radius it starts scout RL from the current pose" in source
 
 
 def test_leader_map_input_uses_field_robot_namespaces():

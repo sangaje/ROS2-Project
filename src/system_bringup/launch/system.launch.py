@@ -1361,6 +1361,7 @@ def generate_launch_description():
                         else 'ACTIVE_SCOUT'
                     ),
                     'role_topic': f'/{scout_robot_name}/role',
+                    'active_scout_id_topic': '/failover/active_scout_id',
                     'pose_topic': (
                         '/burger_pose' if fleet_role_value == 'follower'
                         else '/member_pose'
@@ -1929,8 +1930,8 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'scout_takeover_arrival_tolerance_m',
-            default_value='0.40',
-            description='Follower distance to failed scout pose required for takeover.',
+            default_value='2.00',
+            description='Follower distance to failed scout pose required for takeover; within this radius it starts scout RL from the current pose.',
         ),
         DeclareLaunchArgument(
             'enable_localization_spin_on_takeover',

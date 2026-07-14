@@ -1,0 +1,9 @@
+# Runtime-only Python dependencies for scout RL inference.
+#
+# On Jetson, install this inside the same virtualenv used by ros2 launch:
+#   python -m pip install -r src/system_bringup/requirements-rl.txt
+#
+# Keep the Jetson-specific torch build managed by the robot image/venv. If torch
+# is missing, install the NVIDIA Jetson wheel first, then install this file.
+stable-baselines3==2.8.0
+gymnasium==1.2.3

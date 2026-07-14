@@ -309,7 +309,10 @@ def _deployment_spaces(contract: dict[str, Any]):
         import numpy as np
         from gymnasium import spaces
     except ImportError as exc:
-        raise PolicyContractError(f'gymnasium/numpy unavailable: {exc}') from exc
+        raise PolicyContractError(
+            f'gymnasium/numpy unavailable: {exc}; install RL deps with '
+            'python -m pip install -r src/system_bringup/requirements-rl.txt'
+        ) from exc
 
     observation = contract['observation_contract']
     observation_space = spaces.Dict({
@@ -375,7 +378,10 @@ def load_deployment_model(contract: Optional[dict[str, Any]] = None):
     try:
         from stable_baselines3 import SAC
     except ImportError as exc:
-        raise PolicyContractError(f'stable_baselines3 unavailable: {exc}') from exc
+        raise PolicyContractError(
+            f'stable_baselines3 unavailable: {exc}; install RL deps with '
+            'python -m pip install -r src/system_bringup/requirements-rl.txt'
+        ) from exc
     observation_space, action_space = _deployment_spaces(data)
     try:
         return SAC.load(

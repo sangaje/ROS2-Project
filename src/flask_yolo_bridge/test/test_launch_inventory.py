@@ -43,6 +43,8 @@ def test_camera_sender_has_role_based_rates_and_publish_gate():
     assert 'CAMERA_NETWORK_STATUS |' in node
     assert 'publish_roles' in node
     assert 'standby_roles' in node
+    assert 'active_scout_id_topic' in node
+    assert 'def on_active_scout_id' in node
     assert 'def _current_upload_rate_hz' in node
     assert 'def _current_role_allows_publish' in node
     assert 'camera_process_enabled' in node
@@ -56,8 +58,10 @@ def test_camera_sender_has_role_based_rates_and_publish_gate():
     assert "DeclareLaunchArgument('standby_max_rate_hz', default_value='1.0')" in launch
     assert "DeclareLaunchArgument('jpeg_quality', default_value='65')" in launch
     assert "DeclareLaunchArgument('letterbox_color', default_value='0')" in launch
+    assert "DeclareLaunchArgument('active_scout_id_topic', default_value='/failover/active_scout_id')" in launch
     assert "'standby_roles': LaunchConfiguration('standby_roles')" in launch
     assert "'publish_roles': LaunchConfiguration('publish_roles')" in launch
+    assert "'active_scout_id_topic': LaunchConfiguration('active_scout_id_topic')" in launch
     assert "'active_max_upload_mbps': LaunchConfiguration('active_max_upload_mbps')" in launch
 
 

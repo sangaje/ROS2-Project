@@ -111,7 +111,7 @@ class ScoutFailoverCoordinator(Node):
         self.declare_parameter('leader_recovery_standoff_m', 0.70)
         self.declare_parameter('leader_failure_arrival_tolerance_m', 0.80)
         self.declare_parameter('follower_recovery_standoff_m', 0.15)
-        self.declare_parameter('scout_takeover_arrival_tolerance_m', 0.40)
+        self.declare_parameter('scout_takeover_arrival_tolerance_m', 2.00)
         self.declare_parameter('recovery_goal_republish_sec', 2.0)
         self.declare_parameter('max_recovery_goal_republishes', 5)
         self.declare_parameter('robot_pose_timeout_sec', 2.0)
