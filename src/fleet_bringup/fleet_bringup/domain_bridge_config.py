@@ -376,7 +376,7 @@ def write_fleet_bridge_configs(
     if include_leader_map:
         main_topics['/map'] = topic(
             'nav_msgs/msg/OccupancyGrid',
-            remap='/shared_map_in',
+            remap='/map_bridge',
             profile=map_qos(),
         )
     if simulation:
@@ -470,9 +470,9 @@ def write_fleet_bridge_configs(
     }
     relay_edges = [
         (
-            (int(follower_domain), '/shared_map_in'),
+            (int(follower_domain), '/map_bridge'),
             (int(follower_domain), '/map'),
-            'follower_map_relay:/shared_map_in->/map',
+            'follower_map_relay:/map_bridge->/map',
         )
     ]
     validate_no_duplicate_bridge_routes([main_config, follower_config])

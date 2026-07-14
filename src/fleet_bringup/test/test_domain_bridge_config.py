@@ -74,7 +74,7 @@ def test_real_bridge_directions_and_control_qos(tmp_path):
     assert '/field/follower25/risk_observation' in follower['topics']
     assert '/clock' not in main['topics']
     assert '/cmd_vel' not in follower['topics']
-    assert main['topics']['/map']['remap'] == '/shared_map_in'
+    assert main['topics']['/map']['remap'] == '/map_bridge'
     assert '/scout22/rl_confidence_map' not in main['topics']
     assert '/rl_confidence_seed' not in main['topics']
 
@@ -205,7 +205,7 @@ def test_bridge_cycle_validator_rejects_map_echo_loop():
         'topics': {
             '/map': {
                 'type': 'nav_msgs/msg/OccupancyGrid',
-                'remap': '/shared_map_in',
+                'remap': '/map_bridge',
             },
         },
     }
@@ -229,7 +229,7 @@ def test_bridge_cycle_validator_rejects_map_echo_loop():
         validate_no_bridge_feedback_cycles(
             [main_config, follower_config],
             relay_edges=[
-                ((21, '/shared_map_in'), (21, '/map'), 'map_relay'),
+                ((21, '/map_bridge'), (21, '/map'), 'map_relay'),
                 ((20, '/field/follower21/map'), (20, '/map'), 'active_map_mux'),
             ],
         )

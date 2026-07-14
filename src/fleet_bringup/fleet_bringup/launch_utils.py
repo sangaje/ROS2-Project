@@ -1,20 +1,17 @@
 import os
 import sys
-import tempfile
 from typing import Dict, List
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 from xml.etree import ElementTree as ET
 
-from ament_index_python.packages import get_package_share_directory
-from launch.actions import OpaqueFunction, SetEnvironmentVariable
+from launch.actions import OpaqueFunction
 
 
 REQUIRED_DDS_ENVIRONMENT = (
     'ROS_DOMAIN_ID',
 )
 _CYCLONEDDS_CONFIG_NS = 'https://cdds.io/config'
-_FLEET_MIN_AUTO_PARTICIPANT_INDEX = 240
 
 
 def _perform_if_needed(value, context):
@@ -47,83 +44,9 @@ def _cyclonedds_uri_to_path(uri: str) -> Path | None:
     return Path(uri)
 
 
-def _packaged_cyclonedds_uri() -> str:
-    path = (
-        Path(get_package_share_directory('fleet_bringup'))
-        / 'config'
-        / 'cyclonedds_fleet.xml'
-    )
-    return f'file://{path}'
-
-
-def _ensure_cyclonedds_participant_capacity(env: Dict[str, str]) -> str | None:
-    """Return a launch-local CycloneDDS URI with enough participant slots.
-
-    An integrated leader launch starts well over 30 ROS processes.  A common
-    robot-local CycloneDDS file uses ``ParticipantIndex=auto`` together with a
-    small ``MaxAutoParticipantIndex``; that works for a one-node probe but
-    fails late in the full launch with an opaque rcl node-creation error.  The
-    generated copy keeps peers, interfaces, multicast, and socket settings
-    intact while widening only the local participant-index range.
-    """
-    if env.get('RMW_IMPLEMENTATION', '').strip() != 'rmw_cyclonedds_cpp':
-        return None
-
-    uri = env.get('CYCLONEDDS_URI', '').strip()
-    if not uri:
-        return _packaged_cyclonedds_uri()
-
-    source_path = _cyclonedds_uri_to_path(uri)
-    if source_path is None or not source_path.is_file():
-        return None
-
-    try:
-        tree = ET.parse(source_path)
-    except (ET.ParseError, OSError):
-        return None
-
-    root = tree.getroot()
-    ns = {'c': _CYCLONEDDS_CONFIG_NS}
-    discovery = root.find('.//c:Discovery', ns)
-    if discovery is None:
-        return None
-
-    participant_index = discovery.find('c:ParticipantIndex', ns)
-    if (
-        participant_index is not None
-        and (participant_index.text or '').strip().lower() not in ('', 'auto')
-    ):
-        return None
-
-    max_index = discovery.find('c:MaxAutoParticipantIndex', ns)
-    try:
-        configured_max = int((max_index.text or '').strip()) if max_index is not None else 0
-    except ValueError:
-        configured_max = 0
-    if configured_max >= _FLEET_MIN_AUTO_PARTICIPANT_INDEX:
-        return None
-
-    if max_index is None:
-        max_index = ET.SubElement(
-            discovery,
-            f'{{{_CYCLONEDDS_CONFIG_NS}}}MaxAutoParticipantIndex',
-        )
-    max_index.text = str(_FLEET_MIN_AUTO_PARTICIPANT_INDEX)
-
-    output_dir = Path(tempfile.gettempdir()) / 'fleet_bringup_cyclonedds'
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f'{source_path.stem}_fleet_participants.xml'
-    ET.register_namespace('', _CYCLONEDDS_CONFIG_NS)
-    tree.write(output_path, encoding='utf-8', xml_declaration=True)
-    return f'file://{output_path}'
-
-
 def _prepare_process_environment(domain_id: str) -> Dict[str, str]:
     env = os.environ.copy()
     env['ROS_DOMAIN_ID'] = str(domain_id)
-    replacement_uri = _ensure_cyclonedds_participant_capacity(env)
-    if replacement_uri:
-        env['CYCLONEDDS_URI'] = replacement_uri
     _validate_cyclonedds_socket_buffers(env)
     return env
 
@@ -301,16 +224,11 @@ def with_virtualenv_site_packages(env: Dict[str, str]) -> Dict[str, str]:
 
 
 def dds_launch_environment(domain_id) -> List:
-    """Validate DDS and apply a launch-local participant-capacity override."""
+    """Validate DDS without rewriting the operator's shell DDS settings."""
 
     def _validate(context, *args, **kwargs):
         expected_domain_id = _perform_if_needed(domain_id, context)
         validate_shell_environment(expected_domain_id)
-        env = _prepare_process_environment(expected_domain_id)
-        configured_uri = env.get('CYCLONEDDS_URI', '')
-        inherited_uri = os.environ.get('CYCLONEDDS_URI', '')
-        if configured_uri and configured_uri != inherited_uri:
-            return [SetEnvironmentVariable('CYCLONEDDS_URI', configured_uri)]
         return []
 
     return [OpaqueFunction(function=_validate)]

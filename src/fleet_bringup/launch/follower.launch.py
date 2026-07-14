@@ -143,7 +143,7 @@ def generate_launch_description():
             output='screen',
             parameters=[{
                 'use_sim_time': simulation,
-                'input_topic': '/shared_map_in',
+                'input_topic': '/map_bridge',
                 'output_topic': '/map',
                 'robot_role': 'FOLLOWER',
                 'local_map_outbound': launch_bool(forward_map_to_main.perform(context)),
@@ -475,7 +475,7 @@ def generate_launch_description():
                 'LEADER_EGRESS_BRIDGE | source_domain=', str(main_domain),
                 ' | destination_domain=', str(follower_domain),
                 ' | topics=/map,/leader_pose',
-                ' | bridge_topic=/shared_map_in',
+                ' | bridge_topic=/map_bridge',
                 ' | map_type=nav_msgs/msg/OccupancyGrid',
                 ' | pose_type=geometry_msgs/msg/PoseStamped',
             ]),
