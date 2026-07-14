@@ -204,6 +204,7 @@ def generate_launch_description():
         amcl = None
         localization_lifecycle = None
         map_relay = None
+        confidence_map_relay = None
         kickstart_node = None
         fixed_seed_ready = None
         if cartographer_owned:
@@ -243,6 +244,31 @@ def generate_launch_description():
                     'primary_scout_id': active_scout_robot_name,
                     'follower_scout_id': follower_robot_name,
                     'follower_input_topic': follower_map_bridge_topic,
+                }],
+                env=process_env,
+                respawn=True,
+                respawn_delay=3.0,
+            )
+            confidence_map_relay = Node(
+                package='fleet_bringup',
+                executable='map_relay',
+                name='leader_confidence_map_relay',
+                output='screen',
+                parameters=[{
+                    'use_sim_time': False,
+                    'input_topic': f'/{active_scout_robot_name.perform(context)}/rl_confidence_map',
+                    'output_topic': '/rl_confidence_map',
+                    'check_period_sec': 0.2,
+                    'takeover_grace_sec': 0.0,
+                    'relay_without_primary': True,
+                    'max_publish_rate_hz': 1.0,
+                    'cached_republish_period_sec': 1.0,
+                    'active_scout_id_topic': active_scout_id_topic,
+                    'primary_scout_id': active_scout_robot_name,
+                    'follower_scout_id': follower_robot_name,
+                    'follower_input_topic': (
+                        f'/field/{follower_robot_name.perform(context)}/rl_confidence_map'
+                    ),
                 }],
                 env=process_env,
                 respawn=True,
@@ -685,15 +711,18 @@ def generate_launch_description():
                     )
                 )
             else:
+                relay_actions = [
+                    LogInfo(msg=[
+                        'LEADER_STAGE | starting bridged-map relay',
+                    ]),
+                    map_relay,
+                ]
+                if confidence_map_relay is not None:
+                    relay_actions.append(confidence_map_relay)
                 actions.append(
                     TimerAction(
                         period=0.2,
-                        actions=[
-                            LogInfo(msg=[
-                                'LEADER_STAGE | starting bridged-map relay',
-                            ]),
-                            map_relay,
-                        ],
+                        actions=relay_actions,
                     )
                 )
                 actions.append(

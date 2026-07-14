@@ -70,4 +70,8 @@ def test_leader_map_input_uses_field_robot_namespaces():
     assert "map_source_topic=(" in system
     assert "/map_out" in system
     assert "default_value='/field/follower21/map'" in leader
+    assert "leader_confidence_map_relay" in leader
+    assert "'output_topic': '/rl_confidence_map'" in leader
+    assert "f'/field/{follower_robot_name.perform(context)}/rl_confidence_map'" in leader
     assert "f'/field/{follower_robot_name.perform(context)}/map'" in system
+    assert "include_rl_confidence_map=True" in system

@@ -541,6 +541,8 @@ class UnifiedFieldRobot(Node):
         self._last_role_tuple = next_tuple
         self.epoch = epoch
         if role == Role.RECOVERY_NAVIGATING:
+            self._cancel_follow_goal('recovery_role_command')
+            self.nav.invalidate('recovery_role_command', clear_pending=True)
             target_pose = self._pose_from_json(
                 update.payload.get('target_pose') or update.payload.get('failure_pose')
             )
@@ -1074,7 +1076,9 @@ class UnifiedFieldRobot(Node):
         return self._nav_motion_quiesced()
 
     def _localization_ok(self) -> bool:
-        if self.require_localization_ready and not self.localization_ready:
+        if not self.require_localization_ready:
+            return True
+        if not self.localization_ready:
             return False
         if self.last_amcl_wall is None:
             return False
@@ -1268,6 +1272,8 @@ class UnifiedFieldRobot(Node):
             'nav_goal_active': nav_goal_active,
             'movement_started': self.movement_started,
             'localization_ready': self.localization_ready,
+            'localization_ok': self._localization_ok(),
+            'requires_localization_ready': self.require_localization_ready,
             'system_ready': getattr(self, 'system_ready', True),
             'start_motion': getattr(self, 'start_motion', True),
             'nav_server_ready': self.nav_client.server_is_ready(),
@@ -1302,6 +1308,8 @@ class UnifiedFieldRobot(Node):
                 self.robot_name if self.role == Role.ACTIVE_SCOUT else ''
             ),
             'localization_ready': self.localization_ready,
+            'localization_ok': self._localization_ok(),
+            'requires_localization_ready': self.require_localization_ready,
             'recovery_complete': recovery_complete,
             'active_scout_ready': active_scout_ready,
             'motion_authority': self.motion_authority.value,

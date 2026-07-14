@@ -341,7 +341,9 @@ class ScoutFailoverCoordinator(Node):
             or status == 'ACTIVE_SCOUT_READY'
         )
         recovery_complete = bool(data.get('recovery_complete', False))
-        localization_ready = bool(data.get('localization_ready', False))
+        localization_ready = bool(
+            data.get('localization_ok', data.get('localization_ready', False))
+        )
         nav_goal_active = bool(data.get('nav_goal_active', False))
         pending_goal_count = int(data.get('pending_goal_count', 0) or 0)
         active_goal_count = int(data.get('active_goal_count', 0) or 0)
@@ -491,7 +493,7 @@ class ScoutFailoverCoordinator(Node):
         self.failure_pose_pub.publish(self.failure_pose)
         self.scout_epoch += 1
         self.leader_goal = self._offset_pose(self.failure_pose, self.leader_standoff)
-        self.follower_goal = self._offset_pose(self.failure_pose, self.follower_standoff)
+        self.follower_goal = self._copy_pose(self.failure_pose)
         self.leader_recovery_position_reached = self._leader_already_near_failure()
         self.recovery_goal_publish_count = 0
         self.last_recovery_goal_wall = -1.0e9
@@ -647,6 +649,7 @@ class ScoutFailoverCoordinator(Node):
     def _publish_recovery_role_command(self) -> None:
         if self.follower_goal is None or self.failure_pose is None:
             return
+        target = self.failure_pose
         data = {
             'role': 'RECOVERY_NAVIGATING',
             'epoch': self.scout_epoch,
@@ -654,9 +657,9 @@ class ScoutFailoverCoordinator(Node):
             'previous_scout': self.original_scout_id,
             'target_pose': {
                 'frame_id': 'map',
-                'x': self.follower_goal.pose.position.x,
-                'y': self.follower_goal.pose.position.y,
-                'yaw': yaw_from_quaternion(self.follower_goal.pose.orientation),
+                'x': target.pose.position.x,
+                'y': target.pose.position.y,
+                'yaw': yaw_from_quaternion(target.pose.orientation),
             },
             'failure_pose': {
                 'frame_id': 'map',

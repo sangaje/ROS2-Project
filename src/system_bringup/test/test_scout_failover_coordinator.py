@@ -62,6 +62,9 @@ def _bare_node(now=0.0):
     logger = _Logger()
     node._now = lambda: clock[0]
     node.get_logger = lambda: logger
+    node.get_clock = lambda: type('Clock', (), {
+        'now': lambda self: type('Now', (), {'to_msg': lambda self: None})()
+    })()
 
     node.enabled = True
     node.require_bootstrap_complete = True
@@ -427,3 +430,34 @@ def test_failure_pose_freeze_and_dead_edge_are_exactly_once():
     frozen = [message for _, message in logger.messages if 'LAST_POSE_FROZEN' in message]
     assert len(confirmed) == 1
     assert len(frozen) == 1
+
+
+def test_recovery_role_command_targets_exact_failed_scout_pose():
+    node, _, _ = _bare_node(now=10.0)
+    node.scout_epoch = 2
+    node.failure_pose = _pose(2.0, -1.0, 0.5)
+    node.follower_goal = _pose(1.5, -1.0, 0.5)
+
+    node._publish_recovery_role_command()
+
+    assert len(node.role_command_pub.messages) == 1
+    payload = json.loads(node.role_command_pub.messages[0].data)
+    assert payload['role'] == 'RECOVERY_NAVIGATING'
+    assert payload['target_pose']['x'] == 2.0
+    assert payload['target_pose']['y'] == -1.0
+    assert payload['failure_pose']['x'] == 2.0
+    assert payload['failure_pose']['y'] == -1.0
+
+
+def test_follower_recovery_goal_is_failed_scout_pose_not_standoff():
+    node, _, _ = _bare_node(now=10.0)
+    node.state = FailoverState.SCOUT_SUSPECTED_DEAD
+    node.last_scout_pose = _pose(2.0, -1.0, 0.5)
+    node.last_scout_pose_wall = 9.5
+    node.follower_standoff = 0.5
+    node._trigger_failover = lambda: None
+
+    node._confirm_dead(now=10.0)
+
+    assert node.follower_goal.pose.position.x == pytest.approx(2.0)
+    assert node.follower_goal.pose.position.y == pytest.approx(-1.0)

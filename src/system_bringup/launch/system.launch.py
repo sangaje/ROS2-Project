@@ -529,7 +529,9 @@ def generate_launch_description():
                         'rl_backend': rl_backend_value,
                         'leader_pose_topic': '/leader_pose',
                         'self_pose_topic': self_pose_topic,
-                        'require_localization_ready': not scout_owns_slam,
+                        'require_localization_ready': (
+                            False if follower_initial_role else not scout_owns_slam
+                        ),
                         'require_follow_localization_ready': (
                             False if follower_initial_role else not scout_owns_slam
                         ),
@@ -588,7 +590,9 @@ def generate_launch_description():
                             ),
                             'require_failover_activation': 'true',
                             'require_localization_ready': (
-                                'false' if scout_owns_slam else 'true'
+                                'false'
+                                if (scout_owns_slam or follower_initial_role)
+                                else 'true'
                             ),
                             'require_video_ready': 'false',
                             'video_ready_topic': '/fleet/start_motion',
@@ -677,7 +681,7 @@ def generate_launch_description():
                             f'/field/{active_scout_robot_name.perform(context)}/map_out'
                         ),
                         include_identity_topics=False,
-                        include_rl_confidence_map=False,
+                        include_rl_confidence_map=True,
                         include_risk_outputs=not launch_bool(
                             start_leader_risk_map.perform(context)
                         ),
@@ -1191,7 +1195,7 @@ def generate_launch_description():
                         'scout_pose_timeout_sec': float(
                             scout_pose_timeout_sec.perform(context)
                         ),
-                        'require_bootstrap_complete': True,
+                        'require_bootstrap_complete': False,
                         'bootstrap_ready_topic': '/localization_ready',
                         'leader_recovery_standoff_m': float(
                             leader_recovery_standoff_m.perform(context)
@@ -1915,8 +1919,8 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'follower_recovery_standoff_m',
-            default_value='0.15',
-            description='Follower goal offset behind failed scout pose.',
+            default_value='0.0',
+            description='Follower goal offset behind failed scout pose. Default drives to the failed scout pose.',
         ),
         DeclareLaunchArgument(
             'scout_takeover_arrival_tolerance_m',

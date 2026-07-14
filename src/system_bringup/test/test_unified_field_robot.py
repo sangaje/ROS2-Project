@@ -99,6 +99,12 @@ def _pose(x=0.0, y=0.0, frame='map'):
     return msg
 
 
+def _string(data):
+    msg = String()
+    msg.data = data if isinstance(data, str) else json.dumps(data)
+    return msg
+
+
 def _bare_field(now=10.0):
     node = UnifiedFieldRobot.__new__(UnifiedFieldRobot)
     logger = _Logger()
@@ -106,6 +112,8 @@ def _bare_field(now=10.0):
     node.get_clock = lambda: _Clock()
     node._now = lambda: float(now)
     node.robot_name = 'follower21'
+    node.active_scout_robot_name = 'scout22'
+    node.fleet_role = 'follower'
     node.epoch = 2
     node.role = Role.RECOVERY_NAVIGATING
     node.motion_authority = MotionAuthority.NONE
@@ -114,6 +122,8 @@ def _bare_field(now=10.0):
     node.scout_rl_enabled = True
     node.in_process_rl_enabled = False
     node.nav_client = _ActionClient()
+    node.navigate_action = '/navigate_to_pose'
+    node.last_risk_value = 0
     node.last_odom_xy = (0.0, 0.0)
     node.nav_start_odom_xy = None
     node.movement_started = False
@@ -124,7 +134,17 @@ def _bare_field(now=10.0):
     node.arrival_tolerance = 0.4
     node.navigate_action = '/field_b/navigate_to_pose'
     node.require_localization_ready = True
+    node.require_follow_localization_ready = True
     node.localization_ready = True
+    node.last_amcl_wall = now
+    node.xy_cov = 0.0
+    node.yaw_cov = 0.0
+    node.max_xy_cov = 0.22
+    node.max_yaw_cov = 0.16
+    node.max_amcl_age = 3.0
+    node.status_pub = _Publisher()
+    node.legacy_status_pub = _Publisher()
+    node.role_pub = _Publisher()
     node.recovery_nav_failures = 0
     node.recovery_nav_succeeded = False
     node.recovery_arrived = False
@@ -168,6 +188,45 @@ def test_recovery_goal_has_one_inflight_send_only():
     assert node.nav.inflight_goal_ids == {1}
     assert node.nav.pending_goal is None
     assert node.motion_authority == MotionAuthority.FAILOVER_RECOVERY_NAV
+
+
+def test_recovery_role_command_clears_follow_goal_and_targets_failure_pose():
+    node, _ = _bare_field()
+    node.role = Role.FOLLOWER
+    node.epoch = 2
+    node._last_role_tuple = (Role.FOLLOWER.value, '', 2)
+    node.follow_goal_epoch = 4
+    node.follow_goal_pending = True
+    node.follow_goal_handle = object()
+    node.last_follow_goal_xy = (0.0, 0.0)
+    node.pending_follow_goal_xy = (0.0, 0.0)
+    node.pending_follow_goal_wall = 10.0
+    node.first_follow_leader_xy = (0.0, 0.0)
+    node.first_follow_wall = 10.0
+    node.nav.request_goal(_pose(0.0, 0.0), 'FOLLOW')
+
+    node._on_role_command(_string({
+        'role': 'RECOVERY_NAVIGATING',
+        'robot': 'follower21',
+        'epoch': 3,
+        'target_pose': {'frame_id': 'map', 'x': 2.0, 'y': -1.0, 'yaw': 0.0},
+    }))
+
+    assert node.role == Role.RECOVERY_NAVIGATING
+    assert node.follow_goal_pending is False
+    assert node.follow_goal_handle is None
+    assert node.nav.has_pending_goal is False
+    assert node.recovery_target.pose.position.x == 2.0
+    assert node.recovery_target.pose.position.y == -1.0
+
+
+def test_takeover_localization_ok_can_bypass_stale_amcl_when_not_required():
+    node, _ = _bare_field()
+    node.require_localization_ready = False
+    node.localization_ready = False
+    node.last_amcl_wall = None
+
+    assert node._localization_ok() is True
 
 
 def test_follow_nav_goal_acceptance_timeout_returns_manager_to_idle():
@@ -341,6 +400,8 @@ def test_shadow_goal_cancel_is_edge_triggered_on_failover():
     node = LeaderShadowFollow.__new__(LeaderShadowFollow)
     node.failover_state = 'NORMAL_OPERATION'
     node.shadow_goal_active = True
+    node.nav_goal_handle = None
+    node.nav_goal_pending = False
     node.last_goal = _pose()
     node.cancel_pub = _Publisher()
     logger = _Logger()
@@ -399,6 +460,13 @@ def test_nav2_shadow_goal_starts_even_when_leader_begins_next_to_scout():
     node.video_ready = True
     node.pause_on_omx_aiming = False
     node.pause_on_raw_target_detection = False
+    node.target_detected = False
+    node.target_detected_wall = -1.0e9
+    node.target_stop_hold = 3.0
+    node.last_target_point = None
+    node.target_memory_hold = 0.0
+    node.target_last_seen_wall = -1.0e9
+    node.target_hold_active = False
     node.failover_state = 'NORMAL_OPERATION'
     node.active_scout_id = 'scout22'
     node.original_scout_id = 'scout22'
@@ -414,13 +482,18 @@ def test_nav2_shadow_goal_starts_even_when_leader_begins_next_to_scout():
     node.direct_shadow_cmd_vel = False
     node.shadow_active = True
     node.shadow_goal_active = False
+    node.nav_goal_handle = None
+    node.nav_goal_pending = False
     node.direct_cmd_active = False
     node.map_msg = None
+    node.enable_risk_priority = False
+    node.risk_msg = None
     node.heading = 0.0
     node.previous_scout_sample = None
     node.last_goal = None
     node.last_goal_wall = -1.0e9
     node.last_nominal_target = None
+    node.last_risk_target = None
     node.goal_period = 0.0
     node.goal_min_change = 0.05
     node.follow_distance = 0.40
@@ -442,6 +515,9 @@ def test_nav2_shadow_goal_starts_even_when_leader_begins_next_to_scout():
     node.speed_limit_pending = False
     node.speed_profile = None
     node.controller_client = _ServiceClient()
+    node.nav_client = _ActionClient()
+    node.navigate_action = '/navigate_to_pose'
+    node.last_risk_value = 0
     node.goal_pub = _Publisher()
     node.goal_debug_pub = _Publisher()
     node.cancel_pub = _Publisher()
@@ -450,8 +526,8 @@ def test_nav2_shadow_goal_starts_even_when_leader_begins_next_to_scout():
 
     node._tick()
 
-    assert len(node.goal_pub.messages) == 1
-    goal = node.goal_pub.messages[0]
+    assert len(node.nav_client.sent) == 1
+    goal = node.nav_client.sent[0][0].pose
     assert 0.58 < goal.pose.position.x < 0.62
     assert abs(goal.pose.position.y) < 0.01
     assert node.last_target_behind_scout is True
@@ -477,8 +553,13 @@ def test_leader_shadow_republishes_when_nav2_pipeline_never_executes():
     node.video_ready = True
     node.pause_on_omx_aiming = False
     node.pause_on_raw_target_detection = False
+    node.target_detected = False
     node.target_detected_wall = -1.0e9
     node.target_stop_hold = 3.0
+    node.last_target_point = None
+    node.target_memory_hold = 0.0
+    node.target_last_seen_wall = -1.0e9
+    node.target_hold_active = False
     node.failover_state = 'NORMAL_OPERATION'
     node.active_scout_id = 'scout22'
     node.original_scout_id = 'scout22'
@@ -495,8 +576,12 @@ def test_leader_shadow_republishes_when_nav2_pipeline_never_executes():
     node.direct_shadow_cmd_vel = False
     node.shadow_active = True
     node.shadow_goal_active = False
+    node.nav_goal_handle = None
+    node.nav_goal_pending = False
     node.direct_cmd_active = False
     node.map_msg = None
+    node.enable_risk_priority = False
+    node.risk_msg = None
     node.heading = 0.0
     node.previous_scout_sample = None
     node.last_goal = None
@@ -510,6 +595,7 @@ def test_leader_shadow_republishes_when_nav2_pipeline_never_executes():
     node.previous_distance_to_scout = None
     node.distance_decreased = False
     node.last_nominal_target = None
+    node.last_risk_target = None
     node.goal_period = 0.5
     node.goal_min_change = 0.05
     node.nav_execution_timeout = 2.0
@@ -532,6 +618,9 @@ def test_leader_shadow_republishes_when_nav2_pipeline_never_executes():
     node.speed_limit_pending = False
     node.speed_profile = None
     node.controller_client = _ServiceClient()
+    node.nav_client = _ActionClient()
+    node.navigate_action = '/navigate_to_pose'
+    node.last_risk_value = 0
     node.goal_pub = _Publisher()
     node.goal_debug_pub = _Publisher()
     node.cancel_pub = _Publisher()
@@ -542,7 +631,7 @@ def test_leader_shadow_republishes_when_nav2_pipeline_never_executes():
     now['value'] = 12.2
     node._tick()
 
-    assert len(node.goal_pub.messages) == 2
+    assert len(node.nav_client.sent) == 2
     assert node.shadow_goal_active is True
 
 

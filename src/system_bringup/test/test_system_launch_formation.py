@@ -168,6 +168,8 @@ def test_follower_startup_keeps_slam_off_but_allows_role_gated_rl():
     assert 'cartographer_enabled=false rl_initial_active=false' in text
     assert 'takeover_rl_standby=' in text
     assert 'blocking_reason=waiting_for_takeover' in text
+    assert "'require_bootstrap_complete': False" in text
+    assert "'require_localization_ready': (\n                            False if follower_initial_role else not scout_owns_slam" in text
     assert "initial_role_active': (\n                                'true' if fleet_role_value == 'member' else 'false'" in text
 
 
@@ -184,3 +186,4 @@ def test_follower_map_forwarding_is_explicit_for_takeover_commit():
     assert "f'/field/{follower_robot_name.perform(context)}/map'" in text
     assert "'active_scout_id_topic': active_scout_id_topic" in leader_launch
     assert "'follower_input_topic': follower_map_bridge_topic" in leader_launch
+    assert "'follower_recovery_standoff_m',\n            default_value='0.0'" in text
