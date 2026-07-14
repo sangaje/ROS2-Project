@@ -20,7 +20,10 @@ def test_contract_compiles_the_actual_v132_in_process_configuration():
     config = active_scout_config(contract)
 
     assert assets['runner'].name == 'run_train_v132_clean.sh'
-    assert assets['checkpoint'].name == 'sac_turtlebot3_burger_emergency.zip'
+    assert assets['checkpoint'].name == 'sac_turtlebot3_burger.zip'
+    assert assets['checkpoint'].parent.name == (
+        'pure_velocity_sac_map64_lidar60_h8_deltatcn_domain22_nopriority_gsde_v022_dt02_b128_obs63'
+    )
     assert config.checkpoint == assets['checkpoint']
     assert config.control_dt_sec == 0.2
     assert config.map_substeps_per_action == 2

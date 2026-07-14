@@ -57,7 +57,7 @@ def generate_launch_description():
         return [
             LogInfo(msg=[
                 'SCOUT_RL_INFERENCE | model=',
-                'sac_turtlebot3_burger_emergency.zip vector_dim=63 domain=',
+                'pure_velocity_sac_map64_lidar60_h8_deltatcn_domain22_nopriority_gsde_v022_dt02_b128_obs63/sac_turtlebot3_burger.zip vector_dim=63 domain=',
                 domain_id.perform(context),
             ]),
             Node(
