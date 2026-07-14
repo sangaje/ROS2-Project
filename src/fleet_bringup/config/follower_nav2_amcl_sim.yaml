@@ -86,11 +86,11 @@ controller_server:
       debug_trajectory_details: false
       min_vel_x: -0.06
       min_vel_y: 0.0
-      max_vel_x: 0.24
+      max_vel_x: 0.18
       max_vel_y: 0.0
-      max_vel_theta: 1.10
+      max_vel_theta: 0.90
       min_speed_xy: 0.0
-      max_speed_xy: 0.24
+      max_speed_xy: 0.18
       min_speed_theta: 0.0
       acc_lim_x: 0.80
       acc_lim_y: 0.0
@@ -153,7 +153,7 @@ behavior_server:
     robot_base_frame: "base_footprint"
     transform_tolerance: 1.5
     simulate_ahead_time: 1.2
-    max_rotational_vel: 1.10
+    max_rotational_vel: 0.90
     min_rotational_vel: 0.10
     rotational_acc_lim: 1.60
 

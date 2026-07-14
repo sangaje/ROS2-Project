@@ -23,14 +23,14 @@ def test_system_launch_passes_initial_pose_to_fleet_launches():
     assert "fleet_launch_args['follower_initial_y']" in text
 
 
-def test_system_launch_uses_fixed_seed_localization_and_faster_nav2_leader_defaults():
+def test_system_launch_uses_fixed_seed_localization_and_stable_nav2_leader_defaults():
     text = SYSTEM_LAUNCH.read_text(encoding='utf-8')
 
     assert "'auto_localize', default_value='false'" in text
     assert "'leader_auto_localize', default_value='false'" in text
-    assert "'leader_shadow_max_linear_vel',\n            default_value='0.26'" in text
-    assert "'leader_shadow_catchup_max_linear_vel',\n            default_value='0.26'" in text
-    assert "'leader_shadow_max_angular_vel',\n            default_value='1.00'" in text
+    assert "'leader_shadow_max_linear_vel',\n            default_value='0.20'" in text
+    assert "'leader_shadow_catchup_max_linear_vel',\n            default_value='0.20'" in text
+    assert "'leader_shadow_max_angular_vel',\n            default_value='0.80'" in text
     assert "'leader_shadow_follow_distance_m',\n            default_value='0.40'" in text
     assert "'leader_shadow_stop_distance_m',\n            default_value='0.30'" in text
     assert "'leader_shadow_resume_distance_m',\n            default_value='0.46'" in text
