@@ -449,7 +449,7 @@ def generate_launch_description():
                 ' role=FOLLOWER active_scout_id=',
                 active_scout_robot_name.perform(context),
                 ' follow_enabled=true amcl_enabled=true nav2_enabled=true ',
-                'cartographer_enabled=false rl_worker_standby=true ',
+                'cartographer_enabled=false rl_enabled=false ',
                 'confidence_enabled=false map_authority=false ',
                 'local_map_outbound=false blocking_reason=normal_follower',
             ]))
@@ -474,8 +474,11 @@ def generate_launch_description():
         if (
             role_value == 'scout'
             and (
-                fleet_role_value in ('member', 'follower')
-                or launch_bool(enable_scout_failover.perform(context))
+                fleet_role_value == 'member'
+                or (
+                    launch_bool(enable_scout_failover.perform(context))
+                    and not follower_initial_role
+                )
             )
         ):
             local_exploration = (
@@ -562,12 +565,8 @@ def generate_launch_description():
                     respawn=True,
                     respawn_delay=3.0,
             ))
-            role_gated_takeover_worker = bool(
-                follower_initial_role
-                and launch_bool(enable_scout_failover.perform(context))
-            )
             if (
-                (local_exploration or role_gated_takeover_worker)
+                local_exploration
                 and rl_backend_value == 'external_worker'
                 and start_rl_worker_value
             ):
