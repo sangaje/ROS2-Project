@@ -274,6 +274,24 @@ def test_risk_to_leader_bridge_can_exclude_scout_risk_outputs(tmp_path):
     assert '/risk/evidence_markers' not in config['topics']
 
 
+def test_risk_to_leader_bridge_can_use_scout_map_gateway_source(tmp_path):
+    path = write_risk_to_leader_bridge_config(
+        22,
+        24,
+        map_source_topic='/field/scout22/map_out',
+        output_directory=tmp_path,
+    )
+    config = yaml.safe_load(path.read_text())
+
+    assert '/map' not in config['topics']
+    assert config['topics']['/field/scout22/map_out']['remap'] == (
+        '/field/scout22/map'
+    )
+    assert config['topics']['/field/scout22/map_out']['qos']['durability'] == (
+        'volatile'
+    )
+
+
 def test_leader_to_pc_bridge_is_visualization_only(tmp_path):
     path = write_leader_to_pc_bridge_config(
         24,
