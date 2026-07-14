@@ -63,7 +63,7 @@ def test_leader_shadow_hard_stops_on_best_effort_target_detection():
     assert "self.declare_parameter('target_detected_cancel_period_sec', 0.25)" in source
     assert "self.declare_parameter('target_base_stop_rate_hz', 25.0)" in source
     assert 'self.create_timer(1.0 / self.target_base_stop_rate, self._target_base_stop_tick)' in source
-    assert "now - self.target_detected_wall <= self.target_stop_hold" in source
+    assert "now - getattr(self, 'target_detected_wall', -1.0e9) <= self.target_stop_hold" in source
     assert 'ReliabilityPolicy.BEST_EFFORT' in source
     assert 'def _force_leader_stop_for_target' in source
     assert 'def _target_base_stop_tick' in source

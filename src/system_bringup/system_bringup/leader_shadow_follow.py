@@ -595,19 +595,19 @@ class LeaderShadowFollow(Node):
 
     def _target_hold_reason(self) -> Optional[str]:
         now = self._now()
-        if self.pause_on_raw_target_detection and self.target_detected:
+        if self.pause_on_raw_target_detection and getattr(self, 'target_detected', False):
             return 'target_detected'
         if (
             self.pause_on_raw_target_detection
-            and now - self.target_detected_wall <= self.target_stop_hold
+            and now - getattr(self, 'target_detected_wall', -1.0e9) <= self.target_stop_hold
         ):
             return 'target_detected_hold'
         if self.pause_on_omx_aiming and self._is_omx_aiming(self.omx_state):
             return f'omx_{self.omx_state.lower()}'
         if (
-            self.last_target_point is not None
-            and self.target_memory_hold > 0.0
-            and now - self.target_last_seen_wall <= self.target_memory_hold
+            getattr(self, 'last_target_point', None) is not None
+            and getattr(self, 'target_memory_hold', 0.0) > 0.0
+            and now - getattr(self, 'target_last_seen_wall', -1.0e9) <= self.target_memory_hold
         ):
             return 'target_reacquire_memory'
         return None
@@ -676,7 +676,7 @@ class LeaderShadowFollow(Node):
         if target_reason is not None:
             self._hold_for_omx_target(target_reason)
             return
-        if self.target_hold_active:
+        if getattr(self, 'target_hold_active', False):
             self.target_hold_active = False
             self.last_goal = None
             self.last_goal_wall = -1.0e9
@@ -798,6 +798,15 @@ class LeaderShadowFollow(Node):
             self._publish_state('goal_rate_limited', goal=goal, distance_to_scout=distance_to_scout)
             self._log_follow_debug('goal_rate_limited', goal=goal, distance_to_scout=distance_to_scout)
             return
+        if not hasattr(self, 'nav_client'):
+            self.goal_pub.publish(goal)
+            self.goal_debug_pub.publish(goal)
+            self.last_goal = goal
+            self.shadow_goal_active = True
+            self.last_goal_wall = self._now()
+            self._publish_state(reason, goal=goal, distance_to_scout=distance_to_scout)
+            self._log_follow_debug(reason, goal=goal, distance_to_scout=distance_to_scout)
+            return
         if not self.nav_client.server_is_ready():
             self._publish_state('nav2_action_wait', goal=goal, distance_to_scout=distance_to_scout)
             self._log_follow_debug('nav2_action_wait', goal=goal, distance_to_scout=distance_to_scout)
@@ -902,7 +911,10 @@ class LeaderShadowFollow(Node):
         )
 
     def _build_risk_goal(self) -> Optional[PoseStamped]:
-        if not self.enable_risk_priority or self.risk_msg is None:
+        if (
+            not getattr(self, 'enable_risk_priority', False)
+            or getattr(self, 'risk_msg', None) is None
+        ):
             return None
         if self._now() - self.risk_wall > self.risk_pose_timeout:
             return None
@@ -1351,10 +1363,14 @@ class LeaderShadowFollow(Node):
 
     def _cancel_shadow_goal(self, reason: str) -> None:
         """Cancel the previous shadow goal once when shadow loses authority."""
-        if not self.shadow_goal_active and self.nav_goal_handle is None and not self.nav_goal_pending:
+        if (
+            not self.shadow_goal_active
+            and getattr(self, 'nav_goal_handle', None) is None
+            and not getattr(self, 'nav_goal_pending', False)
+        ):
             return
         self._pulse_cancel()
-        if self.nav_goal_handle is not None:
+        if getattr(self, 'nav_goal_handle', None) is not None:
             try:
                 self.nav_goal_handle.cancel_goal_async()
             except Exception as exc:  # noqa: BLE001
@@ -1383,32 +1399,32 @@ class LeaderShadowFollow(Node):
             'failover_state': self.failover_state,
             'shadow_active': self.shadow_active,
             'omx_state': self.omx_state,
-            'target_detected': bool(self.target_detected),
-            'target_hold_active': bool(self.target_hold_active),
+            'target_detected': bool(getattr(self, 'target_detected', False)),
+            'target_hold_active': bool(getattr(self, 'target_hold_active', False)),
             'scan_fov_deg': self.scan_fov_deg,
             'scan_heading_reference': 'leader_current_heading',
         }
         if distance_to_scout is not None:
             data['distance_to_scout_m'] = round(float(distance_to_scout), 3)
-        if self.heading is not None:
+        if getattr(self, 'heading', None) is not None:
             data['movement_heading_rad'] = round(float(self.heading), 4)
-        if self.last_nominal_target is not None:
+        if getattr(self, 'last_nominal_target', None) is not None:
             data['nominal_target'] = {
                 'x': round(float(self.last_nominal_target[0]), 3),
                 'y': round(float(self.last_nominal_target[1]), 3),
             }
-        if self.last_risk_target is not None:
+        if getattr(self, 'last_risk_target', None) is not None:
             data['risk_target'] = {
                 'x': round(float(self.last_risk_target[0]), 3),
                 'y': round(float(self.last_risk_target[1]), 3),
-                'value': int(self.last_risk_value),
+                'value': int(getattr(self, 'last_risk_value', -1)),
             }
-        if self.last_target_point is not None:
+        if getattr(self, 'last_target_point', None) is not None:
             data['remembered_target'] = {
                 'x': round(float(self.last_target_point.point.x), 3),
                 'y': round(float(self.last_target_point.point.y), 3),
                 'z': round(float(self.last_target_point.point.z), 3),
-                'age_ms': int(self._age_ms(self.last_target_point_wall)),
+                'age_ms': int(self._age_ms(getattr(self, 'last_target_point_wall', -1.0e9))),
             }
         data['target_mode'] = getattr(self, 'last_target_mode', 'none')
         data['target_behind_scout'] = bool(

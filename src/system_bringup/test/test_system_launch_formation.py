@@ -146,8 +146,11 @@ def test_follower_startup_forces_slam_and_rl_off():
     assert "'true' if follower_initial_role else enable_amcl.perform(context)" in text
     assert "local_exploration = (\n                False\n                if follower_initial_role" in text
     assert "'false'\n                if follower_initial_role\n                else forward_field_map_to_main.perform(context)" in text
+    assert "fleet_role_value in ('member', 'follower')" in text
+    assert 'role_gated_takeover_worker = bool(' in text
+    assert '(local_exploration or role_gated_takeover_worker)' in text
     assert 'FOLLOWER_CAPABILITY_STATUS | robot=' in text
-    assert 'cartographer_enabled=false rl_enabled=false' in text
+    assert 'cartographer_enabled=false rl_worker_standby=true' in text
 
 
 def test_follower_map_forwarding_is_explicit_for_takeover_commit():

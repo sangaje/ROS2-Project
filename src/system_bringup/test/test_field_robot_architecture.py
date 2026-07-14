@@ -21,10 +21,11 @@ def test_field_robot_launch_is_single_entrypoint_for_scout_and_follower():
     assert "field_enable_cartographer" in source
     assert "field_enable_amcl" in source
     assert "initial_role=FOLLOWER cannot start Cartographer" in source
-    assert "initial_role=FOLLOWER cannot start the RL worker" in source
     assert "initial_role=FOLLOWER cannot claim map authority" in source
     assert "initial_role=FOLLOWER cannot forward local maps" in source
     assert "default_exploration = False" in source
+    assert "standby_takeover_rl = 'true' if is_follower else requested_rl" in source
+    assert "'start_rl_worker': standby_takeover_rl" in source
     assert "DeclareLaunchArgument('enable_rl', default_value='')" in source
 
 
