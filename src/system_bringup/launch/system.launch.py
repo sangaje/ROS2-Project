@@ -629,14 +629,6 @@ def generate_launch_description():
                     respawn_delay=3.0,
                 ))
             risk_domain_value = risk_domain_id.perform(context).strip()
-            if not risk_domain_value:
-                risk_domain_value = member_domain_id.perform(context).strip()
-                if risk_domain_value:
-                    actions.append(LogInfo(msg=[
-                        'SYSTEM_BRINGUP | risk_domain_id not set; using ',
-                        'member_domain_id=', risk_domain_value,
-                        ' as the active Scout map bridge domain.',
-                    ]))
             if (
                 launch_bool(enable_risk_to_leader_bridge.perform(context))
                 and risk_domain_value
