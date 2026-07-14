@@ -603,9 +603,7 @@ def generate_launch_description():
                             'direct_rl_start': (
                                 'true' if fleet_role_value == 'member' else 'false'
                             ),
-                            'load_model_on_start': (
-                                'true' if fleet_role_value == 'member' else 'false'
-                            ),
+                            'load_model_on_start': 'true',
                             'cmd_vel_topic': DEFAULT_CMD_VEL_TOPIC,
                             'odom_topic': '/odom',
                             'max_odom_age_sec': '2.0',

@@ -173,10 +173,10 @@ def test_follower_startup_keeps_slam_off_but_allows_role_gated_rl():
     assert "'require_localization_ready': (\n                            False if follower_initial_role else not scout_owns_slam" in text
     assert "initial_role_active': (\n                                'true' if fleet_role_value == 'member' else 'false'" in text
     assert "'direct_rl_start': (\n                                'true' if fleet_role_value == 'member' else 'false'" in text
-    assert "'load_model_on_start': (\n                                'true' if fleet_role_value == 'member' else 'false'" in text
+    assert "'load_model_on_start': 'true'" in text
 
 
-def test_scout_rl_worker_uses_launch_env_and_lazy_follower_model_load():
+def test_scout_rl_worker_uses_launch_env_and_preloads_follower_model():
     launch = (
         Path(__file__).parents[1] / 'launch' / 'scout_rl_inference.launch.py'
     ).read_text(encoding='utf-8')
