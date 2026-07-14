@@ -262,9 +262,37 @@ def test_only_current_epoch_follower_completes_valid_takeover_once():
 
     assert node.state == FailoverState.NEW_SCOUT_EXPLORING
     assert node.active_scout_id == 'follower21'
-    assert len(node.role_pub.messages) == 1
+    assert len(node.role_pub.messages) == 2
+    handoff = [message for _, message in logger.messages if 'ACTIVE_SCOUT_HANDOFF' in message]
+    assert len(handoff) == 1
     resumed = [message for _, message in logger.messages if 'EXPLORATION_RESUMED' in message]
     assert len(resumed) == 1
+
+
+def test_follower_active_role_hands_off_source_before_rl_ready():
+    node, _, logger = _bare_node()
+    node.state = FailoverState.FOLLOWER_SCOUT_TAKEOVER
+    node.scout_epoch = 3
+
+    node._on_field_status(_string({
+        'robot': 'follower21',
+        'epoch': 3,
+        'role': 'ACTIVE_SCOUT',
+        'status': 'LOCALIZING',
+        'active_scout_ready': False,
+        'recovery_complete': True,
+        'localization_ready': True,
+        'motion_authority': 'RECOVERY_NAV',
+        'nav_goal_active': False,
+        'pending_goal_count': 0,
+        'active_goal_count': 0,
+    }))
+
+    assert node.state == FailoverState.FOLLOWER_SCOUT_TAKEOVER
+    assert node.active_scout_id == 'follower21'
+    assert len(node.active_scout_pub.messages) >= 1
+    handoff = [message for _, message in logger.messages if 'ACTIVE_SCOUT_HANDOFF' in message]
+    assert len(handoff) == 1
 
 
 def test_follower_completion_is_rejected_before_takeover_state():

@@ -190,8 +190,11 @@ def test_follower_bridge_can_forward_owned_map_to_main(tmp_path):
     assert follower['topics']['/local_slam_map']['remap'] == '/field/follower21/map'
     assert follower['topics']['/local_slam_map']['qos']['reliability'] == 'reliable'
     assert follower['topics']['/local_slam_map']['qos']['durability'] == 'transient_local'
+    assert follower['topics']['/rl_confidence_map']['remap'] == (
+        '/field/follower21/rl_confidence_map'
+    )
+    assert follower['topics']['/risk/risk_map']['remap'] == '/field/follower21/risk_map'
     assert '/map' not in follower['topics']
-    assert '/rl_confidence_map' not in follower['topics']
 
 
 def test_bridge_cycle_validator_rejects_map_echo_loop():

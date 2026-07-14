@@ -4,15 +4,15 @@ from pathlib import Path
 SYSTEM_LAUNCH = Path(__file__).parents[1] / 'launch' / 'system.launch.py'
 
 
-def test_three_robot_initial_formation_defaults_are_scout_centered():
+def test_three_robot_initial_formation_defaults_are_leader_centered():
     text = SYSTEM_LAUNCH.read_text(encoding='utf-8')
 
     assert "'leader_initial_y'," in text
-    assert "default_value='0.10'" in text
-    assert "'scout_initial_y'," in text
     assert "default_value='0.0'" in text
+    assert "'scout_initial_y'," in text
+    assert "default_value='0.20'" in text
     assert "'follower_initial_y'," in text
-    assert "default_value='-0.10'" in text
+    assert "default_value='-0.20'" in text
 
 
 def test_system_launch_passes_initial_pose_to_fleet_launches():
@@ -159,10 +159,15 @@ def test_follower_startup_keeps_slam_off_but_allows_role_gated_rl():
     assert 'risk_map_requested = False' in text
     assert "'true' if follower_initial_role else enable_amcl.perform(context)" in text
     assert "local_exploration = launch_bool(enable_exploration.perform(context))" in text
-    assert "'false'\n                if follower_initial_role\n                else forward_field_map_to_main.perform(context)" in text
+    assert (
+        "fleet_launch_args['forward_map_to_main'] = (\n"
+        "                forward_field_map_to_main.perform(context)\n"
+        "            )"
+    ) in text
     assert 'FOLLOWER_CAPABILITY_STATUS | robot=' in text
     assert 'cartographer_enabled=false rl_initial_active=false' in text
     assert 'takeover_rl_standby=' in text
+    assert 'blocking_reason=waiting_for_takeover' in text
     assert "initial_role_active': (\n                                'true' if fleet_role_value == 'member' else 'false'" in text
 
 

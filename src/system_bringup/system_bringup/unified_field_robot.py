@@ -1253,6 +1253,9 @@ class UnifiedFieldRobot(Node):
             'epoch': self.epoch,
             'role': self.role.value,
             'status': status,
+            'active_scout_id': (
+                self.robot_name if self.role == Role.ACTIVE_SCOUT else ''
+            ),
             'motion_authority': self.motion_authority.value,
             'cmd_source': self.motion_authority.value,
             'goal_generation': self.nav.goal_epoch,

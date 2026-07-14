@@ -28,7 +28,8 @@ def test_field_robot_launch_is_single_entrypoint_for_leader_scout_and_follower()
     assert "field_enable_amcl" in source
     assert "initial_role=FOLLOWER cannot start Cartographer" in source
     assert "initial_role=FOLLOWER cannot claim map authority at startup" in source
-    assert "initial_role=FOLLOWER cannot forward local maps" in source
+    assert "requested_map_forward = _bool_text" in source
+    assert "is_follower," in source
     assert "default_exploration = True" in source
     assert "DeclareLaunchArgument('enable_rl', default_value='')" in source
     assert "DeclareLaunchArgument('enable_follow'" not in source

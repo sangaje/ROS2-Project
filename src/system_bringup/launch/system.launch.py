@@ -320,9 +320,9 @@ def generate_launch_description():
             risk_map_requested = False
 
         # Only the initial ACTIVE_SCOUT/member stack may own local SLAM at
-        # startup. A FOLLOWER uses the Leader shared map for AMCL/Nav2; a
-        # takeover owner must start Cartographer explicitly after failure is
-        # confirmed.
+        # startup. A FOLLOWER uses the Leader shared map for AMCL/Nav2; its
+        # outbound map bridge can still be pre-created so takeover SLAM has
+        # a live route back to the Leader as soon as it starts.
         scout_owns_slam = (
             role_value == 'scout'
             and fleet_role_value == 'member'
@@ -383,9 +383,7 @@ def generate_launch_description():
         if fleet_role_value in ('follower', 'member'):
             fleet_launch_args['main_domain_id'] = str(main_domain)
             fleet_launch_args['forward_map_to_main'] = (
-                'false'
-                if follower_initial_role
-                else forward_field_map_to_main.perform(context)
+                forward_field_map_to_main.perform(context)
             )
         if fleet_role_value == 'member':
             fleet_launch_args['receive_leader_map'] = (
@@ -454,7 +452,9 @@ def generate_launch_description():
                 str(launch_bool(enable_exploration.perform(context))).lower(),
                 ' ',
                 'confidence_enabled=false map_authority=false ',
-                'local_map_outbound=false blocking_reason=normal_follower',
+                'local_map_outbound=',
+                forward_field_map_to_main.perform(context),
+                ' blocking_reason=waiting_for_takeover',
             ]))
         if scout_rl_owns_cmd_vel and launch_bool(start_nav2.perform(context)):
             actions.append(LogInfo(msg=[
@@ -1652,8 +1652,9 @@ def generate_launch_description():
                 'Field robot only: allow the member/follower bridge to send '
                 'its local /map to the leader. Default false; ACTIVE_SCOUT '
                 'maps use the dedicated rate-limited risk->leader map '
-                'gateway, and FOLLOWER maps stay local until explicit '
-                'takeover/commit testing enables this.'
+                'gateway. For FOLLOWER takeover, the field_robot wrapper '
+                'pre-opens this route while local SLAM remains off until '
+                'ACTIVE_SCOUT handoff.'
             ),
         ),
         DeclareLaunchArgument(
@@ -1705,10 +1706,10 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'leader_initial_y',
-            default_value='0.10',
+            default_value='0.0',
             description=(
-                'Leader AMCL initial y. Default is 10 cm left of scout22 '
-                'when all robots face +x.'
+                'Leader AMCL initial y. Default is the centerline of the '
+                'waffle/leader-based three-robot formation.'
             ),
         ),
         DeclareLaunchArgument(
@@ -1723,8 +1724,11 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'scout_initial_y',
-            default_value='0.0',
-            description='Active scout/member AMCL initial y in the shared map frame.',
+            default_value='0.20',
+            description=(
+                'Active scout/member AMCL initial y. Default is 20 cm left '
+                'of the waffle/leader when all robots face +x.'
+            ),
         ),
         DeclareLaunchArgument(
             'scout_initial_yaw',
@@ -1738,10 +1742,10 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'follower_initial_y',
-            default_value='-0.10',
+            default_value='-0.20',
             description=(
-                'Follower AMCL initial y. Default is 10 cm right of scout22 '
-                'when all robots face +x.'
+                'Follower AMCL initial y. Default is 20 cm right of the '
+                'waffle/leader when all robots face +x.'
             ),
         ),
         DeclareLaunchArgument(

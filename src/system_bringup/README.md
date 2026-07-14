@@ -23,6 +23,11 @@ authoritative `/map`을 소유하고, Leader Waffle/Jetson은 그 shared map을
 마지막 scout 위치로 이동한 뒤 ACTIVE_SCOUT 임무를 이어받는다. 각 Burger는
 자기 domain에서 scan/map/TF를 읽고 자기 `/cmd_vel`만 발행한다. RL action과
 `/cmd_vel`은 domain 간 bridge하지 않는다.
+FOLLOWER는 시작 시 shared map + AMCL/Nav2만 사용하고 Cartographer/Risk/RL
+명령은 standby다. 실패 지점 도착 후 ACTIVE_SCOUT로 handoff되면 takeover
+Cartographer/Risk stack을 켜고 `/field/follower21/map`,
+`/field/follower21/risk_map`, `/field/follower21/rl_confidence_map`으로
+리더에 이어서 내보낸다.
 
 Domain 22, active scout `scout22`:
 
@@ -70,8 +75,9 @@ ros2 launch system_bringup field_robot.launch.py \
   risk_domain_id:=22
 ```
 
-기본 초기 pose는 공유 `map` 기준으로 `scout22=(0.00,0.00,0.0)`,
-`leader20=(0.00,+0.10,0.0)`, `follower21=(0.00,-0.10,0.0)`이다.
+기본 초기 pose는 공유 `map` 기준으로 waffle/leader를 중심에 두고
+`leader20=(0.00,0.00,0.0)`, 좌측 `scout22=(0.00,+0.20,0.0)`,
+우측 `follower21=(0.00,-0.20,0.0)`이다.
 세 로봇 모두 `yaw=0.0`, 즉 `+x` 방향을 바라본다. Leader/Follower는
 `auto_localize:=false` fixed-seed AMCL을 기본으로 사용하고,
 `amcl_fixed_seed_ready`가 map/scan/odom/amcl/TF/lifecycle 상태를 확인한
@@ -132,6 +138,10 @@ prediction과 nonzero command를 내지 않는다. takeover 뒤
 `/cmd_vel`을 발행한다. Failover가 켜진 운용에서는 카메라 sender도 role-gated로 동작한다. 즉 follower 중에는 카메라
 장치를 닫고 화면/YOLO 프레임을 보내지 않다가, 기존 active scout가 죽어서 이
 로봇이 `ACTIVE_SCOUT`으로 takeover한 뒤에만 다시 카메라를 열고 송출한다.
+FOLLOWER의 local map outbound bridge는 시작 시 미리 열리지만, 실제 local
+Cartographer/Risk map 발행자는 ACTIVE_SCOUT handoff 전에는 뜨지 않는다.
+handoff 뒤에는 리더의 active source와 map relay가 follower map/pose를
+현재 정찰원으로 선택한다.
 정찰 임무(RL 탐사)를 처음부터 켜려면 `fleet_role`을 `member`(또는 비워서
 기본값)로 둔다.
 
@@ -198,10 +208,9 @@ ros2 launch system_bringup system.launch.py \
 
 이 안전장치는 `fleet_role`이 `member`/`follower`(AMCL, `enable_amcl`로
 끌 수 있음)나 `leader`(Cartographer, `enable_cartographer`로 끌 수 있음)일
-때 적용된다. `fleet_role:=follower`도 `enable_amcl:=false`와 같이 쓰면
-`start_cartographer:=true`를 그대로 쓸 수 있다 (2026-07-06 배선 완료 —
-follower는 결국 정찰봇이므로 follower 중에도 리스크맵 Cartographer가
-SLAM을 계속 소유해야 한다, 위 "follower는 결국 정찰봇이다" 참고).
+때 적용된다. `field_robot.launch.py initial_role:=FOLLOWER` 운용에서는
+시작 시 Cartographer/Risk map 소유권을 갖지 않고, active scout 사망 후
+takeover stack manager가 ACTIVE_SCOUT handoff에 맞춰 SLAM/Risk를 올린다.
 
 `/map` 이중 발행 문제는 `map_relay`가 `count_publishers()`로 Cartographer
 같은 다른 발행자가 있는지 감지해서 있으면 조용히 대기하도록 바뀌어서

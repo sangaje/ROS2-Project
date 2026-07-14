@@ -440,6 +440,16 @@ def write_fleet_bridge_configs(
             remap=f'/field/follower{int(follower_domain)}/map',
             profile=map_qos(),
         )
+        follower_topics['/rl_confidence_map'] = topic(
+            'nav_msgs/msg/OccupancyGrid',
+            remap=f'/field/follower{int(follower_domain)}/rl_confidence_map',
+            profile=map_qos(),
+        )
+        follower_topics['/risk/risk_map'] = topic(
+            'nav_msgs/msg/OccupancyGrid',
+            remap=f'/field/follower{int(follower_domain)}/risk_map',
+            profile=map_qos(),
+        )
     if simulation:
         follower_topics['/cmd_vel'] = topic(
             'geometry_msgs/msg/TwistStamped',

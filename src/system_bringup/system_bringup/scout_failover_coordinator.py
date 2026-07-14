@@ -333,6 +333,7 @@ class ScoutFailoverCoordinator(Node):
         robot = str(data.get('robot', '')).strip()
         if robot != self.follower_name:
             return
+        role = str(data.get('role', '')).strip().upper()
         status = str(data.get('status', data.get('role', ''))).strip().upper()
         motion_authority = str(data.get('motion_authority', '')).strip().upper()
         ready = bool(
@@ -344,23 +345,46 @@ class ScoutFailoverCoordinator(Node):
         nav_goal_active = bool(data.get('nav_goal_active', False))
         pending_goal_count = int(data.get('pending_goal_count', 0) or 0)
         active_goal_count = int(data.get('active_goal_count', 0) or 0)
-        if not (
-            ready
-            and recovery_complete
+        settled_at_failure_pose = (
+            recovery_complete
             and localization_ready
             and not nav_goal_active
             and pending_goal_count == 0
             and active_goal_count == 0
+        )
+        role_handoff_ready = (
+            settled_at_failure_pose
+            and (
+                role == 'ACTIVE_SCOUT'
+                or status == 'ACTIVE_SCOUT'
+                or status == 'ACTIVE_SCOUT_READY'
+            )
+        )
+        if role_handoff_ready:
+            self._handoff_active_scout(robot)
+        if not (
+            ready
+            and settled_at_failure_pose
             and motion_authority in (
                 '', MotionAuthority.NONE.value, MotionAuthority.ACTIVE_SCOUT_RL.value
             )
         ):
             return
-        self.active_scout_id = robot
         self._transition(FailoverState.NEW_SCOUT_EXPLORING)
         self._publish_role()
         self.get_logger().warning(
             '[FAILOVER] EXPLORATION_RESUMED | '
+            f'active_scout={self.active_scout_id} epoch={self.scout_epoch}'
+        )
+
+    def _handoff_active_scout(self, robot: str) -> None:
+        if self.active_scout_id == robot:
+            return
+        self.active_scout_id = robot
+        self._publish_state()
+        self._publish_role()
+        self.get_logger().warning(
+            '[FAILOVER] ACTIVE_SCOUT_HANDOFF | '
             f'active_scout={self.active_scout_id} epoch={self.scout_epoch}'
         )
 

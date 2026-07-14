@@ -104,9 +104,12 @@ def generate_launch_description():
             map_authority_eligible.perform(context),
             default_map_authority,
         )
+        # FOLLOWER does not own /map at startup, but it needs this outbound
+        # route pre-created so a takeover Cartographer/Risk stack can be seen
+        # by the Leader immediately after ACTIVE_SCOUT handoff.
         requested_map_forward = _bool_text(
             forward_field_map_to_main.perform(context),
-            False,
+            is_follower,
         )
         if is_follower and requested_cartographer == 'true':
             raise ValueError(
@@ -118,11 +121,6 @@ def generate_launch_description():
                 'initial_role=FOLLOWER cannot claim map authority at startup. '
                 'Takeover SLAM starts only after ACTIVE_SCOUT authority.'
             )
-        if is_follower and requested_map_forward == 'true':
-            raise ValueError(
-                'initial_role=FOLLOWER cannot forward local maps to Leader.'
-            )
-
         launch_args = {
             'role': 'scout',
             'fleet_role': fleet_role,
@@ -232,13 +230,11 @@ def generate_launch_description():
         DeclareLaunchArgument('map_authority_eligible', default_value=''),
         DeclareLaunchArgument(
             'forward_field_map_to_main',
-            default_value='false',
-            choices=['true', 'false'],
+            default_value='',
             description=(
                 'Forward this field robot local /map through its member/'
-                'follower bridge. Keep false for normal ACTIVE_SCOUT and '
-                'FOLLOWER operation; use only for explicit takeover/commit '
-                'tests.'
+                'follower bridge. Empty keeps ACTIVE_SCOUT on its dedicated '
+                'map gateway and pre-opens FOLLOWER takeover map egress.'
             ),
         ),
         DeclareLaunchArgument('camera_sender_device', default_value='/dev/video1'),
